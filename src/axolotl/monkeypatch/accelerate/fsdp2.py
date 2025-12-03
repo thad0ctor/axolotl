@@ -376,11 +376,54 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def fsdp2_apply_ac(accelerator, model: torch.nn.Module):
+    """
+    Applies the activation checkpointing to the model.
+    Fixed version that handles None auto_wrap_policy.
+
+    Args:
+        accelerator (`Accelerator`): The accelerator instance
+        model (`torch.nn.Module`): The model to apply the activation checkpointing to
+
+    Returns:
+        `torch.nn.Module`: The model with the activation checkpointing applied
+    """
+    from accelerate.utils import get_module_children_bottom_up
+    from accelerate.utils.fsdp_utils import fsdp2_prepare_auto_wrap_policy
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+    )
+
+    auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(accelerator.state.fsdp_plugin, model)
+    
+    # Handle case where auto_wrap_policy_func is None
+    if auto_wrap_policy_func is None:
+        LOG.warning("FSDP2: auto_wrap_policy_func is None, skipping activation checkpointing")
+        return model
+
+    for layer_name, layer in get_module_children_bottom_up(model, return_fqns=True)[:-1]:
+        if len(layer_name.split(".")) > 1:
+            parent_name, child_name = layer_name.rsplit(".", 1)
+        else:
+            parent_name = None
+            child_name = layer_name
+
+        parent_module = model.get_submodule(parent_name) if parent_name else model
+        if auto_wrap_policy_func(parent_module):
+            layer = checkpoint_wrapper(layer, preserve_rng_state=False)
+            parent_module.register_module(child_name, layer)
+
+    return model
+
+
 def patch_accelerate_fsdp2():
     import accelerate
+    from accelerate.utils import fsdp_utils
 
     accelerate.accelerator.fsdp2_prepare_model = fsdp2_prepare_model
     accelerate.Accelerator.get_state_dict = get_state_dict
+    # Patch the problematic function
+    fsdp_utils.fsdp2_apply_ac = fsdp2_apply_ac
     setattr(
         sys.modules["accelerate"],
         "Accelerator.get_state_dict",

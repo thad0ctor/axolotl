@@ -615,6 +615,11 @@ def setup_fsdp_envs(cfg):
         os.environ["FSDP_TRANSFORMER_CLS_TO_WRAP"] = (
             cfg.fsdp_config.transformer_layer_cls_to_wrap
         )
+    if cfg.fsdp_config.min_num_params:
+        os.environ["FSDP_MIN_NUM_PARAMS"] = str(cfg.fsdp_config.min_num_params)
+    elif cfg.fsdp_config.auto_wrap_policy == "SIZE_BASED_WRAP":
+        # Default to 100M parameters if not specified
+        os.environ["FSDP_MIN_NUM_PARAMS"] = str(int(1e8))
     if cfg.fsdp_config.reshard_after_forward:
         os.environ["FSDP_RESHARD_AFTER_FORWARD"] = "true"
 
