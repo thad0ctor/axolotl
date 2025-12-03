@@ -60,6 +60,11 @@ class FSDPConfig(BaseModel):
         default=None,
         description="Class name of transformer layers to wrap (e.g., 'LlamaDecoderLayer')",
     )
+    
+    min_num_params: int | None = Field(
+        default=None,
+        description="Minimum number of parameters for SIZE_BASED_WRAP policy (default: 1e8)",
+    )
 
     reshard_after_forward: bool | None = Field(
         default=None,
