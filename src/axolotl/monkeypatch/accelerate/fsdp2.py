@@ -323,7 +323,15 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         # We need to re-tie the weights, not exactly sure why, but if we don't do this, reference to `lm_head/embed_tokens` stay hanging -> more VRAM usage
         # We assume `transformers` models have a `tie_weights` method if they support it
         if hasattr(model, "tie_weights"):
-            model.tie_weights()
+            try:
+                model.tie_weights()
+            except KeyError as e:
+                if "attribute 'weight' already exists" in str(e):
+                    # This can happen when the model is already on meta device
+                    # and weights are already tied. Safe to ignore.
+                    LOG.debug("Skipping tie_weights as weights already exist (meta device)")
+                else:
+                    raise
 
     is_peft_model = isinstance(model, PeftModel)
 
@@ -337,6 +345,10 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
                 )
                 log_bias_dtype_mismatch |= module_log_bias_mismatch
             if auto_wrap_policy(module) and not isinstance(module, FSDPModule):
+                # Skip container modules that don't implement forward
+                if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+                    LOG.debug(f"Skipping FSDP wrap for container module: {type(module).__name__}")
+                    continue
                 fully_shard(module, **fsdp2_kwargs)
 
     fully_shard(model, **fsdp2_kwargs)
@@ -372,7 +384,13 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         # removing this call makes the have slightly different loss
         # removing the call above leads to extra memory usage as explained in the comment above
         if hasattr(model, "tie_weights"):
-            model.tie_weights()
+            try:
+                model.tie_weights()
+            except KeyError as e:
+                if "attribute 'weight' already exists" in str(e):
+                    LOG.debug("Skipping tie_weights as weights already exist")
+                else:
+                    raise
     return model
 
 
