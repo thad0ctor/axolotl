@@ -491,12 +491,24 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         else:
             if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
+                # DictDefault returns None for missing keys, so we need explicit None checks
+                unmask_image_tokens = self.cfg.unmask_image_tokens
+                if unmask_image_tokens is None:
+                    unmask_image_tokens = True  # Default: unmask image tokens
+                unmask_images_in_user_only = self.cfg.unmask_images_in_user_messages_only
+                if unmask_images_in_user_only is None:
+                    unmask_images_in_user_only = False  # Default: unmask all images
+                
+                LOG.info(f"[IMAGE MASKING CONFIG] unmask_image_tokens={unmask_image_tokens}, unmask_images_in_user_messages_only={unmask_images_in_user_only}")
+                
                 kwargs["processing_strategy"] = get_processing_strategy(
                     self.processor,
                     training_args.chat_template,
                     self.cfg.chat_template,
                     image_size=training_args.image_size,
                     image_resize_algorithm=training_args.image_resize_algorithm,
+                    unmask_image_tokens=unmask_image_tokens,
+                    unmask_images_in_user_messages_only=unmask_images_in_user_only,
                 )
             elif self.cfg.batch_flattening:
                 collator = DataCollatorWithFlattening

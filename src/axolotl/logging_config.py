@@ -38,6 +38,10 @@ class AxolotlOrWarnErrorFilter(logging.Filter):
             self.other_level = logging.getLevelName(other_log_level)
 
     def filter(self, record: LogRecord) -> bool:
+        # Block filelock debug messages
+        if record.name == "filelock" and record.levelno == logging.DEBUG:
+            return False
+            
         # General filter
         if record.levelno >= self.other_level:
             return True

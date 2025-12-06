@@ -415,6 +415,13 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         return dict(res)
 
     def _tokenize_single_prompt(self, prompt: dict) -> Dict[str, List[int]]:
+        # # Debug: Log prompt keys
+        # LOG.debug(f"[TOKENIZE DEBUG] Prompt keys: {list(prompt.keys())}")
+        # if "messages" in prompt:
+        #     LOG.debug(f"[TOKENIZE DEBUG] Messages count: {len(prompt['messages'])}")
+        #     roles = [msg.get("role", "unknown") for msg in prompt["messages"]]
+        #     LOG.debug(f"[TOKENIZE DEBUG] Message roles: {roles}")
+        
         # Old simple legacy behavior that works reliably.
         if (
             not self.roles_to_train
@@ -455,7 +462,17 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
 
         turns = self.get_conversation_thread(prompt)
         tools = self._get_tools(prompt)
-        input_ids = self.prompter.build_prompt(turns, tools=tools)  # type: ignore
+        tokenized_res = self.prompter.build_prompt(turns, tools=tools)  # type: ignore
+        
+        # Handle dict return from multimodal processors
+        if isinstance(tokenized_res, dict):
+            input_ids = tokenized_res["input_ids"]
+            # Store the full dict for later return
+            tokenized_prompt = dict(tokenized_res)
+        else:
+            input_ids = tokenized_res
+            tokenized_prompt = {}
+            
         labels = [IGNORE_TOKEN_ID] * len(input_ids)
 
         last_eos_idx = -1
@@ -572,11 +589,20 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
 
         LOG.debug(f"Final labels: {labels}")
 
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": [1] * len(input_ids),
-        }
+        # If we have a multimodal tokenized_prompt dict, update it with labels
+        if tokenized_prompt:
+            tokenized_prompt["labels"] = labels
+            # Ensure attention_mask exists
+            if "attention_mask" not in tokenized_prompt:
+                tokenized_prompt["attention_mask"] = [1] * len(input_ids)
+            return tokenized_prompt
+        else:
+            # Return standard format for text-only
+            return {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": [1] * len(input_ids),
+            }
 
     def find_first_eos_token(self, input_ids, start_idx):
         eos_token_id = self.tokenizer.eos_token_id
@@ -637,6 +663,12 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         # Generate the conversation up to the turn, with final turn included
         full_ids = self.prompter.build_prompt(turns_with_content, tools=tools)  # type: ignore
 
+        # Handle dict return from processor (multimodal models)
+        if isinstance(dummy_ids, dict):
+            dummy_ids = dummy_ids.get("input_ids", [])
+        if isinstance(full_ids, dict):
+            full_ids = full_ids.get("input_ids", [])
+
         if not full_ids or not dummy_ids:
             LOG.warning(f"Empty template generated for turn {turn_idx}")
             return -1, -1
@@ -689,6 +721,11 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         turns = []
 
         messages = self._get_messages(prompt)
+        
+        # # Debug: Log raw messages
+        # LOG.debug(f"[CHAT_TEMPLATE DEBUG] Raw messages count: {len(messages)}")
+        # for i, msg in enumerate(messages):
+        #     LOG.debug(f"[CHAT_TEMPLATE DEBUG] Message {i}: role='{msg.get('role', 'unknown')}', content_type={type(msg.get('content'))}")
 
         possible_sys_turn = self.transform_message(messages[0])
 
@@ -715,6 +752,11 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
 
         if self.prompter.drop_system_message and turns[0]["role"] == "system":
             turns = turns[1:]
+            
+        # # Debug: Log transformed turns
+        # LOG.debug(f"[CHAT_TEMPLATE DEBUG] Final turns count: {len(turns)}")
+        # roles = [turn.get("role", "unknown") for turn in turns]
+        # LOG.debug(f"[CHAT_TEMPLATE DEBUG] Turn roles: {roles}")
 
         return turns
 

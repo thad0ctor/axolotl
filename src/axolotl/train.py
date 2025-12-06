@@ -209,6 +209,27 @@ def execute_training(
         # if cfg.bf16:
         #     torch.set_default_dtype(torch.bfloat16)
 
+        # ----- BEGIN DIAGNOSTIC: CHECK TRAINABLE PARAMETERS -----
+        LOG.info("="*80)
+        LOG.info("DIAGNOSTIC: CHECKING TRAINABLE PARAMETERS")
+        total_params = 0
+        trainable_params = 0
+        vision_trainable_params = 0
+        for name, param in trainer.model.named_parameters():
+            total_params += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+                if "visual" in name or "vision" in name:
+                    vision_trainable_params += param.numel()
+                    LOG.info(f"  - [TRAINABLE VISION PARAM]: {name}")
+        
+        LOG.info(f"Total Parameters: {total_params / 1_000_000:.2f}M")
+        LOG.info(f"Trainable Parameters: {trainable_params / 1_000_000:.2f}M")
+        LOG.info(f"Trainable Vision Parameters: {vision_trainable_params / 1_000_000:.2f}M")
+        LOG.info(f"Trainable Percentage: {100 * trainable_params / total_params:.2f}%")
+        LOG.info("="*80)
+        # ----- END DIAGNOSTIC -----
+        
         LOG.info("Starting trainer...")
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 

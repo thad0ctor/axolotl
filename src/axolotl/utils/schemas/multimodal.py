@@ -26,6 +26,26 @@ class MultiModalConfig(BaseModel):
             "description": "The resampling algorithm to use for image resizing. Default is bilinear. Please refer to PIL.Image.Resampling for more details."
         },
     )
+    unmask_image_tokens: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Whether to unmask image tokens for multimodal training. "
+                "When True, image tokens will be included in loss calculation. "
+                "Default is True for multimodal models."
+            )
+        },
+    )
+    unmask_images_in_user_messages_only: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "When unmask_image_tokens is True, this controls whether to unmask "
+                "image tokens only in user messages (True) or in all messages (False). "
+                "Default is False (unmask all image tokens)."
+            )
+        },
+    )
 
     @field_validator("image_resize_algorithm", mode="before")
     @classmethod
