@@ -150,11 +150,11 @@ class ProcessingStrategy:
         processed_examples = []
         for example in examples:
             if not ("messages" in example or "conversations" in example):
-                # Debug: Log what keys are actually present
-                LOG.error(f"[PROCESSING DEBUG] Example keys: {list(example.keys())}")
-                LOG.error(f"[PROCESSING DEBUG] Example type: {type(example)}")
-                if len(list(example.keys())) < 10:  # Only log if not too many keys
-                    LOG.error(f"[PROCESSING DEBUG] Full example: {example}")
+                # # Debug: Log what keys are actually present
+                # LOG.error(f"[PROCESSING DEBUG] Example keys: {list(example.keys())}")
+                # LOG.error(f"[PROCESSING DEBUG] Example type: {type(example)}")
+                # if len(list(example.keys())) < 10:  # Only log if not too many keys
+                #     LOG.error(f"[PROCESSING DEBUG] Full example: {example}")
                 raise ValueError(
                     "Only `messages` and `conversations` message keys are currently supported."
                 )
@@ -328,23 +328,23 @@ class ProcessingStrategy:
         Mask non assistant regions to -100.
         To be implemented per subclass.
         """
-        LOG.debug(f"ProcessingStrategy._mask_non_assistant called (base implementation) - returning labels unchanged")
+        # LOG.debug(f"ProcessingStrategy._mask_non_assistant called (base implementation) - returning labels unchanged")
         return labels
 
     def process_labels(self, input_ids: Tensor) -> Tensor:
-        if not hasattr(self, '_labels_step_count'):
-            self._labels_step_count = 0
-        self._labels_step_count += 1
-        
-        if self._labels_step_count <= 10:
-            LOG.debug(f"{self.__class__.__name__}.process_labels called with input_ids shape: {input_ids.shape}")
+        # if not hasattr(self, '_labels_step_count'):
+        #     self._labels_step_count = 0
+        # self._labels_step_count += 1
+        # 
+        # if self._labels_step_count <= 10:
+        #     LOG.debug(f"{self.__class__.__name__}.process_labels called with input_ids shape: {input_ids.shape}")
         labels = input_ids.clone()
 
-        if self._labels_step_count <= 10:
-            LOG.debug(f"{self.__class__.__name__}.process_labels: About to call _mask_non_assistant")
+        # if self._labels_step_count <= 10:
+        #     LOG.debug(f"{self.__class__.__name__}.process_labels: About to call _mask_non_assistant")
         labels = self._mask_non_assistant(labels)
-        if self._labels_step_count <= 10:
-            LOG.debug(f"{self.__class__.__name__}.process_labels: _mask_non_assistant completed")
+        # if self._labels_step_count <= 10:
+        #     LOG.debug(f"{self.__class__.__name__}.process_labels: _mask_non_assistant completed")
 
         # The labels are the input_ids, and we mask the padding tokens in the loss computation
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
@@ -352,8 +352,8 @@ class ProcessingStrategy:
         # Ignore the image token index in the loss computation (model specific)
         labels[labels == self.image_token_id] = -100
 
-        if self._labels_step_count <= 10:
-            LOG.debug(f"{self.__class__.__name__}.process_labels completed, returning labels shape: {labels.shape}")
+        # if self._labels_step_count <= 10:
+        #     LOG.debug(f"{self.__class__.__name__}.process_labels completed, returning labels shape: {labels.shape}")
         return labels
 
 
@@ -381,12 +381,12 @@ class Qwen2VLProcessingStrategy(ProcessingStrategy):
     
     def process_labels(self, input_ids: Tensor) -> Tensor:
         """Override to NOT mask image tokens after _mask_non_assistant"""
-        LOG.debug(f"{self.__class__.__name__}.process_labels called with input_ids shape: {input_ids.shape}")
+        # LOG.debug(f"{self.__class__.__name__}.process_labels called with input_ids shape: {input_ids.shape}")
         labels = input_ids.clone()
 
-        LOG.debug(f"{self.__class__.__name__}.process_labels: About to call _mask_non_assistant")
+        # LOG.debug(f"{self.__class__.__name__}.process_labels: About to call _mask_non_assistant")
         labels = self._mask_non_assistant(labels)
-        LOG.debug(f"{self.__class__.__name__}.process_labels: _mask_non_assistant completed")
+        # LOG.debug(f"{self.__class__.__name__}.process_labels: _mask_non_assistant completed")
 
         # Only mask padding tokens - NOT image tokens!
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
@@ -394,7 +394,7 @@ class Qwen2VLProcessingStrategy(ProcessingStrategy):
         # Do NOT mask image tokens - we need them for multimodal learning
         # (This is different from the base class which masks image tokens)
         
-        LOG.debug(f"{self.__class__.__name__}.process_labels completed, returning labels shape: {labels.shape}")
+        # LOG.debug(f"{self.__class__.__name__}.process_labels completed, returning labels shape: {labels.shape}")
         return labels
 
     def _mask_non_assistant(self, labels: Tensor) -> Tensor:
