@@ -389,10 +389,37 @@ def fused_rms_norm_rope(x, weight, cos, sin, eps=1e-6):
     B, S, H, D = shape
     # Flatten to 2D: (B*S*H, D)
     x_flat = x.reshape(-1, D).contiguous()
-    # Flatten cos/sin to (B*S, D) — the kernel will handle per-head broadcast
-    # by dividing the row_idx by H to get the cos/sin row
-    cos_flat = cos.reshape(B * S, D).contiguous()
-    sin_flat = sin.reshape(B * S, D).contiguous()
+    # Gemma4 can hand rotary embeddings to attention either as:
+    #   - (B, S, D): explicit batch dimension
+    #   - (S, D): shared across the batch and broadcast by attention
+    # The fused kernel only needs one RoPE row per token position and already
+    # broadcasts across heads internally. Handle both layouts here so batched
+    # eval with shared position embeddings does not trip an invalid reshape.
+    if cos.ndim == 3 and sin.ndim == 3:
+        if cos.shape == (B, S, D) and sin.shape == (B, S, D):
+            cos_flat = cos.reshape(B * S, D).contiguous()
+            sin_flat = sin.reshape(B * S, D).contiguous()
+        elif cos.shape == (1, S, D) and sin.shape == (1, S, D):
+            cos_flat = cos.expand(B, -1, -1).reshape(B * S, D).contiguous()
+            sin_flat = sin.expand(B, -1, -1).reshape(B * S, D).contiguous()
+        else:
+            raise RuntimeError(
+                f"Expected rotary embeddings with shape {(B, S, D)} or {(1, S, D)}, "
+                f"got cos={tuple(cos.shape)} sin={tuple(sin.shape)}"
+            )
+    elif cos.ndim == 2 and sin.ndim == 2:
+        if cos.shape != (S, D) or sin.shape != (S, D):
+            raise RuntimeError(
+                f"Expected broadcast rotary embeddings with shape {(S, D)}, "
+                f"got cos={tuple(cos.shape)} sin={tuple(sin.shape)}"
+            )
+        cos_flat = cos.unsqueeze(0).expand(B, -1, -1).reshape(B * S, D).contiguous()
+        sin_flat = sin.unsqueeze(0).expand(B, -1, -1).reshape(B * S, D).contiguous()
+    else:
+        raise RuntimeError(
+            "Unsupported rotary embedding rank for fused_rms_norm_rope: "
+            f"cos.ndim={cos.ndim}, sin.ndim={sin.ndim}"
+        )
 
     y_flat = FusedRMSNormRoPEFunction.apply(x_flat, weight, cos_flat, sin_flat, eps, H)
     return y_flat.view(shape)
