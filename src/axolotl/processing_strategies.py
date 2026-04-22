@@ -404,6 +404,123 @@ class Gemma3nProcessingStrategy(ProcessingStrategy):
         return labels
 
 
+class Gemma4ProcessingStrategy(ProcessingStrategy):
+    """Processing Strategy class for Gemma4.
+
+    Mirrors Gemma3nProcessingStrategy: restricts loss to assistant-generated
+    tokens by scanning for ``<|turn>model`` / ``<turn|>`` boundary sequences,
+    then additionally masks padding and media placeholder tokens.
+    """
+
+    def _mask_non_assistant(self, labels: Tensor) -> Tensor:
+        def _find_token_sequence(label, start_pos, token_sequence):
+            """Check if token_sequence appears at start_pos in label"""
+            if start_pos + len(token_sequence) > len(label):
+                return False
+            if label[start_pos] != token_sequence[0]:
+                return False
+            return (
+                label[start_pos : start_pos + len(token_sequence)].tolist()
+                == token_sequence
+            )
+
+        def _find_assistant_end(label, start_pos, assistant_end_tok, mask, i):
+            """
+            Find the end of assistant response and update mask accordingly
+
+            Returns new position to continue from and whether the end seq is found
+            """
+            k = start_pos
+            while k < len(label):
+                if not _find_token_sequence(label, k, assistant_end_tok):
+                    mask[i][k] = 1
+                    k += 1
+                    continue
+
+                return k + len(assistant_end_tok), True
+
+            return k, False
+
+        mask = zeros_like(labels)
+
+        assistant_start_str = "<|turn>model"
+        assistant_end_str = "<turn|>"
+        include_assistant_start_tok = False
+        include_assistant_end_tok = True
+
+        # str to tokens
+        assistant_start_tok = self.processor.tokenizer.encode(
+            assistant_start_str, add_special_tokens=False
+        )
+        assistant_end_tok = self.processor.tokenizer.encode(
+            assistant_end_str, add_special_tokens=False
+        )
+
+        for i, label in enumerate(labels):
+            j = 0
+            # while loop through each tok index in labels[i]
+            while j < len(label):
+                # Check until match start seq
+                if not _find_token_sequence(label, j, assistant_start_tok):
+                    j += 1
+                    continue
+
+                if include_assistant_start_tok:
+                    mask[i][j : j + len(assistant_start_tok)] = 1
+
+                # Find where the assistant response ends
+                start_of_content = j + len(assistant_start_tok)
+                end_pos, found_end_seq = _find_assistant_end(
+                    label, start_of_content, assistant_end_tok, mask, i
+                )
+
+                # Include end token if requested
+                if include_assistant_end_tok and found_end_seq:
+                    mask[i][end_pos - len(assistant_end_tok) : end_pos] = 1
+
+                j = end_pos
+
+            labels[i][mask[i] == 0] = -100
+
+        return labels
+
+    def process_labels(self, input_ids):
+        labels = input_ids.clone()
+        labels = self._mask_non_assistant(labels)
+
+        tokenizer = self.processor.tokenizer
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+
+        labels[labels == tokenizer.pad_token_id] = -100
+
+        # image_token_id / audio_token_id are standard integer attributes on
+        # the Gemma 4 tokenizer (see transformers/models/gemma4/processing_gemma4.py).
+        if getattr(tokenizer, "image_token_id", None) is not None:
+            labels[labels == tokenizer.image_token_id] = -100
+        if getattr(tokenizer, "audio_token_id", None) is not None:
+            labels[labels == tokenizer.audio_token_id] = -100
+
+        # boi / eoi / boa / eoa are exposed on the processor as token *strings*
+        # (not *_id ints) on Gemma 4, so hasattr(tokenizer, "boi_token_id") is
+        # False and would silently skip. Resolve IDs via convert_tokens_to_ids.
+        for attr in ("boi_token", "eoi_token", "boa_token", "eoa_token"):
+            token_str = getattr(self.processor, attr, None)
+            if token_str is None:
+                continue
+            token_id = tokenizer.convert_tokens_to_ids(token_str)
+            if token_id is None or token_id == unk_id:
+                continue
+            labels[labels == token_id] = -100
+
+        # Gemma 4 processor registers <|video|> explicitly and stores the id
+        # on the processor, not the tokenizer.
+        video_token_id = getattr(self.processor, "video_token_id", None)
+        if video_token_id is not None and video_token_id != unk_id:
+            labels[labels == video_token_id] = -100
+
+        return labels
+
+
 class VoxtralProcessingStrategy(ProcessingStrategy):
     """Processing Strategy class for Voxtral"""
 
@@ -598,6 +715,10 @@ def get_processing_strategy(
         )
     if chat_template_type == "gemma3n":
         return Gemma3nProcessingStrategy(
+            **processing_kwargs,
+        )
+    if chat_template_type == "gemma4":
+        return Gemma4ProcessingStrategy(
             **processing_kwargs,
         )
 
