@@ -232,15 +232,27 @@ class LigerPlugin(BasePlugin):
                 _OrigGemma4RMSNorm = modeling_gemma4.Gemma4RMSNorm
 
                 class _LigerGemma4RMSNorm(LigerRMSNorm):
-                    """LigerRMSNorm for Gemma4 with in_place=False and with_scale support."""
+                    """LigerRMSNorm for Gemma4 with in_place=False and with_scale support.
 
-                    def __new__(cls, dim, eps=1e-6, with_scale=True):
+                    ``dim`` is marked optional so that ``copy.deepcopy`` can
+                    reconstruct instances via ``cls.__new__(cls)`` (no args) —
+                    which happens when PEFT clones modules via
+                    ``lora_modules_to_save`` (e.g. ``vision_tower``) and walks
+                    the submodule tree. The no-arg ``__new__`` / ``__init__``
+                    path is only exercised by pickle/deepcopy; normal
+                    construction from ``modeling_gemma4`` still passes ``dim``.
+                    """
+
+                    def __new__(cls, dim=None, eps=1e-6, with_scale=True):
                         if not with_scale:
                             return _OrigGemma4RMSNorm(dim, eps, with_scale=False)
                         return super().__new__(cls)
 
-                    def __init__(self, dim, eps=1e-6, with_scale=True):
-                        if not with_scale:
+                    def __init__(self, dim=None, eps=1e-6, with_scale=True):
+                        # Deepcopy protocol: __new__ returns a bare instance
+                        # and __setstate__ restores attributes directly, so
+                        # __init__ must be a no-op when called with no dim.
+                        if dim is None or not with_scale:
                             return
                         # offset=0.0 (standard), in_place=False (gradient checkpointing safe)
                         super().__init__(
