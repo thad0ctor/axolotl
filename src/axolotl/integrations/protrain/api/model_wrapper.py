@@ -264,6 +264,16 @@ def protrain_model_wrapper(
     except StopIteration:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    # Gradient checkpointing + HF KV cache leads to recompute-time shape
+    # mismatches (cache grows across calls; the recompute call sees a
+    # different past_key_values length). Force use_cache=False if the model
+    # exposes it — this is standard practice for training regardless of
+    # ProTrain, and the CKPT block wrapper depends on it.
+    cfg_obj = getattr(model, "config", None)
+    if cfg_obj is not None and getattr(cfg_obj, "use_cache", False):
+        LOG.info("ProTrain: forcing model.config.use_cache=False for CKPT compatibility")
+        cfg_obj.use_cache = False
+
     # ---- 1. profile (cached) --------------------------------------------
     cache_key = ProfilerCacheKey(
         arch_hash=_arch_hash(model),

@@ -151,6 +151,14 @@ def run_trace(
 
     device = torch.device(cfg.device)
     tracker = MemoryDeltaTracker(device)
+    # Seed the tracker's baseline with the CURRENT allocated bytes so the
+    # first op's inter-op delta measures only the transient allocated
+    # *between* profiler entry and first hook fire — not the model weights
+    # already resident when the profiler started. Without this, the first
+    # op's inter-op delta captures the entire baseline (e.g. 13 GiB for
+    # Llama-7B), which F_bm in cost/memory.py then double-counts against
+    # the model_state_present term.
+    tracker.mark_end(tracker.snapshot().allocated_bytes)
 
     # --- per-op accumulators -------------------------------------------
     op_records: list[OpRecord] = []

@@ -158,10 +158,12 @@ def _assert_counts(
 # HF LLM layout), then less-common transformer variants, then the base_model
 # layout used by PEFT-wrapped models.
 _KNOWN_BLOCK_PATHS: tuple[str, ...] = (
-    "transformer.h",          # GPT-2, GPT-Neo, GPT-J (some), Falcon (some)
-    "model.layers",           # Llama, Mistral, Qwen, most modern HF LLMs
-    "transformer.layers",     # MPT, some GPT-NeoX variants
-    "base_model.layers",      # PEFT / LoRA-wrapped models
+    "transformer.h",                   # GPT-2, GPT-Neo, GPT-J (some), Falcon (some)
+    "model.layers",                    # Llama, Mistral, Qwen, most modern HF LLMs
+    "transformer.layers",              # MPT, some GPT-NeoX variants
+    "base_model.layers",               # PEFT / LoRA-wrapped models (short form)
+    "base_model.model.model.layers",   # PEFT + LlamaForCausalLM (LoraModel wraps CausalLM)
+    "base_model.model.transformer.h",  # PEFT + GPT-2
 )
 
 
@@ -178,8 +180,18 @@ def _resolve(root: nn.Module, dotted: str) -> nn.Module | None:
 
 def _looks_like_block(m: nn.Module) -> bool:
     """Heuristic: transformer blocks expose an ``attention`` or ``self_attn``
-    attribute. Fall-back path when no known dotted path matches."""
-    return hasattr(m, "attention") or hasattr(m, "self_attn")
+    attribute. Blocks wrapped by ProTrain's dispatcher expose
+    ``_protrain_wrapped_mode``. Fall-back path when no known dotted path
+    matches."""
+    if hasattr(m, "attention") or hasattr(m, "self_attn"):
+        return True
+    if hasattr(m, "_protrain_wrapped_mode"):
+        return True
+    # CheckpointedBlock stores the original in ``.block``; check one level in.
+    inner = getattr(m, "block", None)
+    if inner is not None and (hasattr(inner, "attention") or hasattr(inner, "self_attn")):
+        return True
+    return False
 
 
 def _iter_module_lists(root: nn.Module) -> Iterable[nn.ModuleList]:
