@@ -1110,7 +1110,7 @@ def get_processing_strategy(
 
     if chat_template_type == "qwen2_vl":
         return Qwen2VLProcessingStrategy(**processing_kwargs)
-    if chat_template_type in ["qwen3_5", "qwen3_5_moe"]:
+    if chat_template_type == "qwen3_5":
         return Qwen3_5ProcessingStrategy(**processing_kwargs)
     if chat_template_type == "gemma3":
         return Gemma3ProcessingStrategy(**processing_kwargs)
