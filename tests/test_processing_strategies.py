@@ -562,3 +562,103 @@ def test_base_strategy_warns_when_no_boundaries(caplog):
     assert any("role boundaries" in rec.message for rec in caplog.records)
 
 
+# --------------------------------------------------------------------------- #
+# processor_kwargs plumbing (#3617)
+# --------------------------------------------------------------------------- #
+
+
+def _load_processor_module():
+    """Load ``axolotl.loaders.processor`` directly from its source file so the
+    test doesn't trigger ``axolotl.loaders.__init__``, which eagerly imports
+    bitsandbytes (not installed in all CI environments). Also stubs any
+    optional telemetry deps that processor.py pulls in transitively."""
+    import importlib.util
+    import pathlib
+    import sys
+    import types
+
+    # Stub optional telemetry deps before the loader executes.
+    if "posthog" not in sys.modules:
+        stub = types.ModuleType("posthog")
+        stub.Posthog = lambda *a, **kw: None  # type: ignore[attr-defined]
+        sys.modules["posthog"] = stub
+
+    src = pathlib.Path(__file__).parent.parent / "src" / "axolotl" / "loaders" / "processor.py"
+    spec = importlib.util.spec_from_file_location(
+        "axolotl.loaders.processor", str(src)
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_load_processor_forwards_processor_kwargs():
+    """cfg.processor_kwargs should be merged into the kwargs passed to
+    ``processor_cls.from_pretrained``. axolotl-managed keys (revision,
+    trust_remote_code) must not be overridable via this knob."""
+    from axolotl.utils.dict import DictDefault
+    processor_mod = _load_processor_module()
+
+    captured_kwargs = {}
+
+    class _FakeProcessor:
+        size = {}
+        tokenizer = None
+
+        @classmethod
+        def from_pretrained(cls, name, **kwargs):
+            captured_kwargs.update(kwargs)
+            return cls()
+
+    processor_mod.AutoProcessor = _FakeProcessor
+
+    cfg = DictDefault({
+        "processor_type": None,          # fall through to AutoProcessor
+        "processor_config": "fake/path",
+        "revision_of_model": "abc123",   # axolotl-managed, should win
+        "trust_remote_code": False,      # axolotl-managed, should win
+        "tokenizer_use_mistral_common": False,
+        "image_size": None,
+        "processor_kwargs": {
+            "min_pixels": 128 * 128,
+            "max_pixels": 768 * 768,
+            "revision": "HIJACKED",      # must be filtered out
+            "trust_remote_code": True,   # must be filtered out
+        },
+    })
+    processor_mod.load_processor(cfg, tokenizer=object())
+
+    assert captured_kwargs["min_pixels"] == 128 * 128
+    assert captured_kwargs["max_pixels"] == 768 * 768
+    assert captured_kwargs["revision"] == "abc123"
+    assert captured_kwargs["trust_remote_code"] is False
+
+
+def test_load_processor_handles_absent_processor_kwargs():
+    """Existing configs without processor_kwargs must keep working unchanged."""
+    from axolotl.utils.dict import DictDefault
+    processor_mod = _load_processor_module()
+
+    captured_kwargs = {}
+
+    class _FakeProcessor:
+        size = {}
+        tokenizer = None
+
+        @classmethod
+        def from_pretrained(cls, name, **kwargs):
+            captured_kwargs.update(kwargs)
+            return cls()
+
+    processor_mod.AutoProcessor = _FakeProcessor
+
+    cfg = DictDefault({
+        "processor_type": None,
+        "processor_config": "fake/path",
+        "revision_of_model": None,
+        "trust_remote_code": False,
+        "tokenizer_use_mistral_common": False,
+        "image_size": None,
+    })
+    processor_mod.load_processor(cfg, tokenizer=object())
+    assert captured_kwargs == {"trust_remote_code": False}
