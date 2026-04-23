@@ -653,7 +653,10 @@ class Gemma4ProcessingStrategy(ProcessingStrategy):
             ("system", "system"),
         ]
         for external_role, template_role in role_marker_pairs:
-            start = _encode_markers(tok, [f"<|turn>{template_role}"])
+            # Include trailing ``\n`` for consistency with Qwen/Gemma3/Llama
+            # markers; the newline is part of the marker in the real
+            # google/gemma-4 tokenizer's chat template.
+            start = _encode_markers(tok, [f"<|turn>{template_role}\n"])
             if start:
                 boundaries.append(
                     RoleBoundary(

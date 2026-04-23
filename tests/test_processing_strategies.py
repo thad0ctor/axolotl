@@ -311,12 +311,13 @@ def test_gemma3n_masks_image_and_audio_attrs():
 
 
 class _FakeGemma4Tokenizer(_Tokenizer):
-    """Mirrors google/gemma-4-E2B-it token layout."""
+    """Mirrors google/gemma-4-E2B-it token layout. Gemma4 role-start markers
+    include the trailing newline so the boundary matches the jinja template."""
 
     VOCAB = {
-        "<|turn>model": [105, 4368],
-        "<|turn>user": [105, 7777],
-        "<|turn>system": [105, 8888],
+        "<|turn>model\n": [105, 4368, 108],
+        "<|turn>user\n": [105, 7777, 108],
+        "<|turn>system\n": [105, 8888, 108],
         "<turn|>": [106],
         "<|image|>": [258880],
         "<|video|>": [258884],
@@ -351,48 +352,54 @@ class _FakeGemma4Processor:
 def test_gemma4_masks_everything_outside_assistant_span():
     strategy = Gemma4ProcessingStrategy(_FakeGemma4Processor())
     V = strategy.processor.tokenizer.vocab
+    user_start = V["<|turn>user\n"]
+    model_start = V["<|turn>model\n"]
+    turn_end = V["<turn|>"][0]
     seq = [
         0,
-        V["<|turn>user"][0], V["<|turn>user"][1], 4444, V["<turn|>"][0],
-        V["<|turn>model"][0], V["<|turn>model"][1], 5555, V["<turn|>"][0],
+        *user_start, 4444, turn_end,
+        *model_start, 5555, turn_end,
         9999,
     ]
     labels = strategy.process_labels(torch.tensor([seq]))
-    expected = [-100, -100, -100, -100, -100, -100, -100, 5555, V["<turn|>"][0], -100]
+    expected = (
+        [-100] * (1 + len(user_start) + 1 + 1 + len(model_start))
+        + [5555, turn_end, -100]
+    )
     assert labels.tolist()[0] == expected
 
 
 def test_gemma4_masks_media_tokens_inside_assistant_span():
     strategy = Gemma4ProcessingStrategy(_FakeGemma4Processor())
     V = strategy.processor.tokenizer.vocab
-    seq = [
-        V["<|turn>model"][0], V["<|turn>model"][1],
+    model_start = V["<|turn>model\n"]
+    media = [
         V["<|image|>"][0], V["<|video|>"][0], V["<|audio|>"][0],
         V["<|image>"][0], V["<image|>"][0],
         V["<|audio>"][0], V["<audio|>"][0],
-        9999,
-        V["<turn|>"][0],
     ]
+    turn_end = V["<turn|>"][0]
+    seq = [*model_start, *media, 9999, turn_end]
     labels = strategy.process_labels(torch.tensor([seq]))
-    expected = [-100, -100, -100, -100, -100, -100, -100, -100, -100, 9999,
-                V["<turn|>"][0]]
+    expected = [-100] * (len(model_start) + len(media)) + [9999, turn_end]
     assert labels.tolist()[0] == expected
 
 
 def test_gemma4_multiple_assistant_turns():
     strategy = Gemma4ProcessingStrategy(_FakeGemma4Processor())
     V = strategy.processor.tokenizer.vocab
+    turn_end = V["<turn|>"][0]
 
     def user_turn(x):
-        return [V["<|turn>user"][0], V["<|turn>user"][1], x, V["<turn|>"][0]]
+        return [*V["<|turn>user\n"], x, turn_end]
 
     def model_turn(x):
-        return [V["<|turn>model"][0], V["<|turn>model"][1], x, V["<turn|>"][0]]
+        return [*V["<|turn>model\n"], x, turn_end]
 
     seq = user_turn(1111) + model_turn(2222) + user_turn(3333) + model_turn(4444)
     labels = strategy.process_labels(torch.tensor([seq]))
     kept = [t for t in labels.tolist()[0] if t != -100]
-    assert kept == [2222, V["<turn|>"][0], 4444, V["<turn|>"][0]]
+    assert kept == [2222, turn_end, 4444, turn_end]
 
 
 # --------------------------------------------------------------------------- #
