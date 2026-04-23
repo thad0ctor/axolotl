@@ -521,16 +521,13 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         else:
             if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
-                # Read per-dataset masking knobs from the first MM dataset entry
-                # if present, else fall back to the global cfg values. This
-                # mirrors how the text-only ChatTemplateStrategy resolves them
-                # (see src/axolotl/prompt_strategies/chat_template.py).
+                # Mirror ChatTemplateStrategy: per-dataset masking knobs from first MM dataset, else global cfg.
                 ds_entries = self.cfg.datasets or []
                 ds_cfg = ds_entries[0] if ds_entries else None
                 roles_to_train = None
                 train_on_eos = None
                 if ds_cfg is not None:
-                    # DictDefault / dict / pydantic model — use .get where available.
+                    # Handle DictDefault / dict / pydantic uniformly.
                     get_attr = (
                         ds_cfg.get if hasattr(ds_cfg, "get") else ds_cfg.__getitem__
                     )
@@ -543,9 +540,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     except (AttributeError, KeyError):
                         train_on_eos = None
 
-                # cfg.role_boundaries overrides the strategy's built-in
-                # per-role marker declarations. Pydantic model instances are
-                # passed straight through; the scanner resolver handles both.
+                # cfg.role_boundaries replaces the strategy's built-in markers.
                 role_boundaries_override = None
                 if self.cfg.role_boundaries:
                     role_boundaries_override = list(self.cfg.role_boundaries)

@@ -1,10 +1,4 @@
-"""Tests for ``axolotl.processing_strategies``.
-
-These tests avoid loading real checkpoints so they can run offline and in CI
-without HF Hub access. Each fake processor mirrors the token-id layout and
-attribute shape of the corresponding real model closely enough to exercise
-the boundary-scan and media-token-masking paths.
-"""
+"""Tests for ``axolotl.processing_strategies`` using fake tokenizers (offline/CI-safe)."""
 
 import pytest
 import torch
@@ -32,11 +26,7 @@ from axolotl.processing_strategies import (
 
 
 class _Tokenizer:
-    """Minimal tokenizer stub.
-
-    ``vocab`` maps marker strings → list[int] (tokens the marker encodes to).
-    Single tokens (most unique specials) map to a list of one id.
-    """
+    """Minimal tokenizer stub; ``vocab`` maps marker strings to their id lists."""
 
     def __init__(self, vocab: dict[str, list[int]], pad_id: int = 0,
                  unk_id: int = 3, eos_id: int | None = None):
@@ -51,10 +41,7 @@ class _Tokenizer:
             self.eos_token_id = eos_id
 
     def encode(self, text, add_special_tokens=False):
-        # Return [] for unknown markers. The strategies use ``_encode_markers``
-        # which drops empty results, so callers that only care about a subset
-        # of roles (e.g. dispatcher-routing tests) don't need to declare every
-        # possible role marker in the fake vocab.
+        # Unknown markers return [] so _encode_markers drops them silently.
         return list(self.vocab.get(text, []))
 
     def convert_tokens_to_ids(self, token):
@@ -82,24 +69,12 @@ def _scan(role_boundaries, seq, roles_to_train=("assistant",), train_on_eos="tur
 
 
 def test_scanner_assistant_only_basic():
-    """Single assistant span with `<|im_start|>assistant\\n ... <|im_end|>`."""
     boundaries = [
-        RoleBoundary(
-            role="assistant",
-            start_tokens=[1, 2],   # <|im_start|>assistant\n
-            end_tokens=[9],        # <|im_end|>
-        ),
-        RoleBoundary(
-            role="user",
-            start_tokens=[1, 3],   # <|im_start|>user\n
-            end_tokens=[9],
-        ),
+        RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
+        RoleBoundary(role="user", start_tokens=[1, 3], end_tokens=[9]),
     ]
-    # seq: [user_start][content 7][end]  [assistant_start][content 8 8][end][trail 5]
     seq = [1, 3, 7, 9, 1, 2, 8, 8, 9, 5]
     out = _scan(boundaries, seq)
-    # User span entirely -100; assistant content 8,8 + <|im_end|>(9) kept;
-    # trailing 5 after last span is -100.
     assert out == [-100, -100, -100, -100, -100, -100, 8, 8, 9, -100]
 
 
@@ -109,7 +84,6 @@ def test_scanner_train_on_eos_none_excludes_end_marker():
     ]
     seq = [1, 2, 8, 8, 9]
     out = _scan(boundaries, seq, train_on_eos="none")
-    # End marker 9 dropped.
     assert out == [-100, -100, 8, 8, -100]
 
 
@@ -120,8 +94,6 @@ def test_scanner_train_on_eos_all_keeps_non_assistant_end_marker():
     ]
     seq = [1, 3, 7, 9, 1, 2, 8, 9]
     out = _scan(boundaries, seq, train_on_eos="all")
-    # User content 7 is -100; user end 9 is KEPT (train_on_eos=all);
-    # assistant content 8 and end 9 kept.
     assert out == [-100, -100, -100, 9, -100, -100, 8, 9]
 
 
@@ -132,13 +104,12 @@ def test_scanner_roles_to_train_user_and_assistant():
     ]
     seq = [1, 3, 7, 9, 1, 2, 8, 9]
     out = _scan(boundaries, seq, roles_to_train=("user", "assistant"))
-    # Both spans' content and end markers kept; role-start markers (1,3 and 1,2)
-    # are excluded because include_start defaults to False.
+    # include_start defaults to False so role-start markers stay masked.
     assert out == [-100, -100, 7, 9, -100, -100, 8, 9]
 
 
 def test_scanner_truncated_assistant():
-    """No closing end marker — span runs to end of sequence, end marker not included."""
+    """Missing end marker: span runs to end-of-sequence, end marker not emitted."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
     ]
@@ -148,23 +119,17 @@ def test_scanner_truncated_assistant():
 
 
 def test_scanner_longest_prefix_wins():
-    """When boundary starts overlap, the longer start wins."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[1, 2, 4], end_tokens=[9]),
         RoleBoundary(role="user", start_tokens=[1, 2], end_tokens=[9]),
     ]
-    # Prefix [1,2,4] matches both "assistant" (len 3) and is a prefix of "user"
-    # (len 2). Longer wins → assistant.
     seq = [1, 2, 4, 8, 9]
     out = _scan(boundaries, seq)
     assert out == [-100, -100, -100, 8, 9]
 
 
 def test_scanner_no_boundaries_masks_everything():
-    """With no declared boundaries there are no trainable spans, so every
-    position is masked. Strategies short-circuit this case in
-    ``_mask_non_assistant`` by returning labels unchanged and logging a
-    warning; see ``test_base_strategy_warns_when_no_boundaries``."""
+    # Strategies short-circuit this in _mask_non_assistant; see test_base_strategy_warns_when_no_boundaries.
     labels = torch.tensor([[1, 2, 3, 4]])
     out = _apply_role_boundaries(labels, [], {"assistant"}, "turn")
     assert out.tolist() == [[-100, -100, -100, -100]]
@@ -176,8 +141,7 @@ def test_scanner_no_boundaries_masks_everything():
 
 
 def _qwen_tokenizer():
-    # ChatML-ish: <|im_start|>(101) assistant(102) \n(103) <|im_end|>(104)
-    # system(105), user(106), <|image_pad|>(200), <|video_pad|>(201)
+    # ChatML-ish with image_pad=200, video_pad=201.
     vocab = {
         "<|im_start|>assistant\n": [101, 102, 103],
         "<|im_start|>user\n": [101, 106, 103],
@@ -196,24 +160,18 @@ def _make_qwen2vl():
 
 def test_qwen2vl_masks_user_keeps_assistant_and_image_pad():
     strategy = _make_qwen2vl()
-    # system \n hi <|im_end|>  user \n 7 <|im_end|>  assistant \n <|image_pad|> 8 <|im_end|>
     seq = [
-        101, 105, 103, 77, 104,    # system
-        101, 106, 103, 7, 104,     # user
-        101, 102, 103, 200, 8, 104,  # assistant with image pad
+        101, 105, 103, 77, 104,
+        101, 106, 103, 7, 104,
+        101, 102, 103, 200, 8, 104,
     ]
     labels = strategy.process_labels(torch.tensor([seq]))
     out = labels.tolist()[0]
-    # Assistant content (\n, image_pad→-100, 8) + end marker 104 is kept,
-    # but image_pad(200) is masked post-scan.
-    # Assistant span starts at pos 10: [101,102,103] then content [200,8,104]
-    # content range is [13..15] inclusive of end.
-    # image_pad at 13 → -100, 8 at 14 → kept, 104 at 15 → kept.
-    assert out[:10] == [-100] * 10  # system + user
-    assert out[10] == -100 and out[11] == -100 and out[12] == -100  # assistant markers
-    assert out[13] == -100  # image_pad masked
-    assert out[14] == 8  # content kept
-    assert out[15] == 104  # end marker kept
+    assert out[:10] == [-100] * 10
+    assert out[10] == -100 and out[11] == -100 and out[12] == -100
+    assert out[13] == -100  # image_pad masked post-scan
+    assert out[14] == 8
+    assert out[15] == 104
 
 
 def test_qwen3_5_masks_video_pad_too():
@@ -221,9 +179,7 @@ def test_qwen3_5_masks_video_pad_too():
     strategy = Qwen3_5ProcessingStrategy(_Processor(tok))
     seq = [101, 102, 103, 201, 8, 104]
     labels = strategy.process_labels(torch.tensor([seq]))
-    out = labels.tolist()[0]
-    # assistant_start markers -100, video_pad -100, 8 kept, end kept
-    assert out == [-100, -100, -100, -100, 8, 104]
+    assert labels.tolist()[0] == [-100, -100, -100, -100, 8, 104]
 
 
 def test_qwen2vl_train_on_inputs_true_keeps_everything():
@@ -231,7 +187,6 @@ def test_qwen2vl_train_on_inputs_true_keeps_everything():
     strategy = Qwen2VLProcessingStrategy(_Processor(tok), train_on_inputs=True)
     seq = [101, 106, 103, 7, 104, 101, 102, 103, 8, 104]
     labels = strategy.process_labels(torch.tensor([seq]))
-    # Only pad / image_pad would be masked; no pad/image_pad in sequence.
     assert labels.tolist()[0] == seq
 
 
@@ -255,17 +210,15 @@ def _gemma_tokenizer():
 
 def test_gemma3_scanner_plus_soft_image_token():
     strategy = Gemma3ProcessingStrategy(_Processor(_gemma_tokenizer()))
-    # seq: user [1,10,3] 7 [4]   model [1,2,3] 50 8 262144 [4]
     seq = [1, 10, 3, 7, 4, 1, 2, 3, 50, 8, 262144, 4]
     labels = strategy.process_labels(torch.tensor([seq]))
-    out = labels.tolist()[0]
-    # user entirely masked; assistant content kept except boi(50) and soft(262144)
-    assert out == [-100, -100, -100, -100, -100, -100, -100, -100, -100, 8, -100, 4]
+    # boi(50) and soft-image-token(262144) masked post-scan.
+    assert labels.tolist()[0] == [-100, -100, -100, -100, -100, -100, -100, -100, -100, 8, -100, 4]
 
 
 def test_gemma3n_masks_image_and_audio_attrs():
     tok = _gemma_tokenizer()
-    # Gemma3n presents these as integer attrs on the tokenizer:
+    # Gemma3n exposes these as integer attrs on the tokenizer.
     tok.image_token_id = 70
     tok.audio_token_id = 71
     tok.boi_token_id = 72
@@ -273,7 +226,6 @@ def test_gemma3n_masks_image_and_audio_attrs():
     strategy = Gemma3nProcessingStrategy(_Processor(tok))
     seq = [1, 2, 3, 70, 71, 72, 73, 9, 4]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # assistant start [1,2,3] -100, then all 4 media tokens -100, 9 kept, 4 kept
     assert out == [-100, -100, -100, -100, -100, -100, -100, 9, 4]
 
 
@@ -283,7 +235,7 @@ def test_gemma3n_masks_image_and_audio_attrs():
 
 
 class _FakeGemma4Tokenizer(_Tokenizer):
-    """Tokenizer layout mirroring google/gemma-4-E2B-it."""
+    """Mirrors google/gemma-4-E2B-it token layout."""
 
     VOCAB = {
         "<|turn>model": [105, 4368],
@@ -324,14 +276,12 @@ def test_gemma4_masks_everything_outside_assistant_span():
     strategy = Gemma4ProcessingStrategy(_FakeGemma4Processor())
     V = strategy.processor.tokenizer.vocab
     seq = [
-        0,  # pad
-        V["<|turn>user"][0], V["<|turn>user"][1], 4444, V["<turn|>"][0],  # user
-        V["<|turn>model"][0], V["<|turn>model"][1], 5555, V["<turn|>"][0],  # assistant
-        9999,  # trailing
+        0,
+        V["<|turn>user"][0], V["<|turn>user"][1], 4444, V["<turn|>"][0],
+        V["<|turn>model"][0], V["<|turn>model"][1], 5555, V["<turn|>"][0],
+        9999,
     ]
     labels = strategy.process_labels(torch.tensor([seq]))
-    # Expected: pad masked, user masked, assistant start markers masked,
-    # assistant content (5555) kept, end marker (<turn|>) kept, trailing masked.
     expected = [-100, -100, -100, -100, -100, -100, -100, 5555, V["<turn|>"][0], -100]
     assert labels.tolist()[0] == expected
 
@@ -348,7 +298,6 @@ def test_gemma4_masks_media_tokens_inside_assistant_span():
         V["<turn|>"][0],
     ]
     labels = strategy.process_labels(torch.tensor([seq]))
-    # start markers -100, all media tokens -100, 9999 kept, end marker kept
     expected = [-100, -100, -100, -100, -100, -100, -100, -100, -100, 9999,
                 V["<turn|>"][0]]
     assert labels.tolist()[0] == expected
@@ -385,10 +334,8 @@ def test_llama3_2_vision_assistant_masking():
         "<|eot_id|>": [10],
     }
     strategy = Llama3_2VisionProcessingStrategy(_Processor(_Tokenizer(vocab, pad_id=0)))
-    # user then assistant
     seq = [1, 2, 6, 4, 5, 11, 10, 1, 2, 3, 4, 5, 12, 10]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # user: all masked. assistant content 12 + end 10 kept.
     assert out == [-100] * 12 + [12, 10]
 
 
@@ -413,6 +360,10 @@ def test_llama4_assistant_masking():
 
 
 def test_pixtral_assistant_terminates_at_eos():
+    # Known limitation: [/INST] is both user-end and assistant-start. The scanner
+    # consumes it for user and skips the assistant span. Workaround: set
+    # include_end=False on user and include_start=True on assistant, or use a
+    # template with distinct markers.
     vocab = {
         "[INST]": [50],
         "[/INST]": [51],
@@ -421,23 +372,7 @@ def test_pixtral_assistant_terminates_at_eos():
     strategy = PixtralProcessingStrategy(_Processor(tok))
     seq = [50, 7, 51, 8, 8, 99]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # user (50 7 51) all masked (51 is also assistant start — longest-prefix
-    # tie means assistant wins only when there is an overlap; here [/INST]=51
-    # is both user-end and assistant-start, so 51 is consumed as user-end
-    # first, then 51 immediately re-consumed as assistant-start on the next
-    # scan position — but 51 was already consumed by the user span's
-    # _find_end. Our scanner advances past the end marker. So 51 is masked.
     assert out[:3] == [-100, -100, -100]
-    # Assistant span starts AFTER the user's end-marker position. But with
-    # our current scanner, after user span we sit at position AFTER 51,
-    # so the subsequent tokens [8,8,99] aren't inside any declared span —
-    # assistant span would need to start with [/INST]=51 which we just
-    # consumed. This test documents a known limitation: when user-end and
-    # assistant-start share a token, the scanner consumes it for user and
-    # skips the assistant start. See the class docstring for workarounds.
-    # (Users hit by this should declare include_end=False on user and
-    # include_start=True on assistant, or use a template with distinct
-    # markers.)
 
 
 def test_mistral_v7_tekken_system_user_assistant():
@@ -451,10 +386,9 @@ def test_mistral_v7_tekken_system_user_assistant():
     strategy = MistralV7TekkenProcessingStrategy(_Processor(tok))
     seq = [40, 5, 41, 50, 7, 51, 8, 99]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # system and user fully masked; assistant span limitation same as pixtral
-    # (51 shared between user-end and assistant-start)
-    assert out[:3] == [-100, -100, -100]  # system
-    assert out[3:6] == [-100, -100, -100]  # user
+    # Same [/INST] shared-token limitation as test_pixtral_assistant_terminates_at_eos.
+    assert out[:3] == [-100, -100, -100]
+    assert out[3:6] == [-100, -100, -100]
 
 
 # --------------------------------------------------------------------------- #
@@ -464,8 +398,7 @@ def test_mistral_v7_tekken_system_user_assistant():
 
 @pytest.fixture
 def _mistral_common_stub():
-    """Placeholder fixture; kept for forward-compat. The dispatcher lazy-imports
-    Mistral3Processor and degrades gracefully when mistral_common is absent."""
+    # Placeholder; dispatcher lazy-imports Mistral3Processor and degrades gracefully.
     return None
 
 
@@ -538,7 +471,6 @@ def test_dispatch_mistral_v7_tekken(_mistral_common_stub):
 
 
 def test_dispatch_unknown_falls_back_to_base(_mistral_common_stub):
-    """Unregistered templates (e.g. llava, lfm2vl) fall back to ProcessingStrategy."""
     vocab = {"dummy": [1]}
     s = _dispatch(_Processor(_Tokenizer(vocab, pad_id=0)), "llava")
     assert type(s) is ProcessingStrategy
@@ -550,15 +482,14 @@ def test_dispatch_unknown_falls_back_to_base(_mistral_common_stub):
 
 
 def test_role_boundaries_override_replaces_built_in():
-    """Passing role_boundaries_override to a strategy that already declares
-    boundaries (Qwen2VL here) swaps in the user's spec wholesale."""
+    """Override swaps the built-in boundaries wholesale, not additively."""
     vocab = {
         "<|im_start|>assistant\n": [101, 102, 103],
         "<|im_start|>user\n": [101, 106, 103],
         "<|im_end|>": [104],
-        ">>>A": [200, 201],   # custom assistant-start
-        ">>>U": [200, 202],   # custom user-start
-        "<<<": [210],         # custom end marker
+        ">>>A": [200, 201],
+        ">>>U": [200, 202],
+        "<<<": [210],
         "<|image_pad|>": [250],
     }
     strategy = Qwen2VLProcessingStrategy(
@@ -568,19 +499,16 @@ def test_role_boundaries_override_replaces_built_in():
             {"role": "user", "start": ">>>U", "end": "<<<"},
         ],
     )
-    # Built-in would have matched <|im_start|>assistant; override replaces it,
-    # so the ChatML-shaped prefix is now unmatched scaffolding.
     seq = [
-        101, 106, 103, 7, 104,       # ChatML user turn (ignored by override)
-        200, 201, 9, 9, 210,         # custom assistant turn
+        101, 106, 103, 7, 104,
+        200, 201, 9, 9, 210,
     ]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [-100, -100, -100, -100, -100, -100, -100, 9, 9, 210]
 
 
 def test_role_boundaries_override_enables_unverified_strategy():
-    """Override lets a user enable role masking on strategies that opt out
-    by default. Demonstrated here with the base strategy."""
+    """Override lets users opt in to role masking on strategies that default opt out."""
     vocab = {
         "BOA": [50, 51],
         "EOT": [60],
@@ -597,7 +525,6 @@ def test_role_boundaries_override_enables_unverified_strategy():
 
 
 def test_role_boundaries_override_eos_token_sentinel():
-    """``end: "eos_token"`` resolves to the tokenizer's eos_token_id."""
     vocab = {"BOA": [50]}
     tok = _Tokenizer(vocab, pad_id=0, eos_id=99)
     strategy = ProcessingStrategy(
@@ -612,8 +539,6 @@ def test_role_boundaries_override_eos_token_sentinel():
 
 
 def test_role_boundaries_override_end_null_runs_to_sequence_end():
-    """``end: null`` means no end marker — the span runs to the end of the
-    sequence."""
     vocab = {"BOA": [50]}
     strategy = ProcessingStrategy(
         _Processor(_Tokenizer(vocab, pad_id=0)),
@@ -627,7 +552,6 @@ def test_role_boundaries_override_end_null_runs_to_sequence_end():
 
 
 def test_role_boundaries_override_rejects_bad_spec():
-    """Missing 'role' or 'start' surfaces a clear error at strategy init."""
     vocab = {"BOA": [50]}
     with pytest.raises(ValueError, match="must have both 'role' and 'start'"):
         ProcessingStrategy(
@@ -637,7 +561,6 @@ def test_role_boundaries_override_rejects_bad_spec():
 
 
 def test_role_boundaries_override_rejects_unencodable_start():
-    """A start marker that tokenizes to an empty sequence is unmatchable."""
     vocab = {"BOA": [50]}
     with pytest.raises(ValueError, match="tokenizes to an empty sequence"):
         ProcessingStrategy(
@@ -649,8 +572,7 @@ def test_role_boundaries_override_rejects_unencodable_start():
 
 
 def test_role_boundaries_override_accepts_pydantic_models():
-    """cfg.role_boundaries comes through as RoleBoundarySpec instances after
-    pydantic parsing; the resolver must handle them the same as plain dicts."""
+    # cfg.role_boundaries arrives as RoleBoundarySpec after pydantic parsing.
     from axolotl.utils.schemas.multimodal import RoleBoundarySpec
 
     vocab = {"BOA": [50], "EOT": [60]}
@@ -667,10 +589,7 @@ def test_role_boundaries_override_accepts_pydantic_models():
 
 
 def test_base_strategy_warns_when_no_boundaries(caplog):
-    """A base ProcessingStrategy with no declared boundaries and
-    train_on_inputs=False emits a one-shot warning and returns labels
-    unchanged (legacy behavior)."""
-    # Reset the one-shot dedupe set for this test.
+    """No boundaries + train_on_inputs=False: one-shot warning, labels unchanged."""
     import axolotl.processing_strategies as mod
     mod._ROLE_MASK_WARNED.discard("ProcessingStrategy")
 
@@ -679,7 +598,6 @@ def test_base_strategy_warns_when_no_boundaries(caplog):
     import logging
     with caplog.at_level(logging.WARNING, logger="axolotl.processing_strategies"):
         labels = s.process_labels(torch.tensor([[1, 2, 3]]))
-    # Pad is 0 which isn't in [1,2,3]; no image_token; everything kept.
     assert labels.tolist() == [[1, 2, 3]]
     assert any("role boundaries" in rec.message for rec in caplog.records)
 
@@ -690,16 +608,12 @@ def test_base_strategy_warns_when_no_boundaries(caplog):
 
 
 def _load_processor_module():
-    """Load ``axolotl.loaders.processor`` directly from its source file so the
-    test doesn't trigger ``axolotl.loaders.__init__``, which eagerly imports
-    bitsandbytes (not installed in all CI environments). Also stubs any
-    optional telemetry deps that processor.py pulls in transitively."""
+    """Load processor.py directly to bypass loaders/__init__'s bitsandbytes import."""
     import importlib.util
     import pathlib
     import sys
     import types
 
-    # Stub optional telemetry deps before the loader executes.
     if "posthog" not in sys.modules:
         stub = types.ModuleType("posthog")
         stub.Posthog = lambda *a, **kw: None  # type: ignore[attr-defined]
@@ -715,9 +629,7 @@ def _load_processor_module():
 
 
 def test_load_processor_forwards_processor_kwargs():
-    """cfg.processor_kwargs should be merged into the kwargs passed to
-    ``processor_cls.from_pretrained``. axolotl-managed keys (revision,
-    trust_remote_code) must not be overridable via this knob."""
+    """cfg.processor_kwargs merges through, but revision/trust_remote_code stay axolotl-managed."""
     from axolotl.utils.dict import DictDefault
     processor_mod = _load_processor_module()
 
@@ -735,17 +647,17 @@ def test_load_processor_forwards_processor_kwargs():
     processor_mod.AutoProcessor = _FakeProcessor
 
     cfg = DictDefault({
-        "processor_type": None,          # fall through to AutoProcessor
+        "processor_type": None,
         "processor_config": "fake/path",
-        "revision_of_model": "abc123",   # axolotl-managed, should win
-        "trust_remote_code": False,      # axolotl-managed, should win
+        "revision_of_model": "abc123",
+        "trust_remote_code": False,
         "tokenizer_use_mistral_common": False,
         "image_size": None,
         "processor_kwargs": {
             "min_pixels": 128 * 128,
             "max_pixels": 768 * 768,
-            "revision": "HIJACKED",      # must be filtered out
-            "trust_remote_code": True,   # must be filtered out
+            "revision": "HIJACKED",          # filtered out
+            "trust_remote_code": True,       # filtered out
         },
     })
     processor_mod.load_processor(cfg, tokenizer=object())
@@ -757,7 +669,6 @@ def test_load_processor_forwards_processor_kwargs():
 
 
 def test_load_processor_handles_absent_processor_kwargs():
-    """Existing configs without processor_kwargs must keep working unchanged."""
     from axolotl.utils.dict import DictDefault
     processor_mod = _load_processor_module()
 
@@ -792,12 +703,10 @@ def test_load_processor_handles_absent_processor_kwargs():
 
 
 def test_scanner_batch_size_greater_than_one():
-    """Scanner masks each row independently in a batched tensor."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
         RoleBoundary(role="user", start_tokens=[1, 3], end_tokens=[9]),
     ]
-    # Row 0: user then assistant. Row 1: assistant-only.
     labels = torch.tensor(
         [
             [1, 3, 7, 9, 1, 2, 8, 9],
@@ -812,25 +721,21 @@ def test_scanner_batch_size_greater_than_one():
 
 
 def test_scanner_adjacent_trainable_turns():
-    """Two assistant turns back-to-back (no gap) both keep their content."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
     ]
-    # assistant [1,2] 5 [9] IMMEDIATELY followed by assistant [1,2] 6 [9]
     seq = [1, 2, 5, 9, 1, 2, 6, 9]
     out = _scan(boundaries, seq)
     assert out == [-100, -100, 5, 9, -100, -100, 6, 9]
 
 
 def test_scanner_train_on_eos_none_multi_turn():
-    """train_on_eos='none' drops end markers across multiple assistant turns."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
         RoleBoundary(role="user", start_tokens=[1, 3], end_tokens=[9]),
     ]
     seq = [1, 3, 7, 9, 1, 2, 8, 9, 1, 3, 7, 9, 1, 2, 6, 9]
     out = _scan(boundaries, seq, train_on_eos="none")
-    # Two assistant spans; their 9 end markers should all be masked.
     assert out == [
         -100, -100, -100, -100, -100, -100, 8, -100,
         -100, -100, -100, -100, -100, -100, 6, -100,
@@ -838,21 +743,17 @@ def test_scanner_train_on_eos_none_multi_turn():
 
 
 def test_scanner_train_on_eos_all_with_user_turn_no_end_marker():
-    """train_on_eos='all' with a user turn that has no closing end marker
-    leaves that user content masked (no crash, no accidental inclusion)."""
+    """Unclosed non-trainable span with train_on_eos='all': nothing included, no crash."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
         RoleBoundary(role="user", start_tokens=[1, 3], end_tokens=[9]),
     ]
-    # User span never closes (no 9 between user-start and sequence end — there
-    # is no assistant start either); scanner consumes to end.
     seq = [1, 3, 7, 7, 7]
     out = _scan(boundaries, seq, train_on_eos="all")
     assert out == [-100, -100, -100, -100, -100]
 
 
 def test_scanner_include_start_true_via_override():
-    """include_start=True keeps start marker tokens on trainable spans."""
     vocab = {"BOA": [50, 51], "EOT": [60]}
     strategy = ProcessingStrategy(
         _Processor(_Tokenizer(vocab, pad_id=0)),
@@ -867,13 +768,11 @@ def test_scanner_include_start_true_via_override():
     )
     seq = [1, 50, 51, 7, 8, 60, 9]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # pre-span 1 masked; start markers (50,51) KEPT; content kept; end kept;
-    # post-span 9 masked.
     assert out == [-100, 50, 51, 7, 8, 60, -100]
 
 
 def test_scanner_include_end_false_via_override():
-    """include_end=False drops the end marker even with train_on_eos='turn'."""
+    """include_end=False drops end marker even with train_on_eos='turn'."""
     vocab = {"BOA": [50], "EOT": [60]}
     strategy = ProcessingStrategy(
         _Processor(_Tokenizer(vocab, pad_id=0)),
@@ -888,32 +787,28 @@ def test_scanner_include_end_false_via_override():
     )
     seq = [1, 50, 7, 8, 60, 9]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # end marker 60 should be masked because include_end=False.
     assert out == [-100, -100, 7, 8, -100, -100]
 
 
 def test_scanner_empty_start_tokens_is_defensive_noop():
-    """A RoleBoundary with empty start_tokens matches nothing (defensive)."""
+    """Defensive: empty start_tokens matches nothing; everything masked."""
     boundaries = [
         RoleBoundary(role="assistant", start_tokens=[], end_tokens=[9]),
     ]
     seq = [1, 2, 3, 4, 9]
     out = _scan(boundaries, seq)
-    # No start match ever fires; every position ends up masked.
     assert out == [-100] * 5
 
 
 def test_process_labels_masks_pad_inside_assistant_span():
-    """Pad tokens inside a trainable span are still masked by process_labels."""
+    """Pad inside a trainable span is still masked post-scan."""
     strategy = _make_qwen2vl()
-    # assistant [101,102,103] 8 pad(0) 8 [104]
     seq = [101, 102, 103, 8, 0, 8, 104]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [-100, -100, -100, 8, -100, 8, 104]
 
 
 def test_process_labels_all_pad_sequence_does_not_crash():
-    """An all-pad sequence produces an all-masked label row without error."""
     strategy = _make_qwen2vl()
     seq = [0, 0, 0, 0]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
@@ -921,9 +816,7 @@ def test_process_labels_all_pad_sequence_does_not_crash():
 
 
 def test_qwen2vl_multiple_consecutive_assistant_turns():
-    """Multiple consecutive assistant turns (no user between) all stay trainable."""
     strategy = _make_qwen2vl()
-    # assistant [101,102,103] 8 [104] then immediately assistant [101,102,103] 9 [104]
     seq = [101, 102, 103, 8, 104, 101, 102, 103, 9, 104]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [
@@ -933,24 +826,20 @@ def test_qwen2vl_multiple_consecutive_assistant_turns():
 
 
 def test_qwen2vl_batch_of_two_rows():
-    """Per-strategy batch > 1: each row gets its own mask."""
     strategy = _make_qwen2vl()
-    row_a = [101, 106, 103, 7, 104, 101, 102, 103, 8, 104]  # user + assistant
-    row_b = [101, 102, 103, 9, 104, 0, 0, 0, 0, 0]           # assistant + pad
+    row_a = [101, 106, 103, 7, 104, 101, 102, 103, 8, 104]
+    row_b = [101, 102, 103, 9, 104, 0, 0, 0, 0, 0]
     out = strategy.process_labels(torch.tensor([row_a, row_b])).tolist()
     assert out[0] == [-100, -100, -100, -100, -100, -100, -100, -100, 8, 104]
     assert out[1] == [-100, -100, -100, 9, 104, -100, -100, -100, -100, -100]
 
 
 def test_qwen3_5_train_on_inputs_true_still_masks_video_pad():
-    """train_on_inputs=True skips role masking but the video_pad media token
-    must still be masked by the Qwen3.5 subclass."""
+    """train_on_inputs=True skips role masking but media tokens are still masked."""
     tok = _qwen_tokenizer()
     strategy = Qwen3_5ProcessingStrategy(_Processor(tok), train_on_inputs=True)
-    # user turn with video_pad(201), then assistant with video_pad.
     seq = [101, 106, 103, 201, 7, 104, 101, 102, 103, 201, 8, 104]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # Everything kept EXCEPT the two video_pad positions (3 and 9).
     expected = list(seq)
     expected[3] = -100
     expected[9] = -100
@@ -958,11 +847,10 @@ def test_qwen3_5_train_on_inputs_true_still_masks_video_pad():
 
 
 def test_role_boundaries_override_role_not_in_roles_to_train():
-    """If the override only declares a non-trainable role, everything is masked."""
+    """Override covering only a non-trainable role masks everything."""
     vocab = {"BOU": [50], "EOT": [60]}
     strategy = ProcessingStrategy(
         _Processor(_Tokenizer(vocab, pad_id=0)),
-        # Default roles_to_train=["assistant"]; our override only covers 'user'.
         role_boundaries_override=[
             {"role": "user", "start": "BOU", "end": "EOT"},
         ],
@@ -973,7 +861,6 @@ def test_role_boundaries_override_role_not_in_roles_to_train():
 
 
 def test_role_boundaries_override_include_start_flag_round_trips():
-    """RoleBoundarySpec.include_start=True survives the resolver unchanged."""
     from axolotl.utils.schemas.multimodal import RoleBoundarySpec
 
     vocab = {"BOA": [50], "EOT": [60]}
@@ -991,8 +878,6 @@ def test_role_boundaries_override_include_start_flag_round_trips():
 
 
 def test_multimodal_config_parses_dict_role_boundaries_to_specs():
-    """MultiModalConfig(role_boundaries=[{...}]) yields RoleBoundarySpec items
-    that the strategy resolver accepts unchanged."""
     from axolotl.utils.schemas.multimodal import (
         MultiModalConfig,
         RoleBoundarySpec,
@@ -1013,14 +898,13 @@ def test_multimodal_config_parses_dict_role_boundaries_to_specs():
         _Processor(_Tokenizer(vocab, pad_id=0)),
         role_boundaries_override=cfg.role_boundaries,
     )
-    # Scanner should now mask user content and keep assistant content.
     seq = [51, 7, 60, 50, 8, 60]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [-100, -100, -100, -100, 8, 60]
 
 
 def test_load_processor_empty_processor_kwargs_is_noop():
-    """processor_kwargs={} must not AttributeError and must not change kwargs."""
+    """Empty processor_kwargs={} must not AttributeError."""
     from axolotl.utils.dict import DictDefault
     processor_mod = _load_processor_module()
 

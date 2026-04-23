@@ -19,9 +19,7 @@ def load_processor(cfg: DictDefault, tokenizer: PreTrainedTokenizerBase):
     if cfg.processor_type:
         processor_cls = getattr(transformers, cfg.processor_type)
 
-    # Build common kwargs for processor loading. User-supplied cfg.processor_kwargs
-    # are merged first so that axolotl-managed kwargs (revision, trust_remote_code)
-    # cannot be silently overridden. See issue #3617.
+    # User kwargs go in first so axolotl-managed keys (revision, trust_remote_code) can't be overridden. See #3617.
     processor_kwargs: dict = {}
     user_processor_kwargs = dict(cfg.processor_kwargs) if cfg.processor_kwargs else {}
     _overridden = {

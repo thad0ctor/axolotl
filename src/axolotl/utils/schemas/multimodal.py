@@ -7,11 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class RoleBoundarySpec(BaseModel):
-    """One row of ``cfg.role_boundaries``: declares a role's span markers.
-
-    See docs/multimodal_assistant_mask.md for how axolotl uses these to
-    restrict multimodal loss to trainable roles.
-    """
+    """One ``cfg.role_boundaries`` row; see docs/multimodal_assistant_mask.md."""
 
     role: str = Field(
         json_schema_extra={
