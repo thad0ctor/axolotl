@@ -178,6 +178,23 @@ def test_strategy_accepts_all_supported_train_on_eos_values():
         )
 
 
+def test_process_labels_no_warning_when_image_token_id_none():
+    """image_token_id=None must not trigger a UserWarning from ``labels == None``."""
+    import warnings
+
+    vocab = {"BOA": [50], "EOT": [60]}
+    strategy = ProcessingStrategy(
+        _Processor(_Tokenizer(vocab, pad_id=0)),
+        role_boundaries_override=[
+            {"role": "assistant", "start": "BOA", "end": "EOT"}
+        ],
+    )
+    assert strategy.image_token_id is None
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        strategy.process_labels(torch.tensor([[1, 50, 2, 3, 60]]))
+
+
 def test_roles_to_train_empty_list_masks_everything():
     """An explicit empty list is distinct from None and disables all roles."""
     vocab = {"BOA": [50], "EOT": [60]}

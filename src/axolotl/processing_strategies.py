@@ -283,8 +283,11 @@ class ProcessingStrategy:
     def process_labels(self, input_ids: Tensor) -> Tensor:
         labels = input_ids.clone()
         labels = self._mask_non_assistant(labels)
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        labels[labels == self.image_token_id] = -100
+        pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+        if self.image_token_id is not None:
+            labels[labels == self.image_token_id] = -100
         return labels
 
 
@@ -534,7 +537,8 @@ class Qwen3_5ProcessingStrategy(Qwen2VLProcessingStrategy):
 
     def process_labels(self, input_ids):
         labels = super().process_labels(input_ids)
-        labels[labels == self.video_token_id] = -100
+        if self.video_token_id is not None:
+            labels[labels == self.video_token_id] = -100
         return labels
 
 
@@ -614,14 +618,10 @@ class Gemma3nProcessingStrategy(_GemmaTurnStrategy):
         labels = super().process_labels(input_ids)
         tok = self.processor.tokenizer
         # Follows huggingface-gemma-recipes fine_tune_gemma3n_on_t4 notebook.
-        if hasattr(tok, "image_token_id"):
-            labels[labels == tok.image_token_id] = -100
-        if hasattr(tok, "audio_token_id"):
-            labels[labels == tok.audio_token_id] = -100
-        if hasattr(tok, "boi_token_id"):
-            labels[labels == tok.boi_token_id] = -100
-        if hasattr(tok, "eoi_token_id"):
-            labels[labels == tok.eoi_token_id] = -100
+        for attr in ("image_token_id", "audio_token_id", "boi_token_id", "eoi_token_id"):
+            tok_id = getattr(tok, attr, None)
+            if tok_id is not None:
+                labels[labels == tok_id] = -100
         return labels
 
 
@@ -843,9 +843,13 @@ class VoxtralProcessingStrategy(ProcessingStrategy):
         labels = input_ids.clone()
         labels = self._mask_non_assistant(labels)
 
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        labels[labels == self.audio_token] = -100
-        labels[labels == self.begin_audio_token] = -100
+        pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+        if self.audio_token is not None:
+            labels[labels == self.audio_token] = -100
+        if self.begin_audio_token is not None:
+            labels[labels == self.begin_audio_token] = -100
 
         return labels
 
@@ -925,10 +929,12 @@ class Mistral3ProcessingStrategy(ProcessingStrategy):
         labels = input_ids.clone()
         labels = self._mask_non_assistant(labels)
 
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        labels[labels == self.image_token] = -100
-        labels[labels == self.image_break_token] = -100
-        labels[labels == self.image_end_token] = -100
+        pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+        for tok_id in (self.image_token, self.image_break_token, self.image_end_token):
+            if tok_id is not None:
+                labels[labels == tok_id] = -100
 
         return labels
 
@@ -971,10 +977,13 @@ class InternVLProcessingStrategy(ProcessingStrategy):
         labels = input_ids.clone()
         labels = self._mask_non_assistant(labels)
 
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
+        pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
 
         for ids in self.image_token_ids:
-            labels[labels == ids] = -100
+            if ids is not None:
+                labels[labels == ids] = -100
 
         # Video tokens get converted to image patches during media processing; masking may be redundant.
         return labels
@@ -1037,15 +1046,20 @@ class Glm4vProcessingStrategy(ProcessingStrategy):
         labels = input_ids.clone()
         labels = self._mask_non_assistant(labels)
 
-        labels[labels == self.tokenizer.pad_token_id] = -100
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
 
-        labels[labels == self.image_token_id] = -100
-        labels[labels == self.begin_image_token_id] = -100
-        labels[labels == self.end_image_token_id] = -100
-
-        labels[labels == self.video_token_id] = -100
-        labels[labels == self.begin_video_token_id] = -100
-        labels[labels == self.end_video_token_id] = -100
+        for tok_id in (
+            self.image_token_id,
+            self.begin_image_token_id,
+            self.end_image_token_id,
+            self.video_token_id,
+            self.begin_video_token_id,
+            self.end_video_token_id,
+        ):
+            if tok_id is not None:
+                labels[labels == tok_id] = -100
 
         return labels
 
