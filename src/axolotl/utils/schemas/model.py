@@ -64,16 +64,6 @@ class ModelInputConfig(BaseModel):
     processor_type: str | None = Field(
         default=None, json_schema_extra={"description": "transformers processor class"}
     )
-    processor_kwargs: dict[str, Any] | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": (
-                "Extra keyword arguments forwarded to the multimodal "
-                "processor's ``from_pretrained`` call (e.g. min_pixels, "
-                "max_pixels, num_crops, do_rescale, patch_size). See #3617."
-            )
-        },
-    )
     tokenizer_save_jinja_files: bool | None = Field(
         default=True,  # match the default behavior from transformers
         json_schema_extra={

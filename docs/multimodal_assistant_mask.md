@@ -21,11 +21,6 @@ role-aware labels — but the base `_mask_non_assistant` was a no-op `return
 labels`, and only `Gemma3nProcessingStrategy` overrode it. So for every other
 multimodal model, the retokenized labels are never masked by role.
 
-Parallel bug ([#3617](https://github.com/axolotl-ai-cloud/axolotl/issues/3617)):
-`cfg.processor_kwargs` was never plumbed through to
-`processor_cls.from_pretrained`, so users couldn't pass `min_pixels`,
-`max_pixels`, `num_crops`, etc., to VLM processors.
-
 ## Design
 
 We make role masking a first-class, declarative capability of the base
@@ -71,10 +66,6 @@ builder.
 4. **Plumbing**: `cfg.train_on_inputs`, the first dataset's `roles_to_train`
    and `train_on_eos` are threaded through `build_collator` →
    `get_processing_strategy` → each strategy's constructor.
-5. **`cfg.processor_kwargs`** added to `ModelInputConfig` and merged into
-   kwargs passed to `processor_cls.from_pretrained` in `load_processor`.
-   Axolotl-managed keys (`revision`, `trust_remote_code`) are filtered out
-   with a warning if the user tries to override them.
 
 ## Audit table
 
@@ -160,9 +151,6 @@ this revision the logical units are:
 2. **`feat: thread cfg.train_on_inputs / roles_to_train / train_on_eos into
    MM collator`** — `build_collator` reads the knobs from `cfg` and the
    first dataset entry and passes them to `get_processing_strategy`.
-3. **`feat: forward cfg.processor_kwargs to processor from_pretrained (#3617)`**
-   — schema field added; `load_processor` merges kwargs; axolotl-managed
-   keys (`revision`, `trust_remote_code`) protected.
 4. **`docs: multimodal assistant-mask design doc`** — this file.
 5. **`feat: cfg.role_boundaries YAML override for MM role-mask scanner`** —
    schema field (`MultiModalConfig.role_boundaries`), resolver that converts
@@ -170,11 +158,11 @@ this revision the logical units are:
    wiring through ``build_collator`` / ``get_processing_strategy`` /
    every strategy constructor.
 6. **`test: additional coverage for MM role-mask scanner edge cases`** —
-   expands the unit test suite to 64 tests covering scanner semantics,
-   per-strategy masking, media-token masking within assistant spans,
-   dispatcher routing, processor_kwargs passthrough, override semantics
-   (replace built-in, enable on unverified strategy, eos_token sentinel,
-   null end, validation errors, pydantic model input).
+   expands the unit test suite covering scanner semantics, per-strategy
+   masking, media-token masking within assistant spans, dispatcher
+   routing, and override semantics (replace built-in, enable on unverified
+   strategy, eos_token sentinel, null end, validation errors, pydantic
+   model input).
 7. **`chore: tighten docstrings and comments in multimodal mask refactor`**
    — no-behavior-change polish.
 8. **`fix: resolve MM per-dataset masking knobs for pydantic SFTDataset`**
@@ -199,8 +187,7 @@ this revision the logical units are:
 ## Draft upstream PR description
 
 > Fix silently-ignored `train_on_inputs` / `roles_to_train` / `train_on_eos`
-> in the multimodal training path, and plumb `cfg.processor_kwargs`
-> (#3617).
+> in the multimodal training path.
 >
 > **Why this matters**: for every multimodal model except Gemma 3n, loss was
 > computed on the entire sequence (minus pad and media tokens) regardless of
@@ -225,9 +212,6 @@ this revision the logical units are:
 >   `cfg.datasets[0].train_on_eos` are threaded through
 >   `HFCausalTrainerBuilder.build_collator` → `get_processing_strategy` →
 >   strategy constructor.
-> - `cfg.processor_kwargs` (new) is merged into
->   `processor_cls.from_pretrained` kwargs; `revision` and `trust_remote_code`
->   remain axolotl-managed.
 >
 > **Testing**: 64 offline unit tests; end-to-end verified with the real
 > Gemma 4 and Llama 3.x tokenizers.
