@@ -81,15 +81,17 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
         """Drive both adapters then block on in-flight CPU futures.
 
         Persistent chunks: run the GPU step synchronously.
-        Non-persistent chunks: already stepping async via the chunk
-        manager's ``reduce_grads_and_offload`` (which was invoked by the
-        scheduler's ``post_block_backward`` hook). Here we just make
-        sure every outstanding future has landed.
+        Non-persistent chunks: per-param post-accumulate-grad hooks
+        (installed by :meth:`ChunkManager.materialize_offload`) already
+        kicked off the CPU FusedAdam step the instant each chunk's last
+        grad landed on CPU. Here we just wait on every outstanding
+        future so the next forward sees the updated CPU master params.
         """
         if self._gpu_optim is not None:
             self._gpu_optim.step()
-        if self._cpu_optim is not None:
-            self._cpu_optim.wait_all()
+        # Drain every in-flight CPU Adam future (M4.5 Gap 2: per-param
+        # grad offload enqueued these from the grad hooks).
+        self._chunk_manager.wait_cpu_optim_all()
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
         if self._gpu_optim is not None:

@@ -303,7 +303,24 @@ class Scheduler:
             self._gather_on_prefetch_stream(need)
 
     def post_block_backward(self, block_id: BlockId) -> None:
-        """Reduce-offload this block's chunk grads; kicks off async CPU Adam."""
+        """Finalize this block's backward: release buffers + maybe kick CPU Adam.
+
+        Behavior after the M4.5 runtime-primitives landing:
+
+        * **Non-persistent chunks** — grads for their params were already
+          drained to the pinned-CPU grad shards by the per-parameter
+          post-accumulate-grad hooks installed by
+          :meth:`ChunkManager.materialize_offload` (the block-level hook
+          used to own this, but could only fire after PyTorch's autograd
+          had already accumulated grads for the whole block — too late
+          for the memory-pressure path). The CPU FusedAdam step is
+          kicked off inside those per-param hooks as soon as the last
+          grad for a chunk lands. Here we merely release the GPU buffer
+          and null ``param.data`` so the slot can be recycled.
+        * **Persistent chunks** — their grads live on GPU (no drain);
+          the call is a no-op in single-rank mode, and in multi-rank
+          mode issues the distributed all-reduce per param.
+        """
         for cid in self._chunks_for(block_id):
             self.chunk_manager.reduce_grads_and_offload(cid)
 

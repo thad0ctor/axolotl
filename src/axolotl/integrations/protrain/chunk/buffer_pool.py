@@ -54,6 +54,18 @@ class BufferPool:
     so the most-recently-used chunks stay resident longest. We implement
     this with a FIFO of free slots where ``release`` appends and ``acquire``
     pops the oldest — standard LRU.
+
+    Dtype notes (M4.5)
+    ------------------
+    Buffers are allocated as flat uint8 GPU tensors. The
+    :class:`ChunkManager` reinterprets each buffer on gather via
+    ``buf.narrow(0, offset, nbytes).view(dtype).view(shape)`` per param
+    slot, matching the layout built by
+    :meth:`ChunkManager.materialize_offload`. This keeps the pool dtype-
+    agnostic (works for mixed-dtype chunks — e.g. fp16 weights and fp32
+    lm_head tied-weight cases) at the cost of storing the per-param
+    ``(offset, dtype, shape)`` metadata on the ChunkManager's
+    ``_cpu_slots`` table rather than in the pool.
     """
 
     def __init__(
