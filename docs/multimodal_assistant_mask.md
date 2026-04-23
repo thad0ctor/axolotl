@@ -112,6 +112,44 @@ is visible in training logs. To enable role masking for one of these models,
 subclass the strategy and implement `_build_role_boundaries` — see the Gemma
 and Qwen implementations for the pattern.
 
+## Config-based override: `cfg.role_boundaries`
+
+For the "unverified" strategies above, or for custom chat templates that
+don't match a built-in strategy's markers, users can declare role boundaries
+directly in YAML without subclassing:
+
+```yaml
+role_boundaries:
+  - role: assistant
+    start: "<|turn>model"
+    end: "<turn|>"
+  - role: user
+    start: "<|turn>user"
+    end: "<turn|>"
+  # Optional keys:
+  # include_start: false   # default False
+  # include_end: true      # default True, respects cfg.train_on_eos
+  # end: eos_token         # sentinel: resolves to tokenizer.eos_token_id
+  # end: null              # span runs to end of sequence
+```
+
+Semantics:
+
+- `start` and `end` are literal strings; axolotl encodes them at strategy
+  init via `tokenizer.encode(..., add_special_tokens=False)` and logs the
+  resolved token-id sequences at INFO level.
+- The special value `end: eos_token` is the portable way to express
+  "Pixtral-style assistant turns end at EOS" without hard-coding an id.
+- When `role_boundaries` is set, it **replaces** the strategy's built-in
+  declarations wholesale. This is intentional: partial overlays are hard to
+  reason about at review time.
+- `cfg.roles_to_train` still governs which declared roles contribute to
+  loss. You can declare `user` and `assistant` boundaries and set
+  `roles_to_train: ["assistant"]` to have the scanner correctly identify
+  user spans as masking boundaries without training on their content.
+- Invalid specs fail loudly at strategy init (missing `role`/`start`,
+  unencodable markers), not silently at loss-compute time.
+
 ## Commits on this branch
 
 1. **`feat: systemic multimodal assistant-only loss masking`** — core
@@ -129,6 +167,13 @@ and Qwen implementations for the pattern.
    per-strategy masking, media-token masking within assistant spans,
    dispatcher routing, and the processor_kwargs passthrough.
 5. **`docs: multimodal assistant-mask design doc`** — this file.
+6. **`feat: cfg.role_boundaries YAML override for role-mask scanner`** —
+   schema field (`MultiModalConfig.role_boundaries`), resolver that converts
+   string markers to token ids at strategy init, ``eos_token`` sentinel, and
+   wiring through ``build_collator`` / ``get_processing_strategy`` /
+   every strategy constructor. 7 additional offline unit tests covering
+   override semantics (replace built-in, enable on unverified strategy,
+   eos_token sentinel, null end, validation errors, pydantic model input).
 
 (Final packaging: these were squashed into logical units during implementation
 but the branch commit sequence can be organized per reviewer preference.)

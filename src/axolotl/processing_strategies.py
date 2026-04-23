@@ -62,6 +62,7 @@ class ProcessingStrategy:
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         self.processor = processor
         self.chat_template = chat_template
@@ -86,7 +87,23 @@ class ProcessingStrategy:
                 self.image_token
             )
 
-        self.role_boundaries: list[RoleBoundary] = self._build_role_boundaries()
+        # Built-in declarations from the subclass; may be empty.
+        built_in = self._build_role_boundaries()
+
+        if role_boundaries_override:
+            overridden = _resolve_role_boundary_override(
+                role_boundaries_override, self.processor.tokenizer
+            )
+            LOG.info(
+                "%s: overriding built-in role boundaries (%d decls) "
+                "with cfg.role_boundaries (%d decls).",
+                type(self).__name__,
+                len(built_in),
+                len(overridden),
+            )
+            self.role_boundaries: list[RoleBoundary] = overridden
+        else:
+            self.role_boundaries = built_in
 
     def _build_role_boundaries(self) -> list[RoleBoundary]:
         """Subclasses declare role boundaries here.
@@ -431,6 +448,68 @@ def _encode_markers(tokenizer, marker_strs: list[str]) -> list[list[int]]:
     return result
 
 
+def _resolve_role_boundary_override(
+    specs: list[dict], tokenizer
+) -> list[RoleBoundary]:
+    """Convert user-supplied ``cfg.role_boundaries`` dicts (or Pydantic
+    RoleBoundarySpec instances) into runtime RoleBoundary objects.
+
+    - ``start`` and ``end`` strings are encoded via
+      ``tokenizer.encode(..., add_special_tokens=False)``.
+    - The sentinel ``end == "eos_token"`` resolves to the tokenizer's
+      ``eos_token_id`` (single-token end), which is how Pixtral / Mistral
+      v7-style templates terminate assistant content.
+    - ``end`` omitted / null → empty end_tokens (scanner runs to end of
+      sequence for this span).
+    """
+    out: list[RoleBoundary] = []
+    for i, spec in enumerate(specs):
+        # Accept both dicts and Pydantic models.
+        if hasattr(spec, "model_dump"):
+            d = spec.model_dump()
+        else:
+            d = dict(spec)
+
+        role = d.get("role")
+        start_str = d.get("start")
+        if not role or start_str is None:
+            raise ValueError(
+                f"cfg.role_boundaries[{i}] must have both 'role' and 'start' "
+                f"(got {d!r})."
+            )
+        start_ids = tokenizer.encode(start_str, add_special_tokens=False)
+        if not start_ids:
+            raise ValueError(
+                f"cfg.role_boundaries[{i}]: start marker {start_str!r} "
+                f"tokenizes to an empty sequence; cannot match."
+            )
+
+        end_spec = d.get("end")
+        if end_spec is None:
+            end_ids: list[int] = []
+        elif end_spec == "eos_token":
+            eos = getattr(tokenizer, "eos_token_id", None)
+            if eos is None:
+                raise ValueError(
+                    f"cfg.role_boundaries[{i}] requested end='eos_token' but "
+                    "the tokenizer has no eos_token_id."
+                )
+            end_ids = [eos]
+        else:
+            end_ids = tokenizer.encode(end_spec, add_special_tokens=False)
+
+        out.append(
+            RoleBoundary(
+                role=role,
+                start_tokens=start_ids,
+                end_tokens=end_ids,
+                include_start=bool(d.get("include_start", False)),
+                include_end=bool(d.get("include_end", True)),
+            )
+        )
+    return out
+
+
 class Qwen2VLProcessingStrategy(ProcessingStrategy):
     """Processing Strategy class for Qwen2-VL.
 
@@ -447,6 +526,7 @@ class Qwen2VLProcessingStrategy(ProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -456,6 +536,7 @@ class Qwen2VLProcessingStrategy(ProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
         self.image_token = "<|image_pad|>"  # nosec
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids(
@@ -494,6 +575,7 @@ class Qwen3_5ProcessingStrategy(Qwen2VLProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -503,6 +585,7 @@ class Qwen3_5ProcessingStrategy(Qwen2VLProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
         self.video_token = "<|video_pad|>"  # nosec
         self.video_token_id = processor.tokenizer.convert_tokens_to_ids(
@@ -561,6 +644,7 @@ class Gemma3ProcessingStrategy(_GemmaTurnStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -570,6 +654,7 @@ class Gemma3ProcessingStrategy(_GemmaTurnStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
         # Gemma3 uses boi_token (<start_of_image>) as the image placeholder.
         special_tokens_map = getattr(
@@ -819,6 +904,7 @@ class VoxtralProcessingStrategy(ProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -828,6 +914,7 @@ class VoxtralProcessingStrategy(ProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
         special_ids = (
             processor.tokenizer.tokenizer.instruct_tokenizer.audio_encoder.special_ids
@@ -867,6 +954,7 @@ class SmolVLM2ProcessingStrategy(ProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -876,6 +964,7 @@ class SmolVLM2ProcessingStrategy(ProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
         self.image_token = "<image>"  # nosec
 
@@ -901,6 +990,7 @@ class Mistral3ProcessingStrategy(ProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -910,6 +1000,7 @@ class Mistral3ProcessingStrategy(ProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
         special_ids = (
             processor.tokenizer.tokenizer.instruct_tokenizer.image_encoder.special_ids
@@ -948,6 +1039,7 @@ class InternVLProcessingStrategy(ProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -957,6 +1049,7 @@ class InternVLProcessingStrategy(ProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
 
         if not hasattr(processor, "image_ids"):
@@ -997,6 +1090,7 @@ class Glm4vProcessingStrategy(ProcessingStrategy):
         train_on_inputs: bool = False,
         roles_to_train: Optional[list[str]] = None,
         train_on_eos: Optional[str] = None,
+        role_boundaries_override: Optional[list[dict]] = None,
     ):
         super().__init__(
             processor,
@@ -1006,6 +1100,7 @@ class Glm4vProcessingStrategy(ProcessingStrategy):
             train_on_inputs=train_on_inputs,
             roles_to_train=roles_to_train,
             train_on_eos=train_on_eos,
+            role_boundaries_override=role_boundaries_override,
         )
 
         self.tokenizer = getattr(processor, "tokenizer", processor)
@@ -1058,6 +1153,7 @@ def get_processing_strategy(
     train_on_inputs: bool = False,
     roles_to_train: Optional[list[str]] = None,
     train_on_eos: Optional[str] = None,
+    role_boundaries_override: Optional[list[dict]] = None,
 ):
     # Lazy import: mistral_common is optional. Users who don't install it
     # must still be able to dispatch non-mistral strategies.
@@ -1074,6 +1170,7 @@ def get_processing_strategy(
         "train_on_inputs": train_on_inputs,
         "roles_to_train": roles_to_train,
         "train_on_eos": train_on_eos,
+        "role_boundaries_override": role_boundaries_override,
     }
 
     if chat_template_type in [None, "tokenizer_default"]:

@@ -544,6 +544,128 @@ def test_dispatch_unknown_falls_back_to_base(_mistral_common_stub):
     assert type(s) is ProcessingStrategy
 
 
+# --------------------------------------------------------------------------- #
+# Config-based role-boundary override
+# --------------------------------------------------------------------------- #
+
+
+def test_role_boundaries_override_replaces_built_in():
+    """Passing role_boundaries_override to a strategy that already declares
+    boundaries (Qwen2VL here) swaps in the user's spec wholesale."""
+    vocab = {
+        "<|im_start|>assistant\n": [101, 102, 103],
+        "<|im_start|>user\n": [101, 106, 103],
+        "<|im_end|>": [104],
+        ">>>A": [200, 201],   # custom assistant-start
+        ">>>U": [200, 202],   # custom user-start
+        "<<<": [210],         # custom end marker
+        "<|image_pad|>": [250],
+    }
+    strategy = Qwen2VLProcessingStrategy(
+        _Processor(_Tokenizer(vocab, pad_id=0)),
+        role_boundaries_override=[
+            {"role": "assistant", "start": ">>>A", "end": "<<<"},
+            {"role": "user", "start": ">>>U", "end": "<<<"},
+        ],
+    )
+    # Built-in would have matched <|im_start|>assistant; override replaces it,
+    # so the ChatML-shaped prefix is now unmatched scaffolding.
+    seq = [
+        101, 106, 103, 7, 104,       # ChatML user turn (ignored by override)
+        200, 201, 9, 9, 210,         # custom assistant turn
+    ]
+    out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
+    assert out == [-100, -100, -100, -100, -100, -100, -100, 9, 9, 210]
+
+
+def test_role_boundaries_override_enables_unverified_strategy():
+    """Override lets a user enable role masking on strategies that opt out
+    by default. Demonstrated here with the base strategy."""
+    vocab = {
+        "BOA": [50, 51],
+        "EOT": [60],
+    }
+    strategy = ProcessingStrategy(
+        _Processor(_Tokenizer(vocab, pad_id=0)),
+        role_boundaries_override=[
+            {"role": "assistant", "start": "BOA", "end": "EOT"},
+        ],
+    )
+    seq = [1, 2, 3, 50, 51, 7, 8, 60, 9]
+    out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
+    assert out == [-100, -100, -100, -100, -100, 7, 8, 60, -100]
+
+
+def test_role_boundaries_override_eos_token_sentinel():
+    """``end: "eos_token"`` resolves to the tokenizer's eos_token_id."""
+    vocab = {"BOA": [50]}
+    tok = _Tokenizer(vocab, pad_id=0, eos_id=99)
+    strategy = ProcessingStrategy(
+        _Processor(tok),
+        role_boundaries_override=[
+            {"role": "assistant", "start": "BOA", "end": "eos_token"},
+        ],
+    )
+    seq = [1, 50, 7, 7, 99, 2]
+    out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
+    assert out == [-100, -100, 7, 7, 99, -100]
+
+
+def test_role_boundaries_override_end_null_runs_to_sequence_end():
+    """``end: null`` means no end marker — the span runs to the end of the
+    sequence."""
+    vocab = {"BOA": [50]}
+    strategy = ProcessingStrategy(
+        _Processor(_Tokenizer(vocab, pad_id=0)),
+        role_boundaries_override=[
+            {"role": "assistant", "start": "BOA", "end": None},
+        ],
+    )
+    seq = [1, 2, 50, 7, 8, 9]
+    out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
+    assert out == [-100, -100, -100, 7, 8, 9]
+
+
+def test_role_boundaries_override_rejects_bad_spec():
+    """Missing 'role' or 'start' surfaces a clear error at strategy init."""
+    vocab = {"BOA": [50]}
+    with pytest.raises(ValueError, match="must have both 'role' and 'start'"):
+        ProcessingStrategy(
+            _Processor(_Tokenizer(vocab, pad_id=0)),
+            role_boundaries_override=[{"role": "assistant"}],
+        )
+
+
+def test_role_boundaries_override_rejects_unencodable_start():
+    """A start marker that tokenizes to an empty sequence is unmatchable."""
+    vocab = {"BOA": [50]}
+    with pytest.raises(ValueError, match="tokenizes to an empty sequence"):
+        ProcessingStrategy(
+            _Processor(_Tokenizer(vocab, pad_id=0)),
+            role_boundaries_override=[
+                {"role": "assistant", "start": "MISSING", "end": None}
+            ],
+        )
+
+
+def test_role_boundaries_override_accepts_pydantic_models():
+    """cfg.role_boundaries comes through as RoleBoundarySpec instances after
+    pydantic parsing; the resolver must handle them the same as plain dicts."""
+    from axolotl.utils.schemas.multimodal import RoleBoundarySpec
+
+    vocab = {"BOA": [50], "EOT": [60]}
+    strategy = ProcessingStrategy(
+        _Processor(_Tokenizer(vocab, pad_id=0)),
+        role_boundaries_override=[
+            RoleBoundarySpec(role="assistant", start="BOA", end="EOT")
+        ],
+    )
+    assert len(strategy.role_boundaries) == 1
+    assert strategy.role_boundaries[0].role == "assistant"
+    assert strategy.role_boundaries[0].start_tokens == [50]
+    assert strategy.role_boundaries[0].end_tokens == [60]
+
+
 def test_base_strategy_warns_when_no_boundaries(caplog):
     """A base ProcessingStrategy with no declared boundaries and
     train_on_inputs=False emits a one-shot warning and returns labels

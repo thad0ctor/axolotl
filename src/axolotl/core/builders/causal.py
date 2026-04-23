@@ -543,6 +543,13 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     except (AttributeError, KeyError):
                         train_on_eos = None
 
+                # cfg.role_boundaries overrides the strategy's built-in
+                # per-role marker declarations. Pydantic model instances are
+                # passed straight through; the scanner resolver handles both.
+                role_boundaries_override = None
+                if self.cfg.role_boundaries:
+                    role_boundaries_override = list(self.cfg.role_boundaries)
+
                 kwargs["processing_strategy"] = get_processing_strategy(
                     self.processor,
                     training_args.chat_template,
@@ -552,6 +559,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     train_on_inputs=bool(self.cfg.train_on_inputs),
                     roles_to_train=roles_to_train,
                     train_on_eos=train_on_eos,
+                    role_boundaries_override=role_boundaries_override,
                 )
             elif self.cfg.batch_flattening:
                 collator = DataCollatorWithFlattening
