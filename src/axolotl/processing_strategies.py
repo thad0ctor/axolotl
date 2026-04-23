@@ -448,6 +448,13 @@ def _resolve_role_boundary_override(
             end_ids = [eos]
         else:
             end_ids = tokenizer.encode(end_spec, add_special_tokens=False)
+            if not end_ids:
+                raise ValueError(
+                    f"cfg.role_boundaries[{i}]: end marker {end_spec!r} "
+                    f"tokenizes to an empty sequence; cannot match. Use "
+                    f"end=null to run to end-of-sequence or end='eos_token' "
+                    f"to terminate at the tokenizer's EOS."
+                )
 
         out.append(
             RoleBoundary(

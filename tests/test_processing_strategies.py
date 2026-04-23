@@ -646,6 +646,17 @@ def test_role_boundaries_override_rejects_unencodable_start():
         )
 
 
+def test_role_boundaries_override_rejects_unencodable_end():
+    vocab = {"BOA": [50]}
+    with pytest.raises(ValueError, match="tokenizes to an empty sequence"):
+        ProcessingStrategy(
+            _Processor(_Tokenizer(vocab, pad_id=0)),
+            role_boundaries_override=[
+                {"role": "assistant", "start": "BOA", "end": "MISSING"}
+            ],
+        )
+
+
 def test_role_boundaries_override_accepts_pydantic_models():
     # cfg.role_boundaries arrives as RoleBoundarySpec after pydantic parsing.
     from axolotl.utils.schemas.multimodal import RoleBoundarySpec
