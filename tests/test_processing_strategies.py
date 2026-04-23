@@ -178,6 +178,46 @@ def test_strategy_accepts_all_supported_train_on_eos_values():
         )
 
 
+def test_strategy_init_logs_resolved_masking_config_builtin(caplog):
+    import logging
+    vocab = {
+        "<|im_start|>assistant\n": [101, 102, 103],
+        "<|im_start|>user\n": [101, 106, 103],
+        "<|im_end|>": [104],
+    }
+    with caplog.at_level(logging.INFO, logger="axolotl.processing_strategies"):
+        Qwen2VLProcessingStrategy(_Processor(_Tokenizer(vocab, pad_id=0)))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "ProcessingStrategy init" in m
+        and "Qwen2VLProcessingStrategy" in m
+        and "boundaries_source=built-in" in m
+        for m in msgs
+    )
+
+
+def test_strategy_init_logs_resolved_masking_config_override(caplog):
+    import logging
+    vocab = {"BOA": [50, 51], "EOT": [60]}
+    with caplog.at_level(logging.INFO, logger="axolotl.processing_strategies"):
+        ProcessingStrategy(
+            _Processor(_Tokenizer(vocab, pad_id=0)),
+            role_boundaries_override=[
+                {"role": "assistant", "start": "BOA", "end": "EOT"},
+            ],
+        )
+    msgs = [r.getMessage() for r in caplog.records]
+    # Resolved start/end ids must appear in the log so users can verify what
+    # was actually matched.
+    assert any(
+        "ProcessingStrategy init" in m
+        and "boundaries_source=override" in m
+        and "[50, 51]" in m
+        and "[60]" in m
+        for m in msgs
+    )
+
+
 def test_process_labels_no_warning_when_image_token_id_none():
     """image_token_id=None must not trigger a UserWarning from ``labels == None``."""
     import warnings

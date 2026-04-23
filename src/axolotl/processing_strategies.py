@@ -103,8 +103,33 @@ class ProcessingStrategy:
                 len(overridden),
             )
             self.role_boundaries: list[RoleBoundary] = overridden
+            source = "override"
         else:
             self.role_boundaries = built_in
+            source = "built-in"
+
+        # Single-line, grep-friendly summary of the resolved masking config so
+        # "why isn't masking firing?" is visible in training logs. For
+        # overrides we include the fully resolved (role, start_ids, end_ids)
+        # tuples; for built-ins we log a count (subclasses vary and logging
+        # every id sequence would be noisy on, e.g., Llama3 with five roles).
+        if source == "override":
+            boundaries_repr = [
+                (b.role, b.start_tokens, b.end_tokens) for b in self.role_boundaries
+            ]
+        else:
+            boundaries_repr = f"{len(self.role_boundaries)} built-in"
+        LOG.info(
+            "ProcessingStrategy init: class=%s train_on_inputs=%s "
+            "roles_to_train=%s train_on_eos=%s boundaries_source=%s "
+            "boundaries=%s",
+            type(self).__name__,
+            self.train_on_inputs,
+            self.roles_to_train,
+            self.train_on_eos,
+            source,
+            boundaries_repr,
+        )
 
     def _build_role_boundaries(self) -> list[RoleBoundary]:
         """Subclasses declare role boundaries here; [] opts out of role masking."""
