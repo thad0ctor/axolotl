@@ -32,23 +32,34 @@ _CUDA_SUCCESS = 0
 
 
 def _load_cudart() -> ctypes.CDLL | None:
-    """Locate ``libcudart`` via several common names; return None if unavailable."""
-    # ``torch.cuda.cudart()`` returns the loaded cudart handle on recent torch
-    # versions; prefer that so we use exactly the same runtime torch linked
-    # against. Fall back to ``ctypes.util.find_library`` / common SONAMEs.
-    try:
-        import torch
+    """Locate ``libcudart`` as a ``ctypes.CDLL`` handle; return None if unavailable.
 
-        handle = torch.cuda.cudart()
-        if handle is not None:
-            return handle  # type: ignore[return-value]
-    except Exception as err:  # noqa: BLE001 — broad: torch may not even expose cudart
-        LOG.debug("torch.cuda.cudart() unavailable: %s", err)
+    On recent PyTorch builds ``torch.cuda.cudart()`` returns a Python module
+    (``torch._C._cudart``) rather than a ``ctypes.CDLL`` — the symbols are
+    not the raw C functions we need to set ``argtypes``/``restype`` on, so
+    we skip that path entirely and load the shared object directly via
+    ``ctypes``. We try a handful of common SONAMEs (CUDA 11, 12, 13) and
+    finally ``ctypes.util.find_library('cudart')`` which resolves to
+    whichever ``libcudart.so.*`` ``ldconfig`` knows about.
+    """
+    # Explicit SONAMEs come first so we prefer a specific major version if
+    # more than one is on the library search path. ``libcudart.so`` is the
+    # unversioned symlink (only present with -dev packages); the versioned
+    # names are what end-user CUDA toolkits install.
+    candidates: list[str] = [
+        "libcudart.so",
+        "libcudart.so.13",
+        "libcudart.so.12",
+        "libcudart.so.11.0",
+    ]
+    # Let ctypes locate whatever the current ld cache has, too.
+    resolved = ctypes.util.find_library("cudart")
+    if resolved:
+        candidates.append(resolved)
 
-    for name in ("cudart", "libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
+    for name in candidates:
         try:
-            path = ctypes.util.find_library(name) or name
-            return ctypes.CDLL(path)
+            return ctypes.CDLL(name)
         except OSError:
             continue
     return None

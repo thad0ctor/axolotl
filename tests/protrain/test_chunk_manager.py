@@ -78,19 +78,29 @@ def test_layout_respects_block_grouping():
     # Total model bytes.
     total_bytes = sum(p.numel() * p.element_size() for _, p in model.named_parameters())
 
-    # Pick an S_chunk large enough for each block but smaller than the
-    # whole model + embeddings — guaranteed by max(block_bytes, embed_bytes) <= S <= total/1.1.
+    # Pick an S_chunk large enough for each block (and every single param)
+    # but smaller than the whole model so we actually get multiple chunks.
+    # For the tiny GPT-2 here each block is ~200 KB and total is ~437 KB,
+    # so S_chunk just above max(block_bytes) guarantees the block fits in
+    # one chunk while forcing at least two chunks overall.
     block_bytes_each = []
+    named = dict(model.named_parameters())
     for pids in block_spans.values():
         block_bytes = 0
         for pid in pids:
-            param = dict(model.named_parameters())[pid]
+            param = named[pid]
             block_bytes += param.numel() * param.element_size()
         block_bytes_each.append(block_bytes)
-    S_chunk = max(block_bytes_each) * 4  # fits any single block, still splits model
+    max_param_bytes = max(p.numel() * p.element_size() for p in named.values())
+    # Ensure S_chunk fits the largest single param and any single block, with
+    # a modest safety margin, yet is strictly less than ``total_bytes``.
+    S_chunk = max(max(block_bytes_each), max_param_bytes) + 1024
 
     # Safety: S_chunk should be < total so we actually get multiple chunks.
-    assert S_chunk < total_bytes
+    assert S_chunk < total_bytes, (
+        f"test setup: S_chunk={S_chunk} must be < total_bytes={total_bytes} "
+        "to exercise multi-chunk layout"
+    )
 
     layout = build_layout(model, exec_order, S_chunk, block_spans)
 
@@ -153,43 +163,69 @@ def test_layout_preserves_first_occurrence_for_shared_params():
 
 
 def test_sizing_picks_min_waste():
-    """Crafted param sizes where 64 MB is the clear argmin-waste winner."""
+    """Grid-search chooses the minimum-waste candidate, tie-breaking to the larger S.
+
+    The algorithm (Appendix B.1) simulates greedy-fit chunking for each
+    candidate in {32, 64, 128, 256} MB and picks the S_chunk that minimizes
+    the sum of ``S_chunk - bytes_used`` across every *non-tail* chunk.
+    Overfilled chunks (a single param larger than S) contribute zero waste
+    because the clamp ``max(0, S - bytes)`` floors negatives to zero. Ties
+    are broken by picking the *larger* candidate — fewer chunks ⇒ fewer
+    scheduler iterations.
+    """
     from axolotl.integrations.protrain.chunk.sizing import pick_S_chunk
 
     MB = 1 << 20
-    # Params sized to pack perfectly into 64 MB chunks but leave large
-    # gaps under 128 MB / 256 MB (each 128 MB chunk holds only one ~63 MB
-    # param, wasting ~65 MB; same for 256 MB). At 32 MB a single 63 MB
-    # param doesn't fit — it still gets placed (overflow) but every
-    # *preceding* chunk is counted as waste = 32-63 which clamps to 0.
-    # Net: 64 MB wins with 0 waste.
-    sizes_list = [63 * MB] * 8  # 8 params of 63 MB each
-    sizes: dict[ParamId, int] = {
-        cast(ParamId, f"p{i}"): sz for i, sz in enumerate(sizes_list)
-    }
 
-    picked = pick_S_chunk(sizes)
-    # 32 MB: every 63 MB param spills into its own chunk that overfills;
-    # our greedy tracker counts (32 - bytes_in_chunk) only for chunks that
-    # didn't hit the tail, and overflowed chunks have bytes_in_chunk > 32
-    # so waste is clamped to 0. Waste at 32 MB = 0 as well.
-    # 64 MB: each 63 MB param fits exactly, small 1 MB per-chunk waste × 7.
-    # 128 MB: each 63 MB param takes a fresh chunk (can't fit 2 since
-    # 2*63 = 126 < 128 → actually *does* fit 2, leaving 128-126=2 MB
-    # waste per pair × 3 = 6 MB waste. That's LESS than 64 MB.
-    # Hmm — 128 MB would actually win. Re-pick sizes so 64 is unambiguous.
-    # Use 33 MB params: at 32 MB each spills; at 64 MB pair exactly (64-66=0,
-    # wait 2*33=66 > 64, so only one fits per chunk → 64-33=31 waste × 7).
-    # Easier: use sizes that exactly match 64 MB.
-    sizes2: dict[ParamId, int] = {
+    # Case A — oversized-param regime. 8 × 63 MB params: at S=32 every param
+    # overflows its chunk (63 > 32) so waste clamps to 0, which becomes the
+    # global minimum. At S=64 each 63 MB param sits alone in a chunk leaving
+    # 1 MB of trailing slack × 7 preceding chunks = 7 MB of waste. At S=128
+    # pairs fit (2*63=126 ≤ 128) → 4 chunks, 3 preceding × 2 MB = 6 MB
+    # waste. At S=256 quadruples fit → 2 chunks, 1 preceding × 4 MB = 4 MB.
+    # So S=32 (waste 0) strictly wins; S=256 is the runner-up.
+    sizes_a: dict[ParamId, int] = {
+        cast(ParamId, f"p{i}"): 63 * MB for i in range(8)
+    }
+    picked_a = pick_S_chunk(sizes_a)
+    assert picked_a == 32 * MB, (
+        f"overflow-clamp scenario: expected S=32 MB (waste=0); got {picked_a}"
+    )
+
+    # Case B — exact-fit regime with an all-tied waste profile. 4 × 64 MB
+    # params: at S=32 each overflows (waste=0); at S=64 each fills a chunk
+    # exactly (all preceding chunks have waste=0); at S=128 pairs fit
+    # exactly (waste=0); at S=256 all four fit in a single chunk (waste=0
+    # since tail slack is excluded). Every candidate ties at 0 waste, so
+    # the tie-break rule ("prefer larger S_chunk") selects 256 MB.
+    sizes_b: dict[ParamId, int] = {
         cast(ParamId, f"q{i}"): 64 * MB for i in range(4)
     }
-    picked2 = pick_S_chunk(sizes2)
-    assert picked2 == 64 * MB, (
-        f"4 × 64 MB params should prefer S_chunk=64 MB (zero waste); got {picked2}"
+    picked_b = pick_S_chunk(sizes_b)
+    assert picked_b == 256 * MB, (
+        f"tie-at-zero-waste scenario: expected S=256 MB via tie-break; got {picked_b}"
     )
-    # Quiet the unused-variable warning by asserting something about ``picked``.
-    assert picked in (32 * MB, 64 * MB, 128 * MB, 256 * MB)
+
+    # Case C — mid-grid winner. Construct a layout where S=128 MB is
+    # strictly minimum-waste. Use 3 × 100 MB params: at S=32 each overflows
+    # (waste=0 via clamp); at S=64 each overflows (100 > 64, waste=0); at
+    # S=128 each fills one chunk leaving 28 MB preceding-slack × 2 chunks =
+    # 56 MB; at S=256 pairs fit (200 ≤ 256) so [200][100] — waste =
+    # 256-200 = 56 MB preceding. Ties between 32/64 at 0 and between 128/
+    # 256 at 56; the zero-waste bucket wins, and within it S=64 beats S=32
+    # by tie-break. So the *overall* pick is S=64 MB.
+    sizes_c: dict[ParamId, int] = {
+        cast(ParamId, f"r{i}"): 100 * MB for i in range(3)
+    }
+    picked_c = pick_S_chunk(sizes_c)
+    assert picked_c == 64 * MB, (
+        f"mixed-waste scenario: expected S=64 MB (waste=0, larger of the "
+        f"two zero-waste candidates); got {picked_c}"
+    )
+
+    # Sanity — every pick is drawn from the documented grid.
+    for picked in (picked_a, picked_b, picked_c):
+        assert picked in (32 * MB, 64 * MB, 128 * MB, 256 * MB)
 
 
 # ---------------------------------------------------------------------------
