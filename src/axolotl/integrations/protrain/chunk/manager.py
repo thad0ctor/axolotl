@@ -158,6 +158,14 @@ class ChunkManager:
             device if device is not None else buffer_pool.device
         )
 
+        # When True, :meth:`reduce_grads_and_offload` and the per-param
+        # grad-offload hook skip their internal ``dist.all_reduce`` calls
+        # and trust an outer layer (typically ``DistributedDataParallel``
+        # wrapped over the protrain'd module) to own cross-rank grad
+        # sync. Toggled by ``protrain_model_wrapper`` at compose-time —
+        # see the Multi-GPU section of ``DESIGN.md``.
+        self.skip_internal_grad_reduce: bool = False
+
         # Param lookup by id for gather/offload payload construction.
         self._params_by_id: dict[ParamId, "nn.Parameter"] = {
             cast(ParamId, name): p for name, p in model.named_parameters()
@@ -393,6 +401,22 @@ class ChunkManager:
         def _hook(param: "nn.Parameter") -> None:
             if param.grad is None:
                 return
+            # Multi-rank data-parallel path: reduce the GPU grad across
+            # ranks (AVG = sum / world_size) BEFORE draining to the CPU
+            # shard. Guarded on world_size > 1 AND ``skip_internal_grad_reduce``
+            # being False — the M6 DDP-composed stack sets the flag to
+            # True so DDP's own bucketed allreduce handles this sync
+            # and we don't do a second per-param reduce here. In a bare
+            # non-DDP distributed run the flag is False and this is the
+            # sole grad-sync point.
+            import torch.distributed as _dist
+            if (
+                _dist.is_available()
+                and _dist.is_initialized()
+                and _dist.get_world_size() > 1
+                and not cm.skip_internal_grad_reduce
+            ):
+                _dist.all_reduce(param.grad, op=_dist.ReduceOp.AVG)
             # copy_ supports cross-device; non_blocking=True is safe
             # because the destination is pinned host memory.
             captured_slot.cpu_grad.copy_(param.grad, non_blocking=True)  # type: ignore[union-attr]
@@ -403,21 +427,30 @@ class ChunkManager:
             remaining = cm._grad_remaining.get(captured_cid, 0) - 1
             cm._grad_remaining[captured_cid] = remaining
             if remaining == 0:
-                # All of the chunk's trainable params are drained; kick
-                # off the async CPU Adam step. But first we need to
-                # install the CPU grads onto the param objects that the
-                # CpuFusedAdamAdapter is holding — the adapter was built
-                # with the GPU params, but we want it to consume grads
-                # from our CPU shards. Simplest: attach .grad to each
-                # slot's cpu_grad so the adapter sees it. See
-                # _ensure_cpu_grads_attached for the details.
-                cm._ensure_cpu_grads_attached(captured_cid)
+                # All of the chunk's trainable params are drained. If a
+                # CPU FusedAdam adapter is attached, install the CPU
+                # shards onto the param objects and kick off the async
+                # step — the adapter was built against the GPU param
+                # refs but consumes grads from our CPU shards, so we
+                # temporarily repoint ``.data`` and ``.grad`` for it.
+                #
+                # When ``cpu_optim is None`` (no DeepSpeedCPUAdam — e.g.
+                # the system toolchain's CUDA version mismatches torch's
+                # build), we deliberately skip the repoint: leaving
+                # ``param.grad`` as None and ``param.data`` as the empty
+                # GPU placeholder keeps every ``nn.Parameter`` device-
+                # consistent across iterations. Without this guard,
+                # iter 0's hook would leave 56 trainable LoRA params
+                # pointing at CPU storage and iter 1's backward would
+                # trip the "expected same device" check when autograd
+                # accumulates the new GPU grad onto the stale CPU grad.
+                if cm.cpu_optim is not None:
+                    cm._ensure_cpu_grads_attached(captured_cid)
+                    cm.cpu_optim.step_async(captured_cid)
                 # Reset the counter now so the next backward fires again.
                 cm._grad_remaining[captured_cid] = cm._grad_initial.get(
                     captured_cid, 0
                 )
-                if cm.cpu_optim is not None:
-                    cm.cpu_optim.step_async(captured_cid)
 
         return _hook
 
@@ -593,18 +626,33 @@ class ChunkManager:
 
         if chunk_id in self._persistent_ids:
             # Persistent chunks keep their grads GPU-resident for the
-            # FusedAdam step. In distributed mode we'd all-reduce across
-            # ranks here — but each param has its own storage (not a
-            # flat chunk buffer), so we'd have to iterate params.
-            # Single-rank path is a no-op.
+            # FusedAdam step.
+            #
+            # Distributed grad-sync policy. When another layer above
+            # ProTrain owns the cross-rank reduction (the M6 stack wraps
+            # the protrain'd module in ``DistributedDataParallel``, which
+            # fires its own bucketed allreduce via autograd hooks),
+            # this in-manager all_reduce would be a redundant second
+            # sync — and a costly one on pure-PCIe 3090 pairs because
+            # it runs per-param without bucketing. ``self.skip_internal_grad_reduce``
+            # (set by the wrapper when it detects DDP composition) tells
+            # us to leave the grads alone.
+            #
+            # In the non-DDP distributed path (e.g. a bare ZeRO-3 run)
+            # the flag is False and we do the reduction per-param with
+            # AVG semantics — correct, if slower than a bucketed path.
             if (
                 torch.distributed.is_available()
                 and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+                and not self.skip_internal_grad_reduce
             ):
                 for pid in self.layout.chunks[int(chunk_id)]:
                     param = self._params_by_id.get(pid)
                     if param is not None and param.grad is not None:
-                        torch.distributed.all_reduce(param.grad)
+                        torch.distributed.all_reduce(
+                            param.grad, op=torch.distributed.ReduceOp.AVG
+                        )
             return
 
         # Non-persistent: grad offload is owned by _offload_grad (per-param

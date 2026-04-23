@@ -212,6 +212,7 @@ docstring-code-format = false
 addopts = "-m 'not slow'"
 markers = [
     "slow: marks tests as slow",
+    "gpu: marks tests that require a CUDA GPU",
 ]
 
 # UV specific configuration

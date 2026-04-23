@@ -181,6 +181,12 @@ Zero diffs to Axolotl core files. The entire Axolotl surface consumed:
 - `api/*` — depends on everything; built last.
 - `plugin.py` — consumes `api/*` only; M5. Supports M1→M4 parallel fan-out: profiler, chunk, block run concurrently; cost+search starts once `ProfilerTrace` schema is frozen at end of M1.
 
+### Multi-GPU
+
+ProTrain is a per-rank memory policy. On a multi-GPU box it composes with a conventional data-parallel wrapper applied ON TOP of the ProTrain-wrapped model; the M6 stack uses `torch.nn.parallel.DistributedDataParallel` (`find_unused_parameters=True` is required because LoRA freezes >99% of the base model). Each rank runs its own full `protrain_model_wrapper`, holds its own per-rank chunk layout and buffer pool, and — for LoRA on 7B — keeps the full frozen base resident in fp16 (13.5 GiB, well within the 3090's 24 GiB). DDP handles the cross-rank all-reduce on the tiny LoRA adapter gradient set; ProTrain handles prefetch/offload on chunk state inside each rank.
+
+True ZeRO-3 parameter sharding (base model partitioned across ranks, `all_gather` on each chunk gather, `reduce_scatter` on grad offload) is called out in the paper (§1 "Parallelism foundation: ZeRO-3") but is NOT on the M6 critical path for two reasons: (a) the LoRA-on-7B workload fits in memory on one 3090 already, so sharding the base would only save memory — not enable training; (b) the scheduler's `reduce_grads_and_offload` and the per-param grad-offload hook both now sync grads via `dist.all_reduce(op=AVG)` guarded on `is_initialized() and world_size > 1`, which is the correct reduction when each rank holds a full copy of the state. Moving to true sharding would replace these with `reduce_scatter` (grad) + `all_gather` (param) inside `ChunkManager.gather`/`reduce_grads_and_offload`. That port is M7 work.
+
 ## Out of Scope
 
 Mirrors `plan.md`:
