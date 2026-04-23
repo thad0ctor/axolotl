@@ -559,11 +559,13 @@ class _GemmaTurnStrategy(ProcessingStrategy):
             return []
         end_ids = end[0]
         boundaries = []
-        # Template uses 'model'; external role knob stays 'assistant'.
+        # Template uses 'model'; external role knob stays 'assistant'. Gemma 3
+        # and Gemma 3n jinja templates fold the system message into the first
+        # user's content prefix and never emit '<start_of_turn>system', so we
+        # don't declare a system boundary here.
         role_marker_pairs = [
             ("assistant", "model"),
             ("user", "user"),
-            ("system", "system"),
         ]
         for external_role, template_role in role_marker_pairs:
             start = _encode_markers(tok, [f"<start_of_turn>{template_role}\n"])
