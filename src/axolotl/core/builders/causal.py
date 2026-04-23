@@ -524,26 +524,35 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 # Mirror ChatTemplateStrategy: per-dataset masking knobs from first MM dataset, else global cfg.
                 ds_entries = self.cfg.datasets or []
                 ds_cfg = ds_entries[0] if ds_entries else None
-                roles_to_train = None
-                train_on_eos = None
-                if ds_cfg is not None:
-                    # Handle DictDefault / dict / pydantic uniformly.
-                    get_attr = (
-                        ds_cfg.get if hasattr(ds_cfg, "get") else ds_cfg.__getitem__
-                    )
-                    try:
-                        roles_to_train = get_attr("roles_to_train")
-                    except (AttributeError, KeyError):
-                        roles_to_train = None
-                    try:
-                        train_on_eos = get_attr("train_on_eos")
-                    except (AttributeError, KeyError):
-                        train_on_eos = None
+
+                def _ds_get(cfg_obj, key):
+                    # Handle DictDefault / dict / pydantic uniformly:
+                    # dict-style .get first, then attribute access.
+                    if cfg_obj is None:
+                        return None
+                    if hasattr(cfg_obj, "get"):
+                        try:
+                            return cfg_obj.get(key)
+                        except (AttributeError, KeyError, TypeError):
+                            pass
+                    return getattr(cfg_obj, key, None)
+
+                roles_to_train = _ds_get(ds_cfg, "roles_to_train")
+                train_on_eos = _ds_get(ds_cfg, "train_on_eos")
 
                 # cfg.role_boundaries replaces the strategy's built-in markers.
                 role_boundaries_override = None
                 if self.cfg.role_boundaries:
                     role_boundaries_override = list(self.cfg.role_boundaries)
+
+                LOG.info(
+                    "MM collator: train_on_inputs=%s roles_to_train=%s "
+                    "train_on_eos=%s role_boundaries_override=%s",
+                    bool(self.cfg.train_on_inputs),
+                    roles_to_train,
+                    train_on_eos,
+                    "set" if role_boundaries_override else "none",
+                )
 
                 kwargs["processing_strategy"] = get_processing_strategy(
                     self.processor,
