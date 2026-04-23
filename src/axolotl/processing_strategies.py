@@ -69,9 +69,13 @@ class ProcessingStrategy:
             image_resize_algorithm or Image.Resampling.BILINEAR
         )
 
-        # Defaults mirror the text-only ChatTemplateStrategy.
+        # Defaults mirror the text-only ChatTemplateStrategy. An explicit
+        # empty list is honored as "no trainable roles" (masks everything);
+        # only ``None`` falls back to the default of assistant-only.
         self.train_on_inputs = bool(train_on_inputs)
-        self.roles_to_train = list(roles_to_train) if roles_to_train else ["assistant"]
+        self.roles_to_train = (
+            list(roles_to_train) if roles_to_train is not None else ["assistant"]
+        )
         self.train_on_eos = train_on_eos if train_on_eos is not None else "turn"
         if self.train_on_eos not in _VALID_TRAIN_ON_EOS:
             raise ValueError(

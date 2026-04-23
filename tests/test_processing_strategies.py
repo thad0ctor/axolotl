@@ -178,6 +178,22 @@ def test_strategy_accepts_all_supported_train_on_eos_values():
         )
 
 
+def test_roles_to_train_empty_list_masks_everything():
+    """An explicit empty list is distinct from None and disables all roles."""
+    vocab = {"BOA": [50], "EOT": [60]}
+    strategy = ProcessingStrategy(
+        _Processor(_Tokenizer(vocab, pad_id=0)),
+        roles_to_train=[],
+        role_boundaries_override=[
+            {"role": "assistant", "start": "BOA", "end": "EOT"}
+        ],
+    )
+    assert strategy.roles_to_train == []
+    seq = [1, 50, 7, 8, 60, 9]
+    out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
+    assert out == [-100] * 6
+
+
 # --------------------------------------------------------------------------- #
 # Qwen2VL / Qwen3.5
 # --------------------------------------------------------------------------- #
