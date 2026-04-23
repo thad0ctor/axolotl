@@ -135,6 +135,49 @@ def test_scanner_no_boundaries_masks_everything():
     assert out.tolist() == [[-100, -100, -100, -100]]
 
 
+def test_scanner_train_on_eos_last_only_final_trainable_turn():
+    boundaries = [
+        RoleBoundary(role="assistant", start_tokens=[1, 2], end_tokens=[9]),
+    ]
+    seq = [1, 2, 5, 9, 1, 2, 6, 9]
+    out = _scan(boundaries, seq, train_on_eos="last")
+    # Only the second assistant turn's end marker (index 7) is kept.
+    assert out == [-100, -100, 5, -100, -100, -100, 6, 9]
+
+
+def test_scanner_train_on_eos_last_no_trainable_turn_is_noop():
+    boundaries = [
+        RoleBoundary(role="user", start_tokens=[1, 3], end_tokens=[9]),
+    ]
+    seq = [1, 3, 5, 9, 1, 3, 6, 9]
+    out = _scan(boundaries, seq, roles_to_train=("assistant",), train_on_eos="last")
+    assert out == [-100] * 8
+
+
+def test_strategy_rejects_unknown_train_on_eos():
+    vocab = {"BOA": [50], "EOT": [60]}
+    with pytest.raises(ValueError, match="train_on_eos"):
+        ProcessingStrategy(
+            _Processor(_Tokenizer(vocab, pad_id=0)),
+            train_on_eos="bogus",
+            role_boundaries_override=[
+                {"role": "assistant", "start": "BOA", "end": "EOT"}
+            ],
+        )
+
+
+def test_strategy_accepts_all_supported_train_on_eos_values():
+    vocab = {"BOA": [50], "EOT": [60]}
+    for val in ("turn", "all", "none", "last"):
+        ProcessingStrategy(
+            _Processor(_Tokenizer(vocab, pad_id=0)),
+            train_on_eos=val,
+            role_boundaries_override=[
+                {"role": "assistant", "start": "BOA", "end": "EOT"}
+            ],
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Qwen2VL / Qwen3.5
 # --------------------------------------------------------------------------- #

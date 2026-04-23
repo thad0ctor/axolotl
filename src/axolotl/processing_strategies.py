@@ -21,6 +21,11 @@ LOG = get_logger(__name__)
 # One-shot warning dedupe so opt-out subclasses don't spam per-batch.
 _ROLE_MASK_WARNED: set[str] = set()
 
+# Supported values for ``train_on_eos`` — mirrors the text-only
+# ChatTemplateStrategy (``turn`` = trainable turn ends only, ``all`` = every
+# turn end, ``none`` = never, ``last`` = only the final trainable turn end).
+_VALID_TRAIN_ON_EOS = ("turn", "all", "none", "last")
+
 
 @dataclass(frozen=True)
 class RoleBoundary:
@@ -68,6 +73,11 @@ class ProcessingStrategy:
         self.train_on_inputs = bool(train_on_inputs)
         self.roles_to_train = list(roles_to_train) if roles_to_train else ["assistant"]
         self.train_on_eos = train_on_eos if train_on_eos is not None else "turn"
+        if self.train_on_eos not in _VALID_TRAIN_ON_EOS:
+            raise ValueError(
+                f"train_on_eos={self.train_on_eos!r} is not one of "
+                f"{_VALID_TRAIN_ON_EOS}."
+            )
 
         if hasattr(processor, "image_token"):
             self.image_token = processor.image_token
@@ -285,9 +295,13 @@ def _apply_role_boundaries(
     Scan is greedy-left with longest-prefix-wins on start_tokens to disambiguate
     nested markers (e.g. ``<|im_start|>assistant`` vs ``<|im_start|>``).
     ``train_on_eos`` accepts ``"turn"`` (end marker in loss on trainable turns
-    only), ``"all"`` (always), ``"none"`` (never — overrides ``include_end``).
+    only), ``"all"`` (always), ``"none"`` (never — overrides ``include_end``),
+    ``"last"`` (only on the last trainable turn in the sequence).
     """
     mask = zeros_like(labels)
+    # For "last": remember each trainable turn's end-marker span so we can
+    # unmask only the final one after the scan finishes.
+    last_trainable_end_span: list[Optional[tuple[int, int]]] = [None] * labels.shape[0]
 
     def _match_prefix(label, start_pos, tok_seq):
         if not tok_seq or start_pos + len(tok_seq) > len(label):
@@ -336,13 +350,16 @@ def _apply_role_boundaries(
                     end_after - len(best_match.end_tokens) if found_end else end_after
                 )
                 mask[i][start_of_content:content_end] = 1
-                # train_on_eos="none" overrides include_end.
+                # train_on_eos="none"/"last" override include_end during main
+                # loop; "last" is applied after the scan finishes.
                 if (
                     found_end
                     and best_match.include_end
-                    and train_on_eos != "none"
+                    and train_on_eos not in ("none", "last")
                 ):
                     mask[i][content_end:end_after] = 1
+                if found_end and best_match.include_end and train_on_eos == "last":
+                    last_trainable_end_span[i] = (content_end, end_after)
             else:
                 # Non-trainable role: only the end marker can contribute, and only on train_on_eos="all".
                 if found_end and train_on_eos == "all":
@@ -362,6 +379,10 @@ def _apply_role_boundaries(
                 j = end_after - len(best_match.end_tokens)
             else:
                 j = end_after
+
+        if train_on_eos == "last" and last_trainable_end_span[i] is not None:
+            s, e = last_trainable_end_span[i]
+            mask[i][s:e] = 1
 
         labels[i][mask[i] == 0] = -100
 
