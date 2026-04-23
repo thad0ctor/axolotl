@@ -113,6 +113,7 @@ class ProcessingStrategy:
         # overrides we include the fully resolved (role, start_ids, end_ids)
         # tuples; for built-ins we log a count (subclasses vary and logging
         # every id sequence would be noisy on, e.g., Llama3 with five roles).
+        boundaries_repr: str | list[tuple[str, list[int], list[int]]]
         if source == "override":
             boundaries_repr = [
                 (b.role, b.start_tokens, b.end_tokens) for b in self.role_boundaries
@@ -412,8 +413,8 @@ def _apply_role_boundaries(
             else:
                 j = end_after
 
-        if train_on_eos == "last" and last_trainable_end_span[i] is not None:
-            s, e = last_trainable_end_span[i]
+        if train_on_eos == "last" and (span := last_trainable_end_span[i]) is not None:
+            s, e = span
             mask[i][s:e] = 1
 
         labels[i][mask[i] == 0] = -100
@@ -1112,16 +1113,6 @@ def get_processing_strategy(
     train_on_eos: Optional[str] = None,
     role_boundaries_override: Optional[list[dict]] = None,
 ):
-    # Lazy import: mistral_common is optional.
-    try:
-        from axolotl.utils.mistral.mistral3_processor import Mistral3Processor
-    except (ImportError, ModuleNotFoundError) as exc:
-        LOG.debug(
-            "Mistral3Processor import failed; Mistral3 strategy will be unavailable: %r",
-            exc,
-        )
-        Mistral3Processor = None  # type: ignore[assignment]
-
     processing_kwargs = {
         "processor": processor,
         "chat_template": chat_template,
@@ -1163,8 +1154,18 @@ def get_processing_strategy(
     if isinstance(processor, SmolVLMProcessor):
         return SmolVLM2ProcessingStrategy(**processing_kwargs)
 
-    if Mistral3Processor is not None and isinstance(processor, Mistral3Processor):
-        return Mistral3ProcessingStrategy(**processing_kwargs)
+    # Lazy import: mistral_common is optional. Mirrors the Glm46V pattern below.
+    try:
+        from axolotl.utils.mistral.mistral3_processor import Mistral3Processor
+
+        if isinstance(processor, Mistral3Processor):
+            return Mistral3ProcessingStrategy(**processing_kwargs)
+    except (ImportError, ModuleNotFoundError) as exc:
+        LOG.debug(
+            "Mistral3Processor import failed; Mistral3 strategy will be unavailable: %r",
+            exc,
+        )
+
     try:
         from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
 
