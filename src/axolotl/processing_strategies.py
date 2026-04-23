@@ -349,7 +349,19 @@ def _apply_role_boundaries(
                     content_end = end_after - len(best_match.end_tokens)
                     mask[i][content_end:end_after] = 1
 
-            j = end_after
+            # When include_end=False, do not consume the end marker: back up so
+            # the next iteration can re-match it as the next boundary's start
+            # marker (Pixtral / Mistral V7 Tekken share [/INST] between
+            # user-end and assistant-start). Requires end_tokens non-empty and
+            # actually found.
+            if (
+                found_end
+                and not best_match.include_end
+                and best_match.end_tokens
+            ):
+                j = end_after - len(best_match.end_tokens)
+            else:
+                j = end_after
 
         labels[i][mask[i] == 0] = -100
 
@@ -692,7 +704,12 @@ class Llama4ProcessingStrategy(ProcessingStrategy):
 
 
 class PixtralProcessingStrategy(ProcessingStrategy):
-    """Processing Strategy class for Pixtral (``[INST] ... [/INST]`` user, assistant terminates at ``eos_token``)."""
+    """Processing Strategy class for Pixtral (``[INST] ... [/INST]`` user, assistant terminates at ``eos_token``).
+
+    ``[/INST]`` is shared between user-end and assistant-start. We declare user
+    with ``include_end=False`` so the scanner hands the ``[/INST]`` back to
+    assistant's start match on the next iteration.
+    """
 
     def _build_role_boundaries(self) -> list[RoleBoundary]:
         tok = self.processor.tokenizer
@@ -705,7 +722,10 @@ class PixtralProcessingStrategy(ProcessingStrategy):
         if inst_start and inst_end:
             boundaries.append(
                 RoleBoundary(
-                    role="user", start_tokens=inst_start[0], end_tokens=inst_end[0]
+                    role="user",
+                    start_tokens=inst_start[0],
+                    end_tokens=inst_end[0],
+                    include_end=False,
                 )
             )
             boundaries.append(
@@ -719,7 +739,10 @@ class PixtralProcessingStrategy(ProcessingStrategy):
 
 
 class MistralV7TekkenProcessingStrategy(ProcessingStrategy):
-    """Processing Strategy class for Mistral v7 Tekken (Pixtral-style plus ``[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]``)."""
+    """Processing Strategy class for Mistral v7 Tekken (Pixtral-style plus ``[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]``).
+
+    Same ``[/INST]``-shared-marker treatment as :class:`PixtralProcessingStrategy`.
+    """
 
     def _build_role_boundaries(self) -> list[RoleBoundary]:
         tok = self.processor.tokenizer
@@ -740,7 +763,10 @@ class MistralV7TekkenProcessingStrategy(ProcessingStrategy):
         if inst_start and inst_end:
             boundaries.append(
                 RoleBoundary(
-                    role="user", start_tokens=inst_start[0], end_tokens=inst_end[0]
+                    role="user",
+                    start_tokens=inst_start[0],
+                    end_tokens=inst_end[0],
+                    include_end=False,
                 )
             )
             boundaries.append(

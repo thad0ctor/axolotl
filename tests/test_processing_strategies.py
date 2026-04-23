@@ -360,10 +360,9 @@ def test_llama4_assistant_masking():
 
 
 def test_pixtral_assistant_terminates_at_eos():
-    # Known limitation: [/INST] is both user-end and assistant-start. The scanner
-    # consumes it for user and skips the assistant span. Workaround: set
-    # include_end=False on user and include_start=True on assistant, or use a
-    # template with distinct markers.
+    # [/INST] is both user-end and assistant-start. Scanner backs up when
+    # user.include_end=False so the next iteration picks [/INST] up as
+    # assistant-start (Pixtral-specific handling in _build_role_boundaries).
     vocab = {
         "[INST]": [50],
         "[/INST]": [51],
@@ -372,7 +371,8 @@ def test_pixtral_assistant_terminates_at_eos():
     strategy = PixtralProcessingStrategy(_Processor(tok))
     seq = [50, 7, 51, 8, 8, 99]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    assert out[:3] == [-100, -100, -100]
+    # Full-sequence expectation: user span masked; assistant content + eos kept.
+    assert out == [-100, -100, -100, 8, 8, 99]
 
 
 def test_mistral_v7_tekken_system_user_assistant():
@@ -386,9 +386,8 @@ def test_mistral_v7_tekken_system_user_assistant():
     strategy = MistralV7TekkenProcessingStrategy(_Processor(tok))
     seq = [40, 5, 41, 50, 7, 51, 8, 99]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
-    # Same [/INST] shared-token limitation as test_pixtral_assistant_terminates_at_eos.
-    assert out[:3] == [-100, -100, -100]
-    assert out[3:6] == [-100, -100, -100]
+    # Full-sequence expectation: system + user spans masked; assistant kept.
+    assert out == [-100, -100, -100, -100, -100, -100, 8, 99]
 
 
 # --------------------------------------------------------------------------- #
