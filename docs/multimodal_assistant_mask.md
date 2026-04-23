@@ -82,28 +82,26 @@ builder.
 |---|---|---|---|---|
 | `ProcessingStrategy` (fallback for `llava`, `lfm2vl`, `mistral_v3_tekken`, unknown) | ✗ | fallback + warn | *unverified* | `image_token_id` if processor exposes it |
 | `Qwen2VLProcessingStrategy` (`qwen2_vl`) | ✗ | ✓ | `<\|im_start\|>{role}\n` ... `<\|im_end\|>` | `<\|image_pad\|>` |
-| `Qwen3_5ProcessingStrategy` (`qwen3_5`, `qwen3_5_moe`) | ✗ | ✓ | same as Qwen2VL | `<\|image_pad\|>`, `<\|video_pad\|>` |
+| `Qwen3_5ProcessingStrategy` (`qwen3_5`) | ✗ | ✓ | same as Qwen2VL | `<\|image_pad\|>`, `<\|video_pad\|>` |
 | `Gemma3ProcessingStrategy` (`gemma3`) | ✗ | ✓ | `<start_of_turn>{model/user/system}\n` ... `<end_of_turn>` | `boi_token`, `<image_soft_token>` (262144) |
 | `Gemma3nProcessingStrategy` (`gemma3n`) | ✓ (ad-hoc) | ✓ (shared scanner) | same as Gemma 3 | `image_token_id`, `audio_token_id`, `boi_token_id`, `eoi_token_id` |
 | `Gemma4ProcessingStrategy` (`gemma4`) | n/a (new) | ✓ | `<\|turn>{model/user/system}` ... `<turn\|>` | `image_token_id`, `audio_token_id`, `boi/eoi/boa/eoa` (resolved via `convert_tokens_to_ids`), `video_token_id` (on processor) |
 | `Llama3_2VisionProcessingStrategy` (`llama3_2_vision`) — **new** | ✗ | ✓ | `<\|start_header_id\|>{role}<\|end_header_id\|>\n\n` ... `<\|eot_id\|>` | `image_token_id` via base |
 | `Llama4ProcessingStrategy` (`llama4`) — **new** | ✗ | ✓ | `<\|header_start\|>{role}<\|header_end\|>\n\n` ... `<\|eot\|>` | `image_token_id` via base |
-| `PixtralProcessingStrategy` (`pixtral`) — **new** | ✗ | ✓¹ | user: `[INST]` ... `[/INST]`, assistant: `[/INST]` ... `eos_token` | `image_token_id` via base |
-| `MistralV7TekkenProcessingStrategy` (`mistral_v7_tekken`) — **new** | ✗ | ✓¹ | `[SYSTEM_PROMPT]` ... `[/SYSTEM_PROMPT]`, `[INST]` ... `[/INST]`, assistant ends at `eos_token` | `image_token_id` via base |
+| `PixtralProcessingStrategy` (`pixtral`) — **new** | ✗ | ✓ | user: `[INST]` ... `[/INST]` (`include_end=False`), assistant: `[/INST]` ... `eos_token` | `image_token_id` via base |
+| `MistralV7TekkenProcessingStrategy` (`mistral_v7_tekken`) — **new** | ✗ | ✓ | `[SYSTEM_PROMPT]` ... `[/SYSTEM_PROMPT]`, `[INST]` ... `[/INST]` (`include_end=False`), assistant: `[/INST]` ... `eos_token` | `image_token_id` via base |
 | `VoxtralProcessingStrategy` | ✗ | fallback + warn | *unverified* (mistral-common tokenizer) | `audio_token`, `begin_audio_token` |
 | `SmolVLM2ProcessingStrategy` | ✗ | fallback + warn | *unverified* (checkpoint-dependent default) | `<image>` |
 | `Mistral3ProcessingStrategy` | ✗ | fallback + warn | *unverified* (mistral-common tokenizer) | `img`, `img_break`, `img_end` |
 | `InternVLProcessingStrategy` | ✗ | fallback + warn | *unverified* (InternLM-family) | `processor.image_ids` |
 | `Glm4vProcessingStrategy` | ✗ | fallback + warn | *unverified* | image/video + begin/end markers |
 
-¹ Pixtral and Mistral V7 Tekken share a token (`[/INST]`) between the
-user-end and assistant-start markers. The scanner consumes the first
-occurrence when terminating the user span; the immediate assistant-start
-that follows is therefore skipped unless the user removes the user boundary
-from `roles_to_train` explicitly. This limitation is documented in a
-tombstone test; users who need stricter assistant masking on these templates
-should swap to the `pixtral`/`mistral_v7_tekken` template-type-specific
-subclass we ship and open an issue for the shared-marker case.
+Pixtral and Mistral V7 Tekken share a token (`[/INST]`) between the user-end
+and assistant-start markers. The scanner supports this via `include_end=False`
+on the user boundary: when the scanner hits an end marker that is also another
+boundary's start, it rewinds past it so the next iteration can match the
+shared token as the next role's start. See commit `acfe4fe4` and the full
+per-position assertions in `tests/test_processing_strategies.py`.
 
 *unverified*: the right boundary markers cannot be confirmed without a real
 checkpoint; the fallback preserves the legacy "mask pad + media tokens only"
@@ -172,7 +170,7 @@ this revision the logical units are:
    wiring through ``build_collator`` / ``get_processing_strategy`` /
    every strategy constructor.
 6. **`test: additional coverage for MM role-mask scanner edge cases`** —
-   expands the unit test suite to 55 tests covering scanner semantics,
+   expands the unit test suite to 64 tests covering scanner semantics,
    per-strategy masking, media-token masking within assistant spans,
    dispatcher routing, processor_kwargs passthrough, override semantics
    (replace built-in, enable on unverified strategy, eos_token sentinel,
@@ -187,7 +185,7 @@ this revision the logical units are:
 
 ## Verification
 
-- All 55 unit tests pass offline (`pytest tests/test_processing_strategies.py`).
+- All 64 unit tests pass offline (`pytest tests/test_processing_strategies.py`).
 - End-to-end check against real tokenizers:
   - `google/gemma-4-E2B-it`: 13/40 tokens kept for a 2-turn chat; decoded
     preview shows only assistant responses + `<turn|>` markers remain.
@@ -231,5 +229,5 @@ this revision the logical units are:
 >   `processor_cls.from_pretrained` kwargs; `revision` and `trust_remote_code`
 >   remain axolotl-managed.
 >
-> **Testing**: 55 offline unit tests; end-to-end verified with the real
+> **Testing**: 64 offline unit tests; end-to-end verified with the real
 > Gemma 4 and Llama 3.x tokenizers.
