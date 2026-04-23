@@ -36,6 +36,7 @@ from axolotl.integrations.protrain.types import (
     BlockMode,
     BlockStrategyMap,
     Bounds,
+    ChunkId,
     ChunkLayout,
     CostConfig,
     HardwareProfile,
@@ -45,6 +46,40 @@ from axolotl.integrations.protrain.types import (
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+def _min_n_buffer_for(layout: ChunkLayout, n_persist: int) -> int:
+    """Minimum n_buffer the scheduler needs at this n_persist.
+
+    The scheduler's lookahead prefetch (runtime/scheduler.py::pre_block_forward)
+    holds the current block's chunks resident while simultaneously prefetching
+    the next block's chunks. For any non-persistent chunk to be reachable via
+    the pool, the pool must be sized for the worst-case union across adjacent
+    block pairs. Persistent chunks (the first ``n_persist``) bypass the pool,
+    so we only count non-persistent contributions.
+
+    Returns 0 when every chunk is persistent (``n_persist >= N_chunk``).
+    """
+    if n_persist >= layout.N_chunk:
+        return 0
+    persistent: set[ChunkId] = {ChunkId(i) for i in range(n_persist)}
+    block_ids = sorted(layout.block_to_chunks.keys())
+    if not block_ids:
+        return 0
+    need = 0
+    for i, bid in enumerate(block_ids):
+        cur_np = [c for c in layout.block_to_chunks.get(bid, ()) if c not in persistent]
+        nxt_np: list[ChunkId] = []
+        if i + 1 < len(block_ids):
+            nxt_np = [
+                c
+                for c in layout.block_to_chunks.get(block_ids[i + 1], ())
+                if c not in persistent
+            ]
+        need = max(need, len({*cur_np, *nxt_np}))
+    # Every pool allocator path requires at least 1 buffer when any
+    # non-persistent chunk exists, even if block_to_chunks is sparse.
+    return max(1, need)
 
 
 def _iter_candidates(bounds: Bounds) -> Iterator[CostConfig]:
@@ -260,20 +295,31 @@ def search(
             max_sum = max(0, min(max_sum, bounds.N_chunk))
 
             for n_persist in range(0, bounds.N_chunk + 1):
-                # Max feasible n_buffer at this n_persist.
+                # Max feasible n_buffer at this n_persist (partition + capacity).
                 max_buffer = min(bounds.N_chunk - n_persist, max_sum - n_persist)
                 if max_buffer < 0:
                     # n_persist alone exceeds the capacity budget — any
                     # larger n_persist will too; stop scanning.
                     break
 
-                # Optimum n_buffer is the max feasible (see rationale
-                # above). Also evaluate n_buffer=0 as a sanity boundary
-                # — in the degenerate case where cached and uncached
-                # times are identical the two are equivalent, but we
-                # pay the arithmetic anyway so the tie-breaker is
-                # deterministic.
-                for n_buffer in {max_buffer, 0}:
+                # Scheduler needs enough buffers to hold (current block's
+                # non-persistent chunks) ∪ (next block's non-persistent
+                # chunks) simultaneously — that's how the lookahead
+                # prefetch in runtime/scheduler.py::pre_block_forward
+                # works. Skip n_persist values that can't support that
+                # minimum within the capacity budget.
+                min_buffer = _min_n_buffer_for(layout, n_persist)
+                if min_buffer > max_buffer:
+                    continue
+
+                # Optimum n_buffer is the max feasible: cached chunks
+                # skip re-gather in backward, and estimate_runtime is
+                # monotone non-increasing in n_buffer through the
+                # ``min(n_buffer, n_nonpersist)`` cache-hit term. We also
+                # evaluate n_buffer = min_buffer as the tie-break
+                # boundary so the picked config doesn't over-commit
+                # buffer capacity when the runtime is flat.
+                for n_buffer in {max_buffer, min_buffer}:
                     n_total += 1
                     model_state_present = (n_persist + n_buffer) * s_chunk
                     raw_peak = model_state_present + f_bm

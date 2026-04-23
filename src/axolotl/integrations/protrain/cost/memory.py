@@ -39,7 +39,12 @@ LOG = get_logger(__name__)
 #: Eq. 11 fragmentation factor — applied as a final multiplier on the
 #: raw op-walk peak. Treated as a module-level constant so tests can
 #: import it explicitly for sanity checks.
-ALPHA_FRAGMENTATION: float = 1.10
+#: Starting value 1.20 rather than the paper's 1.10 — empirical on
+#: Llama-7B / 3090 shows the forward-only op walk underpredicts the
+#: backward-pass peak (grad accumulation on persistent chunks + CKPT
+#: recompute bumps stacking with retained activations). A dedicated
+#: backward-walk term in M6 would let us drop this back to 1.10.
+ALPHA_FRAGMENTATION: float = 1.20
 
 
 def _group_ops_by_block(trace: ProfilerTrace) -> dict[BlockId, list[int]]:
