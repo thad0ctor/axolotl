@@ -521,12 +521,37 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         else:
             if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
+                # Read per-dataset masking knobs from the first MM dataset entry
+                # if present, else fall back to the global cfg values. This
+                # mirrors how the text-only ChatTemplateStrategy resolves them
+                # (see src/axolotl/prompt_strategies/chat_template.py).
+                ds_entries = self.cfg.datasets or []
+                ds_cfg = ds_entries[0] if ds_entries else None
+                roles_to_train = None
+                train_on_eos = None
+                if ds_cfg is not None:
+                    # DictDefault / dict / pydantic model — use .get where available.
+                    get_attr = (
+                        ds_cfg.get if hasattr(ds_cfg, "get") else ds_cfg.__getitem__
+                    )
+                    try:
+                        roles_to_train = get_attr("roles_to_train")
+                    except (AttributeError, KeyError):
+                        roles_to_train = None
+                    try:
+                        train_on_eos = get_attr("train_on_eos")
+                    except (AttributeError, KeyError):
+                        train_on_eos = None
+
                 kwargs["processing_strategy"] = get_processing_strategy(
                     self.processor,
                     training_args.chat_template,
                     self.cfg.chat_template,
                     image_size=training_args.image_size,
                     image_resize_algorithm=training_args.image_resize_algorithm,
+                    train_on_inputs=bool(self.cfg.train_on_inputs),
+                    roles_to_train=roles_to_train,
+                    train_on_eos=train_on_eos,
                 )
             elif self.cfg.batch_flattening:
                 collator = DataCollatorWithFlattening
