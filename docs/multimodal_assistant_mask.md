@@ -152,6 +152,9 @@ Semantics:
 
 ## Commits on this branch
 
+Run `git log main..HEAD --oneline` for the authoritative sequence. As of
+this revision the logical units are:
+
 1. **`feat: systemic multimodal assistant-only loss masking`** — core
    refactor of `processing_strategies.py` (`RoleBoundary`,
    `_apply_role_boundaries`, `_build_role_boundaries`), per-strategy boundary
@@ -162,25 +165,29 @@ Semantics:
 3. **`feat: forward cfg.processor_kwargs to processor from_pretrained (#3617)`**
    — schema field added; `load_processor` merges kwargs; axolotl-managed
    keys (`revision`, `trust_remote_code`) protected.
-4. **`test: offline unit tests for multimodal role-mask scanner and
-   processor_kwargs plumbing`** — 32 tests covering scanner semantics,
-   per-strategy masking, media-token masking within assistant spans,
-   dispatcher routing, and the processor_kwargs passthrough.
-5. **`docs: multimodal assistant-mask design doc`** — this file.
-6. **`feat: cfg.role_boundaries YAML override for role-mask scanner`** —
+4. **`docs: multimodal assistant-mask design doc`** — this file.
+5. **`feat: cfg.role_boundaries YAML override for MM role-mask scanner`** —
    schema field (`MultiModalConfig.role_boundaries`), resolver that converts
    string markers to token ids at strategy init, ``eos_token`` sentinel, and
    wiring through ``build_collator`` / ``get_processing_strategy`` /
-   every strategy constructor. 7 additional offline unit tests covering
-   override semantics (replace built-in, enable on unverified strategy,
-   eos_token sentinel, null end, validation errors, pydantic model input).
-
-(Final packaging: these were squashed into logical units during implementation
-but the branch commit sequence can be organized per reviewer preference.)
+   every strategy constructor.
+6. **`test: additional coverage for MM role-mask scanner edge cases`** —
+   expands the unit test suite to 55 tests covering scanner semantics,
+   per-strategy masking, media-token masking within assistant spans,
+   dispatcher routing, processor_kwargs passthrough, override semantics
+   (replace built-in, enable on unverified strategy, eos_token sentinel,
+   null end, validation errors, pydantic model input).
+7. **`chore: tighten docstrings and comments in multimodal mask refactor`**
+   — no-behavior-change polish.
+8. **`fix: resolve MM per-dataset masking knobs for pydantic SFTDataset`**
+   — `build_collator` resolver now uses `.get` → `getattr` fallback so
+   `roles_to_train` / `train_on_eos` are honored when datasets are supplied
+   as pydantic models (not just `DictDefault`). Adds an INFO log of the
+   resolved collator knobs.
 
 ## Verification
 
-- All 32 unit tests pass offline (`pytest tests/test_processing_strategies.py`).
+- All 55 unit tests pass offline (`pytest tests/test_processing_strategies.py`).
 - End-to-end check against real tokenizers:
   - `google/gemma-4-E2B-it`: 13/40 tokens kept for a 2-turn chat; decoded
     preview shows only assistant responses + `<turn|>` markers remain.
@@ -224,5 +231,5 @@ but the branch commit sequence can be organized per reviewer preference.)
 >   `processor_cls.from_pretrained` kwargs; `revision` and `trust_remote_code`
 >   remain axolotl-managed.
 >
-> **Testing**: 32 offline unit tests; end-to-end verified with the real
+> **Testing**: 55 offline unit tests; end-to-end verified with the real
 > Gemma 4 and Llama 3.x tokenizers.
