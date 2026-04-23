@@ -1085,7 +1085,11 @@ def get_processing_strategy(
     # Lazy import: mistral_common is optional.
     try:
         from axolotl.utils.mistral.mistral3_processor import Mistral3Processor
-    except ImportError:
+    except (ImportError, ModuleNotFoundError) as exc:
+        LOG.debug(
+            "Mistral3Processor import failed; Mistral3 strategy will be unavailable: %r",
+            exc,
+        )
         Mistral3Processor = None  # type: ignore[assignment]
 
     processing_kwargs = {
@@ -1136,8 +1140,11 @@ def get_processing_strategy(
 
         if isinstance(processor, Glm46VProcessor):
             return Glm4vProcessingStrategy(**processing_kwargs)
-    except ImportError:
-        pass
+    except (ImportError, ModuleNotFoundError) as exc:
+        LOG.debug(
+            "Glm46VProcessor import failed; Glm4v strategy will be unavailable: %r",
+            exc,
+        )
 
     if isinstance(processor, InternVLProcessor):
         return InternVLProcessingStrategy(**processing_kwargs)
