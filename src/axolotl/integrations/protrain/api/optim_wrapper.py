@@ -185,7 +185,11 @@ def protrain_optimizer_wrapper(
                 eps=eps,
                 weight_decay=weight_decay,
             )
-        except ImportError as err:
+        except (ImportError, Exception) as err:  # noqa: BLE001 - see below
+            # See ``protrain_model_wrapper``: DeepSpeed's CUDA-version
+            # mismatch is a ``CUDAMismatchException`` that bypasses
+            # ``ImportError``. Fall back to the inline GPU optimizer
+            # path for non-persistent chunks.
             LOG.warning(
                 "protrain_optimizer_wrapper: CPU FusedAdam unavailable (%s); "
                 "non-persistent chunks will be stepped inline on the GPU optimizer. "
