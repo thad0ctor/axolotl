@@ -274,21 +274,41 @@ def protrain_model_wrapper(
     )
     trace = load_cached_trace(cache_key)
     if trace is None:
+        import sys as _sys
+
         LOG.info(
             "ProTrain profiler cache miss for %s — running trace (bs=%d seq=%d)",
             cache_key.fingerprint()[:12],
             batch_size,
             seq_len,
         )
+        _sys.stderr.write(
+            f"[protrain] profiler cache miss — running forward-only trace\n"
+        )
+        _sys.stderr.flush()
+        # Forward-only profile: the cost model's op-walk in
+        # :mod:`cost.memory` only reads forward ops (the synthetic
+        # ``<backward>`` record is skipped), and :mod:`cost.runtime`
+        # derives ``t_bwd`` from ``t_fwd`` + activation sizes rather
+        # than a measured backward. Running ``loss.backward()`` on a
+        # 7B-class model in the profiler blows the 24 GiB card before
+        # ProTrain's chunk offload can engage; since the backward
+        # isn't consumed by downstream cost estimation, skipping it is
+        # loss-free and unblocks integration on single-3090 budgets.
         profiler_cfg = ProfilerConfig(
             batch_size=batch_size,
             seq_len=seq_len,
             device=str(device),
-            include_backward=True,
+            include_backward=False,
             on_demand=True,
         )
         batch = _dummy_batch(model, batch_size, seq_len, device)
         trace = run_trace(model, batch, profiler_cfg)
+        _sys.stderr.write(
+            f"[protrain] trace done: {len(trace.op_order)} ops, "
+            f"{len(trace.activation_sizes)} blocks\n"
+        )
+        _sys.stderr.flush()
         save_cached_trace(cache_key, trace)
     else:
         LOG.info(
@@ -296,6 +316,10 @@ def protrain_model_wrapper(
         )
 
     # ---- 2. layout ------------------------------------------------------
+    import sys as _sys2
+
+    _sys2.stderr.write("[protrain] building layout\n")
+    _sys2.stderr.flush()
     blocks, block_spans = _build_block_spans(model)
     exec_order = _param_exec_order(model, block_spans)
 
@@ -312,13 +336,29 @@ def protrain_model_wrapper(
         S_chunk=s_chunk,
         block_spans=block_spans,
     )
+    _sys2.stderr.write(
+        f"[protrain] layout built: S_chunk={layout.S_chunk} "
+        f"N_chunk={layout.N_chunk}\n"
+    )
+    _sys2.stderr.flush()
 
     # ---- 3. search ------------------------------------------------------
     if capacity_bytes is None:
         capacity_bytes = max(
             0, int(hardware_profile.gpu_memory_bytes) - _DEFAULT_HEADROOM_BYTES
         )
+    _sys2.stderr.write(
+        f"[protrain] running exhaustive search (N_chunk={layout.N_chunk}, "
+        f"N_block={len(trace.activation_sizes)})\n"
+    )
+    _sys2.stderr.flush()
     result = search(trace, layout, int(capacity_bytes), hardware_profile)
+    _sys2.stderr.write(
+        f"[protrain] search done: cfg={result.cfg} "
+        f"peak={result.predicted_peak_bytes/1e9:.2f}GB "
+        f"iter={result.predicted_iter_s:.3f}s\n"
+    )
+    _sys2.stderr.flush()
 
     # ---- 4. construct runtime ------------------------------------------
     n_persist = result.cfg.n_persist
@@ -364,10 +404,19 @@ def protrain_model_wrapper(
                 params_per_chunk=cpu_params_per_chunk,
                 lr=1e-4,
             )
-        except ImportError as err:
+        except (ImportError, Exception) as err:  # noqa: BLE001 - see below
+            # CpuFusedAdamAdapter can fail with more than ``ImportError``:
+            # DeepSpeed raises ``CUDAMismatchException`` (not an
+            # ``ImportError`` subclass) when the system nvcc and torch's
+            # cu-version disagree. We degrade gracefully in both cases —
+            # persistent chunks still run fused GPU Adam, non-persistent
+            # chunks fall through to the in-line torch.optim path inside
+            # the optimizer wrapper. The warning surfaces the root cause
+            # so users know they're not getting the async overlap.
             LOG.warning(
                 "ProTrain: CPU FusedAdam unavailable (%s); non-persistent chunks "
-                "will not get async CPU Adam. Install DeepSpeed for full coverage.",
+                "will not get async CPU Adam. Install DeepSpeed with a matching "
+                "CUDA toolkit (or set DS_SKIP_CUDA_CHECK=1) for full coverage.",
                 err,
             )
             cpu_optim = None
