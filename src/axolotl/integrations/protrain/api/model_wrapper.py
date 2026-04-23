@@ -51,9 +51,11 @@ from axolotl.integrations.protrain.runtime.scheduler import Scheduler
 from axolotl.integrations.protrain.search import search
 from axolotl.integrations.protrain.types import (
     BlockId,
+    CostConfig,
     HardwareProfile,
     ParamId,
     ProfilerConfig,
+    SearchResult,
     WrappedModel,
 )
 from axolotl.utils.logging import get_logger
@@ -222,6 +224,11 @@ def protrain_model_wrapper(
     seq_len: int,
     capacity_bytes: int | None = None,
     cache_dir: str | None = None,  # noqa: ARG001 — reserved for future cache redirection
+    force_all_persistent: bool = False,
+    n_persist_override: int | None = None,
+    n_buffer_override: int | None = None,
+    n_swap_override: int | None = None,
+    n_checkpoint_override: int | None = None,
 ) -> WrappedModel:
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
@@ -248,6 +255,21 @@ def protrain_model_wrapper(
         Reserved. Profiler cache directory resolution currently lives
         in ``profiler.cache._cache_root`` via the ``XDG_CACHE_HOME`` env
         var.
+    force_all_persistent:
+        When True, skip the exhaustive searcher and synthesize a
+        ``SearchResult`` that forces every chunk to stay GPU-resident
+        (``n_persist = N_chunk``, ``n_swap = 0``,
+        ``n_checkpoint = N_block``). This is the M5 recommended mode
+        for LoRA on a single 24 GB card until the M4.5 runtime
+        primitives (init-time chunk offload, per-param grad offload)
+        land — search-picked configs that expect CPU-hosted chunks
+        currently OOM because the physical offload is not yet wired.
+    n_persist_override / n_buffer_override / n_swap_override / n_checkpoint_override:
+        Debug escape hatches. When *all four* are set, the searcher is
+        skipped and a synthetic ``SearchResult`` is built from the
+        explicit values. A single override in isolation is ignored (the
+        searcher's picks stay consistent across the 4-tuple); this is
+        documented on the pydantic fields.
 
     Returns
     -------
@@ -352,23 +374,129 @@ def protrain_model_wrapper(
     )
     _sys2.stderr.flush()
 
-    # ---- 3. search ------------------------------------------------------
+    # ---- 3. search (or synthesize) -------------------------------------
     if capacity_bytes is None:
         capacity_bytes = max(
             0, int(hardware_profile.gpu_memory_bytes) - _DEFAULT_HEADROOM_BYTES
         )
-    _sys2.stderr.write(
-        f"[protrain] running exhaustive search (N_chunk={layout.N_chunk}, "
-        f"N_block={len(trace.activation_sizes)})\n"
+
+    n_block = max(1, len(trace.activation_sizes))
+    # Max chunks seen in any one transformer block — used for the
+    # force_all_persistent buffer-pool sizing (we need enough buffers to
+    # hold every chunk a single block touches during its forward, times
+    # 2 for the rolling forward→backward reuse the BufferPool assumes).
+    max_chunks_per_block = 1
+    if layout.block_to_chunks:
+        max_chunks_per_block = max(
+            (len(cids) for cids in layout.block_to_chunks.values()), default=1
+        )
+
+    all_overrides_set = all(
+        v is not None
+        for v in (
+            n_persist_override,
+            n_buffer_override,
+            n_swap_override,
+            n_checkpoint_override,
+        )
     )
-    _sys2.stderr.flush()
-    result = search(trace, layout, int(capacity_bytes), hardware_profile)
-    _sys2.stderr.write(
-        f"[protrain] search done: cfg={result.cfg} "
-        f"peak={result.predicted_peak_bytes/1e9:.2f}GB "
-        f"iter={result.predicted_iter_s:.3f}s\n"
-    )
-    _sys2.stderr.flush()
+
+    if force_all_persistent:
+        # Synthesize a SearchResult that pins every chunk on GPU and
+        # uses activation checkpointing on every block. This is the M5
+        # workaround for the two known M4.5 runtime gaps (init-time
+        # chunk offload, per-param grad offload) — see DESIGN.md and
+        # the M4 integration xfail. The cost model is skipped; predicted
+        # numbers are filled with zeros so downstream consumers don't
+        # misread them as real predictions.
+        synth_cfg = CostConfig(
+            n_persist=layout.N_chunk,
+            n_buffer=max(1, 2 * max_chunks_per_block),
+            n_swap=0,
+            n_checkpoint=n_block,
+        )
+        block_map = assign_modes(
+            n_swap=0, n_checkpoint=n_block, N_block=n_block
+        )
+        result = SearchResult(
+            cfg=synth_cfg,
+            block_map=block_map,
+            predicted_peak_bytes=0,
+            predicted_iter_s=0.0,
+        )
+        LOG.warning(
+            "ProTrain: force_all_persistent=True — bypassing searcher. "
+            "n_persist=%d n_buffer=%d n_swap=0 n_checkpoint=%d. "
+            "All model state stays GPU-resident; activations rely on CKPT. "
+            "This is the documented workaround for the M4.5 runtime gaps.",
+            synth_cfg.n_persist,
+            synth_cfg.n_buffer,
+            synth_cfg.n_checkpoint,
+        )
+        _sys2.stderr.write(
+            f"[protrain] force_all_persistent: cfg={result.cfg}\n"
+        )
+        _sys2.stderr.flush()
+    elif all_overrides_set:
+        # Explicit 4-tuple override path — still skip the searcher but
+        # honour the caller's exact knob selection. Bounds-check is
+        # mandatory; the searcher normally enforces these.
+        if not (0 <= n_persist_override <= layout.N_chunk):
+            raise ValueError(
+                f"n_persist_override={n_persist_override} out of range "
+                f"[0, {layout.N_chunk}]"
+            )
+        if n_buffer_override < 1:
+            raise ValueError(
+                f"n_buffer_override must be >= 1, got {n_buffer_override}"
+            )
+        if not (0 <= n_swap_override <= n_block):
+            raise ValueError(
+                f"n_swap_override={n_swap_override} out of range [0, {n_block}]"
+            )
+        if not (0 <= n_checkpoint_override <= n_block - n_swap_override):
+            raise ValueError(
+                f"n_checkpoint_override={n_checkpoint_override} incompatible "
+                f"with n_swap_override={n_swap_override} (N_block={n_block})"
+            )
+        synth_cfg = CostConfig(
+            n_persist=n_persist_override,
+            n_buffer=n_buffer_override,
+            n_swap=n_swap_override,
+            n_checkpoint=n_checkpoint_override,
+        )
+        block_map = assign_modes(
+            n_swap=n_swap_override,
+            n_checkpoint=n_checkpoint_override,
+            N_block=n_block,
+        )
+        result = SearchResult(
+            cfg=synth_cfg,
+            block_map=block_map,
+            predicted_peak_bytes=0,
+            predicted_iter_s=0.0,
+        )
+        LOG.warning(
+            "ProTrain: explicit knob override path — bypassing searcher. cfg=%s",
+            synth_cfg,
+        )
+        _sys2.stderr.write(
+            f"[protrain] explicit override: cfg={result.cfg}\n"
+        )
+        _sys2.stderr.flush()
+    else:
+        _sys2.stderr.write(
+            f"[protrain] running exhaustive search (N_chunk={layout.N_chunk}, "
+            f"N_block={n_block})\n"
+        )
+        _sys2.stderr.flush()
+        result = search(trace, layout, int(capacity_bytes), hardware_profile)
+        _sys2.stderr.write(
+            f"[protrain] search done: cfg={result.cfg} "
+            f"peak={result.predicted_peak_bytes/1e9:.2f}GB "
+            f"iter={result.predicted_iter_s:.3f}s\n"
+        )
+        _sys2.stderr.flush()
 
     # ---- 4. construct runtime ------------------------------------------
     n_persist = result.cfg.n_persist
