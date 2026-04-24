@@ -418,6 +418,7 @@ def protrain_model_wrapper(
     n_buffer_override: int | None = None,
     n_swap_override: int | None = None,
     n_checkpoint_override: int | None = None,
+    zero3_shard: bool | None = None,
 ) -> WrappedModel:
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
@@ -459,6 +460,15 @@ def protrain_model_wrapper(
         explicit values. A single override in isolation is ignored (the
         searcher's picks stay consistent across the 4-tuple); this is
         documented on the pydantic fields.
+    zero3_shard:
+        M7 ZeRO-3 activation. When ``None`` (default) the wrapper
+        auto-detects: shard iff
+        ``torch.distributed.get_world_size() > 1`` AND
+        ``force_all_persistent`` is False. When explicitly True or
+        False the caller override wins. Sharded mode requires a live
+        ``torch.distributed`` process group AND the model must not be
+        wrapped in DDP at training time (sharding is the grad-sync
+        point itself; DDP would double-reduce).
 
     Returns
     -------
@@ -740,6 +750,31 @@ def protrain_model_wrapper(
     if persistent_params:
         gpu_optim = GpuFusedAdamAdapter(params=persistent_params, lr=1e-4)
 
+    # ---- Distributed context + M7 zero3_shard decision -----------------
+    # Auto-detect world_size / rank from the active process group;
+    # default to single-rank when no group is up. ``zero3_shard`` defaults
+    # to True when world_size > 1 AND force_all_persistent is False;
+    # callers can override explicitly. The ChunkManager silently
+    # degrades zero3_shard to False when world_size == 1, so the auto-
+    # detect path is safe on single-rank hosts too.
+    _ws = 1
+    _rank = 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        _ws = int(torch.distributed.get_world_size())
+        _rank = int(torch.distributed.get_rank())
+    if zero3_shard is None:
+        _zero3 = (_ws > 1) and (not force_all_persistent)
+    else:
+        _zero3 = bool(zero3_shard) and (_ws > 1)
+    LOG.info(
+        "ProTrain: distributed context world_size=%d rank=%d zero3_shard=%s "
+        "(requested=%s)",
+        _ws,
+        _rank,
+        _zero3,
+        zero3_shard,
+    )
+
     chunk_manager = ChunkManager(
         model=model,
         layout=layout,
@@ -748,6 +783,9 @@ def protrain_model_wrapper(
         cpu_optim=None,  # wired in after materialize_offload (BUG 3)
         gpu_optim=gpu_optim,
         device=device,
+        world_size=_ws,
+        rank=_rank,
+        zero3_shard=_zero3,
     )
 
     # Chunks containing ANY non-block param (embeddings, final norm,
@@ -869,11 +907,22 @@ def protrain_model_wrapper(
     # is "transient" (``protrain_optimizer_wrapper`` rebuilds it at the
     # user's real hyperparams) but we still need one live here so the
     # chunk manager has something to drive during smoke tests.
+    # M7: for sharded non-persistent chunks, the CPU Adam updates the
+    # chunk's single flat shard_param rather than the user-facing
+    # param list. Redirect cpu_params_per_chunk for those chunks.
+    cpu_params_per_chunk_for_optim: dict = {}
+    for cid, chunk_params in cpu_params_per_chunk.items():
+        shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
+        if shard_state is not None:
+            cpu_params_per_chunk_for_optim[cid] = [shard_state.shard_param]
+        else:
+            cpu_params_per_chunk_for_optim[cid] = chunk_params
+
     cpu_optim: CpuFusedAdamAdapter | None = None
-    if any(params for params in cpu_params_per_chunk.values()):
+    if any(params for params in cpu_params_per_chunk_for_optim.values()):
         try:
             cpu_optim = CpuFusedAdamAdapter(
-                params_per_chunk=cpu_params_per_chunk,
+                params_per_chunk=cpu_params_per_chunk_for_optim,
                 lr=1e-4,
             )
         except (ImportError, Exception) as err:  # noqa: BLE001 - see below

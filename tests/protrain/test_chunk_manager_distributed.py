@@ -293,3 +293,215 @@ def test_reduce_grads_and_offload_distributed(tmp_path) -> None:
         nprocs=world_size,
         join=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# M7 sharded-path coverage (gloo, CPU-only, 2-rank)
+# ---------------------------------------------------------------------------
+
+
+def _worker_zero3_sharded_roundtrip(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """2-rank gloo test: gather → fake backward → reduce_scatter → step.
+
+    Builds a :class:`ChunkManager` with ``zero3_shard=True`` on a CPU
+    device (gloo backend does not need CUDA). Exercises the full
+    sharded round-trip:
+
+    1. ``materialize_offload()`` partitions the chunk's bytes across
+       ranks. Each rank only holds ``shard_bytes`` of the full chunk.
+    2. ``gather()`` runs ``all_gather_into_tensor`` to reconstruct the
+       full chunk on each rank's pool buffer. Verify the reconstructed
+       bytes match the original param data across ranks.
+    3. Plant rank-specific grads, call ``reduce_grads_and_offload()``.
+       The reduce_scatter output on rank ``r`` must equal the mean
+       grad in rank ``r``'s slice of the full chunk.
+
+    The test skips if gloo doesn't support the needed collectives on
+    the installed torch version.
+    """
+    import os as _os
+    import torch
+    import torch.distributed as dist
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import (
+        PinnedHostMemory,
+    )
+    from axolotl.integrations.protrain.types import BlockId, ChunkId, ParamId
+
+    _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    _os.environ.setdefault("MASTER_PORT", "29545")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-zero3",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        # Tiny model: one fp16 Linear layer — 4-in, 4-out + bias,
+        # enough to stress the byte-slicing logic.
+        torch.manual_seed(0)  # SAME seed on every rank — fresh-init
+        # bytes are identical across ranks before training.
+        from torch import nn
+        layer = nn.Linear(4, 4, bias=True).half()
+        model = nn.Module()
+        model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+        # Layout: single chunk holding both params.
+        block_spans: dict = {}
+        for name, _p in model.named_parameters():
+            block_spans.setdefault(BlockId(0), []).append(ParamId(name))  # type: ignore[index]
+        exec_order = [ParamId(n) for n, _ in model.named_parameters()]
+        S_chunk = 1 << 14
+        layout = build_layout(model, exec_order, S_chunk, block_spans)
+
+        host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+        pool = BufferPool(
+            n_buffer=1,
+            S_chunk=layout.S_chunk,
+            pinned_host=host,
+            device=torch.device("cpu"),
+        )
+
+        # Snapshot the original param bytes BEFORE materialize_offload
+        # so we can compare the gathered output against the truth.
+        pre_data = {
+            str(name): p.detach().clone().cpu()
+            for name, p in model.named_parameters()
+        }
+
+        # zero3_shard=True + world_size=2 should activate the sharded
+        # path on the single chunk.
+        mgr = ChunkManager(
+            model=model,
+            layout=layout,
+            n_persist=0,
+            buffer_pool=pool,
+            cpu_optim=None,
+            gpu_optim=None,
+            device=torch.device("cpu"),
+            world_size=world_size,
+            rank=rank,
+            zero3_shard=True,
+        )
+        try:
+            mgr.materialize_offload()
+        except RuntimeError as exc:
+            # gloo + older torch may not support all_gather_into_tensor
+            # on CPU tensors; if construction itself works but we can't
+            # exercise the sharded collective, skip.
+            if "gloo" in str(exc).lower():
+                _os.makedirs(tmpdir, exist_ok=True)
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
+                    f.write(f"gloo-unsupported: {exc}\n")
+                return
+            raise
+
+        # (1) Invariant: chunk 0 is sharded.
+        assert mgr.sharded_chunk_ids() == [ChunkId(0)], (
+            f"rank {rank}: expected chunk 0 to be sharded, got "
+            f"{mgr.sharded_chunk_ids()}"
+        )
+        my_shard_bytes = mgr.shard_bytes_for(ChunkId(0))
+        assert my_shard_bytes > 0, (
+            f"rank {rank}: shard_bytes is 0 — sharding not engaged"
+        )
+
+        # (2) Gather should reconstruct identical full chunks on every
+        # rank. We verify this by reading back the gathered param.data
+        # bytes and comparing against the pre-offload snapshot.
+        try:
+            mgr.gather(ChunkId(0))
+        except RuntimeError as exc:
+            if "not implemented" in str(exc).lower() or "nccl" in str(exc).lower():
+                # gloo doesn't support all_gather_into_tensor on this
+                # build — skip the round-trip test body but let the
+                # materialize_offload/sharding invariant above stand.
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
+                    f.write(f"gloo-collective-unsupported: {exc}\n")
+                return
+            raise
+
+        for name, p in model.named_parameters():
+            snap = pre_data[str(name)]
+            # param.data after gather is a view into the pool buffer;
+            # bytes should match the original.
+            assert torch.allclose(p.data.cpu().float(), snap.float(), atol=0.0), (
+                f"rank {rank}: after sharded gather, param '{name}' does "
+                f"not match pre-offload snapshot"
+            )
+
+        # (3) Plant rank-specific grads on every param, call
+        # reduce_grads_and_offload, verify the shard grad holds the
+        # MEAN across ranks (AVG reduction).
+        for _n, p in model.named_parameters():
+            p.grad = torch.full_like(p.data, float(rank))
+
+        mgr.reduce_grads_and_offload(ChunkId(0))
+
+        # The rank's CPU shard grad, reinterpreted as primary_dtype
+        # (fp16 here), should be uniformly (0 + 1 + ... + W-1) / W.
+        expected_mean = sum(range(world_size)) / float(world_size)
+        shard_state = mgr._chunk_shards[ChunkId(0)]
+        # shard_state.shard_param.grad is a view of the pinned uint8
+        # grad bytes reinterpreted as primary_dtype.
+        obs = shard_state.shard_param.grad.detach().cpu().float()  # type: ignore[union-attr]
+        assert torch.allclose(
+            obs,
+            torch.full_like(obs, float(expected_mean)),
+            atol=1e-3,
+            rtol=1e-3,
+        ), (
+            f"rank {rank}: sharded reduce_scatter grad should be "
+            f"uniform {expected_mean}, got min={obs.min().item()} "
+            f"max={obs.max().item()}"
+        )
+
+        mgr.uninstall()
+        host.close()
+
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+@pytest.mark.gpu  # paired with the other distributed tests' marks
+def test_zero3_sharded_roundtrip_2rank(tmp_path) -> None:
+    """2-rank gloo test for the M7 ZeRO-3 sharded round-trip.
+
+    Each rank (a) holds only its shard on CPU after materialize_offload,
+    (b) reconstructs the full chunk via all_gather on gather, and
+    (c) receives its slice of the AVG-reduced grad via reduce_scatter
+    on reduce_grads_and_offload.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_zero3_sharded_roundtrip,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    # If any rank wrote a ``.skip`` file due to unsupported collectives,
+    # downgrade to a skip rather than a fail.
+    skip_files = list(tmp_path.glob("rank*.skip"))
+    if skip_files:
+        reasons = [f.read_text().strip() for f in skip_files]
+        pytest.skip(f"gloo does not support required collective(s): {reasons}")

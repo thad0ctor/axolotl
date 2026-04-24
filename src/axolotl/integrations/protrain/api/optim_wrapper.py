@@ -178,10 +178,22 @@ def protrain_optimizer_wrapper(
             eps=eps,
             weight_decay=weight_decay,
         )
-    if any(params for params in cpu_params_per_chunk.values()):
+
+    # M7: for sharded non-persistent chunks the CPU Adam updates the
+    # chunk's flat shard_param (one per rank slice) rather than the
+    # user-facing per-param list.
+    cpu_params_per_chunk_for_optim: dict[ChunkId, list["nn.Parameter"]] = {}
+    for cid, chunk_params in cpu_params_per_chunk.items():
+        shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
+        if shard_state is not None:
+            cpu_params_per_chunk_for_optim[cid] = [shard_state.shard_param]
+        else:
+            cpu_params_per_chunk_for_optim[cid] = chunk_params
+
+    if any(params for params in cpu_params_per_chunk_for_optim.values()):
         try:
             cpu_optim = CpuFusedAdamAdapter(
-                params_per_chunk=cpu_params_per_chunk,
+                params_per_chunk=cpu_params_per_chunk_for_optim,
                 lr=lr,
                 betas=betas,
                 eps=eps,

@@ -120,6 +120,22 @@ class ProTrainArgs(BaseModel):
         json_schema_extra={"description": "Debug override for n_checkpoint."},
     )
 
+    protrain_zero3_shard: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "M7 ZeRO-3 override. When None (default), ProTrain auto-"
+                "enables sharded CPU chunks when the process group reports "
+                "world_size > 1 AND the trainer is NOT wrapping the model "
+                "in DistributedDataParallel AND protrain_force_all_persistent "
+                "is False. Setting to True forces sharding on (subject to the "
+                "world_size > 1 gate). Setting to False disables sharding "
+                "even at world_size > 1 — use this when composing the "
+                "protrain'd module under DDP."
+            )
+        },
+    )
+
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------

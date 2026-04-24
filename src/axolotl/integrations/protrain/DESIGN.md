@@ -183,9 +183,28 @@ Zero diffs to Axolotl core files. The entire Axolotl surface consumed:
 
 ### Multi-GPU
 
-ProTrain is a per-rank memory policy. On a multi-GPU box it composes with a conventional data-parallel wrapper applied ON TOP of the ProTrain-wrapped model; the M6 stack uses `torch.nn.parallel.DistributedDataParallel` (`find_unused_parameters=True` is required because LoRA freezes >99% of the base model). Each rank runs its own full `protrain_model_wrapper`, holds its own per-rank chunk layout and buffer pool, and — for LoRA on 7B — keeps the full frozen base resident in fp16 (13.5 GiB, well within the 3090's 24 GiB). DDP handles the cross-rank all-reduce on the tiny LoRA adapter gradient set; ProTrain handles prefetch/offload on chunk state inside each rank.
+ProTrain is a per-rank memory policy. Two composition modes are supported; choose per-deployment by the `protrain_zero3_shard` YAML flag or by auto-detection.
 
-True ZeRO-3 parameter sharding (base model partitioned across ranks, `all_gather` on each chunk gather, `reduce_scatter` on grad offload) is called out in the paper (§1 "Parallelism foundation: ZeRO-3") but is NOT on the M6 critical path for two reasons: (a) the LoRA-on-7B workload fits in memory on one 3090 already, so sharding the base would only save memory — not enable training; (b) the scheduler's `reduce_grads_and_offload` and the per-param grad-offload hook both now sync grads via `dist.all_reduce(op=AVG)` guarded on `is_initialized() and world_size > 1`, which is the correct reduction when each rank holds a full copy of the state. Moving to true sharding would replace these with `reduce_scatter` (grad) + `all_gather` (param) inside `ChunkManager.gather`/`reduce_grads_and_offload`. That port is M7 work.
+**Mode A — DDP composition (pre-M7, still supported).** Each rank runs its own full `protrain_model_wrapper` and holds a full (replicated) copy of every non-persistent chunk on pinned CPU. The trainer wraps the protrain'd module in `torch.nn.parallel.DistributedDataParallel`. DDP handles the cross-rank all-reduce on the trainable gradient set; ProTrain's internal per-param `all_reduce` is silenced via `skip_internal_grad_reduce=True` (auto-set when `post_trainer_create` detects a DDP wrap). This mode is what the M6 multi-GPU throughput test exercises with `force_all_persistent=True` at world_size=4 on 3090s. It is the right choice for LoRA on ~7B where the frozen base fits in fp16 on one card (no memory pressure), because DDP's bucketed allreduce is faster than ProTrain's per-param reduction.
+
+**Mode B — true ZeRO-3 chunk sharding (M7, new).** Non-persistent chunks are partitioned across ranks on CPU: each rank holds only `ceil(chunk_bytes / world_size)` pinned bytes per chunk. Forward/backward sees the full chunk via `all_gather_into_tensor` at `ChunkManager.gather`; grads are reduced + partitioned via `reduce_scatter_tensor(op=AVG)` at `ChunkManager.reduce_grads_and_offload`. The CPU FusedAdam step runs only on the rank-local shard slice — each chunk's single `shard_param` is the Adam target, updated in place; the next gather's `all_gather` propagates the update back to every rank's replicated GPU copy.
+
+Sharding only engages when the chunk is homogeneous-dtype (all params share `element_size`); mixed-dtype chunks fall back to the replicated path even when `zero3_shard=True`. This is rare enough on HF transformer blocks (everything in one block is typically fp16/bf16 after `.half()`) to be a non-issue in practice. Persistent chunks are fully replicated in both modes.
+
+**Auto-enable logic.** `protrain_model_wrapper` decides at construction time:
+
+| `world_size` | `force_all_persistent` | outer DDP | `zero3_shard` result |
+|---|---|---|---|
+| 1 | * | * | off (degrades to replicated even if True requested) |
+| >1 | True | * | off (everything is persistent) |
+| >1 | False | auto-detected YES | off, AND `skip_internal_grad_reduce=on` |
+| >1 | False | NO | on (M7 ZeRO-3 path) |
+
+The user can override via the `protrain_zero3_shard: true/false` field on `ProTrainArgs`. When DDP is composed on top AND sharding was auto-enabled, `post_trainer_create` logs a WARNING (the two paths don't compose cleanly); the operator should set `protrain_zero3_shard: false` in YAML for DDP deployments.
+
+**Shard layout.** Rank `r` owns the byte range `[r * shard_bytes, (r + 1) * shard_bytes)` of the padded full chunk. `shard_bytes = chunk_bytes_padded / world_size`, where `chunk_bytes_padded` is rounded up to `lcm(primary_element_size, world_size)` — this guarantees both (a) the shard boundary is dtype-aligned (so `.view(fp16)` on the pool buffer after `all_gather` doesn't raise "offset not aligned") and (b) every rank holds an equal shard size (required by `all_gather_into_tensor` / `reduce_scatter_tensor`). Params straddling shard boundaries are NOT special-cased — each rank just holds the bytes it owns; reassembly is byte-exact under `all_gather`'s contiguous layout.
+
+**Memory-safety contract.** The cost/search models do NOT currently divide non-persistent chunk bytes by world_size when computing peak. This means the searcher *over-estimates* memory in sharded mode (conservatively — it may reject feasible configs on tight budgets). Acceptable trade-off for M7; M8 can plumb `world_size` through `HardwareProfile` → `CostConfig` if a concrete case arises where the searcher rejects a true-sharded config that would have fit.
 
 ## Out of Scope
 
