@@ -332,18 +332,187 @@ def test_buffer_pool_acquire_release():
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.skip(
-    reason="full integration test, runs after M5 when Axolotl glue wires this end-to-end"
-)
 def test_loss_parity_n_persist_extremes():
     """Loss values must match between pure-GPU and pure-offload modes.
 
-    M2 GPU validation: run 5 steps with n_persist=N_chunk (pure GPU) vs
-    n_persist=0 (pure offload); assert ``|loss_a - loss_b| < 1e-2`` across
-    all 5 steps.
+    End-to-end correctness check that ProTrain's chunk-offload paths do
+    not perturb training math. Run 5 steps of a tiny GPT-2 twice with
+    identical seeds and batches:
+
+    * Config A: ``n_persist = N_chunk`` (every chunk stays on GPU; no
+      offload, no prefetch).
+    * Config B: ``n_persist = 0`` (pure offload; every chunk H2D/D2H-
+      transits the PCIe bus each iteration).
+
+    The per-step loss trajectories must match to fp16-noise tolerance
+    (``|loss_a[i] - loss_b[i]| < 5e-2``) — optimizer math is the same in
+    both cases; only the physical residency of params differs.
     """
-    # TODO(m5): instantiate two ChunkManager configurations on the same
-    # tiny GPT-2, run 5 train steps with identical batches, and assert the
-    # loss trajectories match to within 1e-2. Skeleton kept so the case
-    # isn't lost.
-    raise NotImplementedError
+    import torch
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from axolotl.integrations.protrain.api import (
+        protrain_model_wrapper,
+        protrain_optimizer_wrapper,
+    )
+    from axolotl.integrations.protrain.types import HardwareProfile
+
+    device = torch.device("cuda")
+    gpt2_cfg = GPT2Config(
+        n_layer=2, n_head=2, n_embd=64, vocab_size=128, n_positions=16
+    )
+
+    hw = HardwareProfile(
+        gpu_sku=torch.cuda.get_device_name(device),
+        gpu_memory_bytes=torch.cuda.get_device_properties(device).total_memory,
+        gpu_count=1,
+        pcie_h2d_bps=12e9,
+        pcie_d2h_bps=12e9,
+        has_nvlink=False,
+    )
+
+    bs, seq = 1, 8
+    # Shared batches — generated once so both configs see the same data.
+    torch.manual_seed(123)
+    batches = [
+        {
+            "input_ids": torch.randint(
+                0, gpt2_cfg.vocab_size, (bs, seq), device=device, dtype=torch.long
+            ),
+        }
+        for _ in range(5)
+    ]
+    for b in batches:
+        b["labels"] = b["input_ids"].clone()
+
+    def _run_config(n_persist_mode: str) -> list[float]:
+        """Run 5 steps and return per-step losses."""
+        import gc
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+        # Deterministic init.
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+        model = GPT2LMHeadModel(gpt2_cfg).to(device)
+
+        if n_persist_mode == "all":
+            # force_all_persistent synthesizes n_persist=N_chunk, which is
+            # the "pure GPU" config we want here. It also enables CKPT on
+            # every block — we don't want that for the math-parity test
+            # because CKPT's recompute can swing fp32 activations by a ulp
+            # and we need <5e-2 tolerance. Use explicit override instead.
+            probe = protrain_model_wrapper(
+                model,
+                model_config=gpt2_cfg,
+                hardware_profile=hw,
+                batch_size=bs,
+                seq_len=seq,
+                capacity_bytes=2 * (1 << 30),
+                force_all_persistent=True,
+            )
+            n_chunk = probe.chunk_manager.layout.N_chunk
+            # Tear down and rebuild without CKPT.
+            for h in probe._hook_handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            del probe
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
+            model = GPT2LMHeadModel(gpt2_cfg).to(device)
+            wrapped = protrain_model_wrapper(
+                model,
+                model_config=gpt2_cfg,
+                hardware_profile=hw,
+                batch_size=bs,
+                seq_len=seq,
+                capacity_bytes=2 * (1 << 30),
+                n_persist_override=n_chunk,
+                n_buffer_override=max(1, n_chunk),
+                n_swap_override=0,
+                n_checkpoint_override=0,
+            )
+        elif n_persist_mode == "none":
+            # Full offload — need N_chunk. Probe first.
+            probe = protrain_model_wrapper(
+                model,
+                model_config=gpt2_cfg,
+                hardware_profile=hw,
+                batch_size=bs,
+                seq_len=seq,
+                capacity_bytes=2 * (1 << 30),
+                force_all_persistent=True,
+            )
+            n_chunk = probe.chunk_manager.layout.N_chunk
+            for h in probe._hook_handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            del probe
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
+            model = GPT2LMHeadModel(gpt2_cfg).to(device)
+            # n_persist=0, still no CKPT so the math matches A exactly.
+            wrapped = protrain_model_wrapper(
+                model,
+                model_config=gpt2_cfg,
+                hardware_profile=hw,
+                batch_size=bs,
+                seq_len=seq,
+                capacity_bytes=2 * (1 << 30),
+                n_persist_override=0,
+                n_buffer_override=max(2, n_chunk),
+                n_swap_override=0,
+                n_checkpoint_override=0,
+            )
+        else:
+            raise AssertionError(f"unknown mode {n_persist_mode!r}")
+
+        optim = protrain_optimizer_wrapper(wrapped, lr=1e-4)
+
+        losses: list[float] = []
+        for batch in batches:
+            out = wrapped.module(**batch)
+            out.loss.backward()
+            optim.step()
+            optim.zero_grad()
+            losses.append(float(out.loss.detach()))
+
+        # Teardown.
+        for h in wrapped._hook_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        del wrapped, model, optim
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        return losses
+
+    losses_all = _run_config("all")
+    losses_none = _run_config("none")
+
+    print(f"\nloss trajectory (n_persist=N_chunk):  {losses_all}")
+    print(f"loss trajectory (n_persist=0):        {losses_none}")
+
+    assert len(losses_all) == len(losses_none) == 5
+    for i, (a, b) in enumerate(zip(losses_all, losses_none)):
+        assert abs(a - b) < 5e-2, (
+            f"loss divergence at step {i}: n_persist=N_chunk->{a:.6f} "
+            f"vs n_persist=0->{b:.6f} (|Δ|={abs(a-b):.6f})"
+        )

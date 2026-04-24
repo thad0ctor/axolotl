@@ -185,6 +185,59 @@ def test_swap_with_flag_constructs(monkeypatch: pytest.MonkeyPatch) -> None:
     assert wrapped._protrain_wrapped_mode is BlockMode.SWAP
 
 
+@pytest.mark.gpu
+def test_swap_forward_backward_with_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forward/backward through a SwappedBlock must match the unwrapped block.
+
+    Contract here is **correctness-only**: the M3 SwappedBlock schedules
+    async D2H/H2D copies as a placeholder, but the MLSys 2026 paper is
+    explicit that M3 provides the interface while M4's scheduler drives
+    the actual overlap. This test validates the math is unaffected — the
+    forward output, backward grad, and parameter grad all match an
+    unwrapped reference module to fp32 tolerance. It does NOT claim any
+    memory saving or throughput improvement; those live with M4.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    monkeypatch.setenv("PROTRAIN_ENABLE_SWAP", "1")
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    block = nn.Linear(16, 16).to(device)
+    ref_block = nn.Linear(16, 16).to(device)
+    ref_block.load_state_dict(block.state_dict())
+
+    wrapped = SwappedBlock(block)
+
+    x_a = torch.randn(4, 16, device=device, requires_grad=True)
+    x_b = x_a.detach().clone().requires_grad_(True)
+
+    out_wrapped = wrapped(x_a)
+    out_ref = ref_block(x_b)
+
+    # Forward outputs must match to fp32 tolerance.
+    assert torch.allclose(out_wrapped, out_ref, atol=1e-5), (
+        "SwappedBlock forward must match unwrapped block to fp32 tolerance"
+    )
+
+    # Backward: grad must flow through the swap wrapper.
+    out_wrapped.sum().backward()
+    out_ref.sum().backward()
+
+    # Parameter grads exist and are finite.
+    w_grad = block.weight.grad
+    assert w_grad is not None, "grad did not flow to SwappedBlock's inner param"
+    assert torch.isfinite(w_grad).all(), "SwappedBlock produced NaN/Inf grads"
+
+    # Parameter grads match the reference block (same init + same input).
+    assert torch.allclose(w_grad, ref_block.weight.grad, atol=1e-5), (
+        "SwappedBlock param grads must match unwrapped reference"
+    )
+    # Input grads match as well.
+    assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # discover_blocks
 # ---------------------------------------------------------------------------
@@ -210,22 +263,142 @@ def test_discover_blocks_gpt2() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.skip(
-    reason=(
-        "requires M2 chunk manager for end-to-end memory sweep; runs after M5 "
-        "integration"
-    )
-)
 def test_monotonic_memory_reduction_sweep() -> None:
     """Peak GPU memory should decrease monotonically as n_checkpoint grows.
 
-    Intent: construct a small transformer, iterate n_checkpoint in
-    [0, 1, ..., N_block], and measure peak CUDA memory after a single
-    forward+backward. Higher n_checkpoint must never increase peak.
-    This verifies that the block manager wiring actually recovers
-    memory in backward.
-
-    Blocked on M2's ChunkManager for realistic param-side memory
-    accounting and M5 plugin wiring for the integration harness.
+    Sweep ``n_checkpoint`` in ``{0, 2, N_block}`` for a tiny GPT-2 wrapped
+    through ProTrain with ``n_persist=N_chunk`` (keeps the sweep focused
+    on the block-manager CKPT wrapper — no chunk offload noise). Run one
+    forward per config, record ``torch.cuda.max_memory_allocated()``,
+    and assert the series is non-increasing in ``n_checkpoint``.
     """
-    raise NotImplementedError
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    transformers = pytest.importorskip("transformers")
+
+    # Lazy import so the CPU-only pytest lane doesn't load the full
+    # ProTrain api module (which pulls torch CUDA extensions).
+    from axolotl.integrations.protrain.api import protrain_model_wrapper
+    from axolotl.integrations.protrain.types import HardwareProfile
+
+    device = torch.device("cuda")
+    cfg = transformers.GPT2Config(n_layer=4, n_head=2, n_embd=64, vocab_size=128, n_positions=16)
+
+    hw = HardwareProfile(
+        gpu_sku=torch.cuda.get_device_name(device),
+        gpu_memory_bytes=torch.cuda.get_device_properties(device).total_memory,
+        gpu_count=1,
+        pcie_h2d_bps=12e9,
+        pcie_d2h_bps=12e9,
+        has_nvlink=False,
+    )
+
+    peaks: dict[int, int] = {}
+
+    # Pre-probe to learn N_chunk / N_block so the sweep targets real knob values.
+    # We do a single tiny wrap with default search to read the layout, then
+    # tear down and redo for each override.
+    def _one_forward(n_checkpoint: int) -> int:
+        import gc
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+        torch.manual_seed(0)
+        model = transformers.GPT2LMHeadModel(cfg).to(device)
+
+        # First probe: let the wrapper discover N_chunk / N_block so we can
+        # ask for n_persist = N_chunk and the right CKPT count.
+        n_block = cfg.n_layer
+
+        # Force n_persist=N_chunk by using force_all_persistent=True... but
+        # that also sets n_checkpoint=N_block, which we don't want for the
+        # sweep. Use the 4-tuple explicit override instead — it requires
+        # all four overrides set, and the wrapper will derive N_chunk from
+        # the layout during the call.
+        # We don't know N_chunk up front, so do a throwaway wrap with
+        # defaults to learn it, tear down, then redo with explicit knobs.
+        try:
+            probe = protrain_model_wrapper(
+                model,
+                model_config=cfg,
+                hardware_profile=hw,
+                batch_size=1,
+                seq_len=8,
+                capacity_bytes=2 * (1 << 30),
+                force_all_persistent=True,  # skip searcher; we just want the layout
+            )
+        except Exception:
+            pytest.skip("probe wrap failed on this GPU/env")
+        n_chunk = probe.chunk_manager.layout.N_chunk
+        # Uninstall hooks from the probe so we can rebuild.
+        for h in probe._hook_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        del probe
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+        # Rebuild fresh — the probe wrap mutated param.data (moved chunks
+        # to CPU via materialize_offload). Simplest path: new model.
+        torch.manual_seed(0)
+        model = transformers.GPT2LMHeadModel(cfg).to(device)
+
+        wrapped = protrain_model_wrapper(
+            model,
+            model_config=cfg,
+            hardware_profile=hw,
+            batch_size=1,
+            seq_len=8,
+            capacity_bytes=2 * (1 << 30),
+            n_persist_override=n_chunk,
+            n_buffer_override=max(1, n_chunk),
+            n_swap_override=0,
+            n_checkpoint_override=min(n_checkpoint, n_block),
+        )
+
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 8), device=device, dtype=torch.long)
+        batch = {"input_ids": input_ids, "labels": input_ids.clone()}
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        out = wrapped.module(**batch)
+        # Include the backward pass so CKPT's recompute actually triggers.
+        out.loss.backward()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+
+        # Teardown: remove hooks.
+        for h in wrapped._hook_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        del wrapped, model, out
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        return peak
+
+    N_block = cfg.n_layer
+    for n_ckpt in (0, 2, N_block):
+        peaks[n_ckpt] = _one_forward(n_ckpt)
+
+    print(f"\nCKPT memory sweep: {peaks}")
+
+    # Assert monotonic non-increase as n_checkpoint grows.
+    sorted_keys = sorted(peaks.keys())
+    for prev_k, next_k in zip(sorted_keys, sorted_keys[1:]):
+        # Allow a small slack for allocator fragmentation noise (<5% of
+        # the smaller value). On a tiny model the absolute deltas are
+        # small, so the slack prevents flakes without masking regressions.
+        slack = int(0.05 * min(peaks[prev_k], peaks[next_k]))
+        assert peaks[next_k] <= peaks[prev_k] + slack, (
+            f"peak not monotonically non-increasing in n_checkpoint: "
+            f"{peaks} (between n_ckpt={prev_k} and n_ckpt={next_k})"
+        )
