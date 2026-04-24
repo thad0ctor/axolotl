@@ -191,7 +191,7 @@ ProTrain is a per-rank memory policy. Two composition modes are supported; choos
 
 Sharding handles BOTH homogeneous-dtype and mixed-dtype chunks (M7 follow-up). Each chunk is modelled as an ordered list of `_DtypeRegion` entries — one per maximal-length contiguous same-dtype byte run — and each region is independently partitioned across ranks and participates in its own `all_gather_into_tensor` / `reduce_scatter_tensor` collective. Homogeneous chunks lay out exactly one region and issue one collective per gather/reduce; mixed-dtype chunks (e.g. a Llama block with fp32 RMSNorm scales between fp16 linear layers) issue one collective per region. Persistent chunks are fully replicated in both modes.
 
-**Auto-enable logic.** `protrain_model_wrapper` decides at construction time:
+**Auto-enable logic (pre-auto-mode).** When `protrain_auto_mode=False` (explicit-override mode), `protrain_model_wrapper` decides at construction time:
 
 | `world_size` | `force_all_persistent` | outer DDP | `zero3_shard` result |
 |---|---|---|---|
@@ -201,6 +201,19 @@ Sharding handles BOTH homogeneous-dtype and mixed-dtype chunks (M7 follow-up). E
 | >1 | False | NO | on (M7 ZeRO-3 path) |
 
 The user can override via the `protrain_zero3_shard: true/false` field on `ProTrainArgs`. When DDP is composed on top AND sharding was auto-enabled, `post_trainer_create` logs a WARNING (the two paths don't compose cleanly); the operator should set `protrain_zero3_shard: false` in YAML for DDP deployments.
+
+**Mode selection (auto, default).** `protrain_auto_mode: true` (default) runs the searcher first, then picks one of three modes based on workload fit + per-rank CPU RAM:
+
+* **Mode A — GPU-resident / DDP-friendly** (`force_all_persistent=True`). Chosen when the searcher places `n_persist == N_chunk` under the capacity budget — the model fits entirely on GPU and no CPU offload is needed. This is the throughput winner on a 3090 rig: DDP's bucketed NCCL allreduce beats ProTrain's per-param grad sync, and the M7 benchmark measured **3.64x** scaling at world_size=4 on PCIe Gen3.
+* **Mode B — replicated CPU-offload** (`zero3_shard=False`). Chosen when the model needs offload AND per-rank CPU RAM can hold the full non-persistent chunk set (`cpu_ram_per_rank >= (N_chunk - n_persist) * S_chunk`). Each rank holds a full replicated copy of every non-persistent chunk; no per-chunk collectives, so it's ~1.9x faster than sharded on PCIe Gen3.
+* **Mode C — ZeRO-3 sharded CPU-offload** (`zero3_shard=True`). Chosen when per-rank CPU RAM is too tight for replication but fits a `1/world_size` shard per chunk. Measured throughput is **0.70x** single-rank on 4x 3090 — the `all_gather` / `reduce_scatter` collectives dominate on PCIe Gen3 Llama-3B. Picked only when Mode B can't fit.
+* **Otherwise** — `RuntimeError`. The model doesn't fit on this node even with sharding; user must scale up (more nodes / larger RAM / smaller model) before retrying.
+
+**CPU-RAM-per-rank estimate.** `node RAM available / world_size`. Probes `psutil.virtual_memory().available` first (preferred; part of Axolotl's env already), falls back to `/proc/meminfo:MemAvailable` on Linux. Returns 0 when neither probe succeeds — the selector then prefers Mode A and raises if offload is required. Caveats: the divide-by-world-size model is pessimistic on NUMA-bound allocations and optimistic on heterogeneous multi-host setups where the smallest node's RAM binds. Users whose production topology doesn't match "node RAM / world_size" should set `protrain_auto_mode: false` and pick the mode explicitly via `protrain_force_all_persistent` / `protrain_zero3_shard`.
+
+**Mode B over Mode C — throughput trade-off.** The selector prefers Mode B over Mode C even when C would save pinned RAM, because B is ~1.9x faster on PCIe Gen3 and "CPU RAM fits replicated" is the loose binding constraint. Users with binding CPU pressure (e.g., a 96 GB system driving 8 ranks of a model whose non-persistent set is 80 GB replicated but 10 GB sharded) should set `protrain_auto_mode: false, protrain_zero3_shard: true` to force Mode C.
+
+**Explicit overrides.** `protrain_auto_mode: false` bypasses the selector and honours `protrain_force_all_persistent` / `protrain_zero3_shard` verbatim (following the pre-auto-mode table above). When `protrain_auto_mode: true` and the user still sets one of the mode flags, the selector logs a warning and proceeds with the auto-selected mode — the flags are explicitly documented as overrides that require turning auto-mode off to take effect.
 
 **Shard layout.** Rank `r` owns the byte range `[r * shard_bytes, (r + 1) * shard_bytes)` within each region. `shard_bytes = region_bytes_padded / world_size`, where `region_bytes_padded` is rounded up to `lcm(region_element_size, world_size)` — this guarantees both (a) the shard boundary is dtype-aligned (so `.view(fp16)` on the pool buffer after `all_gather` doesn't raise "offset not aligned") and (b) every rank holds an equal shard size (required by `all_gather_into_tensor` / `reduce_scatter_tensor`). Params straddling shard boundaries are NOT special-cased — each rank just holds the bytes it owns; reassembly is byte-exact under `all_gather`'s contiguous layout. Regions within a chunk are gap-tolerant: per-region padding lives inside a transient scratch buffer at gather/reduce time rather than the pool buffer's byte layout, so params always index into the pool buffer at their original `aligned_offsets`.
 

@@ -567,6 +567,12 @@ _ZERO3_WORKER_SCRIPT = textwrap.dedent(
         # chunks during the forward prefetch), n_swap=0, n_checkpoint=0
         # (keep activations GPU-resident; the test is about model-state
         # offload, not activation offload).
+        #
+        # auto_mode=False because the test's whole point is to exercise
+        # the ZeRO-3 sharded path; with auto_mode=True the selector
+        # would see ample CPU RAM and pick Mode B (replicated) instead,
+        # defeating the test. Set explicit zero3_shard + bypass the
+        # selector.
         wrapped = protrain_model_wrapper(
             model,
             model_config=cfg,
@@ -580,6 +586,7 @@ _ZERO3_WORKER_SCRIPT = textwrap.dedent(
             n_swap_override=0,
             n_checkpoint_override=0,
             zero3_shard=None if not force_replicate else False,
+            auto_mode=False,
         )
         optim = protrain_optimizer_wrapper(wrapped, lr=1e-5)
 
