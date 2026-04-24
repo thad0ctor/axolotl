@@ -58,7 +58,17 @@ def _is_plugin_active(cfg) -> bool:
 
 
 def _build_hardware_profile(cfg):
-    """Construct a ``HardwareProfile`` from the first visible CUDA device."""
+    """Construct a ``HardwareProfile`` from the first visible CUDA device.
+
+    Populates ``zero3_shard`` from the same auto-detect logic used by
+    :func:`protrain_model_wrapper`: when no explicit
+    ``protrain_zero3_shard`` override is set in YAML, enable sharding
+    iff ``world_size > 1`` AND ``protrain_force_all_persistent`` is
+    False. The wrapper itself re-checks this (honouring a live
+    ``torch.distributed`` process group) and will update the field in
+    place — this initial population keeps the cost model honest even
+    when the wrapper is bypassed.
+    """
     import torch
 
     from axolotl.integrations.protrain.types import HardwareProfile
@@ -86,6 +96,18 @@ def _build_hardware_profile(cfg):
 
     world_size = max(1, int(torch.cuda.device_count()))
 
+    # Mirror protrain_model_wrapper's zero3_shard auto-detect so the
+    # searcher's CPU-footprint accounting lines up with the runtime's
+    # actual per-rank pinned-memory layout.
+    force_all_persistent = bool(
+        getattr(cfg, "protrain_force_all_persistent", False)
+    )
+    explicit = getattr(cfg, "protrain_zero3_shard", None)
+    if explicit is None:
+        zero3_shard = (world_size > 1) and (not force_all_persistent)
+    else:
+        zero3_shard = bool(explicit) and (world_size > 1)
+
     return HardwareProfile(
         gpu_sku=gpu_sku,
         gpu_memory_bytes=gpu_memory_bytes,
@@ -93,6 +115,7 @@ def _build_hardware_profile(cfg):
         pcie_h2d_bps=pcie_h2d_bps,
         pcie_d2h_bps=pcie_d2h_bps,
         has_nvlink=False,
+        zero3_shard=zero3_shard,
     )
 
 

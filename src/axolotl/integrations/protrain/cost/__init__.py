@@ -16,6 +16,7 @@ from __future__ import annotations
 from axolotl.integrations.protrain.cost.bandwidth import effective_bw
 from axolotl.integrations.protrain.cost.memory import (
     ALPHA_FRAGMENTATION,
+    estimate_cpu_footprint,
     estimate_peak,
 )
 from axolotl.integrations.protrain.cost.runtime import estimate_runtime
@@ -23,6 +24,7 @@ from axolotl.integrations.protrain.cost.runtime import estimate_runtime
 __all__ = [
     "estimate_runtime",
     "estimate_peak",
+    "estimate_cpu_footprint",
     "effective_bw",
     "ALPHA_FRAGMENTATION",
 ]

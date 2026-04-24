@@ -185,6 +185,13 @@ class HardwareProfile:
 
     ProTrain is RTX 3090 / 3090 Ti scoped for this workstream — treat the two
     SKUs as equivalent when picking the target pool.
+
+    The ``zero3_shard`` flag is plumbed from ``protrain_model_wrapper`` (which
+    decides sharding on/off via the same auto-detect logic documented in
+    ``DESIGN.md §Multi-GPU``) through to ``cost/memory.estimate_cpu_footprint``
+    so per-rank CPU-pressure accounting reflects ZeRO-3 partitioning. It does
+    NOT change the GPU peak estimate — the gather materializes the full chunk
+    on GPU regardless of sharding — so ``estimate_peak`` ignores this field.
     """
 
     gpu_sku: str
@@ -193,6 +200,7 @@ class HardwareProfile:
     pcie_h2d_bps: float
     pcie_d2h_bps: float
     has_nvlink: bool                                  # informational; we never use NVLink paths
+    zero3_shard: bool = False                         # True when M7 chunk-sharding is active
 
 
 # ---------------------------------------------------------------------------

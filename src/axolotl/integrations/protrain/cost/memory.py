@@ -16,6 +16,12 @@ Design contract (see DESIGN.md §Design Decisions):
 - Gradient checkpointing bumps the peak at the *first* op of each CKPT
   block — this is when recomputation materializes the block's
   activations before the backward pass consumes them.
+- ZeRO-3 sharding (``HardwareProfile.zero3_shard=True``) does NOT
+  reduce the GPU peak: each rank's gather issues
+  ``all_gather_into_tensor`` to reconstruct the full chunk on GPU
+  before forward/backward compute, so the buffer-pool residency term
+  is identical to the replicated path. Sharding only changes the
+  per-rank pinned CPU footprint — see :func:`estimate_cpu_footprint`.
 """
 
 from __future__ import annotations
@@ -63,6 +69,56 @@ def _group_ops_by_block(trace: ProfilerTrace) -> dict[BlockId, list[int]]:
             continue
         grouped[op.block_id].append(i)
     return grouped
+
+
+def estimate_cpu_footprint(
+    cfg: CostConfig,
+    layout: ChunkLayout,
+    hw: HardwareProfile,
+) -> int:
+    """Per-rank pinned CPU bytes held by non-persistent chunks.
+
+    The non-persistent chunks live on CPU in pinned memory. Under the
+    replicated (pre-M7) path every rank holds a FULL copy of each
+    non-persistent chunk, so the per-rank footprint is
+    ``(N_chunk - n_persist) * S_chunk``. Under the M7 ZeRO-3 sharded
+    path each rank holds only ``ceil(chunk_bytes / world_size)`` per
+    chunk, so the per-rank footprint divides by ``gpu_count``.
+
+    This accounting is **orthogonal to** :func:`estimate_peak`, which
+    models GPU memory: the gather materializes the full chunk on GPU
+    via ``all_gather_into_tensor`` regardless of sharding, so GPU peak
+    is unchanged by ``zero3_shard``. The real savings from sharding
+    appear here (CPU bytes/rank) and in the reduce bandwidth
+    (reduce_scatter vs. per-param all_reduce).
+
+    Parameters
+    ----------
+    cfg:
+        Candidate knob configuration. Only ``n_persist`` is consumed —
+        ``n_buffer``/``n_swap``/``n_checkpoint`` do not change pinned
+        CPU footprint.
+    layout:
+        Chunk layout. ``S_chunk`` and ``N_chunk`` are read directly.
+    hw:
+        Hardware profile. Reads ``gpu_count`` and ``zero3_shard``.
+
+    Returns
+    -------
+    int
+        Per-rank pinned CPU bytes. Rounded up via ceiling division so
+        the returned value is a conservative upper bound on actual
+        shard allocations (shard sizes themselves are rounded up to a
+        dtype-aligned boundary by ``ChunkManager.materialize_offload``;
+        the arithmetic here tracks the same ceiling).
+    """
+    non_persist = max(0, layout.N_chunk - cfg.n_persist)
+    total_bytes = non_persist * layout.S_chunk
+    # Under sharding each rank holds 1/gpu_count of each chunk. Ceiling
+    # division so small chunks don't underreport for the trailing rank.
+    per_rank_divisor = hw.gpu_count if hw.zero3_shard else 1
+    per_rank_divisor = max(1, per_rank_divisor)
+    return (total_bytes + per_rank_divisor - 1) // per_rank_divisor
 
 
 def estimate_peak(
@@ -248,4 +304,4 @@ def estimate_peak(
     return scaled
 
 
-__all__ = ["estimate_peak", "ALPHA_FRAGMENTATION"]
+__all__ = ["estimate_peak", "estimate_cpu_footprint", "ALPHA_FRAGMENTATION"]
