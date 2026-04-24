@@ -239,6 +239,121 @@ def test_estimate_peak_increases_with_n_persist_until_activations_dominate(
     assert peaks[-1] - peaks[0] >= expected_min_delta
 
 
+def test_estimate_peak_uses_per_block_caps(toy_layout, toy_hw):
+    """``steady_fwd_block_peak_bytes`` caps the op-walk raw_peak for ANY config.
+
+    Build a trace with an absurdly large synthetic intra_op_delta so the
+    op-walk would compute a huge raw_peak absent the measured cap. Populate
+    ``steady_fwd_block_peak_bytes`` with a modest per-block peak; the cap
+    must pull raw_peak down to ``forward_max_block_peak + ckpt_recomp_bump``
+    regardless of n_checkpoint/n_swap.
+
+    Contrast: the v5 ``steady_fwd_peak_bytes`` cap only fires when
+    n_checkpoint==0 && n_swap==0, so a config with n_checkpoint>0 would
+    see the full (huge) op-walk peak. With per-block data the cap
+    tightens fractional-NONE configs too.
+    """
+    n_block = 8
+    # Raw op-walk raw_peak: uniform intra_delta of 1 GB per op.
+    # Op-walk raw_peak >> 1 GB. Set per-block measured peaks to 512 MB —
+    # the cap must pull raw_peak to ~512 MB + max(activation CKPT bump).
+    huge_intra = 1 * GB
+    activation_bytes_per_block = 64 * MB
+    trace = _make_trace(
+        n_block=n_block,
+        ops_per_block=5,
+        activation_bytes_per_block=activation_bytes_per_block,
+        intra_delta_bytes=huge_intra,
+    )
+    per_block_peak = 512 * MB
+    # Rebuild with block-peak dict populated — ProfilerTrace is frozen,
+    # so construct a fresh one copying all fields from the base trace.
+    from dataclasses import replace
+
+    trace = replace(
+        trace,
+        steady_fwd_block_peak_bytes={
+            BlockId(b): per_block_peak for b in range(n_block)
+        },
+    )
+
+    # All-NONE config: ckpt_recomp_bump = 0, cap = per_block_peak.
+    cfg_all_none = CostConfig(
+        n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0
+    )
+    bm_all_none = assign_modes(0, 0, n_block)
+    peak_all_none = estimate_peak(
+        cfg_all_none, trace, toy_layout, bm_all_none, toy_hw
+    )
+    # Scaled cap = ALPHA_FRAGMENTATION * per_block_peak; op-walk would
+    # otherwise be > 1 GB * alpha. The cap should pin peak near the
+    # scaled per_block_peak value.
+    assert peak_all_none <= int(ALPHA_FRAGMENTATION * per_block_peak) + 1, (
+        f"all-NONE peak {peak_all_none/1e6:.1f}MB should be capped at "
+        f"~{ALPHA_FRAGMENTATION * per_block_peak / 1e6:.1f}MB"
+    )
+
+    # Fractional-NONE config: 3 blocks CKPT. ckpt_recomp_bump =
+    # max activation across CKPT blocks = activation_bytes_per_block.
+    cfg_mixed = CostConfig(
+        n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=3
+    )
+    bm_mixed = assign_modes(0, 3, n_block)
+    peak_mixed = estimate_peak(
+        cfg_mixed, trace, toy_layout, bm_mixed, toy_hw
+    )
+    expected_cap = int(
+        ALPHA_FRAGMENTATION * (per_block_peak + activation_bytes_per_block)
+    )
+    # 1% slack for ALPHA_FRAGMENTATION * int() rounding.
+    assert peak_mixed <= expected_cap + 1, (
+        f"mixed-CKPT peak {peak_mixed/1e6:.1f}MB should be capped at "
+        f"~{expected_cap/1e6:.1f}MB (forward_max_block + max_ckpt_activation)"
+    )
+    # Without per-block cap the op-walk raw_peak would dwarf this
+    # (intra_delta=1GB per op). Sanity check: the capped value is well
+    # below 1 GB * alpha.
+    assert peak_mixed < int(ALPHA_FRAGMENTATION * huge_intra), (
+        "per-block cap should pull peak well below the raw op-walk "
+        "estimate; got {peak_mixed/1e9:.3f}GB"
+    )
+
+
+def test_estimate_peak_per_block_cap_respects_under_predict_floor(toy_layout, toy_hw):
+    """Per-block cap must not under-predict when the op-walk is tighter.
+
+    If the op-walk's raw_peak is ALREADY smaller than
+    ``forward_max_block_peak + ckpt_recomp_bump``, the cap is a no-op.
+    Verify that a trace with tiny intra_deltas and a large per-block
+    measurement yields the op-walk's value, not the inflated measurement.
+    """
+    n_block = 8
+    trace = _make_trace(
+        n_block=n_block,
+        ops_per_block=3,
+        activation_bytes_per_block=4 * MB,
+        intra_delta_bytes=1 * MB,
+        inter_delta_bytes=256 * 1024,
+    )
+    from dataclasses import replace
+
+    trace = replace(
+        trace,
+        steady_fwd_block_peak_bytes={
+            BlockId(b): 10 * GB for b in range(n_block)
+        },
+    )
+    cfg = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
+    bm = assign_modes(0, 0, n_block)
+    peak = estimate_peak(cfg, trace, toy_layout, bm, toy_hw)
+    # The per-block cap is 10 GB+; the op-walk gives a much smaller
+    # peak (<< 1 GB). The cap must NOT raise raw_peak — only lower it.
+    assert peak < int(ALPHA_FRAGMENTATION * 1 * GB), (
+        f"peak {peak/1e9:.3f}GB should track the tight op-walk, not the "
+        "10 GB per-block measurement"
+    )
+
+
 # ---------------------------------------------------------------------------
 # memory / estimate_cpu_footprint (M7 follow-up: ZeRO-3 awareness)
 # ---------------------------------------------------------------------------

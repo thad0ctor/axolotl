@@ -289,16 +289,46 @@ def estimate_peak(
         raw_peak = model_state_present + retained_none_bytes
 
     # Ground-truth forward cap from the profiler's hook-less steady pass.
-    # The op-walk's ``live_none + ckpt_extra + intra + inter`` can over-
-    # estimate the retained-activation set for all-NONE configurations —
-    # the real peak during the un-hooked forward (``steady_fwd_peak_bytes``)
-    # is a strictly tighter upper bound when it's available. Replace the
-    # retained-activations portion (everything after model_state_present)
-    # with the measured value when we have it AND the config keeps every
-    # block in NONE (n_checkpoint == 0 && n_swap == 0). For CKPT/SWAP
-    # configs the measurement doesn't apply (no CKPT recompute peaks in
-    # the hot-iter forward), so we preserve the op-walk estimate.
-    if (
+    #
+    # Per-block cap (TRACE_VERSION>=6): lightweight block-level hooks during
+    # the steady forward record each block's peak bytes. The MAX across
+    # those per-block peaks is a strict upper bound on the forward peak
+    # regardless of which blocks are NONE/CKPT/SWAP — CKPT and SWAP blocks
+    # free their activations before the next block runs, so a mixed
+    # configuration's forward peak can never exceed the per-block max
+    # observed under the all-NONE profile. CKPT blocks do add a
+    # recomputation peak during BACKWARD (one block's activations
+    # rematerialized at a time, serially), which isn't captured during
+    # this forward-only measurement — add the max single-CKPT-block
+    # activation bytes on top.
+    #
+    # This supersedes the v5 aggregate-only cap (which only applied when
+    # n_checkpoint==0 && n_swap==0, making it a no-op for the 7B LoRA
+    # test where the searcher picks n_checkpoint≈9). With per-block data
+    # the cap tightens ALL configs, including fractional-NONE.
+    #
+    # Fallback order:
+    #   1. Per-block dict populated (v6+) -> use forward_max_block + ckpt_bump
+    #   2. Aggregate-only populated (v5, or v6 when discover_blocks failed)
+    #      AND all-NONE cfg -> use aggregate
+    #   3. Neither -> preserve op-walk raw_peak
+    if trace.steady_fwd_block_peak_bytes:
+        forward_max_block_peak = max(trace.steady_fwd_block_peak_bytes.values())
+        # Max single-CKPT-block activation bytes. Backward replays CKPT
+        # blocks one at a time, so the bump is per-block not summed.
+        # (This mirrors the op-walk's ckpt_extra, which adds a single
+        # block's activation at the first op of each CKPT block and
+        # takes the max across op positions.)
+        ckpt_recomp_bump = 0
+        for bid_raw, act_sz in trace.activation_sizes.items():
+            bid = BlockId(int(bid_raw))
+            if block_map.get(bid, BlockMode.NONE) is BlockMode.CKPT:
+                if act_sz > ckpt_recomp_bump:
+                    ckpt_recomp_bump = act_sz
+        measured_cap = forward_max_block_peak + ckpt_recomp_bump
+        if raw_peak > measured_cap:
+            raw_peak = measured_cap
+    elif (
         trace.steady_fwd_peak_bytes > 0
         and cfg.n_checkpoint == 0
         and cfg.n_swap == 0
