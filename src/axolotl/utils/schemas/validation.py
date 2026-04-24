@@ -1301,6 +1301,87 @@ class PretrainingValidationMixin:
             )
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def check_multimodal_cpt(cls, data):
+        """Gate multimodal CPT at config-load time.
+
+        Rejects incompatible combinations before any model/dataset is touched
+        so the user sees a clear message instead of a cryptic mid-training
+        error. Model-level architecture rejection (Mllama/Pixtral/InternVL)
+        happens when the processor is actually loaded — see
+        `check_processor_compatibility` in `prompt_strategies/multimodal_pretrain.py`.
+        """
+        pd = data.get("pretraining_dataset")
+        if not pd:
+            return data
+
+        pd_list = pd if isinstance(pd, list) else [pd]
+
+        def _entry_is_mm(entry) -> bool:
+            if isinstance(entry, dict):
+                ds_type_ = entry.get("type")
+                mm_flag_ = entry.get("multimodal")
+            else:
+                ds_type_ = getattr(entry, "type", None)
+                mm_flag_ = getattr(entry, "multimodal", None)
+            return ds_type_ == "multimodal_pretrain" or bool(mm_flag_)
+
+        # Multimodal CPT is a single-dataset mode: builder/collator/encoder
+        # resolve MM config and MM-mode detection from `pretraining_dataset[0]`
+        # only. Multi-entry configs either miscollate (MM in entry[0] leaks
+        # its image settings onto the other entries' rows) or silently demote
+        # (MM in a later entry is ignored because entry[0] drives detection
+        # → run trains as plain text CPT). Reject both, whichever slot the
+        # MM entry lives in.
+        if len(pd_list) > 1 and any(_entry_is_mm(e) for e in pd_list):
+            raise ValueError(
+                "Multimodal CPT supports exactly one `pretraining_dataset` "
+                f"entry (found {len(pd_list)}). Image settings "
+                "(`image_base_dir`, `image_token`) and MM-mode detection "
+                "both resolve from entry[0] only, so additional entries "
+                "would be silently miscollated or drop their MM config. "
+                "Split multimodal CPT into its own run."
+            )
+
+        first = pd_list[0]
+        if not isinstance(first, dict):
+            return data
+
+        ds_type = first.get("type")
+        is_mm_cpt = ds_type == "multimodal_pretrain" or bool(first.get("multimodal"))
+        if not is_mm_cpt:
+            return data
+
+        if not data.get("processor_type"):
+            raise ValueError(
+                "Multimodal CPT (type: multimodal_pretrain) requires "
+                "`processor_type` to be set — e.g. `processor_type: AutoProcessor`. "
+                "Without a processor, images in the dataset cannot be turned "
+                "into pixel tensors."
+            )
+        if data.get("sample_packing"):
+            raise ValueError(
+                "Multimodal CPT is incompatible with `sample_packing: true`. "
+                "Each image's placeholder token expands to a variable number "
+                "of patch tokens at the processor, so cross-row packing would "
+                "break the 1-to-1 alignment between text placeholders and "
+                "pixel_values. Set `sample_packing: false`."
+            )
+        if data.get("chat_template"):
+            raise ValueError(
+                "Multimodal CPT (raw image+text pretraining) is incompatible "
+                "with `chat_template`. The point of the CPT path is to avoid "
+                "conversational scaffolding entirely. Remove `chat_template` "
+                "or switch to chat-template SFT."
+            )
+        # Force-disable column stripping so the `images` and `_mm_text`
+        # columns survive through to the collator.
+        if data.get("remove_unused_columns") is not False:
+            data["remove_unused_columns"] = False
+
+        return data
+
 
 class ModelCompatibilityValidationMixin:
     """Validation methods for specific model compatibility."""

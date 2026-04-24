@@ -44,10 +44,35 @@ from axolotl.utils.collators import (
     V2BatchSamplerDataCollatorForSeq2Seq,
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
+from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.import_helper import get_cls_from_module_str
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+def _is_multimodal_cpt(cfg) -> bool:
+    """True iff this config is a raw image+text CPT run (no chat template)."""
+    if not getattr(cfg, "pretraining_dataset", None):
+        return False
+    ds_first = cfg.pretraining_dataset[0]
+    ds_type = None
+    mm_flag = None
+    if hasattr(ds_first, "type"):
+        ds_type = getattr(ds_first, "type", None)
+        mm_flag = getattr(ds_first, "multimodal", None)
+    elif isinstance(ds_first, dict):
+        ds_type = ds_first.get("type")
+        mm_flag = ds_first.get("multimodal")
+    return (ds_type == "multimodal_pretrain") or bool(mm_flag)
+
+
+def _mm_cpt_get(pt_cfg, key, default=None):
+    """Read a field from a pretraining_dataset entry that may be dict, pydantic
+    model, or DictDefault."""
+    if isinstance(pt_cfg, dict):
+        return pt_cfg.get(key, default)
+    return getattr(pt_cfg, key, default)
 
 
 class HFCausalTrainerBuilder(TrainerBuilderBase):
@@ -451,6 +476,29 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
 
         return trainer
 
+    def _build_mm_pretrain_collator(self, pad_to_multiple_of=None):
+        """Construct the multimodal CPT collator with pt_cfg-derived spec
+        and image_base_dir. Shared between the pretraining and non-pretraining
+        dispatch branches in `build_collator`."""
+        from axolotl.prompt_strategies.multimodal_pretrain import (
+            build_image_token_spec,
+        )
+
+        pt_cfg = self.cfg.pretraining_dataset[0] if self.cfg.pretraining_dataset else {}
+        spec = build_image_token_spec(
+            self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
+        )
+        collator_kwargs = {
+            "tokenizer": self.tokenizer,
+            "processor": self.processor,
+            "image_token_spec": spec,
+            "image_base_dir": _mm_cpt_get(pt_cfg, "image_base_dir"),
+            "max_length": self.cfg.sequence_len,
+        }
+        if pad_to_multiple_of is not None:
+            collator_kwargs["pad_to_multiple_of"] = pad_to_multiple_of
+        return MultiModalPretrainDataCollator(**collator_kwargs)
+
     def build_collator(
         self,
         training_args,  # type: "AxolotlTrainingArguments"  # type: ignore
@@ -458,6 +506,21 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         **kwargs,
     ):
         if training_args.pretraining:
+            # Multimodal CPT: intercept BEFORE the text-only pretraining branches
+            # so our custom collator is wired up correctly.
+            # Training batches only — eval datasets from `test_datasets` are
+            # loaded through the regular path and don't carry the
+            # `_mm_text` / `images` columns MultiModalPretrainDataCollator
+            # requires, so an eval step would hard-fail in its torch_call.
+            if (
+                not is_eval
+                and self.cfg.processor_type
+                and self.processor
+                and _is_multimodal_cpt(self.cfg)
+            ):
+                return self._build_mm_pretrain_collator(
+                    pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+                )
             if (
                 self.cfg.pretraining_sample_concatenation is False
                 or self.cfg.micro_batch_size > 1
@@ -519,6 +582,15 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             else:
                 collator = BatchSamplerDataCollatorForSeq2Seq
         else:
+            if (
+                not is_eval
+                and self.cfg.processor_type
+                and self.processor
+                and _is_multimodal_cpt(self.cfg)
+            ):
+                return self._build_mm_pretrain_collator(
+                    pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+                )
             if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
                 kwargs["processing_strategy"] = get_processing_strategy(
