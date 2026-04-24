@@ -137,9 +137,9 @@ def test_collator_builds_batch_and_masks_labels(smolvlm_processor, two_tiny_imag
     assert isinstance(batch["input_ids"], torch.Tensor)
     # Label masking check: no image-family ids remaining as valid labels.
     for tid in spec.image_family_token_ids:
-        assert (
-            int((batch["labels"] == tid).sum().item()) == 0
-        ), f"label masking left id={tid} in labels"
+        assert int((batch["labels"] == tid).sum().item()) == 0, (
+            f"label masking left id={tid} in labels"
+        )
     # Pad is also masked.
     pad_id = smolvlm_processor.tokenizer.pad_token_id
     if pad_id is not None:

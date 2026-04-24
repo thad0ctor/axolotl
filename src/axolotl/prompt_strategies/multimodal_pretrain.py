@@ -208,7 +208,7 @@ def check_processor_compatibility(processor: ProcessorMixin) -> None:
         reason = _INCOMPATIBLE_PROCESSOR_REASONS.get(base_cls.__name__)
         if reason is not None:
             raise ValueError(
-                f"Multimodal CPT is not supported for {base_cls.__name__}: " f"{reason}"
+                f"Multimodal CPT is not supported for {base_cls.__name__}: {reason}"
             )
 
 

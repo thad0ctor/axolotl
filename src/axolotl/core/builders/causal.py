@@ -484,11 +484,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             build_image_token_spec,
         )
 
-        pt_cfg = (
-            self.cfg.pretraining_dataset[0]
-            if self.cfg.pretraining_dataset
-            else {}
-        )
+        pt_cfg = self.cfg.pretraining_dataset[0] if self.cfg.pretraining_dataset else {}
         spec = build_image_token_spec(
             self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
         )

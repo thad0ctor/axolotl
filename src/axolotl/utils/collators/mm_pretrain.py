@@ -139,8 +139,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 n_frames = getattr(src, "n_frames", 1)
                 if n_frames > 1:
                     raise ValueError(
-                        f"Multi-frame images are not supported "
-                        f"(got {n_frames} frames)."
+                        f"Multi-frame images are not supported (got {n_frames} frames)."
                     )
                 img = src.convert("RGB")
                 img.load()
