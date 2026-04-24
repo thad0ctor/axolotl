@@ -164,17 +164,62 @@ def _prepare_streaming_dataset(
     # Load evaluation dataset if specified
     eval_dataset = None
     if cfg.test_datasets:
-        _, eval_dataset, _ = _load_and_prepare_datasets(
-            tokenizer,
-            cfg,
-            split="test",
-            processor=processor,
-            streaming=False,
+        first_test = cfg.test_datasets[0]
+        first_test_dict = (
+            first_test if isinstance(first_test, dict) else dict(first_test)
         )
+        # Multimodal CPT eval MUST go through the same streaming encoder as
+        # training so rows carry `input_ids`/`labels`/`images`/`_mm_text` —
+        # the SFT loader does not register `multimodal_pretrain` and with
+        # `skip_prepare_dataset: true` (auto-set for MM configs) it would
+        # return raw rows, causing the model forward to fail with "must
+        # specify input_ids or inputs_embeds" at the first eval step.
+        is_mm_cpt_eval = (
+            first_test_dict.get("type") == "multimodal_pretrain"
+            or bool(first_test_dict.get("multimodal"))
+        )
+        if is_mm_cpt_eval:
+            eval_config = _pretraining_config_from_entry(first_test_dict)
+            eval_dataset = _load_streaming_dataset(
+                eval_config, cfg, tokenizer, processor=processor
+            )
+        else:
+            _, eval_dataset, _ = _load_and_prepare_datasets(
+                tokenizer,
+                cfg,
+                split="test",
+                processor=processor,
+                streaming=False,
+            )
 
     # For streaming, we return max_steps directly from config or -1 if not set
     total_num_steps = cfg.max_steps if cfg.max_steps else -1
     return train_dataset, eval_dataset, total_num_steps, []
+
+
+def _pretraining_config_from_entry(entry: dict) -> DictDefault:
+    """Build the iterable-pretraining config from a single dataset entry dict.
+
+    Shared between `_extract_pretraining_config` (for `pretraining_dataset`)
+    and the multimodal-CPT eval branch in `_prepare_streaming_dataset`
+    (for `test_datasets`), so both sides produce identically-shaped configs.
+    """
+    return DictDefault(
+        {
+            "path": entry["path"],
+            "name": entry.get("name"),
+            "skip": entry.get("skip"),
+            "split": entry.get("split", "train"),
+            "data_files": entry.get("data_files"),
+            "type": entry.get("type", "pretrain"),
+            "text_column": entry.get("text_column", "text"),
+            # Multimodal CPT fields (opt-in; safe defaults for text-only).
+            "multimodal": entry.get("multimodal"),
+            "image_column": entry.get("image_column", "images"),
+            "image_base_dir": entry.get("image_base_dir"),
+            "image_token": entry.get("image_token"),
+        }
+    )
 
 
 def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
@@ -182,23 +227,7 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
     if isinstance(cfg.pretraining_dataset, list) and isinstance(
         cfg.pretraining_dataset[0], dict
     ):
-        config = cfg.pretraining_dataset[0]
-        return DictDefault(
-            {
-                "path": config["path"],
-                "name": config.get("name"),
-                "skip": config.get("skip"),
-                "split": config.get("split", "train"),
-                "data_files": config.get("data_files"),
-                "type": config.get("type", "pretrain"),
-                "text_column": config.get("text_column", "text"),
-                # Multimodal CPT fields (opt-in; safe defaults for text-only).
-                "multimodal": config.get("multimodal"),
-                "image_column": config.get("image_column", "images"),
-                "image_base_dir": config.get("image_base_dir"),
-                "image_token": config.get("image_token"),
-            }
-        )
+        return _pretraining_config_from_entry(cfg.pretraining_dataset[0])
     # Simple string path case
     return DictDefault(
         {
