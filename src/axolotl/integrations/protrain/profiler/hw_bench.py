@@ -1,10 +1,30 @@
-"""Hardware microbenchmarks: PCIe H2D/D2H + NCCL collectives."""
+"""Hardware microbenchmarks: PCIe H2D/D2H + NCCL collectives + Adam throughput."""
 
 from __future__ import annotations
+
+import statistics
+import time
 
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+# Bytes-per-param accounting used by the Adam microbenchmarks below.
+# Breakdown (simplified; see module docstring in cost/runtime.py):
+#   fp16 param    : 2 B read + 2 B write = 4 B
+#   fp16 grad     : 2 B read             = 2 B
+#   fp32 master   : 4 B read + 4 B write = 8 B
+#   fp32 momentum : 4 B read + 4 B write = 8 B
+#   fp32 variance : 4 B read + 4 B write = 8 B (counted as 2x momentum below)
+# Collapsing the two momenta into a single "2x momentum" term and rounding
+# to the roofline-style estimate the paper uses lands at ~30 B/param. We
+# keep the constant conservative (20 B/param) because DeepSpeedCPUAdam and
+# apex FusedAdam both fuse the master+momenta update into a single kernel
+# that does fewer round-trips to DRAM than the naive count predicts. The
+# MEASURED throughput returned is empirical regardless; this constant only
+# determines the units (bytes/sec) we report.
+_ADAM_BYTES_PER_PARAM: int = 20
 
 
 def measure_pcie(
@@ -71,6 +91,252 @@ def measure_pcie(
     return h2d_bps, d2h_bps
 
 
+def measure_cpu_adam(n_params: int = 10_000_000, n_iters: int = 10) -> float:
+    """Return bytes/sec throughput of CPU Adam on this host.
+
+    Benchmarks ``deepspeed.ops.adam.DeepSpeedCPUAdam`` (the kernel the
+    ``CpuFusedAdamAdapter`` uses in production) over a synthetic
+    ``n_params``-long fp16 parameter + fp16 grad + fp32 optimizer state.
+    Returns 0.0 if DeepSpeedCPUAdam cannot be imported or compiled —
+    the cost model falls back to a hardcoded prior in that case.
+
+    The default ``n_params = 10M`` yields ~200 MB of state (20 B/param) —
+    well beyond L2/L3 cache sizes on any relevant host, so the measurement
+    reflects sustained DRAM bandwidth rather than a cache-resident
+    microbench.
+
+    Parameters
+    ----------
+    n_params:
+        Number of scalar fp16 parameters in the synthetic model.
+    n_iters:
+        Step invocations timed. The first is a warmup and is discarded
+        from the median.
+
+    Returns
+    -------
+    float
+        Sustained Adam throughput in bytes/sec, where bytes = n_params *
+        20 (see ``_ADAM_BYTES_PER_PARAM`` for the accounting breakdown).
+        ``0.0`` on compile / import failure.
+    """
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001 - import OR compile failure
+        LOG.warning(
+            "measure_cpu_adam: DeepSpeedCPUAdam unavailable (%s); "
+            "returning 0.0 so the runtime cost model falls back to a "
+            "hardcoded prior",
+            exc,
+        )
+        return 0.0
+
+    import torch
+    from torch import nn
+
+    # DeepSpeedCPUAdam's ``__del__`` method calls
+    # ``self.ds_opt_adam.destroy_adam(...)`` unconditionally; when the
+    # constructor raises before ``ds_opt_adam`` is set (common on dev
+    # rigs with CUDA toolchain mismatch), ``__del__`` raises
+    # AttributeError on every GC pass. Python's unraisable-exception
+    # handler fires, pytest's warning-capture hook intercepts it, and
+    # the resulting traceback transitively pins autograd tensors from
+    # the ProfilerTrace's traced forward pass (observed as +50 MB
+    # ``memory_allocated`` on tiny-GPT2 in suite-level runs).
+    # Neutralise the broken ``__del__`` before we try to instantiate so
+    # any failed construction GC's cleanly.
+    _orig_del = getattr(DeepSpeedCPUAdam, "__del__", None)
+
+    def _safe_del(self: object) -> None:
+        try:
+            if hasattr(self, "ds_opt_adam"):
+                _orig_del(self)  # type: ignore[misc]
+        except Exception:  # noqa: BLE001 - suppress silently; dev-rig safety
+            pass
+
+    DeepSpeedCPUAdam.__del__ = _safe_del  # type: ignore[attr-defined]
+
+    # Synthetic fp16 param + fp16 grad on CPU; DeepSpeedCPUAdam allocates
+    # fp32 master + two fp32 momenta internally on first step.
+    param = nn.Parameter(
+        torch.randn(n_params, dtype=torch.float16, device="cpu"),
+        requires_grad=True,
+    )
+    param.grad = torch.randn(n_params, dtype=torch.float16, device="cpu")
+
+    try:
+        optim = DeepSpeedCPUAdam([param], lr=1e-4)
+    except Exception as exc:  # noqa: BLE001 - CUDA toolchain mismatch etc.
+        LOG.warning(
+            "measure_cpu_adam: DeepSpeedCPUAdam constructor failed (%s); "
+            "returning 0.0",
+            repr(exc),
+        )
+        # Drop the exception traceback before returning so it can't pin
+        # locals (and, via cycles, autograd tensors from the subsequent
+        # traced forward pass — observed as a +50 MB ``memory_allocated``
+        # ghost on tiny-GPT2 under pytest's unraisable-warning hook).
+        exc.__traceback__ = None
+        del exc, param
+        return 0.0
+
+    # Warmup — first step allocates optimizer state and JITs the kernel.
+    try:
+        optim.step()
+    except Exception as exc:  # noqa: BLE001 - defensive
+        LOG.warning("measure_cpu_adam: warmup step failed (%s); returning 0.0", exc)
+        return 0.0
+
+    iter_s: list[float] = []
+    for _ in range(n_iters):
+        # Re-populate grad each iter — Adam consumes it in-place but the
+        # measurement should track the steady-state kernel cost.
+        param.grad = torch.randn(n_params, dtype=torch.float16, device="cpu")
+        t0 = time.perf_counter()
+        optim.step()
+        iter_s.append(time.perf_counter() - t0)
+
+    median_iter = statistics.median(iter_s)
+    if median_iter <= 0:
+        bps = 0.0
+    else:
+        bytes_processed = n_params * _ADAM_BYTES_PER_PARAM
+        bps = bytes_processed / median_iter
+        LOG.debug(
+            "measure_cpu_adam n_params=%d median_iter=%.4fs throughput=%.2f GB/s",
+            n_params,
+            median_iter,
+            bps / 1e9,
+        )
+    # Explicit cleanup — same rationale as measure_gpu_adam. We omit
+    # gc.collect() here to avoid perturbing pytest's unraisable-exception
+    # tracking of a failed DeepSpeedCPUAdam __del__ path.
+    try:
+        optim.zero_grad(set_to_none=True)
+        optim.state.clear()
+    except Exception:  # noqa: BLE001 - defensive
+        pass
+    del optim, param
+    return float(bps)
+
+
+def measure_gpu_adam(
+    device_idx: int = 0, n_params: int = 5_000_000, n_iters: int = 10
+) -> float:
+    """Return bytes/sec throughput of GPU Adam on this device.
+
+    Uses the same fallback chain as
+    :class:`axolotl.integrations.protrain.chunk.optim.GpuFusedAdamAdapter`:
+    ``apex.optimizers.FusedAdam`` first (paper-cited), then
+    ``torch.optim.AdamW`` (stock). Returns 0.0 only on a CUDA outage.
+
+    Parameters
+    ----------
+    device_idx:
+        CUDA ordinal.
+    n_params:
+        Scalar fp16 params in the synthetic model. 10M keeps state around
+        200 MB — outside L2 on any 3090-class GPU, so the measurement
+        reflects HBM bandwidth rather than L2 residency.
+    n_iters:
+        Timed step invocations. The first is a warmup, discarded.
+
+    Returns
+    -------
+    float
+        Throughput in bytes/sec (n_params * 20 / median_iter_s). 0.0 if
+        no Adam implementation is constructible.
+    """
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        LOG.warning("measure_gpu_adam: CUDA unavailable; returning 0.0")
+        return 0.0
+
+    device = torch.device(f"cuda:{device_idx}")
+
+    param = nn.Parameter(
+        torch.randn(n_params, dtype=torch.float16, device=device),
+        requires_grad=True,
+    )
+    param.grad = torch.randn(n_params, dtype=torch.float16, device=device)
+
+    optim = None
+    try:
+        from apex.optimizers import FusedAdam  # type: ignore[import-not-found]
+
+        optim = FusedAdam([param], lr=1e-4)
+        backend = "apex.FusedAdam"
+    except Exception:  # noqa: BLE001 - apex missing OR build mismatch
+        pass
+
+    if optim is None:
+        try:
+            # torch.optim.FusedAdam is a nightly-only alias; the stable
+            # name is AdamW with fused=True on CUDA. Try that.
+            optim = torch.optim.AdamW([param], lr=1e-4, fused=True)
+            backend = "torch.optim.AdamW(fused=True)"
+        except (TypeError, RuntimeError):
+            # Older torch, or GPU without fused kernel support.
+            optim = torch.optim.AdamW([param], lr=1e-4)
+            backend = "torch.optim.AdamW"
+
+    LOG.debug("measure_gpu_adam: backend=%s", backend)
+
+    # Warmup + JIT.
+    try:
+        optim.step()
+        torch.cuda.synchronize(device)
+    except Exception as exc:  # noqa: BLE001 - defensive
+        LOG.warning("measure_gpu_adam: warmup step failed (%s); returning 0.0", exc)
+        return 0.0
+
+    iter_s: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(n_iters):
+        # Re-issue a fresh grad each iter. Keep it simple — copy in place
+        # so we don't thrash the allocator.
+        param.grad.copy_(torch.randn_like(param.grad))
+        torch.cuda.synchronize(device)
+        start.record()
+        optim.step()
+        end.record()
+        torch.cuda.synchronize(device)
+        iter_s.append(start.elapsed_time(end) / 1000.0)
+
+    median_iter = statistics.median(iter_s)
+    bytes_processed = n_params * _ADAM_BYTES_PER_PARAM
+    bps = bytes_processed / median_iter if median_iter > 0 else 0.0
+    LOG.debug(
+        "measure_gpu_adam backend=%s n_params=%d median_iter=%.4fs throughput=%.2f GB/s",
+        backend,
+        n_params,
+        median_iter,
+        bps / 1e9,
+    )
+    # Release the synthetic param + optimizer state before returning.
+    # Fused AdamW holds references to optim-state tensors in ``optim.state``
+    # and sometimes via CUDA graph caches, so a plain ``del`` isn't enough.
+    # We explicitly clear the state dict and zero out ``param.data`` so the
+    # caching allocator can reclaim the blocks; empty_cache is intentionally
+    # NOT called because it forces the upcoming traced forward pass to
+    # re-reserve memory from scratch, inflating its first-iter peak vs. the
+    # ground-truth run that the reconstruct-peak test compares against.
+    try:
+        optim.zero_grad(set_to_none=True)
+        optim.state.clear()
+        optim.param_groups.clear()
+    except Exception:  # noqa: BLE001 - defensive, no behavior change
+        pass
+    param.grad = None
+    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+    del optim, param
+    torch.cuda.synchronize(device)
+    return float(bps)
+
+
 def measure_nccl(world_size: int) -> dict[int, tuple[float, float]]:
     """Measure NCCL gather/reduce latencies per payload size.
 
@@ -88,4 +354,4 @@ def measure_nccl(world_size: int) -> dict[int, tuple[float, float]]:
     )
 
 
-__all__ = ["measure_pcie", "measure_nccl"]
+__all__ = ["measure_pcie", "measure_nccl", "measure_cpu_adam", "measure_gpu_adam"]

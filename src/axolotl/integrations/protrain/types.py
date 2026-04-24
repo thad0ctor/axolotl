@@ -123,6 +123,14 @@ class ProfilerTrace:
     # warning. New in TRACE_VERSION=2 (see profiler/cache.py).
     op_latencies: dict[OpId, float] = field(default_factory=dict)
 
+    # Measured CPU / GPU Adam throughput (bytes/sec) from the hw_bench
+    # microbenchmarks. Replaces the hardcoded ``_CPU_ADAM_BYTES_PER_SEC``
+    # / ``_GPU_ADAM_BYTES_PER_SEC`` priors in ``cost/runtime.py``. 0.0
+    # means "unavailable" — the cost model falls back to a hardcoded
+    # prior and logs a warning. New in TRACE_VERSION=3.
+    cpu_adam_bytes_per_sec: float = 0.0
+    gpu_adam_bytes_per_sec: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)
@@ -201,6 +209,15 @@ class HardwareProfile:
     pcie_d2h_bps: float
     has_nvlink: bool                                  # informational; we never use NVLink paths
     zero3_shard: bool = False                         # True when M7 chunk-sharding is active
+    # Measured Adam throughput (bytes/sec). 0.0 means "unavailable" —
+    # ``cost/runtime.estimate_runtime`` falls back to a hardcoded prior in
+    # that case. Populated by
+    # :func:`axolotl.integrations.protrain.profiler.hw_bench.measure_cpu_adam`
+    # and ``measure_gpu_adam`` after :func:`run_trace` completes, then
+    # plumbed into the HardwareProfile the searcher consumes. New in
+    # TRACE_VERSION=3 (see profiler/cache.py).
+    cpu_adam_bytes_per_sec: float = 0.0
+    gpu_adam_bytes_per_sec: float = 0.0
 
 
 # ---------------------------------------------------------------------------

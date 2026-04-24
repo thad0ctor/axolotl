@@ -22,6 +22,8 @@ from axolotl.integrations.protrain.types import (
 )
 
 from axolotl.integrations.protrain.profiler.hw_bench import (
+    measure_cpu_adam,
+    measure_gpu_adam,
     measure_nccl,
     measure_pcie,
 )
@@ -157,6 +159,42 @@ def run_trace(
     import torch
 
     device = torch.device(cfg.device)
+    cuda_available_for_bench = (
+        device.type == "cuda" and torch.cuda.is_available()
+    )
+
+    # Run the Adam microbenchmarks BEFORE installing the memory-delta
+    # tracker. The benchmarks allocate a ~100-200 MB synthetic param
+    # + optimizer state that is cleaned up before return, but the
+    # caching allocator retains some of it as reserved-but-free. By
+    # folding that into the ``tracker.mark_end`` baseline below, we
+    # avoid perturbing the intra/inter-op delta accounting that the
+    # cost model consumes for peak reconstruction.
+    try:
+        cpu_adam_bps = measure_cpu_adam()
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.warning("measure_cpu_adam failed (%s); recording 0.0", exc)
+        cpu_adam_bps = 0.0
+    try:
+        dev_idx_for_bench = device.index if device.index is not None else 0
+        gpu_adam_bps = (
+            measure_gpu_adam(dev_idx_for_bench) if cuda_available_for_bench else 0.0
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.warning("measure_gpu_adam failed (%s); recording 0.0", exc)
+        gpu_adam_bps = 0.0
+
+    # Sync after benches — but do NOT call empty_cache() here. Doing so
+    # would release reserved-but-free blocks that the caching allocator
+    # would later need to reallocate during the traced forward+backward,
+    # inflating the traced pass's peak memory vs. the post-trace
+    # "ground truth" run (which the reconstructed-peak test compares
+    # against). Letting the allocator reuse the reserved pool keeps
+    # the first-iter peak representative.
+    if cuda_available_for_bench:
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
     tracker = MemoryDeltaTracker(device)
     # Seed the tracker's baseline with the CURRENT allocated bytes so the
     # first op's inter-op delta measures only the transient allocated
@@ -379,12 +417,19 @@ def run_trace(
             op_latencies[op_id] = elapsed_ms / 1000.0
 
     # --- hardware microbenchmarks --------------------------------------
+    # PCIe is measured here (post-trace) rather than pre-trace because the
+    # copy engines are unaffected by the earlier Adam microbenchmarks and
+    # running PCIe post-trace matches the pre-v3 measurement ordering.
     try:
         dev_idx = device.index if device.index is not None else 0
         pcie_h2d_bps, pcie_d2h_bps = measure_pcie(dev_idx)
     except Exception as exc:  # pragma: no cover - defensive, GPU-only
         LOG.warning("measure_pcie failed (%s); recording zeros", exc)
         pcie_h2d_bps = pcie_d2h_bps = 0.0
+
+    # Adam microbenchmark results (cpu_adam_bps, gpu_adam_bps) were
+    # populated above, BEFORE the tracker baseline was captured, so
+    # their allocator footprint does not perturb op-delta accounting.
 
     nccl_table = measure_nccl(world_size=1)  # M1 is single-rank.
 
@@ -404,6 +449,8 @@ def run_trace(
         sku=_sku(device),
         world=1,
         op_latencies=op_latencies,
+        cpu_adam_bytes_per_sec=cpu_adam_bps,
+        gpu_adam_bytes_per_sec=gpu_adam_bps,
     )
 
 

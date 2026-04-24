@@ -15,6 +15,8 @@ from axolotl.integrations.protrain.profiler.cache import (
     save_cached_trace,
 )
 from axolotl.integrations.protrain.profiler.hw_bench import (
+    measure_cpu_adam,
+    measure_gpu_adam,
     measure_nccl,
     measure_pcie,
 )
@@ -50,6 +52,8 @@ __all__ = [
     "reconstruct_peak_bytes",
     "measure_pcie",
     "measure_nccl",
+    "measure_cpu_adam",
+    "measure_gpu_adam",
     "load_cached_trace",
     "save_cached_trace",
     "ProfilerCacheKey",
