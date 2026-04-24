@@ -26,6 +26,7 @@ def _get_incompatible_processor_classes() -> tuple[type, ...]:
     ):
         try:
             import importlib
+
             mod = importlib.import_module(mod_path)
             cls = getattr(mod, name, None)
             if cls is not None:
@@ -125,9 +126,7 @@ def build_image_token_spec(
         known_special_tokens |= set(tokenizer.get_added_vocab().keys())
     except Exception:
         pass
-    known_special_tokens |= set(
-        getattr(tokenizer, "all_special_tokens", None) or []
-    )
+    known_special_tokens |= set(getattr(tokenizer, "all_special_tokens", None) or [])
     known_special_tokens |= set(
         getattr(tokenizer, "additional_special_tokens", None) or []
     )
@@ -209,8 +208,7 @@ def check_processor_compatibility(processor: ProcessorMixin) -> None:
         reason = _INCOMPATIBLE_PROCESSOR_REASONS.get(base_cls.__name__)
         if reason is not None:
             raise ValueError(
-                f"Multimodal CPT is not supported for {base_cls.__name__}: "
-                f"{reason}"
+                f"Multimodal CPT is not supported for {base_cls.__name__}: " f"{reason}"
             )
 
 
@@ -263,9 +261,7 @@ class MultimodalPretrainTokenizationStrategy(PretrainTokenizationStrategy):
         # Count placeholder occurrences by tokenizing once and counting token
         # ids — safer than `text.count(...)` which has prefix-match bugs
         # (e.g. "<image>" substring-matching inside "<image_soft_token>").
-        probe_ids = self.tokenizer(
-            text, add_special_tokens=False
-        )["input_ids"]
+        probe_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
         n_placeholders = sum(1 for t in probe_ids if t == self.image_token_id)
         if n_placeholders != len(images):
             raise ValueError(

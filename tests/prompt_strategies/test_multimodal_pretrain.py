@@ -11,9 +11,9 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from axolotl.prompt_strategies.multimodal_pretrain import (
+    _INCOMPATIBLE_PROCESSOR_REASONS,
     ImageTokenSpec,
     MultimodalPretrainTokenizationStrategy,
-    _INCOMPATIBLE_PROCESSOR_REASONS,
     build_image_token_spec,
     check_processor_compatibility,
     load,
@@ -88,12 +88,15 @@ def test_check_processor_compatibility_rejects_incompatible(cls_name):
 def test_check_processor_compatibility_rejects_subclass():
     """Reviewer finding: must catch user-defined subclasses via MRO, not
     just exact class-name match."""
+
     class BaseMllama:
         pass
+
     BaseMllama.__name__ = "MllamaProcessor"
 
     class CustomUserProcessor(BaseMllama):
         pass
+
     CustomUserProcessor.__name__ = "CustomUserProcessor"
 
     with pytest.raises(ValueError, match="MllamaProcessor"):
@@ -117,8 +120,8 @@ def _make_strategy(
     return MultimodalPretrainTokenizationStrategy(
         PretrainTokenizer(),
         smolvlm_processor.tokenizer,
-        False,         # train_on_inputs
-        2048,          # sequence_len
+        False,  # train_on_inputs
+        2048,  # sequence_len
         text_column=text_column,
         image_column=image_column,
         image_base_dir=None,
@@ -130,10 +133,12 @@ def _make_strategy(
 
 def test_strategy_preserves_images_and_text(smolvlm_processor, tiny_image_path):
     strat = _make_strategy(smolvlm_processor)
-    out = strat.tokenize_prompt({
-        "text": "<image>\nsample transcription text",
-        "images": [str(tiny_image_path)],
-    })
+    out = strat.tokenize_prompt(
+        {
+            "text": "<image>\nsample transcription text",
+            "images": [str(tiny_image_path)],
+        }
+    )
     assert "input_ids" in out
     assert "images" in out and "_mm_text" in out
     # one chunk -> parallel lists of length 1
@@ -144,23 +149,29 @@ def test_strategy_preserves_images_and_text(smolvlm_processor, tiny_image_path):
     assert out["_mm_text"][0].startswith("<image>")
 
 
-def test_strategy_rejects_placeholder_count_mismatch(smolvlm_processor, tiny_image_path):
+def test_strategy_rejects_placeholder_count_mismatch(
+    smolvlm_processor, tiny_image_path
+):
     strat = _make_strategy(smolvlm_processor)
     # 2 placeholders, 1 image -> must raise
     with pytest.raises(ValueError, match="occurrence"):
-        strat.tokenize_prompt({
-            "text": "<image><image>\ntwo placeholders one image",
-            "images": [str(tiny_image_path)],
-        })
+        strat.tokenize_prompt(
+            {
+                "text": "<image><image>\ntwo placeholders one image",
+                "images": [str(tiny_image_path)],
+            }
+        )
 
 
 def test_strategy_rejects_non_list_image_column(smolvlm_processor, tiny_image_path):
     strat = _make_strategy(smolvlm_processor)
     with pytest.raises(ValueError, match="list"):
-        strat.tokenize_prompt({
-            "text": "<image>\nbad image field",
-            "images": str(tiny_image_path),  # should be a list
-        })
+        strat.tokenize_prompt(
+            {
+                "text": "<image>\nbad image field",
+                "images": str(tiny_image_path),  # should be a list
+            }
+        )
 
 
 # ---- load() factory --------------------------------------------------------

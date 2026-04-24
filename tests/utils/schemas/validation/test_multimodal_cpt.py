@@ -10,20 +10,23 @@ from axolotl.utils.dict import DictDefault
 
 def _mm_cpt_cfg(min_base_cfg, **overrides) -> DictDefault:
     base = DictDefault(
-        **(min_base_cfg | {
-            "datasets": None,
-            "pretraining_dataset": [
-                {
-                    "path": "some/ds",
-                    "type": "multimodal_pretrain",
-                    "image_column": "images",
-                }
-            ],
-            "streaming": True,
-            "max_steps": 10,
-            "processor_type": "AutoProcessor",
-            "sequence_len": 2048,
-        })
+        **(
+            min_base_cfg
+            | {
+                "datasets": None,
+                "pretraining_dataset": [
+                    {
+                        "path": "some/ds",
+                        "type": "multimodal_pretrain",
+                        "image_column": "images",
+                    }
+                ],
+                "streaming": True,
+                "max_steps": 10,
+                "processor_type": "AutoProcessor",
+                "sequence_len": 2048,
+            }
+        )
     )
     return base | DictDefault(overrides)
 
@@ -67,14 +70,15 @@ class TestMultimodalCPTGates:
     def test_non_mm_pretraining_dataset_unaffected(self, min_base_cfg):
         """Pure text pretraining_dataset should remain valid without the new fields."""
         cfg = DictDefault(
-            **(min_base_cfg | {
-                "datasets": None,
-                "pretraining_dataset": [
-                    {"path": "some/ds", "type": "pretrain"}
-                ],
-                "streaming": True,
-                "max_steps": 10,
-                "sequence_len": 2048,
-            })
+            **(
+                min_base_cfg
+                | {
+                    "datasets": None,
+                    "pretraining_dataset": [{"path": "some/ds", "type": "pretrain"}],
+                    "streaming": True,
+                    "max_steps": 10,
+                    "sequence_len": 2048,
+                }
+            )
         )
         validate_config(cfg)  # must not raise

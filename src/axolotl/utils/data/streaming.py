@@ -2,7 +2,7 @@
 
 import functools
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from datasets import Dataset
@@ -296,11 +296,18 @@ def wrap_streaming_dataset(
         # loading function for non-packed streaming datasets. Refer to
         # _prepare_streaming_datasets in sft.py for that code path.
         ds_first = cfg.pretraining_dataset[0] if cfg.pretraining_dataset else {}
-        text_column = getattr(ds_first, "text_column", "text") or "text"
-        ds_type = (getattr(ds_first, "type", None) or "").strip()
-        is_mm_cpt = (
-            ds_type == "multimodal_pretrain"
-            or bool(getattr(ds_first, "multimodal", False))
+        # Support both plain-dict and object-shaped config entries (pydantic
+        # models, DictDefault). A pure `getattr` path silently returns the
+        # default on a plain dict, which would miss `type: multimodal_pretrain`.
+        get_ds_value = (
+            ds_first.get
+            if isinstance(ds_first, dict)
+            else lambda key, default=None: getattr(ds_first, key, default)
+        )
+        text_column = get_ds_value("text_column", "text") or "text"
+        ds_type = (get_ds_value("type", None) or "").strip()
+        is_mm_cpt = ds_type == "multimodal_pretrain" or bool(
+            get_ds_value("multimodal", False)
         )
 
         if is_mm_cpt:
@@ -318,11 +325,9 @@ def wrap_streaming_dataset(
             check_processor_compatibility(processor)
             spec = build_image_token_spec(
                 processor,
-                override=getattr(ds_first, "image_token", None),
+                override=get_ds_value("image_token", None),
             )
-            image_column = (
-                getattr(ds_first, "image_column", None) or "images"
-            )
+            image_column = get_ds_value("image_column", None) or "images"
             LOG.info(
                 f"multimodal streaming CPT: placeholder={spec.image_token!r} "
                 f"(id={spec.image_token_id})"

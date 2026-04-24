@@ -67,6 +67,14 @@ def _is_multimodal_cpt(cfg) -> bool:
     return (ds_type == "multimodal_pretrain") or bool(mm_flag)
 
 
+def _mm_cpt_get(pt_cfg, key, default=None):
+    """Read a field from a pretraining_dataset entry that may be dict, pydantic
+    model, or DictDefault."""
+    if isinstance(pt_cfg, dict):
+        return pt_cfg.get(key, default)
+    return getattr(pt_cfg, key, default)
+
+
 class HFCausalTrainerBuilder(TrainerBuilderBase):
     """
     Build the HuggingFace training args/trainer for causal models and reward modeling
@@ -468,6 +476,33 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
 
         return trainer
 
+    def _build_mm_pretrain_collator(self, pad_to_multiple_of=None):
+        """Construct the multimodal CPT collator with pt_cfg-derived spec
+        and image_base_dir. Shared between the pretraining and non-pretraining
+        dispatch branches in `build_collator`."""
+        from axolotl.prompt_strategies.multimodal_pretrain import (
+            build_image_token_spec,
+        )
+
+        pt_cfg = (
+            self.cfg.pretraining_dataset[0]
+            if self.cfg.pretraining_dataset
+            else {}
+        )
+        spec = build_image_token_spec(
+            self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
+        )
+        collator_kwargs = {
+            "tokenizer": self.tokenizer,
+            "processor": self.processor,
+            "image_token_spec": spec,
+            "image_base_dir": _mm_cpt_get(pt_cfg, "image_base_dir"),
+            "max_length": self.cfg.sequence_len,
+        }
+        if pad_to_multiple_of is not None:
+            collator_kwargs["pad_to_multiple_of"] = pad_to_multiple_of
+        return MultiModalPretrainDataCollator(**collator_kwargs)
+
     def build_collator(
         self,
         training_args,  # type: "AxolotlTrainingArguments"  # type: ignore
@@ -487,40 +522,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 and self.processor
                 and _is_multimodal_cpt(self.cfg)
             ):
-                from axolotl.prompt_strategies.multimodal_pretrain import (
-                    build_image_token_spec,
-                )
-
-                pt_cfg = self.cfg.pretraining_dataset[0]
-                image_token_override = (
-                    getattr(pt_cfg, "image_token", None)
-                    if hasattr(pt_cfg, "image_token")
-                    else pt_cfg.get("image_token")
-                    if isinstance(pt_cfg, dict)
-                    else None
-                )
-                image_base_dir = (
-                    getattr(pt_cfg, "image_base_dir", None)
-                    if hasattr(pt_cfg, "image_base_dir")
-                    else pt_cfg.get("image_base_dir")
-                    if isinstance(pt_cfg, dict)
-                    else None
-                )
-                spec = build_image_token_spec(
-                    self.processor, override=image_token_override
-                )
-                # Mirror the kwargs `DataCollatorForSeq2Seq` would have had so
-                # the caller's padding settings still apply.
-                mm_kwargs = {
-                    "pad_to_multiple_of": kwargs.get("pad_to_multiple_of"),
-                }
-                return MultiModalPretrainDataCollator(
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    image_token_spec=spec,
-                    image_base_dir=image_base_dir,
-                    max_length=self.cfg.sequence_len,
-                    **{k: v for k, v in mm_kwargs.items() if v is not None},
+                return self._build_mm_pretrain_collator(
+                    pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
                 )
             if (
                 self.cfg.pretraining_sample_concatenation is False
@@ -589,38 +592,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 and self.processor
                 and _is_multimodal_cpt(self.cfg)
             ):
-                from axolotl.prompt_strategies.multimodal_pretrain import (
-                    build_image_token_spec,
+                return self._build_mm_pretrain_collator(
+                    pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
                 )
-
-                pt_cfg = (
-                    self.cfg.pretraining_dataset[0]
-                    if self.cfg.pretraining_dataset
-                    else {}
-                )
-                image_token_override = (
-                    getattr(pt_cfg, "image_token", None)
-                    if hasattr(pt_cfg, "image_token")
-                    else pt_cfg.get("image_token")
-                    if isinstance(pt_cfg, dict)
-                    else None
-                )
-                image_base_dir = (
-                    getattr(pt_cfg, "image_base_dir", None)
-                    if hasattr(pt_cfg, "image_base_dir")
-                    else pt_cfg.get("image_base_dir")
-                    if isinstance(pt_cfg, dict)
-                    else None
-                )
-                spec = build_image_token_spec(
-                    self.processor, override=image_token_override
-                )
-                collator = MultiModalPretrainDataCollator
-                kwargs["processor"] = self.processor
-                kwargs["image_token_spec"] = spec
-                kwargs["image_base_dir"] = image_base_dir
-                kwargs["max_length"] = self.cfg.sequence_len
-            elif self.cfg.processor_type and self.processor:
+            if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
                 kwargs["processing_strategy"] = get_processing_strategy(
                     self.processor,

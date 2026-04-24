@@ -62,9 +62,7 @@ def test_encode_preserves_images_and_text(smolvlm_processor, two_tiny_images):
     assert len(out["input_ids"]) == 2
     assert out["images"] == [[str(two_tiny_images[0])], [str(two_tiny_images[1])]]
     # EOS appended -> input_ids len equals attention_mask len and > text
-    for ids, mask in zip(
-        out["input_ids"], out["attention_mask"], strict=True
-    ):
+    for ids, mask in zip(out["input_ids"], out["attention_mask"], strict=True):
         assert len(ids) == len(mask) and len(ids) > 0
     # CPT: labels == input_ids pre-masking.
     for ids, lbls in zip(out["input_ids"], out["labels"], strict=True):
@@ -121,7 +119,10 @@ def test_collator_builds_batch_and_masks_labels(smolvlm_processor, two_tiny_imag
         image_token_id=spec.image_token_id,
     )
     rows = [
-        {k: encoded[k][i] for k in ("input_ids", "labels", "attention_mask", "images", "_mm_text")}
+        {
+            k: encoded[k][i]
+            for k in ("input_ids", "labels", "attention_mask", "images", "_mm_text")
+        }
         for i in range(2)
     ]
     collator = MultiModalPretrainDataCollator(
@@ -136,9 +137,9 @@ def test_collator_builds_batch_and_masks_labels(smolvlm_processor, two_tiny_imag
     assert isinstance(batch["input_ids"], torch.Tensor)
     # Label masking check: no image-family ids remaining as valid labels.
     for tid in spec.image_family_token_ids:
-        assert int((batch["labels"] == tid).sum().item()) == 0, (
-            f"label masking left id={tid} in labels"
-        )
+        assert (
+            int((batch["labels"] == tid).sum().item()) == 0
+        ), f"label masking left id={tid} in labels"
     # Pad is also masked.
     pad_id = smolvlm_processor.tokenizer.pad_token_id
     if pad_id is not None:
@@ -198,10 +199,15 @@ def test_collator_rejects_remote_urls(smolvlm_processor):
         image_token_spec=spec,
     )
     for url in (
-        "http://example.com/a.png", "https://x/y.jpg", "file:///etc/passwd",
-        "ftp://x/y.png", "data:image/png;base64,xxx",
+        "http://example.com/a.png",
+        "https://x/y.jpg",
+        "file:///etc/passwd",
+        "ftp://x/y.png",
+        "data:image/png;base64,xxx",
         # Case-variant bypass attempts (round-3 finding)
-        "HTTP://evil.com/x.png", "Https://x/y.jpg", "FILE:///etc/passwd",
+        "HTTP://evil.com/x.png",
+        "Https://x/y.jpg",
+        "FILE:///etc/passwd",
         "DATA:image/png;base64,xxx",
     ):
         with pytest.raises(RuntimeError) as exc:
@@ -232,10 +238,12 @@ def test_collator_rejects_non_string_image_entries(smolvlm_processor, two_tiny_i
         processor=smolvlm_processor,
         image_token_spec=spec,
     )
-    rows = [{
-        "_mm_text": f"{spec.image_token}\nrow",
-        "images": [None],  # type: ignore[list-item]
-    }]
+    rows = [
+        {
+            "_mm_text": f"{spec.image_token}\nrow",
+            "images": [None],  # type: ignore[list-item]
+        }
+    ]
     with pytest.raises(TypeError, match="path must be str"):
         collator.torch_call(rows)
 
@@ -249,10 +257,12 @@ def test_collator_rejects_bytes_mm_text(smolvlm_processor, two_tiny_images):
         processor=smolvlm_processor,
         image_token_spec=spec,
     )
-    rows = [{
-        "_mm_text": f"{spec.image_token}\nrow".encode(),
-        "images": [str(two_tiny_images[0])],
-    }]
+    rows = [
+        {
+            "_mm_text": f"{spec.image_token}\nrow".encode(),
+            "images": [str(two_tiny_images[0])],
+        }
+    ]
     with pytest.raises(TypeError, match="`_mm_text` must be str"):
         collator.torch_call(rows)
 

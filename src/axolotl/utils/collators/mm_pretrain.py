@@ -59,9 +59,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
 
     def __post_init__(self) -> None:
         check_processor_compatibility(self.processor)
-        self._image_family_token_ids = set(
-            self.image_token_spec.image_family_token_ids
-        )
+        self._image_family_token_ids = set(self.image_token_spec.image_family_token_ids)
         if self.image_base_dir is not None:
             self._base_dir_real = os.path.realpath(self.image_base_dir)
 
@@ -70,9 +68,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
     def _resolve_image_path(self, p: str) -> str:
         """Canonicalize path and enforce `image_base_dir` containment if set."""
         if not isinstance(p, str):
-            raise ValueError(
-                f"Image path must be str, got {type(p).__name__}."
-            )
+            raise ValueError(f"Image path must be str, got {type(p).__name__}.")
         # Embedded NUL bytes are a classic filesystem-trick vector; most
         # syscalls stop at the NUL but some libc/tools don't.
         if "\x00" in p:
@@ -237,7 +233,9 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 # corrupt alignment on LLaVA/Qwen families).
                 LOG.warning(
                     "Row %d: %d/%d images failed to load; dropping row.",
-                    i, len(raw_paths) - len(loaded), len(raw_paths),
+                    i,
+                    len(raw_paths) - len(loaded),
+                    len(raw_paths),
                 )
                 texts.pop()
                 continue
@@ -280,8 +278,10 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             for i, (t, imgs) in enumerate(zip(texts, images, strict=True)):
                 try:
                     self.processor(
-                        text=[t], images=[imgs],
-                        return_tensors=self.return_tensors, padding=self.padding,
+                        text=[t],
+                        images=[imgs],
+                        return_tensors=self.return_tensors,
+                        padding=self.padding,
                     )
                 except Exception as retry_exc:
                     if isinstance(retry_exc, type(exc)) or isinstance(
@@ -315,7 +315,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 "Batch input_ids length %d exceeds configured sequence_len %d "
                 "(image placeholder expansion). Reduce max_images_per_row or "
                 "raise sequence_len if this fires repeatedly.",
-                input_ids_len, self.max_length,
+                input_ids_len,
+                self.max_length,
             )
 
         # Build labels from the processor's (re-)tokenized input_ids.

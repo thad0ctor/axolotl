@@ -212,7 +212,7 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
             "multimodal": None,
             "image_column": "images",
             "image_base_dir": None,
-            "image_token": None,
+            "image_token": None,  # nosec
         }
     )
 
