@@ -113,6 +113,16 @@ class ProfilerTrace:
     sku: str                                          # torch.cuda.get_device_name() result
     world: int                                        # world_size at profile time
 
+    # Per-op wall-clock latencies (seconds), measured via torch.cuda.Event during
+    # the same single-iteration trace. Keys match ``op_order[i].op_id``. Populated
+    # for forward ops and for the synthetic ``<backward>`` op that stands in for
+    # the aggregate backward pass. Consumed by ``cost/runtime.py`` to replace the
+    # activation-bytes compute-rate proxy with measured per-block compute time.
+    # Optional: traces predating this field deserialize with an empty dict, in
+    # which case ``cost/runtime.py`` falls back to the roofline proxy and logs a
+    # warning. New in TRACE_VERSION=2 (see profiler/cache.py).
+    op_latencies: dict[OpId, float] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)

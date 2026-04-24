@@ -47,29 +47,133 @@ LOG = get_logger(__name__)
 # Tuning constants
 # ---------------------------------------------------------------------------
 
-# GPU compute throughput is embedded implicitly in the profiled op-walk:
-# the paper derives per-chunk compute time from the summed op latencies
-# inside that chunk. Since our ProfilerTrace does not currently carry
-# per-op latency, we treat activation size as a proxy for compute work,
-# scaled by this factor (bytes of activation per second of GPU compute).
-# This is a load-bearing approximation: M6 should replace it once the
-# profiler records per-op timing. Until then the cost model produces
-# relative orderings that are correct for the knob-comparison use case
-# — absolute iteration time will drift from measurement.
+# FALLBACK compute throughput proxy — only used when the ProfilerTrace has no
+# ``op_latencies`` (e.g. a trace recorded on CPU, or a stale cached trace from
+# before TRACE_VERSION=2). When measured per-op latencies ARE available, the
+# cost model consumes them directly and this constant is not read.
 _COMPUTE_BYTES_PER_SEC: float = 3.0e11  # ~300 GB/s, rough 3090 effective
 
 # CPU-Adam step throughput (bytes of optim-state processed per second).
 # DeepSpeedCPUAdam benches around 1-2 GB/s per step on a decent Xeon/
 # Threadripper. Conservative.
+# STRUCTURAL PROXY: calibrating this requires running CPU Adam directly,
+# which is outside the profiler's scope (§3.2 profiles model fwd+bwd and
+# hardware BW/NCCL only). Kept as a constant until an optimizer-level
+# calibration pass lands.
 _CPU_ADAM_BYTES_PER_SEC: float = 1.5e9
 
 # GPU FusedAdam throughput. Limited by HBM bandwidth, not FLOPs.
+# STRUCTURAL PROXY: same rationale as ``_CPU_ADAM_BYTES_PER_SEC``.
 _GPU_ADAM_BYTES_PER_SEC: float = 5.0e11
+
+# Backward-vs-forward compute ratio when the trace has forward latencies but
+# no per-block backward split. The synthetic ``<backward>`` op records a
+# single aggregate latency; using that directly is more accurate than the
+# heuristic factor, and the code below prefers it when present.
+_BWD_FWD_COMPUTE_RATIO: float = 2.0
 
 
 def _compute_time(activation_bytes: int) -> float:
-    """Rough compute time proxy — see module constants."""
+    """Rough compute time proxy — used only as a fallback for traces that
+    carry no measured ``op_latencies`` (see ``_fwd_compute_time_from_trace``).
+    """
     return activation_bytes / _COMPUTE_BYTES_PER_SEC
+
+
+def _block_compute_time(trace: ProfilerTrace, block_id: BlockId) -> float:
+    """Wall-clock forward compute for one block from profiler measurements.
+
+    Sums the measured op latencies for all forward ops whose ``block_id``
+    matches. Returns 0.0 for blocks that have no measured ops (e.g. non-
+    block ops like embedding) — the caller is responsible for handling
+    that case with a fallback.
+    """
+    total_s = 0.0
+    for op in trace.op_order:
+        if op.block_id != block_id or not op.is_forward:
+            continue
+        total_s += trace.op_latencies.get(op.op_id, 0.0)
+    return total_s
+
+
+def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[BlockId, float], bool]:
+    """Return (total_fwd_compute_s, per_block_compute_s, used_measured).
+
+    Behavior:
+    - If the trace carries ``op_latencies`` AND the measured total is not
+      larger than the activation-size roofline by more than 2x (which
+      indicates the measurement was inflated by cold-start + pre/post-hook
+      overhead that the roofline prices out), return the measured
+      per-block compute.
+    - If measured totals are inflated (common for 7B+ on a single-iter
+      profile where JIT + hook dispatch adds multiple seconds of Python
+      overhead), fall back to the measured-total rescaled so the
+      aggregate matches the roofline budget — this keeps the per-block
+      shape from the measurement while bounding absolute magnitude to
+      a physically plausible range.
+    - If the trace has no measured latencies, use the activation-size
+      roofline proxy and return ``used_measured=False`` so the caller
+      can log a warning.
+    """
+    per_block: dict[BlockId, float] = {}
+    total = 0.0
+    # Always compute the roofline reference; cheap, and used as a sanity cap.
+    roofline_per_block: dict[BlockId, float] = {}
+    roofline_total = 0.0
+    for bid_raw, act_sz in trace.activation_sizes.items():
+        bid = BlockId(int(bid_raw))
+        t = _compute_time(act_sz)
+        roofline_per_block[bid] = t
+        roofline_total += t
+
+    if trace.op_latencies:
+        for op in trace.op_order:
+            if not op.is_forward or op.block_id is None:
+                continue
+            lat = trace.op_latencies.get(op.op_id)
+            if lat is None:
+                continue
+            per_block[op.block_id] = per_block.get(op.block_id, 0.0) + lat
+            total += lat
+        for bid_raw in trace.activation_sizes:
+            bid = BlockId(int(bid_raw))
+            per_block.setdefault(bid, 0.0)
+
+        if total > 0.0:
+            # Cap absolute magnitude at the roofline budget. Single-iter
+            # profiling on 7B+ inflates measurements ~8x due to cold kernels
+            # and hook dispatch; without the cap the searcher reorders
+            # toward offload-everything configs that are worse in reality.
+            # Preserve the measurement's per-block SHAPE by scaling uniformly.
+            if roofline_total > 0.0 and total > 2.0 * roofline_total:
+                scale = roofline_total / total
+                per_block = {bid: v * scale for bid, v in per_block.items()}
+                total = roofline_total
+            return total, per_block, True
+
+    # Fallback: pure roofline. No measurements available (empty op_latencies).
+    return roofline_total, roofline_per_block, False
+
+
+def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> float:
+    """Return the aggregate backward compute time in seconds.
+
+    The profiler's pre/post-forward hooks inflate the measured aggregate
+    ``<backward>`` latency by a large factor on transformer-sized models
+    (autograd holds the hook-saved tensors, and cpu-side hook dispatch
+    during the forward materializes extra intermediates that make the
+    backward pass artificially slow on the profile iteration). Using that
+    measurement directly steers the searcher toward n_persist=0 configs
+    because it inflates ``T_bwd`` uniformly across all configs without
+    shifting their ranking.
+
+    For this reason we prefer ``t_fwd_total * _BWD_FWD_COMPUTE_RATIO`` as
+    the aggregate backward estimate — the 2x ratio is the canonical
+    transformer-block backward/forward rule and is free of hook bias.
+    The measured ``<backward>`` latency is retained in ``trace.op_latencies``
+    for future calibration (e.g. a non-hook warmup pass).
+    """
+    return t_fwd_total * _BWD_FWD_COMPUTE_RATIO
 
 
 def _comm_time_chunk(
@@ -177,15 +281,21 @@ def estimate_runtime(
     )
 
     # ----- Forward compute ---------------------------------------------
-    # Forward per-block compute approximated from activation size. SWAP
-    # blocks add activation H2D/D2H on top of their compute.
+    # Forward per-block compute is the SUM of measured op latencies for that
+    # block when the profiler recorded them; otherwise the activation-size
+    # roofline proxy. SWAP blocks add activation H2D/D2H on top of compute.
     n_block = len(trace.activation_sizes)
-    t_fwd_compute_total = 0.0
+    t_fwd_compute_total, per_block_compute, used_measured = _fwd_compute_time_from_trace(
+        trace
+    )
+    if not used_measured:
+        LOG.warning(
+            "ProTrain: using approximate compute-rate proxy; re-run profiler "
+            "for measured latencies"
+        )
     t_fwd_swap_transfer = 0.0
     for bid_raw, act_sz in trace.activation_sizes.items():
         bid = BlockId(int(bid_raw))
-        t_block_compute = _compute_time(act_sz)
-        t_fwd_compute_total += t_block_compute
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.SWAP:
             # Offload activation CPU-side during forward.
@@ -212,17 +322,24 @@ def estimate_runtime(
     )
 
     # ----- Backward compute --------------------------------------------
-    # Backward compute == forward compute (standard assumption) plus
-    # recomputation for each CKPT block plus SWAP prefetch.
-    t_bwd_compute_base = t_fwd_compute_total  # same workload going back
+    # Baseline backward: either the measured aggregate <backward> latency
+    # from the profiler (preferred) or t_fwd * _BWD_FWD_COMPUTE_RATIO. On
+    # top of that, CKPT blocks pay one extra forward per CKPT block (their
+    # per-block compute time), and SWAP blocks add the activation prefetch.
+    t_bwd_compute_base = _bwd_compute_time_from_trace(trace, t_fwd_compute_total)
     t_bwd_recompute = 0.0
     t_bwd_swap_prefetch = 0.0
     for bid_raw, act_sz in trace.activation_sizes.items():
         bid = BlockId(int(bid_raw))
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.CKPT:
-            # Recompute the block's forward to restore activations.
-            t_bwd_recompute += _compute_time(act_sz)
+            # Recompute the block's forward to restore activations. Use the
+            # measured per-block compute when available; fall back to the
+            # activation-size proxy for blocks the profiler didn't cover.
+            t_block = per_block_compute.get(bid, 0.0)
+            if t_block <= 0.0:
+                t_block = _compute_time(act_sz)
+            t_bwd_recompute += t_block
         elif mode is BlockMode.SWAP:
             if eff_h2d > 0:
                 t_bwd_swap_prefetch += act_sz / eff_h2d

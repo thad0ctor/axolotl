@@ -61,6 +61,13 @@ class _OpFrame:
     is_forward: bool
     allocated_before: int
     prev_end_before: int
+    # Pair of torch.cuda.Events recorded at pre-/post-forward. ``elapsed_time``
+    # is read lazily after the final ``torch.cuda.synchronize`` at the end of
+    # ``run_trace`` so the hook path does not stall on a per-op sync.
+    # Typed as ``object`` here to keep this module import-light (torch is a
+    # TYPE_CHECKING-only import at the top of the file).
+    pre_event: object = None
+    post_event: object = None
 
 
 def _infer_block_id(module_path: str) -> BlockId | None:
@@ -166,12 +173,20 @@ def run_trace(
     inter_deltas: dict[OpId, int] = {}
     activation_sizes: dict[BlockId, int] = {}
 
+    # Eager-record / lazy-read cuda.Event pairs per op. Populated by the
+    # post-forward hook after recording the "post" event; resolved into
+    # ``op_latencies`` (seconds) after ``torch.cuda.synchronize()`` so that
+    # ``Event.elapsed_time`` reads never stall the hook path.
+    pending_events: list[tuple[OpId, object, object]] = []
+
     # Stack of in-flight _OpFrames keyed by the calling module id. Submodules
     # fire pre-hooks before their parent's post-hook; a dict keyed on id()
     # matches that LIFO nesting without needing a real stack type.
     live_frames: dict[int, _OpFrame] = {}
 
     next_op_id = 0
+
+    cuda_available = device.type == "cuda" and torch.cuda.is_available()
 
     def _module_path(m: "nn.Module") -> str:
         """Dotted path of ``m`` inside ``model`` (root -> '')."""
@@ -187,6 +202,10 @@ def run_trace(
         tracker.reset()
         snap = tracker.snapshot()
         path = _module_path(module)
+        pre_event = None
+        if cuda_available:
+            pre_event = torch.cuda.Event(enable_timing=True)
+            pre_event.record()
         live_frames[id(module)] = _OpFrame(
             op_id=op_id,
             module_path=path,
@@ -196,6 +215,7 @@ def run_trace(
             is_forward=True,
             allocated_before=snap.allocated_bytes,
             prev_end_before=tracker.last_end_bytes,
+            pre_event=pre_event,
         )
 
     def _post_forward(module: "nn.Module", inputs, output):
@@ -206,6 +226,11 @@ def run_trace(
         intra = intra_op_delta(frame.allocated_before, snap.peak_allocated_bytes)
         inter = inter_op_delta(frame.prev_end_before, snap.peak_allocated_bytes)
         tracker.mark_end(snap.allocated_bytes)
+
+        if cuda_available and frame.pre_event is not None:
+            post_event = torch.cuda.Event(enable_timing=True)
+            post_event.record()
+            pending_events.append((frame.op_id, frame.pre_event, post_event))
 
         op_records.append(
             OpRecord(
@@ -243,6 +268,33 @@ def run_trace(
                 stack.extend(item.values())
         return total
 
+    # --- warmup passes (no hooks) to JIT-compile kernels ---------------
+    # Without warmup, the ``op_latencies`` captured in the traced pass
+    # below measure COLD-start kernel times (JIT compile + allocator
+    # warm-up), which can be 10x higher than steady-state. Running a
+    # couple of un-timed forward+backward passes first brings kernels
+    # into the cache so the traced pass reflects steady-state per-op
+    # cost. Two warmups land comfortably inside the 3-6s profiling
+    # budget §3.2 quotes for 7-20B models and closes most of the
+    # cold-vs-warm gap (the second hot iter is ~2x faster than the
+    # first, diminishing-returns after).
+    N_WARMUP = 2
+    if cuda_available:
+        for _i in range(N_WARMUP):
+            try:
+                torch.cuda.synchronize(device)
+                warm_out = model(**batch)
+                if cfg.include_backward:
+                    warm_loss = _extract_loss(warm_out)
+                    warm_loss.backward()
+                    model.zero_grad(set_to_none=True)
+                del warm_out
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+            except Exception as exc:  # pragma: no cover - defensive
+                LOG.debug("profiler warmup pass failed (%s); continuing cold", exc)
+                break
+
     # --- install hooks on every nn.Module (leaves + composites) --------
     handles: list[Any] = []
     for sub in model.modules():
@@ -277,7 +329,15 @@ def run_trace(
                 tracker.reset()
                 before = tracker.snapshot()
                 prev_end = tracker.last_end_bytes
+                bwd_pre_event = None
+                if cuda_available:
+                    bwd_pre_event = torch.cuda.Event(enable_timing=True)
+                    bwd_pre_event.record()
                 loss.backward()
+                if cuda_available and bwd_pre_event is not None:
+                    bwd_post_event = torch.cuda.Event(enable_timing=True)
+                    bwd_post_event.record()
+                    pending_events.append((bwd_op_id, bwd_pre_event, bwd_post_event))
                 snap = tracker.snapshot()
                 intra_deltas[bwd_op_id] = intra_op_delta(
                     before.allocated_bytes, snap.peak_allocated_bytes
@@ -300,6 +360,23 @@ def run_trace(
     finally:
         for h in handles:
             h.remove()
+
+    # --- resolve pending events into op_latencies (seconds) -------------
+    # Eager-record / lazy-read: all Events were recorded during the hook
+    # path; ``elapsed_time`` is only valid after both events complete,
+    # which the sync above guarantees. Reading now avoids per-op stalls.
+    op_latencies: dict[OpId, float] = {}
+    if cuda_available:
+        for op_id, pre_ev, post_ev in pending_events:
+            try:
+                elapsed_ms = pre_ev.elapsed_time(post_ev)
+            except Exception as exc:  # pragma: no cover - defensive
+                LOG.debug("Event.elapsed_time failed for op %s: %s", op_id, exc)
+                continue
+            # Guard negative / absurd readings from clock skew.
+            if elapsed_ms < 0:
+                continue
+            op_latencies[op_id] = elapsed_ms / 1000.0
 
     # --- hardware microbenchmarks --------------------------------------
     try:
@@ -326,6 +403,7 @@ def run_trace(
         seq=cfg.seq_len,
         sku=_sku(device),
         world=1,
+        op_latencies=op_latencies,
     )
 
 
