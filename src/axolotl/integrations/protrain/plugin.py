@@ -163,6 +163,7 @@ class ProTrainPlugin(BasePlugin):
         n_checkpoint_override = getattr(
             cfg, "protrain_n_checkpoint_override", None
         )
+        zero3_shard = getattr(cfg, "protrain_zero3_shard", None)
 
         wrapped = protrain_model_wrapper(
             model,
@@ -177,6 +178,7 @@ class ProTrainPlugin(BasePlugin):
             n_buffer_override=n_buffer_override,
             n_swap_override=n_swap_override,
             n_checkpoint_override=n_checkpoint_override,
+            zero3_shard=zero3_shard,
         )
 
         # Stash on cfg so post_trainer_create (which only receives cfg +
@@ -340,6 +342,21 @@ class ProTrainPlugin(BasePlugin):
         )
         if is_ddp:
             wrapped.chunk_manager.skip_internal_grad_reduce = True
+            # DDP composition is incompatible with ZeRO-3 sharding —
+            # the sharded path's reduce_scatter would overlap with
+            # DDP's bucketed all_reduce. If sharding was auto-enabled
+            # in post_model_load (before the DDP wrap), warn loudly:
+            # at this point materialize_offload has already created
+            # per-rank shards, so we can't cleanly revert. The
+            # operator should have set ``protrain_zero3_shard: false``
+            # in the YAML when composing with DDP.
+            if getattr(wrapped.chunk_manager, "zero3_shard", False):
+                LOG.warning(
+                    "ProTrain: DDP composition detected but ZeRO-3 sharding "
+                    "is active on the chunk manager. The two paths are not "
+                    "composable (DDP + reduce_scatter would double-reduce). "
+                    "Set ``protrain_zero3_shard: false`` in YAML to silence."
+                )
             LOG.info(
                 "ProTrain: detected DDP composition; set "
                 "skip_internal_grad_reduce=True (DDP owns the cross-rank grad "
