@@ -206,6 +206,21 @@ The user can override via the `protrain_zero3_shard: true/false` field on `ProTr
 
 **Memory-safety contract.** GPU peak is unchanged by sharding (the gather reconstructs the full chunk on GPU via `all_gather_into_tensor` regardless), so `cost/memory.py::estimate_peak` ignores `HardwareProfile.zero3_shard`. The per-rank pinned CPU footprint DOES scale with sharding — `cost/memory.py::estimate_cpu_footprint` returns `(N_chunk - n_persist) * S_chunk / world_size` under sharding vs. the full product under replication. The searcher's GPU-capacity gate (the only feasibility filter today) is therefore sharding-agnostic; the explicit `zero3_shard` plumbing on `HardwareProfile` exists so future CPU-budget filters (if added) can consult it.
 
+#### Multi-GPU — Measured Throughput (4x 3090)
+
+Benchmark: fresh-init Llama-3B + LoRA r=8, bs=2 per rank, seq=256, fp16. 6 iterations per mode, 2 warm-up discarded, median of the remaining 4 is reported. GPUs 1, 4, 5, 7 on a PCIe-Gen3 test rig (no NVLink). Reproduce with `CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID python scripts/benchmark_multi_gpu.py`; full JSON at `scripts/multi_gpu_benchmark_results.json`.
+
+| Mode | World | Throughput (samples/s) | Scaling vs 1-GPU | Per-rank GPU peak | Per-rank CPU pinned |
+|---|---|---|---|---|---|
+| Single-rank (baseline) | 1 | 8.48 | 1.00x | 5.36 GB | 0.00 GB |
+| DDP (`force_all_persistent=True`) | 4 | 30.90 | 3.64x | 5.38 GB | 0.00 GB |
+| Replicated offload (`zero3_shard=False`) | 4 | 11.06 | 1.30x | 3.09 GB | 3.82 GB |
+| ZeRO-3 sharded (`zero3_shard=True`) | 4 | 5.93 | 0.70x | 3.09 GB | 0.96 GB |
+
+**How to pick a mode on a 3090 rig.** DDP is the clear throughput winner when the model + optimizer fit on one card (the 7B-LoRA / 3B-full regime) — outer-bucketed NCCL allreduce amortizes better than ProTrain's per-param grad sync and keeps every chunk GPU-resident. Reach for **replicated offload** only when one card can't hold the full model at peak; per-rank GPU drops ~42% (5.4 GB → 3.1 GB here) at a ~3x throughput cost vs DDP. **ZeRO-3 sharded** is only worth it when CPU RAM is the binding constraint — it cuts per-rank pinned CPU by almost exactly `1/world_size` (3.82 GB → 0.96 GB here, a 4.0x reduction, matching world_size) but pays an additional ~1.9x iteration-time penalty from the per-chunk `all_gather` + `reduce_scatter` collectives on PCIe Gen3. For 7B LoRA on 4x 3090 with NVMe or 128+ GB system RAM, stay on DDP with `force_all_persistent=True`.
+
+Note: ZeRO-3 throughput fell below the "within 15% of replicated" design target in this measurement — at Llama-3B / bs=2 / seq=256 the compute per chunk is too small to hide the two per-chunk collectives on PCIe. The ratio should improve at larger batch size / sequence length where compute dominates; see M7 profiler runs before broad deployment.
+
 ## Out of Scope
 
 Mirrors `plan.md`:
