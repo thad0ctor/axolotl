@@ -55,14 +55,18 @@ pinned bytes — the ``rank``-th slice of the full chunk's byte layout.
   FusedAdam step against the shard (CPU Adam is built over a single
   shard-flat ``nn.Parameter`` — see ``materialize_offload``).
 
-The sharded path assumes a homogeneous-dtype chunk (all params share
-``element_size``) and an element-size-aligned shard boundary; both hold
-for the typical fp16/bf16 transformer-block payload. The shard size is
-padded up so ``shard_bytes * world_size`` ≥ the chunk's actual byte
-footprint and the final rank's shard may contain trailing zeros (the
-boundary is a byte offset, not a param boundary — params straddling the
-boundary are partitioned across two ranks' shards and reassembled on
-gather by ``all_gather``).
+The sharded path handles BOTH homogeneous-dtype and mixed-dtype
+chunks. Each chunk is modelled as an ordered list of
+:class:`_DtypeRegion` entries — one per maximal-length contiguous
+same-dtype byte run — and each region is independently partitioned
+across ranks. Gather/reduce issues one collective per region: a
+homogeneous chunk lands exactly one collective (identical to the
+pre-followup behaviour), a Llama block with fp32 RMSNorm scales
+between fp16 linear layers lands 3. Shard boundaries are padded up to
+``lcm(region_element_size, world_size)`` so every ``.view(dtype)``
+after ``all_gather`` lands on a clean element boundary. Params
+straddling a shard boundary within a region are partitioned across
+two ranks' shards and reassembled on gather by ``all_gather``.
 
 Persistent chunks are FULLY REPLICATED even in sharded mode — they're
 small, live on GPU, and the FusedAdam step runs locally on each rank.
@@ -147,70 +151,140 @@ class _CpuParamSlot:
         self.element_size = element_size
 
 
-class _ChunkShardState:
-    """Per-chunk ZeRO-3 shard bookkeeping (populated when ``zero3_shard=True``).
+class _DtypeRegion:
+    """One contiguous same-dtype byte region inside a sharded chunk.
 
-    For each non-persistent chunk we keep:
+    A chunk with homogeneous dtype maps to a single region spanning the
+    whole chunk. A chunk with mixed dtypes (e.g. fp16 attention +
+    fp32 RMSNorm scales) maps to ONE REGION PER maximal-length
+    contiguous run of same-dtype params — a standard Llama fp16 block
+    with fp32 layernorms produces ~3 regions per block.
 
-    * ``cpu_shard_bytes`` — a pinned ``uint8`` tensor of exactly
-      ``shard_bytes`` bytes holding THIS RANK's slice of the full
-      chunk's byte layout. The slice covers the byte range
-      ``[rank * shard_bytes, (rank + 1) * shard_bytes)`` of the logical
-      full chunk (truncated by ``chunk_bytes`` for the trailing rank).
-    * ``cpu_shard_grad_bytes`` — a same-sized pinned ``uint8`` tensor
-      holding the ``reduce_scatter``'d grad slice once backward drains.
-    * ``chunk_bytes`` — the total byte footprint of the full chunk
-      (including alignment padding; matches the pre-M7 single-rank
-      cpu buffer size).
-    * ``shard_bytes`` — ``ceil(chunk_bytes / world_size)`` padded up to
-      a multiple of the dominant element size so shard boundaries land
-      on clean fp16/bf16/fp32 element alignments (avoids an unaligned
-      ``.view(dtype)`` after ``all_gather`` reconstructs the full
-      chunk). ``shard_bytes * world_size >= chunk_bytes``.
-    * ``primary_dtype`` / ``primary_element_size`` — the dominant dtype
-      of params in this chunk. When the chunk is homogeneous (all
-      params share one dtype) this is that dtype; when mixed we fall
-      back to ``torch.uint8`` and forgo the single-param CPU-Adam
-      shortcut (the chunk is kept fully-replicated in that case — see
-      ``materialize_offload``'s shard-feasibility check).
-    * ``shard_param`` — a single ``nn.Parameter`` whose ``.data`` views
-      ``cpu_shard_bytes`` reinterpreted as the primary dtype. This is
-      the param DeepSpeedCPUAdam is built over for the sharded path:
-      one flat param per chunk instead of one per original weight,
-      because each rank only owns a SLICE of the chunk's bytes and
-      those slices generally don't align to original-param boundaries.
-      The CPU Adam step updates ``shard_param.data`` in place; the
-      next ``gather`` re-uploads the updated shard + re-runs
-      ``all_gather`` to propagate the changes to every rank.
+    Each region is partitioned across ranks independently: rank ``r``
+    owns the byte range ``[r * shard_bytes, (r + 1) * shard_bytes)``
+    within the region, where ``shard_bytes = region_bytes_padded /
+    world_size`` and ``region_bytes_padded`` is rounded up to
+    ``lcm(element_size, world_size)`` so shard slices land on clean
+    element boundaries. The collective (``all_gather_into_tensor`` on
+    gather, ``reduce_scatter_tensor`` on reduce) is issued ONCE PER
+    REGION — correctness-first; a mixed-dtype chunk with 3 regions
+    issues 3 collectives per gather/reduce. This trades peak throughput
+    for correctness: the alternative (one collective coalescing regions
+    across dtypes) would need careful pack/unpack buffers at each rank
+    and was judged out-of-scope for the M7 follow-up.
+
+    Fields
+    ------
+    chunk_offset:
+        Byte offset of this region inside the chunk's padded byte
+        layout. All params in the region have ``byte_offset ∈
+        [chunk_offset, chunk_offset + region_bytes)``.
+    region_bytes:
+        Size of the region (before world_size padding). May be padded
+        per-param for element alignment but excludes any inter-region
+        alignment padding ``materialize_offload`` adds at the region's
+        tail.
+    region_bytes_padded:
+        ``region_bytes`` rounded up to ``lcm(element_size, world_size)``.
+        Equals ``shard_bytes * world_size``.
+    shard_bytes:
+        Bytes this rank owns within the region: ``region_bytes_padded
+        / world_size``.
+    dtype / element_size:
+        The common dtype of every param in the region and its
+        ``dtype.itemsize``.
+    cpu_shard_bytes / cpu_shard_grad_bytes:
+        Pinned ``uint8`` tensors holding THIS RANK's slice of the
+        region's data / grad. Both are ``shard_bytes`` long.
+    shard_param:
+        An ``nn.Parameter`` whose ``.data`` views ``cpu_shard_bytes``
+        as ``dtype``. The CPU FusedAdam adapter is built against this
+        param — one flat Adam step per region.
     """
 
     __slots__ = (
+        "chunk_offset",
+        "region_bytes",
+        "region_bytes_padded",
+        "shard_bytes",
+        "dtype",
+        "element_size",
         "cpu_shard_bytes",
         "cpu_shard_grad_bytes",
-        "chunk_bytes",
-        "shard_bytes",
-        "primary_dtype",
-        "primary_element_size",
         "shard_param",
     )
 
     def __init__(
         self,
+        chunk_offset: int,
+        region_bytes: int,
+        region_bytes_padded: int,
+        shard_bytes: int,
+        dtype: "torch.dtype",
+        element_size: int,
         cpu_shard_bytes: "torch.Tensor",
         cpu_shard_grad_bytes: "torch.Tensor",
-        chunk_bytes: int,
-        shard_bytes: int,
-        primary_dtype: "torch.dtype",
-        primary_element_size: int,
         shard_param: "torch.Tensor",
     ) -> None:
+        self.chunk_offset = chunk_offset
+        self.region_bytes = region_bytes
+        self.region_bytes_padded = region_bytes_padded
+        self.shard_bytes = shard_bytes
+        self.dtype = dtype
+        self.element_size = element_size
         self.cpu_shard_bytes = cpu_shard_bytes
         self.cpu_shard_grad_bytes = cpu_shard_grad_bytes
+        self.shard_param = shard_param
+
+
+class _ChunkShardState:
+    """Per-chunk ZeRO-3 shard bookkeeping (populated when ``zero3_shard=True``).
+
+    A chunk is modelled as an ordered list of :class:`_DtypeRegion`
+    entries, each describing one maximal-length contiguous same-dtype
+    byte span within the chunk. For homogeneous-dtype chunks this
+    reduces to a single region covering the whole chunk; for
+    mixed-dtype chunks we get one region per contiguous same-dtype
+    run. Each region is independently partitioned across ranks and
+    participates in its own ``all_gather_into_tensor`` /
+    ``reduce_scatter_tensor`` collective during gather/reduce.
+
+    ``chunk_bytes`` is the total byte footprint of the chunk including
+    any inter-region alignment padding (equal to the sum of the
+    regions' ``region_bytes_padded`` plus any leading/trailing pad).
+
+    ``shard_bytes`` is the SUM of per-region ``shard_bytes`` — the
+    total number of CPU-pinned bytes THIS RANK holds for the chunk.
+    Exposed primarily for tests and for the CPU-footprint assertion in
+    ``test_multi_gpu_7b.py::test_protrain_4gpu_zero3_sharding``.
+    """
+
+    __slots__ = (
+        "regions",
+        "chunk_bytes",
+        "shard_bytes",
+    )
+
+    def __init__(
+        self,
+        regions: "list[_DtypeRegion]",
+        chunk_bytes: int,
+        shard_bytes: int,
+    ) -> None:
+        self.regions = regions
         self.chunk_bytes = chunk_bytes
         self.shard_bytes = shard_bytes
-        self.primary_dtype = primary_dtype
-        self.primary_element_size = primary_element_size
-        self.shard_param = shard_param
+
+    @property
+    def is_sharded(self) -> bool:
+        """Whether this chunk is genuinely in the sharded path.
+
+        True whenever at least one region exists. Useful for test
+        assertions that the sharded path engaged (vs. silently
+        falling back to replicated mode, which would leave
+        ``_chunk_shards`` empty for the chunk).
+        """
+        return bool(self.regions)
 
 
 class ChunkManager:
@@ -481,29 +555,69 @@ class ChunkManager:
             if chunk_bytes == 0:
                 continue
 
-            # --- Step 1b: decide whether to shard this chunk ------------
-            # Sharding is only viable if we're running with
-            # ``zero3_shard=True`` AND the chunk's params share a single
-            # element size (so the shard boundary can be aligned). For
-            # mixed-dtype chunks (e.g. a trailing chunk holding both
-            # fp16 weights and fp32 RMSNorm scales) we fall back to the
-            # replicated path even when zero3_shard is on — this is
-            # rare enough on Llama-style models that the memory gain is
-            # negligible, and the alternative (padding each param to
-            # max_element_size) wastes more memory than sharding saves.
-            unique_esizes = {
-                esz for esz in element_sizes if esz > 0
-            }
-            unique_dtypes = {
-                self._params_by_id[pid].data.dtype
-                for pid, nbytes in zip(param_ids, per_param_bytes)
-                if nbytes > 0 and self._params_by_id.get(pid) is not None
-            }
-            chunk_is_shardable = (
-                self.zero3_shard
-                and len(unique_esizes) == 1
-                and len(unique_dtypes) == 1
-            )
+            # --- Step 1b: decide shardability + compute dtype regions ----
+            # When ``zero3_shard`` is on we always try to shard — even
+            # mixed-dtype chunks. The chunk is modelled as an ordered
+            # list of maximal-length contiguous same-dtype regions;
+            # each region is sharded independently (its own
+            # ``all_gather`` / ``reduce_scatter`` collective). For a
+            # homogeneous chunk this reduces to a single region
+            # spanning the whole chunk and behaves identically to the
+            # pre-M7-followup path.
+            #
+            # Region layout is derived from the per-param aligned
+            # offsets computed above: walk params in order, start a
+            # new region whenever the dtype changes (or the first
+            # non-empty param is seen). Empty / missing params do not
+            # split regions — they simply contribute nothing.
+            chunk_is_shardable = self.zero3_shard
+            dtype_regions: list[tuple] = []  # list of (dtype, esize, start_off, end_off)
+            if chunk_is_shardable:
+                cur_dtype = None
+                cur_esize = 0
+                cur_start = 0
+                cur_end = 0
+                for pid, nbytes, off, esz in zip(
+                    param_ids, per_param_bytes, aligned_offsets, element_sizes
+                ):
+                    if nbytes == 0 or esz == 0:
+                        continue
+                    param = self._params_by_id.get(pid)
+                    if param is None:
+                        continue
+                    dtype_here = param.data.dtype
+                    param_end = off + nbytes
+                    if cur_dtype is None:
+                        cur_dtype = dtype_here
+                        cur_esize = esz
+                        cur_start = off
+                        cur_end = param_end
+                    elif dtype_here == cur_dtype:
+                        # Extend the current region. If the per-param
+                        # aligned offset left a gap (can happen on
+                        # weird dtype sequences) the gap bytes remain
+                        # unused — the region's end is just the max
+                        # observed param_end.
+                        if param_end > cur_end:
+                            cur_end = param_end
+                        if off < cur_start:
+                            cur_start = off
+                    else:
+                        dtype_regions.append(
+                            (cur_dtype, cur_esize, cur_start, cur_end)
+                        )
+                        cur_dtype = dtype_here
+                        cur_esize = esz
+                        cur_start = off
+                        cur_end = param_end
+                if cur_dtype is not None:
+                    dtype_regions.append(
+                        (cur_dtype, cur_esize, cur_start, cur_end)
+                    )
+
+            # No chunk without any regions is shardable (empty chunk).
+            if chunk_is_shardable and not dtype_regions:
+                chunk_is_shardable = False
 
             # --- Step 2: one pinned CPU allocation per chunk ------------
             # We allocate fresh pinned memory rather than reusing the
@@ -514,39 +628,54 @@ class ChunkManager:
             # per-param alignment padding).
             #
             # In the sharded path this full-chunk buffer is allocated
-            # ONLY to perform the initial H2D→shard partition; after
-            # the per-rank shard is populated it is released. Each rank
-            # permanently holds only ``shard_bytes`` of pinned CPU
-            # storage per chunk.
+            # ONLY to perform the initial full-chunk → per-region
+            # partition; after every region's per-rank shard is
+            # populated it is released. Each rank permanently holds
+            # only ``sum(region.shard_bytes)`` of pinned CPU storage
+            # per chunk.
+            #
+            # Region padding strategy: the chunk's data layout (param
+            # byte offsets) is NEVER relocated — params see the same
+            # aligned-offsets they always did, both in the CPU copy
+            # and in the GPU pool buffer. Instead, each region's
+            # gather/reduce collective runs into/out of a TRANSIENT
+            # per-collective scratch buffer of
+            # ``region_bytes_padded`` bytes, then the valid
+            # ``region_bytes`` prefix is copied in/out of the
+            # pool-buffer slice at the region's original chunk offset.
+            # This costs one extra GPU memcpy per region per gather
+            # but keeps the chunk-wide byte layout rigid and
+            # correctness-proof trivial.
+            region_plans: list[dict] = []
+            total_shard_bytes = 0
             if chunk_is_shardable:
-                primary_esize = next(iter(unique_esizes))
-                primary_dtype = next(iter(unique_dtypes))
-                # Pad chunk_bytes up so (chunk_bytes_padded / world_size)
-                # is both integral and a multiple of primary_esize.
-                # ``lcm(world_size, primary_esize)`` is the smallest
-                # padded size that satisfies both. For fp16
-                # (primary_esize=2) and world_size=4, the total pads up
-                # to a multiple of 4 bytes; shard_bytes is a multiple
-                # of 2 (fp16-aligned), as required by ``.view(dtype)``
-                # after ``all_gather`` reassembles the chunk.
                 import math as _math
-                pad_unit = (primary_esize * self.world_size) // _math.gcd(
-                    primary_esize, self.world_size
-                )
-                chunk_bytes_padded = (
-                    (chunk_bytes + pad_unit - 1) // pad_unit
-                ) * pad_unit
-                shard_bytes = chunk_bytes_padded // self.world_size
-            else:
-                chunk_bytes_padded = chunk_bytes
-                shard_bytes = 0
-                primary_esize = 0
-                primary_dtype = None  # type: ignore[assignment]
+                for dtype_r, esize_r, start_off, end_off in dtype_regions:
+                    region_bytes = end_off - start_off
+                    pad_unit = (esize_r * self.world_size) // _math.gcd(
+                        esize_r, self.world_size
+                    )
+                    region_bytes_padded = (
+                        (region_bytes + pad_unit - 1) // pad_unit
+                    ) * pad_unit
+                    shard_bytes_r = region_bytes_padded // self.world_size
+                    region_plans.append({
+                        "dtype": dtype_r,
+                        "esize": esize_r,
+                        "chunk_offset": start_off,
+                        "region_bytes": region_bytes,
+                        "region_bytes_padded": region_bytes_padded,
+                        "shard_bytes": shard_bytes_r,
+                    })
+                    total_shard_bytes += shard_bytes_r
 
-            # Full-chunk buffer (transient in sharded mode, permanent
-            # otherwise).
+            # Full-chunk buffer. For the sharded path we keep this
+            # allocation sized exactly to ``chunk_bytes`` — the same as
+            # the replicated path — because every region's padding is
+            # absorbed into the PER-REGION scratch buffer at
+            # gather/reduce time, not into the pool-buffer layout.
             cpu_bytes = torch.empty(
-                chunk_bytes_padded, dtype=torch.uint8, pin_memory=True
+                chunk_bytes, dtype=torch.uint8, pin_memory=True
             )
 
             # --- Step 3: copy + rebind param.data -----------------------
@@ -621,61 +750,89 @@ class ChunkManager:
             self._grad_initial[cid] = trainable_count
             self._grad_remaining[cid] = trainable_count
 
-            # --- Step 3b: partition the full chunk bytes into this rank's shard
+            # --- Step 3b: partition each region's bytes into rank-local shards
             # Only applies to shardable chunks. After this block the
             # full-chunk ``cpu_bytes`` tensor is no longer referenced
-            # (Python GC will reclaim it).
+            # (Python GC will reclaim it). Each region owns its own
+            # pinned shard + grad + shard_param; the full-chunk buffer
+            # is read REGION-BY-REGION through a transient padded
+            # scratch tensor so region_bytes_padded > region_bytes
+            # cases (trailing pad for world_size alignment) stay
+            # correct without disturbing the chunk's aggregate byte
+            # layout.
             if chunk_is_shardable:
-                # Pad the full-chunk buffer up to chunk_bytes_padded by
-                # leaving any trailing bytes zero-initialized. The
-                # ``torch.empty`` above did NOT zero, so explicitly zero
-                # the tail so peer ranks with trailing slices don't hold
-                # uninitialized bytes that would then propagate through
-                # all_gather on the first gather (correctness doesn't
-                # depend on this since the initial gather overwrites
-                # with the trained values anyway — but a zero-init makes
-                # the first-iter param.data deterministic).
-                if chunk_bytes_padded > chunk_bytes:
-                    cpu_bytes.narrow(
-                        0, chunk_bytes, chunk_bytes_padded - chunk_bytes
-                    ).zero_()
-                # This rank's byte slice of the padded full chunk.
-                my_off = self.rank * shard_bytes
-                my_end = my_off + shard_bytes
-                cpu_shard_bytes = torch.empty(
-                    shard_bytes, dtype=torch.uint8, pin_memory=True
-                )
-                cpu_shard_bytes.copy_(
-                    cpu_bytes.narrow(0, my_off, shard_bytes)
-                )
-                cpu_shard_grad_bytes = torch.zeros(
-                    shard_bytes, dtype=torch.uint8, pin_memory=True
-                )
-                # Shard-level nn.Parameter — the CPU Adam's view of this
-                # rank's slice. Build it against the pinned bytes
-                # reinterpreted as primary_dtype so DeepSpeedCPUAdam's
-                # element-wise updates land on the right storage.
                 from torch import nn as _nn
-                shard_numel = shard_bytes // primary_esize
-                shard_view = cpu_shard_bytes.view(primary_dtype).view(
-                    shard_numel
-                )
-                shard_param = _nn.Parameter(shard_view, requires_grad=True)
-                # Pin its grad at a view of the pinned grad bytes so
-                # the CPU Adam reads the right storage without a copy.
-                shard_grad_view = cpu_shard_grad_bytes.view(
-                    primary_dtype
-                ).view(shard_numel)
-                shard_param.grad = shard_grad_view
+                regions: list[_DtypeRegion] = []
+                for plan in region_plans:
+                    r_dtype = plan["dtype"]
+                    r_esize = plan["esize"]
+                    r_chunk_off = plan["chunk_offset"]
+                    r_bytes = plan["region_bytes"]
+                    r_bytes_padded = plan["region_bytes_padded"]
+                    r_shard_bytes = plan["shard_bytes"]
+
+                    # Build the padded region image in a transient
+                    # scratch buffer: copy the valid region_bytes from
+                    # cpu_bytes into [0, region_bytes), pad the tail
+                    # up to region_bytes_padded with zeros. This keeps
+                    # peer ranks that receive the padded tail from
+                    # seeing uninitialized bytes on the first
+                    # ``gather`` (the initial gather broadcasts every
+                    # rank's shard to everyone, so tail bytes on
+                    # rank W-1 end up in the pool buffer until a
+                    # subsequent training step overwrites them — but
+                    # the params' ``.data`` views never index into
+                    # padding, so correctness is preserved
+                    # regardless).
+                    region_scratch = torch.zeros(
+                        r_bytes_padded, dtype=torch.uint8, pin_memory=False
+                    )
+                    region_scratch.narrow(0, 0, r_bytes).copy_(
+                        cpu_bytes.narrow(0, r_chunk_off, r_bytes)
+                    )
+
+                    # This rank's shard of the region.
+                    my_off = self.rank * r_shard_bytes
+                    cpu_region_shard = torch.empty(
+                        r_shard_bytes, dtype=torch.uint8, pin_memory=True
+                    )
+                    cpu_region_shard.copy_(
+                        region_scratch.narrow(0, my_off, r_shard_bytes)
+                    )
+                    cpu_region_grad = torch.zeros(
+                        r_shard_bytes, dtype=torch.uint8, pin_memory=True
+                    )
+
+                    # Shard-level nn.Parameter for this region — one
+                    # flat Adam step per region.
+                    shard_numel = r_shard_bytes // r_esize
+                    shard_view = cpu_region_shard.view(r_dtype).view(
+                        shard_numel
+                    )
+                    shard_param = _nn.Parameter(shard_view, requires_grad=True)
+                    shard_grad_view = cpu_region_grad.view(r_dtype).view(
+                        shard_numel
+                    )
+                    shard_param.grad = shard_grad_view
+
+                    regions.append(
+                        _DtypeRegion(
+                            chunk_offset=r_chunk_off,
+                            region_bytes=r_bytes,
+                            region_bytes_padded=r_bytes_padded,
+                            shard_bytes=r_shard_bytes,
+                            dtype=r_dtype,
+                            element_size=r_esize,
+                            cpu_shard_bytes=cpu_region_shard,
+                            cpu_shard_grad_bytes=cpu_region_grad,
+                            shard_param=shard_param,
+                        )
+                    )
 
                 self._chunk_shards[cid] = _ChunkShardState(
-                    cpu_shard_bytes=cpu_shard_bytes,
-                    cpu_shard_grad_bytes=cpu_shard_grad_bytes,
-                    chunk_bytes=chunk_bytes_padded,
-                    shard_bytes=shard_bytes,
-                    primary_dtype=primary_dtype,
-                    primary_element_size=primary_esize,
-                    shard_param=shard_param,
+                    regions=regions,
+                    chunk_bytes=chunk_bytes,
+                    shard_bytes=total_shard_bytes,
                 )
 
             # --- Step 4: per-param grad hooks for trainable params -----
@@ -960,34 +1117,52 @@ class ChunkManager:
     ) -> None:
         """ZeRO-3 all_gather path: reconstruct the full chunk on GPU.
 
-        Uses ``torch.distributed.all_gather_into_tensor`` (new in
-        torch 2.1+; confirmed present on this codebase's torch 2.10).
-        The gather layout is rank-contiguous: rank ``r``'s bytes
-        occupy ``[r * shard_bytes, (r + 1) * shard_bytes)`` of the
-        gathered full-chunk buffer, mirroring the partition applied
-        at ``materialize_offload`` time.
+        One :func:`all_gather_into_tensor` collective per
+        :class:`_DtypeRegion` — homogeneous chunks issue exactly one
+        collective (matches the pre-followup single-region fast path);
+        mixed-dtype chunks issue N collectives, one per dtype region.
+
+        For each region:
+
+        1. H2D copy this rank's pinned ``shard_bytes`` slice into a
+           GPU staging tensor.
+        2. all_gather_into_tensor to a padded per-region scratch
+           tensor (``region_bytes_padded`` bytes).
+        3. Copy the valid ``region_bytes`` prefix into the pool buffer
+           at ``chunk_offset``. The scratch is freed when it falls out
+           of scope.
+
+        Step 3 is what keeps the pool buffer's byte layout identical
+        to the replicated path — ``_rebind_params_to_buffer`` can
+        then index every param at its original byte_offset without
+        caring whether sharding was engaged.
         """
         import torch
         import torch.distributed as dist
 
-        shard_bytes = shard_state.shard_bytes
-        full_bytes = shard_state.chunk_bytes  # padded
-        # We write the all_gather output directly into the pool buffer
-        # (truncated to ``full_bytes`` — the pool buffer is S_chunk
-        # wide which may be > full_bytes for non-final chunks, but the
-        # collective only writes the prefix).
-        #
-        # H2D the local shard into pinned-free GPU staging. For
-        # correctness all_gather_into_tensor requires the input to live
-        # on the same device as the output (the GPU buffer) and the
-        # dtypes to match. We allocate a staging tensor on the same
-        # device as ``buf``.
-        gather_out = buf.narrow(0, 0, full_bytes)
-        my_shard_gpu = torch.empty(
-            shard_bytes, dtype=torch.uint8, device=buf.device
-        )
-        my_shard_gpu.copy_(shard_state.cpu_shard_bytes, non_blocking=True)
-        dist.all_gather_into_tensor(gather_out, my_shard_gpu)
+        for region in shard_state.regions:
+            # Staging: this rank's shard on GPU.
+            my_shard_gpu = torch.empty(
+                region.shard_bytes, dtype=torch.uint8, device=buf.device
+            )
+            my_shard_gpu.copy_(region.cpu_shard_bytes, non_blocking=True)
+
+            # Gather output scratch: region_bytes_padded (may be > region_bytes).
+            gather_scratch = torch.empty(
+                region.region_bytes_padded,
+                dtype=torch.uint8,
+                device=buf.device,
+            )
+            dist.all_gather_into_tensor(gather_scratch, my_shard_gpu)
+
+            # Write the valid-bytes prefix into the pool buffer at the
+            # region's chunk offset. The pool buffer is S_chunk wide
+            # and already zero-sentinelled on the first acquire; the
+            # narrow() slice here covers exactly the original region
+            # bytes the params' byte_offsets index into.
+            buf.narrow(0, region.chunk_offset, region.region_bytes).copy_(
+                gather_scratch.narrow(0, 0, region.region_bytes)
+            )
 
     def _rebind_params_to_buffer(
         self,
@@ -1123,19 +1298,21 @@ class ChunkManager:
     ) -> None:
         """Sharded path: reduce_scatter chunk grads, D2H shard, kick CPU Adam.
 
+        One :func:`reduce_scatter_tensor` collective per
+        :class:`_DtypeRegion` — homogeneous chunks issue exactly one
+        collective; mixed-dtype chunks issue N collectives, one per
+        dtype region. D2H into a per-region pinned grad shard, then
+        kick the region's CPU FusedAdam step.
+
         Precondition: every trainable param in the chunk has a GPU grad
         (backward drained the chunk). Postcondition: every GPU grad is
-        nulled, this rank's CPU shard grad holds its slice of the
+        nulled, every region's CPU shard grad holds its slice of the
         ``AVG``-reduced cross-rank grad, and the CPU Adam step for
-        this chunk has been submitted to the async worker.
+        the chunk has been submitted to the async worker (once; the
+        adapter bundles all regions' shard_params under the chunk key).
         """
         import torch
         import torch.distributed as dist
-
-        shard_bytes = shard_state.shard_bytes
-        chunk_bytes = shard_state.chunk_bytes
-        primary_dtype = shard_state.primary_dtype
-        primary_esize = shard_state.primary_element_size
 
         slots = self._cpu_slots.get(chunk_id, [])
         if not slots:
@@ -1144,68 +1321,90 @@ class ChunkManager:
         # Device from the first live param.grad (all params in a chunk
         # share a device by construction).
         device = self.device
+        any_grad = False
         for slot in slots:
             p = self._params_by_id.get(slot.param_id)
             if p is not None and p.grad is not None:
                 device = p.grad.device
+                any_grad = True
                 break
-
-        # Flatten every param's grad bytes into a full-chunk buffer at
-        # the recorded byte offsets — same layout the all_gather output
-        # occupies. Trailing pad bytes stay zero.
-        grad_flat_bytes = torch.zeros(
-            chunk_bytes, dtype=torch.uint8, device=device
-        )
-        any_grad = False
-        for slot in slots:
-            p = self._params_by_id.get(slot.param_id)
-            if p is None or p.grad is None:
-                continue
-            any_grad = True
-            nbytes = slot.numel * slot.element_size
-            dst_bytes = grad_flat_bytes.narrow(0, slot.byte_offset, nbytes)
-            dst_typed = dst_bytes.view(slot.dtype).view(slot.shape)
-            dst_typed.copy_(p.grad)
-            # Null the GPU grad now that we've captured its bytes.
-            p.grad = None
-
         if not any_grad:
             return
 
-        # reduce_scatter_tensor requires matching typed views on input
-        # (full chunk) and output (this rank's shard). Reinterpret the
-        # byte buffer as the primary dtype.
-        shard_numel = shard_bytes // primary_esize
-        full_numel = chunk_bytes // primary_esize
-        grad_flat_typed = grad_flat_bytes.view(primary_dtype).view(full_numel)
-        my_shard_grad_gpu = torch.empty(
-            shard_numel, dtype=primary_dtype, device=device
-        )
-        dist.reduce_scatter_tensor(
-            my_shard_grad_gpu, grad_flat_typed, op=dist.ReduceOp.AVG
-        )
+        # Build an index from slot.byte_offset -> slot so we can quickly
+        # locate every param whose bytes land inside a given region.
+        # Slots are ordered by byte_offset within a chunk (the
+        # aligned-offsets pass in ``materialize_offload`` preserves
+        # input order), so a linear scan per region is fine.
 
-        # D2H the rank's grad slice to the pinned shard grad. The
-        # shard_param.grad was pinned to a view over
-        # cpu_shard_grad_bytes at materialize_offload time; copying
-        # into it is what makes the CPU Adam see the fresh grad.
         d2h_event = None
-        if my_shard_grad_gpu.is_cuda:
-            shard_state.shard_param.grad.copy_(  # type: ignore[union-attr]
-                my_shard_grad_gpu, non_blocking=True
+        for region in shard_state.regions:
+            r_start = region.chunk_offset
+            r_end = r_start + region.region_bytes
+
+            # Stage a padded per-region grad buffer on GPU so
+            # reduce_scatter's input length matches
+            # region_bytes_padded. Trailing (padding) bytes stay zero.
+            region_grad = torch.zeros(
+                region.region_bytes_padded,
+                dtype=torch.uint8,
+                device=device,
             )
-            d2h_event = torch.cuda.Event(blocking=True)
-            d2h_event.record()
-        else:
-            shard_state.shard_param.grad.copy_(my_shard_grad_gpu)  # type: ignore[union-attr]
+            for slot in slots:
+                if slot.byte_offset < r_start:
+                    continue
+                if slot.byte_offset >= r_end:
+                    break
+                p = self._params_by_id.get(slot.param_id)
+                if p is None or p.grad is None:
+                    continue
+                nbytes = slot.numel * slot.element_size
+                # Param offset relative to the region's start.
+                rel_off = slot.byte_offset - r_start
+                dst_bytes = region_grad.narrow(0, rel_off, nbytes)
+                dst_typed = dst_bytes.view(slot.dtype).view(slot.shape)
+                dst_typed.copy_(p.grad)
+                # Null the GPU grad now that we've captured its bytes.
+                p.grad = None
+
+            # reduce_scatter_tensor requires matching typed views on
+            # input (padded full region) and output (this rank's
+            # region shard). Use the region's dtype.
+            shard_numel_r = region.shard_bytes // region.element_size
+            full_numel_r = region.region_bytes_padded // region.element_size
+            region_grad_typed = region_grad.view(region.dtype).view(
+                full_numel_r
+            )
+            my_shard_grad_gpu = torch.empty(
+                shard_numel_r, dtype=region.dtype, device=device
+            )
+            dist.reduce_scatter_tensor(
+                my_shard_grad_gpu,
+                region_grad_typed,
+                op=dist.ReduceOp.AVG,
+            )
+
+            if my_shard_grad_gpu.is_cuda:
+                region.shard_param.grad.copy_(  # type: ignore[union-attr]
+                    my_shard_grad_gpu, non_blocking=True
+                )
+                ev = torch.cuda.Event(blocking=True)
+                ev.record()
+                d2h_event = ev  # last region's event is enough — the
+                # CPU Adam worker waits on it before running Adam;
+                # because prior regions' D2Hs were launched on the
+                # same default stream the last event is at-or-after
+                # all previous region copies.
+            else:
+                region.shard_param.grad.copy_(my_shard_grad_gpu)  # type: ignore[union-attr]
 
         # Reset the hook counter so the next backward's per-param
         # decrements land correctly.
         self._grad_remaining[chunk_id] = self._grad_initial.get(chunk_id, 0)
 
-        # Kick async CPU Adam for this chunk's shard. The adapter's
-        # per-chunk optim was built over shard_state.shard_param, so
-        # step_async updates only this rank's slice.
+        # Kick async CPU Adam for this chunk — the adapter was built
+        # against every region's shard_param for this chunk, so one
+        # step_async call updates every region's slice at once.
         if self.cpu_optim is not None:
             self.cpu_optim.step_async(
                 chunk_id, d2h_event=d2h_event, post_step=None
@@ -1256,13 +1455,24 @@ class ChunkManager:
         return sorted(self._chunk_shards.keys())
 
     def shard_bytes_for(self, chunk_id: ChunkId) -> int:
-        """Return this rank's ``shard_bytes`` for ``chunk_id``.
+        """Return this rank's total pinned CPU shard bytes for ``chunk_id``.
 
-        Returns 0 when the chunk is not sharded (persistent or dropped
-        out of the sharded path due to mixed-dtype).
+        Sum across every :class:`_DtypeRegion` in the chunk. Returns
+        0 when the chunk is not sharded (persistent, or ``zero3_shard``
+        was off at materialize time).
         """
         s = self._chunk_shards.get(chunk_id)
         return 0 if s is None else s.shard_bytes
+
+    def per_rank_cpu_bytes(self) -> int:
+        """Total pinned CPU bytes this rank holds across every sharded chunk.
+
+        Equals the sum of ``shard_bytes_for`` over every sharded chunk
+        id. Convenience accessor for the 4-GPU sharding test which
+        asserts per-rank CPU footprint roughly equals
+        ``total_non_persistent_bytes / world_size``.
+        """
+        return sum(s.shard_bytes for s in self._chunk_shards.values())
 
     # ---- internals -----------------------------------------------------
 
@@ -1296,11 +1506,14 @@ class ChunkManager:
             slot = int(chunk_id) % self.buffer_pool.n_buffer
             return self.buffer_pool.pinned_host.buffer(slot)
         if slots[0].cpu_data is None:
-            # Sharded slot — return the shard bytes reinterpreted as the
-            # primary dtype as a best-effort legacy answer.
+            # Sharded slot — return the first region's shard bytes
+            # reinterpreted as its dtype as a best-effort legacy
+            # answer. Callers interpreting this path are out-of-spec
+            # for the M7+ semantics; use ``_chunk_shards`` directly.
             shard = self._chunk_shards.get(chunk_id)
-            if shard is not None:
-                return shard.cpu_shard_bytes.view(shard.primary_dtype)
+            if shard is not None and shard.regions:
+                r0 = shard.regions[0]
+                return r0.cpu_shard_bytes.view(r0.dtype)
         return slots[0].cpu_data  # type: ignore[return-value]
 
 

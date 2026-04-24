@@ -579,6 +579,27 @@ def protrain_model_wrapper(
             0, int(hardware_profile.gpu_memory_bytes) - _DEFAULT_HEADROOM_BYTES
         )
 
+    # Resolve the ZeRO-3 sharding flag early so we can propagate it into
+    # ``HardwareProfile`` before the cost-model search runs. The same
+    # rules as the later in-place re-check (post-materialize_offload)
+    # apply here — auto-enable when ``world_size > 1`` AND
+    # ``force_all_persistent`` is False, honour explicit caller
+    # overrides otherwise. The ChunkManager additionally degrades to
+    # False on single-rank hosts (so setting this True on ws=1 is a
+    # no-op); we mirror that here for HW profile consistency.
+    _ws_early = 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        _ws_early = int(torch.distributed.get_world_size())
+    if zero3_shard is None:
+        _zero3_for_hw = (_ws_early > 1) and (not force_all_persistent)
+    else:
+        _zero3_for_hw = bool(zero3_shard) and (_ws_early > 1)
+    # Propagate into the hardware_profile the searcher consumes. Replace
+    # is cheap; HardwareProfile is frozen so we can't mutate in place.
+    if _zero3_for_hw != hardware_profile.zero3_shard:
+        from dataclasses import replace as _replace
+        hardware_profile = _replace(hardware_profile, zero3_shard=_zero3_for_hw)
+
     n_block = max(1, len(trace.activation_sizes))
     # Max chunks seen in any one transformer block — used for the
     # force_all_persistent buffer-pool sizing (we need enough buffers to
@@ -752,20 +773,18 @@ def protrain_model_wrapper(
 
     # ---- Distributed context + M7 zero3_shard decision -----------------
     # Auto-detect world_size / rank from the active process group;
-    # default to single-rank when no group is up. ``zero3_shard`` defaults
-    # to True when world_size > 1 AND force_all_persistent is False;
-    # callers can override explicitly. The ChunkManager silently
-    # degrades zero3_shard to False when world_size == 1, so the auto-
-    # detect path is safe on single-rank hosts too.
+    # default to single-rank when no group is up. ``zero3_shard`` was
+    # already resolved above the search call so it could flow through
+    # ``HardwareProfile.zero3_shard`` into the cost model; re-use that
+    # decision here for the ChunkManager constructor. The ChunkManager
+    # silently degrades zero3_shard to False when world_size == 1, so
+    # the auto-detect path is safe on single-rank hosts too.
     _ws = 1
     _rank = 0
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         _ws = int(torch.distributed.get_world_size())
         _rank = int(torch.distributed.get_rank())
-    if zero3_shard is None:
-        _zero3 = (_ws > 1) and (not force_all_persistent)
-    else:
-        _zero3 = bool(zero3_shard) and (_ws > 1)
+    _zero3 = bool(hardware_profile.zero3_shard) and (_ws > 1)
     LOG.info(
         "ProTrain: distributed context world_size=%d rank=%d zero3_shard=%s "
         "(requested=%s)",
@@ -907,14 +926,18 @@ def protrain_model_wrapper(
     # is "transient" (``protrain_optimizer_wrapper`` rebuilds it at the
     # user's real hyperparams) but we still need one live here so the
     # chunk manager has something to drive during smoke tests.
-    # M7: for sharded non-persistent chunks, the CPU Adam updates the
-    # chunk's single flat shard_param rather than the user-facing
-    # param list. Redirect cpu_params_per_chunk for those chunks.
+    # M7: for sharded non-persistent chunks, the CPU Adam updates each
+    # region's flat shard_param (one per :class:`_DtypeRegion`) rather
+    # than the user-facing param list. Homogeneous-dtype chunks have
+    # one region and behave exactly like the pre-followup single-param
+    # case; mixed-dtype chunks expose one shard_param per region.
     cpu_params_per_chunk_for_optim: dict = {}
     for cid, chunk_params in cpu_params_per_chunk.items():
         shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
-        if shard_state is not None:
-            cpu_params_per_chunk_for_optim[cid] = [shard_state.shard_param]
+        if shard_state is not None and shard_state.regions:
+            cpu_params_per_chunk_for_optim[cid] = [
+                r.shard_param for r in shard_state.regions
+            ]
         else:
             cpu_params_per_chunk_for_optim[cid] = chunk_params
 

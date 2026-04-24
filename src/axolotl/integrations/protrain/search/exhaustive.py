@@ -247,6 +247,20 @@ def search(
     """
     bounds = derive_bounds(trace, layout)
 
+    # Under ZeRO-3 sharding (``hw.zero3_shard=True``) each rank holds
+    # only ``chunk_bytes / world_size`` per non-persistent chunk on
+    # CPU, so the CPU-pressure constraint that would otherwise shrink
+    # viable ``n_buffer`` ceilings goes away. We therefore let
+    # ``n_buffer`` roam up to its natural upper bound of
+    # ``N_chunk - n_persist`` in both modes — the search's GPU-capacity
+    # gate (``predicted_peak > capacity_bytes``) is the only
+    # feasibility filter, and it is sharding-agnostic because the
+    # gather materializes the full chunk on GPU regardless. See
+    # ``cost/memory.py::estimate_cpu_footprint`` for the per-rank CPU
+    # accounting that would feed a tighter CPU-budget filter if one
+    # is added downstream.
+    _ = hw.zero3_shard  # noqa: F841 — explicit acknowledgement
+
     n_total = 0
     n_feasible = 0
     best_iter_s: float = float("inf")

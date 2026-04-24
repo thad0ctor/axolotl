@@ -179,14 +179,19 @@ def protrain_optimizer_wrapper(
             weight_decay=weight_decay,
         )
 
-    # M7: for sharded non-persistent chunks the CPU Adam updates the
-    # chunk's flat shard_param (one per rank slice) rather than the
-    # user-facing per-param list.
+    # M7: for sharded non-persistent chunks the CPU Adam updates each
+    # :class:`_DtypeRegion`'s flat shard_param (one per rank slice per
+    # dtype region) rather than the user-facing per-param list.
+    # Homogeneous-dtype chunks have exactly one region and behave
+    # identically to the pre-followup path; mixed-dtype chunks expose
+    # one shard_param per region.
     cpu_params_per_chunk_for_optim: dict[ChunkId, list["nn.Parameter"]] = {}
     for cid, chunk_params in cpu_params_per_chunk.items():
         shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
-        if shard_state is not None:
-            cpu_params_per_chunk_for_optim[cid] = [shard_state.shard_param]
+        if shard_state is not None and shard_state.regions:
+            cpu_params_per_chunk_for_optim[cid] = [
+                r.shard_param for r in shard_state.regions
+            ]
         else:
             cpu_params_per_chunk_for_optim[cid] = chunk_params
 

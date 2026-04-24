@@ -17,6 +17,7 @@ from axolotl.integrations.protrain.block.layout_rules import assign_modes
 from axolotl.integrations.protrain.cost import (
     ALPHA_FRAGMENTATION,
     effective_bw,
+    estimate_cpu_footprint,
     estimate_peak,
     estimate_runtime,
 )
@@ -134,6 +135,7 @@ def _make_hw(
     gpu_count: int = 1,
     pcie_h2d_bps: float = 12e9,
     pcie_d2h_bps: float = 12e9,
+    zero3_shard: bool = False,
 ) -> HardwareProfile:
     return HardwareProfile(
         gpu_sku="NVIDIA GeForce RTX 3090 (synthetic)",
@@ -142,6 +144,7 @@ def _make_hw(
         pcie_h2d_bps=pcie_h2d_bps,
         pcie_d2h_bps=pcie_d2h_bps,
         has_nvlink=False,
+        zero3_shard=zero3_shard,
     )
 
 
@@ -225,6 +228,64 @@ def test_estimate_peak_increases_with_n_persist_until_activations_dominate(
         ALPHA_FRAGMENTATION * toy_layout.N_chunk * toy_layout.S_chunk * 0.5
     )
     assert peaks[-1] - peaks[0] >= expected_min_delta
+
+
+# ---------------------------------------------------------------------------
+# memory / estimate_cpu_footprint (M7 follow-up: ZeRO-3 awareness)
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_cpu_footprint_scales_with_world_size():
+    """Per-rank pinned CPU footprint divides by ``gpu_count`` under sharding.
+
+    The replicated path (``zero3_shard=False``) has every rank hold a
+    full copy of every non-persistent chunk on CPU. The ZeRO-3
+    sharded path (``zero3_shard=True``) partitions each chunk's bytes
+    across ranks so each rank holds only ``chunk_bytes/world_size``
+    pinned bytes per chunk. This test locks in the arithmetic that
+    future searcher CPU-budget filters (if added) rely on.
+
+    Toy layout: N_chunk=12, S_chunk=128MB. With n_persist=4 the
+    non-persistent set is 8 chunks * 128MB = 1 GB.
+    """
+    n_chunk = 12
+    s_chunk = 128 * MB
+    n_persist = 4
+    cfg = CostConfig(
+        n_persist=n_persist, n_buffer=2, n_swap=0, n_checkpoint=0
+    )
+    layout = _make_layout(n_chunk=n_chunk, s_chunk=s_chunk, n_block=8)
+
+    expected_total = (n_chunk - n_persist) * s_chunk  # 1 GB
+
+    hw_single = _make_hw(gpu_count=1, zero3_shard=False)
+    footprint_single = estimate_cpu_footprint(cfg, layout, hw_single)
+    assert footprint_single == expected_total, (
+        f"single-GPU / no-shard footprint should be the full "
+        f"non-persistent total ({expected_total}B), got {footprint_single}B"
+    )
+
+    hw_4gpu_ddp = _make_hw(gpu_count=4, zero3_shard=False)
+    footprint_4gpu_ddp = estimate_cpu_footprint(cfg, layout, hw_4gpu_ddp)
+    assert footprint_4gpu_ddp == expected_total, (
+        f"4-GPU without shard (DDP mode) still replicates full chunks "
+        f"per rank — expected {expected_total}B, got {footprint_4gpu_ddp}B"
+    )
+
+    hw_4gpu_shard = _make_hw(gpu_count=4, zero3_shard=True)
+    footprint_4gpu_shard = estimate_cpu_footprint(cfg, layout, hw_4gpu_shard)
+    # Ceiling division so the trailing rank's shard pad counts: for
+    # 1 GB / 4 = 256 MB exactly, no rounding.
+    expected_sharded = expected_total // 4
+    assert footprint_4gpu_shard == expected_sharded, (
+        f"4-GPU sharded footprint should be total/world_size = "
+        f"{expected_sharded}B, got {footprint_4gpu_shard}B"
+    )
+
+    # Sanity ratio: sharded is exactly 1/world_size of replicated at
+    # this chunk-size / world_size alignment.
+    assert footprint_single == 4 * footprint_4gpu_shard
+    assert footprint_4gpu_ddp > footprint_4gpu_shard
 
 
 # ---------------------------------------------------------------------------

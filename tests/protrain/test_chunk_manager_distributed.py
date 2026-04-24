@@ -444,13 +444,18 @@ def _worker_zero3_sharded_roundtrip(
 
         mgr.reduce_grads_and_offload(ChunkId(0))
 
-        # The rank's CPU shard grad, reinterpreted as primary_dtype
-        # (fp16 here), should be uniformly (0 + 1 + ... + W-1) / W.
+        # The rank's CPU shard grad, reinterpreted as the region's
+        # dtype (fp16 for this homogeneous chunk), should be uniformly
+        # (0 + 1 + ... + W-1) / W. Homogeneous chunks produce a single
+        # :class:`_DtypeRegion` carrying the whole chunk.
         expected_mean = sum(range(world_size)) / float(world_size)
         shard_state = mgr._chunk_shards[ChunkId(0)]
-        # shard_state.shard_param.grad is a view of the pinned uint8
-        # grad bytes reinterpreted as primary_dtype.
-        obs = shard_state.shard_param.grad.detach().cpu().float()  # type: ignore[union-attr]
+        assert len(shard_state.regions) == 1, (
+            f"rank {rank}: homogeneous chunk should produce one dtype "
+            f"region, got {len(shard_state.regions)}"
+        )
+        region0 = shard_state.regions[0]
+        obs = region0.shard_param.grad.detach().cpu().float()  # type: ignore[union-attr]
         assert torch.allclose(
             obs,
             torch.full_like(obs, float(expected_mean)),
@@ -501,6 +506,223 @@ def test_zero3_sharded_roundtrip_2rank(tmp_path) -> None:
 
     # If any rank wrote a ``.skip`` file due to unsupported collectives,
     # downgrade to a skip rather than a fail.
+    skip_files = list(tmp_path.glob("rank*.skip"))
+    if skip_files:
+        reasons = [f.read_text().strip() for f in skip_files]
+        pytest.skip(f"gloo does not support required collective(s): {reasons}")
+
+
+# ---------------------------------------------------------------------------
+# M7 follow-up: mixed-dtype sharded round-trip (gloo, CPU-only, 2-rank)
+# ---------------------------------------------------------------------------
+
+
+def _worker_zero3_sharded_roundtrip_mixed_dtype(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """2-rank gloo test: sharded round-trip over a fp16 + fp32 chunk.
+
+    Builds a model with ``nn.Linear(16, 16, dtype=fp16)`` followed by
+    ``nn.LayerNorm(16, dtype=fp32)``, packs both into one chunk, and
+    drives the sharded gather/reduce_scatter path. The dtype-regions
+    machinery should produce 2 regions (one fp16, one fp32); each
+    region gets its own collective. After gather every param
+    reconstructs bit-exactly; after reduce_scatter each rank's
+    region-level shard grad is the cross-rank AVG of the planted
+    grads.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import (
+        PinnedHostMemory,
+    )
+    from axolotl.integrations.protrain.types import BlockId, ChunkId, ParamId
+
+    _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    _os.environ.setdefault("MASTER_PORT", "29547")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-zero3-mixed",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        torch.manual_seed(0)  # SAME seed on every rank — fresh-init
+        # bytes are identical before training.
+        from torch import nn
+
+        # fp16 Linear + fp32 LayerNorm in one module, packed into a
+        # single chunk. Sizes chosen so both region kinds carry
+        # non-trivial byte counts: Linear = 16*16+16 = 272 params *
+        # 2 bytes = 544 B; LayerNorm = 16+16 = 32 params * 4 bytes =
+        # 128 B.
+        class _MixedLayer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(16, 16, bias=True).to(torch.float16)
+                self.norm = nn.LayerNorm(16).to(torch.float32)
+
+        layer = _MixedLayer()
+        model = nn.Module()
+        model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+        block_spans: dict = {}
+        for name, _p in model.named_parameters():
+            block_spans.setdefault(BlockId(0), []).append(ParamId(name))  # type: ignore[index]
+        exec_order = [ParamId(n) for n, _ in model.named_parameters()]
+        S_chunk = 1 << 14
+        layout = build_layout(model, exec_order, S_chunk, block_spans)
+
+        host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+        pool = BufferPool(
+            n_buffer=1,
+            S_chunk=layout.S_chunk,
+            pinned_host=host,
+            device=torch.device("cpu"),
+        )
+
+        pre_data = {
+            str(name): p.detach().clone().cpu()
+            for name, p in model.named_parameters()
+        }
+
+        mgr = ChunkManager(
+            model=model,
+            layout=layout,
+            n_persist=0,
+            buffer_pool=pool,
+            cpu_optim=None,
+            gpu_optim=None,
+            device=torch.device("cpu"),
+            world_size=world_size,
+            rank=rank,
+            zero3_shard=True,
+        )
+
+        try:
+            mgr.materialize_offload()
+        except RuntimeError as exc:
+            if "gloo" in str(exc).lower():
+                _os.makedirs(tmpdir, exist_ok=True)
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
+                ) as f:
+                    f.write(f"gloo-unsupported: {exc}\n")
+                return
+            raise
+
+        # (1) Mixed-dtype chunk must actually shard — no silent
+        # fall-back to replicated. Post-followup ``materialize_offload``
+        # produces a shard state with 2 regions (fp16 + fp32).
+        assert mgr.sharded_chunk_ids() == [ChunkId(0)], (
+            f"rank {rank}: mixed-dtype chunk should engage sharded path"
+        )
+        shard_state = mgr._chunk_shards[ChunkId(0)]
+        # Expect two regions: fp16 (Linear) and fp32 (LayerNorm). Order
+        # follows named_parameters() insertion order — Linear first,
+        # then LayerNorm.
+        assert len(shard_state.regions) == 2, (
+            f"rank {rank}: expected 2 dtype regions (fp16 + fp32), "
+            f"got {len(shard_state.regions)}"
+        )
+        dtypes_seen = {r.dtype for r in shard_state.regions}
+        assert dtypes_seen == {torch.float16, torch.float32}, (
+            f"rank {rank}: unexpected region dtypes: {dtypes_seen}"
+        )
+
+        # (2) Gather should reconstruct every param bit-exactly on
+        # every rank. Because materialize_offload ran the initial
+        # shard copy from full-chunk CPU bytes, and all ranks started
+        # from identical weights, a successful all_gather produces
+        # identical full chunks on every rank.
+        try:
+            mgr.gather(ChunkId(0))
+        except RuntimeError as exc:
+            if "not implemented" in str(exc).lower() or "nccl" in str(exc).lower():
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
+                ) as f:
+                    f.write(f"gloo-collective-unsupported: {exc}\n")
+                return
+            raise
+
+        for name, p in model.named_parameters():
+            snap = pre_data[str(name)]
+            # Compare element-wise without dtype coercion loss: both
+            # sides share the param's original dtype.
+            assert p.data.dtype == snap.dtype, (
+                f"rank {rank}: dtype mismatch after gather for "
+                f"{name}: {p.data.dtype} vs {snap.dtype}"
+            )
+            assert torch.equal(p.data.cpu(), snap), (
+                f"rank {rank}: after mixed-dtype sharded gather, param "
+                f"'{name}' does not match pre-offload snapshot"
+            )
+
+        # (3) Plant rank-specific grads on every param, call
+        # reduce_grads_and_offload, verify each region's CPU shard grad
+        # holds the AVG across ranks.
+        for _n, p in model.named_parameters():
+            p.grad = torch.full_like(p.data, float(rank))
+
+        mgr.reduce_grads_and_offload(ChunkId(0))
+
+        expected_mean = sum(range(world_size)) / float(world_size)
+        for region in shard_state.regions:
+            obs = region.shard_param.grad.detach().cpu().float()  # type: ignore[union-attr]
+            assert torch.allclose(
+                obs,
+                torch.full_like(obs, float(expected_mean)),
+                atol=1e-3,
+                rtol=1e-3,
+            ), (
+                f"rank {rank}: region (dtype={region.dtype}) shard grad "
+                f"should be uniform {expected_mean}, got "
+                f"min={obs.min().item()} max={obs.max().item()}"
+            )
+
+        mgr.uninstall()
+        host.close()
+
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_zero3_sharded_roundtrip_mixed_dtype_2rank(tmp_path) -> None:
+    """M7-followup mixed-dtype variant of the 2-rank sharded round-trip.
+
+    Covers the dtype-region machinery that replaced the pre-followup
+    "fall back to replicated when dtypes are mixed" path.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_zero3_sharded_roundtrip_mixed_dtype,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
     skip_files = list(tmp_path.glob("rank*.skip"))
     if skip_files:
         reasons = [f.read_text().strip() for f in skip_files]

@@ -610,6 +610,34 @@ _ZERO3_WORKER_SCRIPT = textwrap.dedent(
 
         peak_mem_bytes = torch.cuda.max_memory_allocated(device)
 
+        # M7-followup: measure per-rank pinned CPU bytes held by the
+        # chunk manager. In sharded mode this should be ~1/world_size
+        # of the total non-persistent chunk bytes; in replicated mode
+        # it equals the full total on every rank.
+        chunk_manager = wrapped.chunk_manager
+        per_rank_cpu_bytes = chunk_manager.per_rank_cpu_bytes()
+        # Every non-persistent chunk state must have engaged the
+        # sharded path (no silent replicated fall-back from the
+        # pre-followup mixed-dtype branch). Only meaningful when
+        # sharding is active; in replicated mode the shard dict is
+        # empty by construction and we treat the assertion as vacuous.
+        shard_states = list(chunk_manager._chunk_shards.values())
+        if not force_replicate:
+            all_sharded = bool(shard_states) and all(
+                s.is_sharded for s in shard_states
+            )
+        else:
+            all_sharded = True  # replicated mode: nothing to shard, vacuously true
+        # Total non-persistent bytes (replicated-mode CPU footprint
+        # per rank). Uses ``layout.S_chunk`` as an upper bound on
+        # per-chunk bytes; matches the cost model's
+        # :func:`estimate_cpu_footprint` so the test's 1.5x tolerance
+        # is coherent with the searcher's accounting.
+        n_persist_effective = len(chunk_manager._persistent_ids)
+        total_non_persist = (
+            chunk_manager.layout.N_chunk - n_persist_effective
+        ) * chunk_manager.layout.S_chunk
+
         # Compute a cheap post-train param checksum: sum of abs values
         # of every trainable param's current .data. In sharded mode each
         # rank sees the same post-gather full chunk (via all_gather), so
@@ -638,19 +666,30 @@ _ZERO3_WORKER_SCRIPT = textwrap.dedent(
                     f"peak_mem_bytes_rank0={peak_mem_bytes}\\n"
                     f"all_sums={all_sums}\\n"
                     f"max_diff={max_diff}\\n"
+                    f"per_rank_cpu_bytes_rank0={per_rank_cpu_bytes}\\n"
+                    f"total_non_persist={total_non_persist}\\n"
+                    f"all_sharded={all_sharded}\\n"
                 )
             print(
                 f"[rank0] zero3_shard_replicate={force_replicate} "
                 f"peak_mem={peak_mem_bytes/1e9:.2f}GB "
                 f"losses={losses} "
                 f"all_sums={all_sums} "
-                f"max_diff={max_diff:.6f}",
+                f"max_diff={max_diff:.6f} "
+                f"cpu_bytes={per_rank_cpu_bytes/1e9:.3f}GB "
+                f"total_np={total_non_persist/1e9:.3f}GB "
+                f"all_sharded={all_sharded}",
                 flush=True,
             )
         # Also write a per-rank peak so we can compute mean across ranks.
         per_rank_out = os.path.join(out_dir, f"rank{rank}.peak")
         with open(per_rank_out, "w") as f:
             f.write(f"{peak_mem_bytes}\\n")
+        # Per-rank CPU bytes + sharded-engagement for the outer
+        # assertion in the test body.
+        per_rank_cpu_out = os.path.join(out_dir, f"rank{rank}.cpu_bytes")
+        with open(per_rank_cpu_out, "w") as f:
+            f.write(f"{per_rank_cpu_bytes}\\n{int(all_sharded)}\\n")
 
 
     def main() -> int:
@@ -750,6 +789,20 @@ def _launch_zero3(
         if p.exists():
             per_rank_peaks.append(int(p.read_text().strip()))
     stats["per_rank_peaks"] = per_rank_peaks
+
+    # Read per-rank CPU bytes + sharded-engagement flag (M7 follow-up).
+    per_rank_cpu_bytes: list[int] = []
+    per_rank_all_sharded: list[bool] = []
+    for r in range(world_size):
+        p = out_dir / f"rank{r}.cpu_bytes"
+        if p.exists():
+            lines = p.read_text().strip().splitlines()
+            if lines:
+                per_rank_cpu_bytes.append(int(lines[0]))
+            if len(lines) >= 2:
+                per_rank_all_sharded.append(bool(int(lines[1])))
+    stats["per_rank_cpu_bytes"] = per_rank_cpu_bytes
+    stats["per_rank_all_sharded"] = per_rank_all_sharded
     return stats
 
 
@@ -912,27 +965,25 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
         f"ratio={peak_ratio:.2f} — investigate for leaked staging "
         f"buffers in the all_gather / reduce_scatter paths"
     )
-    # That sharding ACTUALLY engaged is verified transitively by
-    # the rank-agreement check above (if sharding were silently off,
-    # the per-rank post-train weights would not be equal because
-    # reduce_scatter's partitioning wouldn't apply). For belt +
-    # braces, also require the two modes to produce DIFFERENT loss
-    # trajectories — if sharding is off in both runs, the losses
-    # match bit-for-bit (same initial seed, same training step
-    # semantics). The sharded run uses FAR fewer CPU-optim-state
-    # bytes per rank, so the first-iter loss typically differs by
-    # ~1-2% (momentum-state carried across chunks is per-rank in
-    # sharded mode, full across all in replicated — this is
-    # expected and harmless).
-    diff_pct = abs(shard_losses[0] - replicate_losses[0]) / max(
-        abs(replicate_losses[0]), 1e-6
-    )
-    assert diff_pct > 1e-4, (
-        f"sharded and replicated iter-0 losses are identical "
-        f"({shard_losses[0]} vs {replicate_losses[0]}); sharding "
-        f"likely did not engage (check worker log for "
-        f"'zero3_shard=True' in the protrain log lines)"
-    )
+    # That sharding ACTUALLY engaged is asserted directly via the
+    # worker's ``all_sharded`` per-rank flag (see the M7-follow-up
+    # block below that reads ``per_rank_all_sharded`` from the
+    # stats files). The iter-0 losses are BIT-IDENTICAL across
+    # sharded/replicated (same initial weights, same input tokens,
+    # forward has not yet been exposed to the shard/replicate code
+    # path's divergent collective paths because updates only
+    # manifest starting iter 1). Iters >= 1 MAY differ slightly
+    # when per-rank momentum state differs (sharded CPU-Adam holds
+    # partitioned moments; replicated holds a local full copy) —
+    # when DeepSpeed CPU-Adam is not available on the host the
+    # trajectories coincide more tightly. We therefore only assert
+    # the trajectories are "not obviously wrong" (both finite, both
+    # descending) — the strong correctness signal is the per-rank
+    # param-checksum agreement above + the ``all_sharded`` flag below.
+    for i, lv in enumerate(replicate_losses):
+        assert _math.isfinite(lv), (
+            f"replicate: loss at iter {i} is not finite: {replicate_losses}"
+        )
 
     # Sanity: replicate path also trained OK (loss finite, rank
     # agreement holds there too since replicated mode holds a full
@@ -946,3 +997,42 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
         f"replicate: post-train param checksum diverges across ranks, "
         f"max_diff={replicate_max_diff} rel_diff={replicate_rel_diff:.3e}"
     )
+
+    # ---- M7 follow-up: per-rank CPU footprint + sharding engagement ----
+    # (1) Every non-persistent chunk in the sharded run must engage
+    # the sharded path — no silent fall-back to replicated. The
+    # worker records ``all_sharded = all(s.is_sharded for s in
+    # chunk_manager._chunk_shards.values())`` per rank.
+    shard_all_sharded = shard_stats.get("per_rank_all_sharded", [])
+    assert shard_all_sharded and all(shard_all_sharded), (
+        f"sharded run did not engage the sharded path on every "
+        f"non-persistent chunk: per_rank_all_sharded={shard_all_sharded}"
+    )
+
+    # (2) Per-rank pinned CPU bytes in sharded mode should be
+    # roughly ``total_non_persist / world_size``. Allow allocator /
+    # alignment overhead up to 1.5x the expected shard bytes before
+    # flagging a regression.
+    world_size = 4
+    shard_cpu_bytes = shard_stats.get("per_rank_cpu_bytes", [])
+    replicate_cpu_bytes = replicate_stats.get("per_rank_cpu_bytes", [])
+    total_np_shard = int(shard_stats.get("total_non_persist", "0"))
+
+    print(
+        "  shard per-rank CPU:  "
+        f"{[b/1e9 for b in shard_cpu_bytes]} GB "
+        f"(total_non_persist={total_np_shard/1e9:.3f} GB)"
+    )
+    print(
+        "  replicate per-rank CPU: "
+        f"{[b/1e9 for b in replicate_cpu_bytes]} GB"
+    )
+
+    if shard_cpu_bytes and total_np_shard > 0:
+        expected_shard_bytes = total_np_shard / world_size
+        max_shard_bytes = max(shard_cpu_bytes)
+        assert max_shard_bytes < 1.5 * expected_shard_bytes, (
+            f"sharded per-rank CPU footprint {max_shard_bytes/1e9:.3f} GB "
+            f"exceeds 1.5 * expected shard {expected_shard_bytes/1e9:.3f} GB — "
+            f"sharding may not be partitioning bytes as intended"
+        )
