@@ -92,7 +92,12 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
             "lora_target_modules": ["q_proj", "v_proj"],
             "plugins": ["axolotl.integrations.protrain.ProTrainPlugin"],
             "protrain_auto_memory": True,
-            "protrain_force_all_persistent": True,
+            # Deliberately DO NOT set protrain_auto_mode — rely on its
+            # True default. For SmolLM2-135M on single-rank the
+            # selector picks Mode A (force_all_persistent=True,
+            # zero3_shard=False) which is the path this test is
+            # validating. Regression guard: if the default flips, this
+            # test's coverage of Mode A under auto-select breaks.
             "gradient_accumulation_steps": 1,
             "micro_batch_size": 1,
             # 30 steps trades a few more wall-seconds for averaging out
@@ -124,6 +129,16 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
                 "pad_token": "<|endoftext|>",
             },
         }
+    )
+
+    # Regression guard for the ``protrain_auto_mode`` default: every
+    # user YAML must inherit True so the plugin auto-selects the
+    # mode. Hard-code-checked rather than imported from the module so
+    # a careless default flip surfaces here with a clear failure.
+    from axolotl.integrations.protrain.args import ProTrainArgs
+    assert ProTrainArgs.model_fields["protrain_auto_mode"].default is True, (
+        "protrain_auto_mode default must be True — flipping it silently "
+        "breaks the M7 ZeRO-3 footgun fix."
     )
 
     _marker("cfg built; registering plugin via prepare_plugins")

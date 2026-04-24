@@ -55,20 +55,45 @@ class ProTrainArgs(BaseModel):
         },
     )
 
+    protrain_auto_mode: bool | None = Field(
+        default=True,
+        json_schema_extra={
+            "description": (
+                "Auto-select the multi-GPU mode (A/B/C) based on measured fit "
+                "and CPU-RAM-per-rank. When True (the default) the wrapper "
+                "ignores the mode-picking intent of ``protrain_force_all_persistent`` "
+                "and ``protrain_zero3_shard`` and picks one of: "
+                "(A) GPU-resident / DDP-friendly (force_all_persistent=True), "
+                "when the searcher can place ``n_persist == N_chunk`` under the "
+                "capacity budget; "
+                "(B) replicated CPU-offload (zero3_shard=False), when the model "
+                "needs offload and per-rank CPU RAM can hold the full "
+                "non-persistent chunk set; "
+                "(C) ZeRO-3 sharded CPU-offload (zero3_shard=True), when the "
+                "model needs offload but per-rank CPU RAM is too tight for "
+                "replication. Set this to False to bypass the auto-selector and "
+                "honour ``protrain_force_all_persistent`` + ``protrain_zero3_shard`` "
+                "as explicit overrides — useful for reproducing specific "
+                "benchmark configurations or for heterogeneous-CPU setups where "
+                "the node-RAM/world-size heuristic is wrong. See DESIGN.md "
+                "§Multi-GPU for the measured throughput ordering that motivates "
+                "this default."
+            )
+        },
+    )
+
     protrain_force_all_persistent: bool | None = Field(
         default=False,
         json_schema_extra={
             "description": (
-                "Debug / compatibility override: bypass the 4-knob searcher and "
-                "force every chunk to stay GPU-resident "
+                "Explicit override for the GPU-resident mode. "
+                "When ``protrain_auto_mode`` is True (default) this flag is "
+                "IGNORED — the plugin auto-selects based on workload fit. When "
+                "``protrain_auto_mode`` is False, True here bypasses the "
+                "4-knob searcher and forces every chunk to stay GPU-resident "
                 "(n_persist = N_chunk, n_swap = 0, n_checkpoint = N_block). "
-                "The default is False because the paper's exhaustive search over "
-                "(n_persist, n_buffer, n_swap, n_checkpoint) is the core "
-                "contribution of ProTrain; shipping with the searcher disabled "
-                "would hide the feature behind a flag. Set to True only for "
-                "24 GB LoRA workloads that cannot yet survive the search-picked "
-                "CPU-offload path (the M6 true-ZeRO-3 sharding milestone closes "
-                "this gap)."
+                "Set ``protrain_auto_mode: false`` alongside to make this "
+                "effective — otherwise the auto-selector may override it."
             )
         },
     )
@@ -124,14 +149,17 @@ class ProTrainArgs(BaseModel):
         default=None,
         json_schema_extra={
             "description": (
-                "M7 ZeRO-3 override. When None (default), ProTrain auto-"
-                "enables sharded CPU chunks when the process group reports "
-                "world_size > 1 AND the trainer is NOT wrapping the model "
-                "in DistributedDataParallel AND protrain_force_all_persistent "
-                "is False. Setting to True forces sharding on (subject to the "
-                "world_size > 1 gate). Setting to False disables sharding "
-                "even at world_size > 1 — use this when composing the "
-                "protrain'd module under DDP."
+                "Explicit override for the ZeRO-3 sharded-offload mode. "
+                "When ``protrain_auto_mode`` is True (default) this flag is "
+                "IGNORED by the mode-selector — the plugin auto-picks A/B/C "
+                "based on workload fit + CPU-RAM-per-rank. When "
+                "``protrain_auto_mode`` is False, None preserves the pre-auto "
+                "behaviour (auto-enable at world_size>1 unless DDP is on top), "
+                "True forces sharding on (subject to world_size>1), False "
+                "disables sharding. M7 benchmark (DESIGN.md §Multi-GPU) shows "
+                "sharded throughput lands around 0.70x single-rank on PCIe "
+                "Gen3 4x RTX 3090 — only pick this when CPU RAM is truly the "
+                "binding constraint."
             )
         },
     )

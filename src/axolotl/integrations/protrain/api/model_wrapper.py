@@ -404,6 +404,141 @@ def _calibrate_peak_with_actual_chunk_bytes(
     return calibrated
 
 
+def _cpu_ram_per_rank_bytes(world_size: int) -> int:
+    """Best-effort estimate of per-rank available CPU RAM in bytes.
+
+    Heuristic: read node-level available RAM (``psutil.virtual_memory().available``
+    preferred; falls back to ``/proc/meminfo`` on Linux) and divide by
+    ``world_size`` as a crude per-rank share. This is PESSIMISTIC on
+    machines with NUMA-aware CPU allocation and OPTIMISTIC on
+    heterogeneous multi-host setups (where the smallest node's RAM is
+    the binding constraint, not the average). Users whose production
+    topology doesn't match the "node RAM / world_size" model should
+    disable ``protrain_auto_mode`` and pick the mode explicitly — see
+    DESIGN.md §Multi-GPU.
+
+    Returns 0 when neither probe succeeds; the auto-selector interprets
+    0 as "no offload is safe" and falls through to Mode A (which is
+    usually correct — if the plugin can't see the RAM, assume the
+    workload fits on GPU).
+    """
+    ws = max(1, int(world_size))
+    # Preferred path: psutil (already in Axolotl's env for trainer bookkeeping).
+    try:
+        import psutil
+
+        return max(0, int(psutil.virtual_memory().available) // ws)
+    except ImportError:
+        pass
+
+    # Fallback: /proc/meminfo on Linux. ``MemAvailable`` field is the
+    # kernel's own estimate of RAM that can be used without swapping;
+    # matches psutil.virtual_memory().available on modern Linux.
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    # Format: "MemAvailable:    12345678 kB"
+                    kb = int(line.split()[1])
+                    return max(0, (kb * 1024) // ws)
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # No reliable probe — return 0 so the auto-selector can detect the
+    # gap and pick the safest fit-on-GPU path. Callers can log a warning
+    # at the call site.
+    return 0
+
+
+def _select_mode(
+    search_result: SearchResult,
+    layout,
+    hw: HardwareProfile,
+    world_size: int,
+    cpu_ram_per_rank_bytes: int,
+    *,
+    auto_mode: bool,
+    user_force_all_persistent: bool,
+    user_zero3_shard: bool | None,
+) -> tuple[bool, bool]:
+    """Resolve ``(force_all_persistent, zero3_shard)`` for the wrapper.
+
+    Decision tree (``auto_mode=True``):
+
+    * ``n_persist >= N_chunk`` → Mode A ``(True, False)``. Model fits
+      fully on GPU; DDP+replicated is the throughput winner per the M7
+      benchmark (3.64x vs 0.70x ZeRO-3 on PCIe Gen3 4x 3090).
+    * Otherwise model needs offload. Pick between:
+       - Mode B (replicated): ``(False, False)``. Faster: no per-chunk
+         ``all_gather`` / ``reduce_scatter`` collectives. Requires
+         ``cpu_ram_per_rank_bytes >= replicated_footprint``.
+       - Mode C (sharded): ``(False, True)``. Slower but fits: each rank
+         holds ``1/world_size`` of each non-persistent chunk's pinned
+         bytes. Requires ``cpu_ram_per_rank_bytes >= sharded_footprint``.
+       - Neither: raise ``RuntimeError`` — the model truly doesn't fit
+         on this node, user must scale up (more nodes / more RAM /
+         smaller model) before retrying.
+
+    ``auto_mode=False`` returns the user's explicit flags unchanged
+    (with ``None`` zero3_shard → False).
+
+    The "Mode B over Mode C when both fit" policy is a deliberate
+    throughput trade — Mode B is ~1.9x faster than Mode C on PCIe Gen3,
+    so we keep CPU-replication as long as it fits even if the sharded
+    path would save pinned RAM. Users with binding CPU pressure should
+    set ``protrain_auto_mode=False, protrain_zero3_shard=True`` to force
+    Mode C.
+    """
+    # Explicit overrides — bypass the selector.
+    if not auto_mode:
+        return (
+            bool(user_force_all_persistent),
+            bool(user_zero3_shard) if user_zero3_shard is not None else False,
+        )
+
+    # Single-rank auto path: no multi-GPU mode to pick — Mode A is
+    # always the right answer (no CPU offload to replicate/shard).
+    if world_size <= 1:
+        return (True, False)
+
+    # Mode A: searcher says everything fits on GPU. Best throughput.
+    if int(search_result.cfg.n_persist) >= int(layout.N_chunk):
+        return (True, False)
+
+    # Compute per-rank CPU footprint under both replicated and sharded
+    # modes from the searcher's picked config. Build throwaway hardware
+    # profiles so the cost model can read ``zero3_shard`` directly.
+    from dataclasses import replace as _replace
+
+    from axolotl.integrations.protrain.cost.memory import (
+        estimate_cpu_footprint,
+    )
+
+    hw_replicated = _replace(hw, zero3_shard=False)
+    replicated_footprint = int(
+        estimate_cpu_footprint(search_result.cfg, layout, hw_replicated)
+    )
+    hw_sharded = _replace(hw, zero3_shard=True)
+    sharded_footprint = int(
+        estimate_cpu_footprint(search_result.cfg, layout, hw_sharded)
+    )
+
+    if cpu_ram_per_rank_bytes >= replicated_footprint:
+        return (False, False)
+    if cpu_ram_per_rank_bytes >= sharded_footprint:
+        return (False, True)
+
+    raise RuntimeError(
+        "ProTrain auto-mode: model does not fit on this node. Searcher "
+        f"picked n_persist={search_result.cfg.n_persist}/"
+        f"{layout.N_chunk} (needs CPU offload), but per-rank CPU RAM "
+        f"({cpu_ram_per_rank_bytes / 1e9:.1f} GB) is smaller than the "
+        f"sharded footprint ({sharded_footprint / 1e9:.1f} GB). Scale "
+        "up: more nodes, more system RAM, smaller model, or a larger "
+        "per-rank capacity budget."
+    )
+
+
 def protrain_model_wrapper(
     model: nn.Module,
     model_config: object,  # noqa: ARG001 — accepted for API symmetry with the plan
@@ -419,6 +554,7 @@ def protrain_model_wrapper(
     n_swap_override: int | None = None,
     n_checkpoint_override: int | None = None,
     zero3_shard: bool | None = None,
+    auto_mode: bool = False,
 ) -> WrappedModel:
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
@@ -469,6 +605,17 @@ def protrain_model_wrapper(
         ``torch.distributed`` process group AND the model must not be
         wrapped in DDP at training time (sharding is the grad-sync
         point itself; DDP would double-reduce).
+    auto_mode:
+        When True, the wrapper runs the searcher first and then calls
+        :func:`_select_mode` to resolve ``(force_all_persistent,
+        zero3_shard)`` from workload fit + per-rank CPU RAM. The
+        caller's ``force_all_persistent`` / ``zero3_shard`` arguments
+        are IGNORED on this path (they become explicit overrides only
+        when ``auto_mode=False``). Designed to save users from the
+        ZeRO-3 footgun surfaced by the M7 benchmark (0.70x throughput
+        vs. 3.64x DDP on PCIe Gen3 4x 3090 when the model fits on GPU).
+        Default is False on this direct entry point; the plugin sets it
+        to True via ``ProTrainArgs.protrain_auto_mode``.
 
     Returns
     -------
@@ -579,6 +726,43 @@ def protrain_model_wrapper(
             0, int(hardware_profile.gpu_memory_bytes) - _DEFAULT_HEADROOM_BYTES
         )
 
+    # Early world-size probe — the mode selector + zero3_shard plumbing
+    # both need this before the search runs.
+    _ws_early = 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        _ws_early = int(torch.distributed.get_world_size())
+
+    # Stash the caller's raw intent before the auto-selector potentially
+    # rewrites the effective flags. The selector is applied AFTER
+    # search() returns; until then we treat the run as a "best fit"
+    # search with zero3_shard=False in the hardware profile so the
+    # searcher's CPU accounting uses the replicated baseline (the GPU
+    # peak filter is sharding-agnostic anyway — see
+    # cost/memory.estimate_peak — so the searcher's pick of n_persist is
+    # not distorted by this choice).
+    _user_force_all_persistent = bool(force_all_persistent)
+    _user_zero3_shard = zero3_shard
+
+    if auto_mode:
+        # On the auto path, disable the force_all_persistent short-circuit
+        # below and let the searcher pick n_persist. If the fit is tight
+        # the selector flips the mode post-search; if the fit is loose
+        # the searcher lands at n_persist=N_chunk naturally, which is
+        # already Mode A semantically (no runtime difference vs. the
+        # force_all_persistent synthetic path). We also suppress an
+        # explicit user ``zero3_shard=True`` for the hw profile here;
+        # it gets re-evaluated after search + selector.
+        if _user_force_all_persistent:
+            LOG.info(
+                "ProTrain auto-mode: user set force_all_persistent=True "
+                "but auto-mode overrides explicit flags. Running searcher "
+                "— will pick Mode A naturally if the workload fits on "
+                "GPU. Set ``protrain_auto_mode: false`` to force-honour "
+                "force_all_persistent=True."
+            )
+        force_all_persistent = False
+        zero3_shard = False
+
     # Resolve the ZeRO-3 sharding flag early so we can propagate it into
     # ``HardwareProfile`` before the cost-model search runs. The same
     # rules as the later in-place re-check (post-materialize_offload)
@@ -587,9 +771,6 @@ def protrain_model_wrapper(
     # overrides otherwise. The ChunkManager additionally degrades to
     # False on single-rank hosts (so setting this True on ws=1 is a
     # no-op); we mirror that here for HW profile consistency.
-    _ws_early = 1
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        _ws_early = int(torch.distributed.get_world_size())
     if zero3_shard is None:
         _zero3_for_hw = (_ws_early > 1) and (not force_all_persistent)
     else:
@@ -717,6 +898,87 @@ def protrain_model_wrapper(
             f"iter={result.predicted_iter_s:.3f}s\n"
         )
         _sys2.stderr.flush()
+
+    # ---- 3.5: auto-mode selection (M7 follow-up) -----------------------
+    # With the searcher's ``n_persist`` pick in hand, resolve the real
+    # (force_all_persistent, zero3_shard) pair from workload fit +
+    # per-rank CPU RAM. See ``_select_mode`` for the decision tree and
+    # the DESIGN.md §Multi-GPU measured throughput ordering that
+    # motivates the default (A > B > C on PCIe Gen3 3090).
+    if auto_mode:
+        cpu_ram = _cpu_ram_per_rank_bytes(_ws_early)
+        if cpu_ram == 0 and _ws_early > 1:
+            LOG.warning(
+                "ProTrain auto-mode: could not probe CPU RAM via psutil or "
+                "/proc/meminfo. Treating per-rank RAM as 0 bytes — the "
+                "selector will prefer Mode A (force_all_persistent) and "
+                "raise if the model needs offload. Set "
+                "``protrain_auto_mode: false`` and pick the mode "
+                "explicitly on exotic topologies."
+            )
+        auto_force_persistent, auto_zero3 = _select_mode(
+            search_result=result,
+            layout=layout,
+            hw=hardware_profile,
+            world_size=_ws_early,
+            cpu_ram_per_rank_bytes=cpu_ram,
+            auto_mode=True,
+            user_force_all_persistent=_user_force_all_persistent,
+            user_zero3_shard=_user_zero3_shard,
+        )
+
+        # Warn if the user set an explicit flag that the selector is
+        # overriding. This is the key safety check for the M7 footgun:
+        # users who requested ZeRO-3 on a workload that fits in Mode A
+        # should learn they're leaving throughput on the table.
+        if _user_zero3_shard is True and not auto_zero3 and _ws_early > 1:
+            LOG.warning(
+                "ProTrain auto-mode: user set zero3_shard=True but the "
+                "workload fits in Mode A (force_all_persistent). "
+                "Auto-mode picked Mode A for better throughput — on "
+                "PCIe Gen3 RTX 3090, DDP+Mode_A gives ~3.6x scaling vs "
+                "ZeRO-3's ~0.7x. Set ``protrain_auto_mode: false`` to "
+                "force-honour zero3_shard=True."
+            )
+
+        if auto_force_persistent:
+            if _ws_early > 1:
+                LOG.info(
+                    "ProTrain auto-mode: picking Mode A "
+                    "(force_all_persistent=True). On PCIe Gen3 RTX 3090, "
+                    "DDP+Mode_A gives ~3.6x scaling vs ZeRO-3's ~0.7x — see "
+                    "DESIGN.md §Multi-GPU for benchmark data."
+                )
+            else:
+                LOG.info(
+                    "ProTrain auto-mode: picking Mode A "
+                    "(force_all_persistent=True, single-rank)."
+                )
+        elif not auto_zero3:
+            LOG.info(
+                "ProTrain auto-mode: picking Mode B (CPU-offload, "
+                "replicated). Per-rank CPU RAM sufficient for the full "
+                "non-persistent chunk set."
+            )
+        else:
+            LOG.info(
+                "ProTrain auto-mode: picking Mode C (CPU-offload, "
+                "ZeRO-3 sharded). Per-rank CPU RAM too tight for "
+                "replication — falling back to 1/world_size shard."
+            )
+
+        force_all_persistent = auto_force_persistent
+        zero3_shard = auto_zero3
+        # If the selector picked Mode C (sharded), we need the downstream
+        # chunk manager to see zero3_shard=True. Propagate via the
+        # hardware_profile so the remaining pipeline picks it up exactly
+        # as the explicit path would. (If selector picked Mode B, the
+        # prior hw flip to False is already correct.)
+        if zero3_shard != hardware_profile.zero3_shard:
+            from dataclasses import replace as _replace
+            hardware_profile = _replace(
+                hardware_profile, zero3_shard=bool(zero3_shard)
+            )
 
     # ---- 4. construct runtime ------------------------------------------
     n_persist = result.cfg.n_persist

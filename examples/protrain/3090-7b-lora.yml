@@ -7,17 +7,20 @@
 # wiring path because Axolotl's OptimizerMixin.create_optimizer does NOT
 # dispatch to PluginManager.create_optimizer (see plugin.py for why).
 #
-# Current recommended setting: protrain_force_all_persistent: true.
-# This is the M5 workaround for two known M4.5 runtime gaps:
-#   (1) init-time chunk offload not physically moving non-persistent chunks
-#       to CPU, so search-picked configs OOM on 7B/8B LoRA at first gather;
-#   (2) per-param grad offload during backward not yet wired (LoRA with
-#       frozen base sidesteps this gap).
-# With force_all_persistent the searcher is bypassed and all chunks stay
-# GPU-resident; activation memory is managed via checkpointing (n_checkpoint
-# = N_block). This is a valid ProTrain configuration for LoRA on 24 GB —
-# once the M6 true-ZeRO-3 sharding milestone lands, flip the flag to false
-# to recover the full automatic search and CPU-offload behaviour.
+# Mode selection is automatic. Leave ``protrain_auto_mode`` on (default);
+# the plugin runs the searcher and then picks Mode A (GPU-resident / DDP-
+# friendly), Mode B (replicated CPU-offload), or Mode C (ZeRO-3 sharded
+# CPU-offload) based on the model's fit and per-rank CPU RAM. For 7B/8B
+# LoRA on a single 24 GB 3090 the selector picks Mode A — the frozen
+# base fits in fp16 alongside LoRA optimizer state + activations, and
+# DDP scales at ~3.6x on PCIe Gen3 4x 3090 while ZeRO-3 sharding on
+# the same rig lands at ~0.7x (see DESIGN.md §Multi-GPU).
+#
+# Set ``protrain_auto_mode: false`` below only if you need explicit
+# control (reproducing a specific benchmark configuration, or a
+# heterogeneous-CPU setup where the node-RAM/world-size heuristic is
+# wrong). In that case ``protrain_force_all_persistent`` and
+# ``protrain_zero3_shard`` become the explicit overrides.
 
 # NousResearch/Meta-Llama-3-8B-Instruct is the 8B-class Llama mirror on HF
 # Hub that is *not* gated (public-license, no HF-terms accept step). It was
@@ -60,7 +63,9 @@ plugins:
 
 # -- ProTrain knobs (see axolotl.integrations.protrain.args.ProTrainArgs) --
 protrain_auto_memory: true
-protrain_force_all_persistent: true
+# Leave auto-mode on (default); the plugin picks the right mode.
+# protrain_auto_mode: true   # default — the selector handles it
+# protrain_force_all_persistent: true   # explicit override (only honoured when protrain_auto_mode=false)
 
 gradient_accumulation_steps: 1
 micro_batch_size: 1
@@ -74,9 +79,10 @@ fp16: false
 tf32: false
 
 # IMPORTANT: the ProTrain block manager installs its own CKPT hooks when
-# force_all_persistent is True (n_checkpoint = N_block). Enabling Axolotl /
-# HuggingFace gradient checkpointing here would double-checkpoint the
-# forward pass — and the ProTrainArgs validator will refuse the config.
+# the searcher assigns a block to CKPT mode (typical for tight-capacity
+# offload configs). Enabling Axolotl / HuggingFace gradient checkpointing
+# here would double-checkpoint the forward pass — and the ProTrainArgs
+# validator will refuse the config.
 gradient_checkpointing: false
 
 flash_attention: false

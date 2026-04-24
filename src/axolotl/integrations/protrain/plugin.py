@@ -188,6 +188,17 @@ class ProTrainPlugin(BasePlugin):
         )
         zero3_shard = getattr(cfg, "protrain_zero3_shard", None)
 
+        # auto_mode defaults to True (see ProTrainArgs). On the auto
+        # path, the wrapper runs the searcher first and then calls
+        # :func:`axolotl.integrations.protrain.api.model_wrapper._select_mode`
+        # to resolve ``(force_all_persistent, zero3_shard)`` from
+        # workload fit + CPU-RAM-per-rank. When explicitly disabled,
+        # the wrapper honours the user's flags verbatim — see the
+        # ProTrainArgs docstrings for the override semantics.
+        auto_mode = getattr(cfg, "protrain_auto_mode", True)
+        if auto_mode is None:
+            auto_mode = True
+
         wrapped = protrain_model_wrapper(
             model,
             model_config=getattr(model, "config", None),
@@ -202,6 +213,7 @@ class ProTrainPlugin(BasePlugin):
             n_swap_override=n_swap_override,
             n_checkpoint_override=n_checkpoint_override,
             zero3_shard=zero3_shard,
+            auto_mode=bool(auto_mode),
         )
 
         # Stash on cfg so post_trainer_create (which only receives cfg +
@@ -210,14 +222,27 @@ class ProTrainPlugin(BasePlugin):
         cfg._protrain_wrapped = wrapped  # type: ignore[attr-defined]
 
         picked = wrapped.search_result.cfg
+        # Derive the effective-mode string from the chunk manager's
+        # post-wrapper state rather than the raw user flag: with
+        # ``auto_mode=True`` the selector may have overridden the
+        # user's force_all_persistent / zero3_shard intent, and the
+        # log should reflect what's actually installed.
+        n_chunk_total = getattr(wrapped.chunk_manager.layout, "N_chunk", -1)
+        effective_force_persistent = int(picked.n_persist) >= int(n_chunk_total)
+        effective_zero3 = bool(
+            getattr(wrapped.chunk_manager, "zero3_shard", False)
+        )
         LOG.info(
             "ProTrain: %s config picked (n_persist=%d, n_buffer=%d, "
-            "n_checkpoint=%d, force_all_persistent=%s)",
+            "n_checkpoint=%d, force_all_persistent=%s, zero3_shard=%s, "
+            "auto_mode=%s)",
             type(getattr(model, "base_model", model)).__name__,
             getattr(picked, "n_persist", -1),
             getattr(picked, "n_buffer", -1),
             getattr(picked, "n_checkpoint", -1),
-            force_all_persistent,
+            effective_force_persistent,
+            effective_zero3,
+            bool(auto_mode),
         )
 
     def create_optimizer(
