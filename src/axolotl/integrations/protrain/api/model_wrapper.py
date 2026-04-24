@@ -800,6 +800,21 @@ def protrain_model_wrapper(
         and trace.gpu_adam_bytes_per_sec > 0.0
     ):
         _hw_updates["gpu_adam_bytes_per_sec"] = trace.gpu_adam_bytes_per_sec
+    # PCIe rates: overwrite the caller's hardcoded prior (usually 13e9 =
+    # Gen3) with the profiler's measured H2D/D2H. A 3090 on PCIe Gen4 x16
+    # sits around 50-56 GB/s — 4× the conservative default — and the
+    # cost model's per-chunk comm is S_chunk / eff_h2d, so this flow-
+    # through directly corrects the 7B over-prediction.
+    if (
+        hardware_profile.pcie_h2d_bps <= 13e9 + 1e6  # within 1MB of default
+        and trace.pcie_h2d_bps > 13e9 + 1e6
+    ):
+        _hw_updates["pcie_h2d_bps"] = trace.pcie_h2d_bps
+    if (
+        hardware_profile.pcie_d2h_bps <= 13e9 + 1e6
+        and trace.pcie_d2h_bps > 13e9 + 1e6
+    ):
+        _hw_updates["pcie_d2h_bps"] = trace.pcie_d2h_bps
     if _hw_updates:
         hardware_profile = _replace(hardware_profile, **_hw_updates)
 
