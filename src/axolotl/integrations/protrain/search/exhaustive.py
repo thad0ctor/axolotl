@@ -271,7 +271,10 @@ def search(
     # Pre-compute block-map-dependent terms once per (n_swap, n_ckpt).
     # ``F(block_map)`` is the raw-peak contribution excluding the
     # ``(n_persist + n_buffer) * S_chunk`` term, pre-alpha.
-    from axolotl.integrations.protrain.cost.memory import ALPHA_FRAGMENTATION
+    from axolotl.integrations.protrain.cost.memory import (
+        ALPHA_FRAGMENTATION,
+        hot_iter_peak_cap,
+    )
 
     alpha = ALPHA_FRAGMENTATION
     s_chunk = layout.S_chunk
@@ -337,6 +340,20 @@ def search(
                     n_total += 1
                     model_state_present = (n_persist + n_buffer) * s_chunk
                     raw_peak = model_state_present + f_bm
+                    # Apply the hot-iter ground-truth cap (v6+ traces with
+                    # per-block peaks). Mirrors the cap in
+                    # ``cost/memory.py::estimate_peak`` so the searcher
+                    # picks the same config ``estimate_peak`` would
+                    # validate, closing the F_bm-vs-estimate_peak gap.
+                    _cfg_for_cap = CostConfig(
+                        n_persist=n_persist,
+                        n_buffer=n_buffer,
+                        n_swap=n_swap,
+                        n_checkpoint=n_ckpt,
+                    )
+                    _cap = hot_iter_peak_cap(trace, block_map, _cfg_for_cap)
+                    if _cap is not None and raw_peak > _cap:
+                        raw_peak = _cap
                     predicted_peak = (
                         int(alpha * raw_peak) if raw_peak > 0 else 0
                     )

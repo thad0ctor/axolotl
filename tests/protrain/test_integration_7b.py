@@ -230,20 +230,17 @@ def test_protrain_7b_end_to_end() -> None:
     # trading for more retained activation memory), and α's over-estimate
     # compounds. 35% ceiling acknowledges this without losing the signal.
     #
-    # Post-per-block-peak-cap state: ``cost/memory.py::estimate_peak`` now
-    # caps the op-walk's raw_peak at
-    # ``max(steady_fwd_block_peak_bytes) + max_ckpt_activation`` when the
-    # v6 per-block dict is populated. This tightens estimate_peak callers
-    # (unit tests + any downstream rebuild) for ALL fractional-NONE
-    # configs — not just all-NONE like the v5 aggregate cap. The 7B
-    # end-to-end pipeline observes only a marginal tightening here
-    # (34% → 33% over-predict) because ``search/exhaustive.py`` uses an
-    # inline ``alpha * (model_state + F_bm)`` fast path that does not
-    # call ``estimate_peak`` (see ``search.exhaustive._block_map_peak_contribution``
-    # — equivalent to estimate_peak's op-walk, but without the cap).
-    # Closing the gap below 25% requires mirroring the cap inside the
-    # search's inline formula, which is out-of-scope for this commit.
-    assert peak_err < 0.35, f"peak prediction off by {peak_err*100:.1f}%"
+    # Post-per-block-peak-cap + search-path propagation: the shared
+    # ``hot_iter_peak_cap`` helper in cost/memory.py is now called from
+    # BOTH ``estimate_peak`` AND the search's inline ``F_bm`` fast path
+    # (``search/exhaustive.py``). The 7B end-to-end over-predict dropped
+    # from 32-34% to sub-1% because the searcher now picks the config
+    # that ``estimate_peak`` would actually validate, and the measured
+    # per-block peak is a strict ground-truth upper bound on what
+    # steady-state forward can allocate.
+    #
+    # Ceiling tightened 0.35 → 0.10 to match the paper's original spec.
+    assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
     # Runtime tolerance: 90% ceiling.
     #
     # Calibration history on this workload:
@@ -283,7 +280,7 @@ def test_protrain_7b_end_to_end() -> None:
     #      over-estimated communication time.
     #
     # Peak stays strict at 10% — that is the OOM-safety invariant.
-    assert runtime_err < 0.90, (
+    assert runtime_err < 0.50, (
         f"runtime prediction off by {runtime_err*100:.1f}% — hook-dispatch "
         "calibration at 0.3 clamp + 2x roofline secondary cap reproduces "
         "the pre-calibration forward-compute estimate on this 7B workload. "
