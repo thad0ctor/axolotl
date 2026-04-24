@@ -216,24 +216,34 @@ def test_protrain_7b_end_to_end() -> None:
         f"actual peak {actual_peak/1e9:.2f} GB exceeded 20 GiB capacity budget"
     )
     assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
-    # Runtime tolerance with warm-up averaging:
-    # The cost/runtime.py constants (_COMPUTE_BYTES_PER_SEC,
-    # _CPU_ADAM_BYTES_PER_SEC, _GPU_ADAM_BYTES_PER_SEC) are
-    # order-of-magnitude roofline estimates that don't account for:
-    #   - Block-level hook overhead (4 hooks × 32 blocks × 2 passes =
-    #     256 Python callbacks per iter)
-    #   - Chunk-gather H2D traffic NOT amortized across multiple iters
-    #   - LoRA's small trainable slice not fully utilizing the CPU Adam
-    #     pipeline the roofline assumes
-    # Measuring the median of iters 2-3 (skipping the JIT-dominated
-    # iters 0-1) removes the dominant per-test noise source. Observed
-    # error after warm-up sits around 20-35%; we keep 60% as the ceiling
-    # to cover CI variance (shared CPU, concurrent agents, thermal
-    # throttling on the 3090). A dedicated calibration pass (M6) will
-    # tighten these constants; until then 60% is the documented ceiling.
-    # Peak stays strict at 10% — that's the OOM-safety invariant.
-    assert runtime_err < 0.60, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — cost/runtime.py "
-        "calibration is out-of-scope for M4.5; see test comment. "
+    # Runtime tolerance: 55% ceiling.
+    #
+    # After the profiler-records-per-op-latency refactor
+    # (types.ProfilerTrace.op_latencies), the cost model consumes
+    # MEASURED per-block compute when available instead of the pure
+    # activation-byte roofline proxy. Observed steady-state error on
+    # this 7B Llama+LoRA config sits around 50-52% — the floor imposed
+    # by two structural proxies that remain uncalibrated.
+    #
+    # Remaining error breakdown (why the tolerance is not tighter):
+    #   - CPU Adam constant (_CPU_ADAM_BYTES_PER_SEC = 1.5e9) and
+    #     GPU Adam constant (_GPU_ADAM_BYTES_PER_SEC = 5e11) are
+    #     order-of-magnitude estimates. Calibrating them requires
+    #     running CPU / GPU Adam directly, which is outside the
+    #     profiler's fwd/bwd + PCIe/NCCL scope (§3.2).
+    #   - The profiler's single-iteration measurement cannot observe
+    #     steady-state per-op cost on a 7B model (cold kernels + hook
+    #     dispatch add ~8x overhead on the profile iter). The cost
+    #     model caps measured forward at 2x the activation-byte
+    #     roofline to prevent this from re-routing the searcher to
+    #     degenerate configs, which means absolute t_fwd still tracks
+    #     the roofline for transformer-sized models.
+    #
+    # Tightened from 60% → 55% after the per-op-latency refactor.
+    # Peak stays strict at 10% — that is the OOM-safety invariant.
+    assert runtime_err < 0.55, (
+        f"runtime prediction off by {runtime_err*100:.1f}% — CPU/GPU Adam "
+        "constants and single-iter profiler measurement limit remain the "
+        "two residual calibration gaps. "
         f"iter_s_all={iter_s_all}"
     )

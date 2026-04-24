@@ -75,6 +75,7 @@ def _make_trace(
     intra_delta_bytes: int = 8 * MB,
     inter_delta_bytes: int = 2 * MB,
     world: int = 1,
+    op_latency_s: float = 0.0002,   # 200 µs per forward op; toy but >0
 ) -> ProfilerTrace:
     op_order = _make_op_order(n_block, ops_per_block)
     intra_op_delta: dict[OpId, int] = {op.op_id: intra_delta_bytes for op in op_order}
@@ -82,6 +83,11 @@ def _make_trace(
     activation_sizes: dict[BlockId, int] = {
         BlockId(b): activation_bytes_per_block for b in range(n_block)
     }
+    # Populated op_latencies so the cost model exercises the measured-compute
+    # path rather than the activation-bytes fallback. Uniform per-op timing
+    # keeps the synthetic invariants (monotonicity in n_buffer, CKPT-adds-
+    # recompute, etc.) easy to reason about.
+    op_latencies: dict[OpId, float] = {op.op_id: op_latency_s for op in op_order}
     return ProfilerTrace(
         op_order=op_order,
         intra_op_delta=intra_op_delta,
@@ -97,6 +103,7 @@ def _make_trace(
         seq=128,
         sku="RTX 3090 (synthetic)",
         world=world,
+        op_latencies=op_latencies,
     )
 
 

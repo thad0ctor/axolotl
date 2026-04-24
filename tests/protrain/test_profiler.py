@@ -185,6 +185,50 @@ def test_hw_bench_pcie_returns_positive(gpu_device):
     assert d2h < 200e9
 
 
+@pytest.mark.gpu
+def test_trace_records_op_latencies(gpu_device):
+    """Profiler must populate ``trace.op_latencies`` with measured per-op times."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    device = torch.device(f"cuda:{gpu_device}")
+    _name, tok, model = _load_tiny_gpt2()
+    model = model.to(device)
+
+    bs, seq = 1, 64
+    batch = _build_batch(tok, bs, seq, device)
+
+    cfg = ProfilerConfig(
+        batch_size=bs,
+        seq_len=seq,
+        device=str(device),
+        include_backward=True,
+        on_demand=False,
+    )
+
+    trace = run_trace(model, batch, cfg)
+
+    # Must be non-empty — if this fails we regressed the capture path.
+    assert trace.op_latencies, "trace.op_latencies must be populated"
+
+    # Every recorded latency is positive and well under 1s on tiny-GPT-2;
+    # the latter trips if elapsed_ms is not converted to seconds.
+    for op_id, lat in trace.op_latencies.items():
+        assert lat > 0.0, f"op {op_id} has non-positive latency {lat}"
+        assert lat < 1.0, f"op {op_id} latency {lat}s exceeds sanity ceiling"
+
+    # Coverage: at least 80% of ops in op_order must have a latency entry.
+    # (Some edge-case modules may fire a pre-hook but no post-hook if
+    # forward re-enters the same module id; skip those.)
+    n_ops = len(trace.op_order)
+    n_covered = sum(1 for op in trace.op_order if op.op_id in trace.op_latencies)
+    assert n_covered / max(1, n_ops) >= 0.80, (
+        f"only {n_covered}/{n_ops} ops have latencies — coverage too low"
+    )
+
+
 def test_on_demand_disabled_fast_path():
     """Disabled OnDemandTensorMgr must be a no-op context manager."""
     mgr = OnDemandTensorMgr(device="cuda:0", disabled=True)

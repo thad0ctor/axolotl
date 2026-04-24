@@ -16,6 +16,13 @@ LOG = get_logger(__name__)
 
 _CACHE_SUBDIR = Path("protrain") / "profiler"
 
+# Bump when the ProfilerTrace schema changes in a way that invalidates existing
+# cached traces. Version 2 adds per-op wall-clock latencies (``op_latencies``)
+# — traces from v1 have no latency data, so the runtime cost model would fall
+# back to the hardcoded roofline proxy. Bumping the version forces a re-profile
+# rather than silently degrading accuracy.
+TRACE_VERSION = 2
+
 
 @dataclass(frozen=True)
 class ProfilerCacheKey:
@@ -32,8 +39,12 @@ class ProfilerCacheKey:
     world: int
 
     def fingerprint(self) -> str:
-        """Deterministic 64-char sha256 hex digest used as the on-disk filename."""
-        raw = f"{self.arch_hash}|{self.bs}|{self.seq}|{self.sku}|{self.world}"
+        """Deterministic 64-char sha256 hex digest used as the on-disk filename.
+
+        The ``TRACE_VERSION`` prefix ensures a schema bump invalidates all prior
+        cache entries — old files stay on disk but are never looked up.
+        """
+        raw = f"v{TRACE_VERSION}|{self.arch_hash}|{self.bs}|{self.seq}|{self.sku}|{self.world}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
