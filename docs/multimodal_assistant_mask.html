@@ -797,8 +797,8 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 
 <section id="multimodal-assistant-only-loss-masking" class="level1">
 <h1>Multimodal assistant-only loss masking</h1>
-<section id="correct-placement" class="level3">
-<h3 class="anchored" data-anchor-id="correct-placement">Correct placement</h3>
+<section id="correct-placement" class="level2">
+<h2 class="anchored" data-anchor-id="correct-placement">Correct placement</h2>
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Top-level: only train_on_inputs lives here.</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">train_on_inputs</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
@@ -817,10 +817,10 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> assistant</span></span>
 <span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">train_on_eos</span><span class="kw">:</span><span class="at"> turn</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </section>
-<section id="how-to-verify-at-runtime" class="level3">
-<h3 class="anchored" data-anchor-id="how-to-verify-at-runtime">How to verify at runtime</h3>
+<section id="how-to-verify-at-runtime" class="level2">
+<h2 class="anchored" data-anchor-id="how-to-verify-at-runtime">How to verify at runtime</h2>
 <p><code>build_collator</code> logs the resolved knobs at INFO:</p>
-<pre><code>MM collator: train_on_inputs=False roles_to_train=['assistant'] train_on_eos=turn role_boundaries_override=none</code></pre>
+<pre class="text"><code>MM collator: train_on_inputs=False roles_to_train=['assistant'] train_on_eos=turn role_boundaries_override=none</code></pre>
 <p>If <code>roles_to_train</code> logs as <code>None</code>, the YAML knobs are not reaching the
 scanner — check that they are under <code>datasets[0]</code>, not at the root.</p>
 <p>Each verified strategy additionally logs its resolved boundary token ids at
