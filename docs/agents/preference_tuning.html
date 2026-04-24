@@ -842,7 +842,7 @@ Exception: ORPO and SimPO do NOT use a reference model (~50% less VRAM).</code><
 <li>Paired preference data (chosen + rejected)?
 <ul>
 <li>Default → <code>rl: dpo</code></li>
-<li>Overfitting → <code>rl: ipo</code></li>
+<li>Overfitting → <code>rl: dpo, dpo_loss_type: ["ipo"]</code></li>
 <li>VRAM-limited → <code>rl: orpo</code> (no ref model)</li>
 <li>Length-sensitive → <code>rl: simpo</code> (no ref model)</li>
 </ul></li>
