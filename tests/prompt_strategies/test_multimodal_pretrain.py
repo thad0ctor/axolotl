@@ -1,0 +1,187 @@
+"""Tests for the multimodal CPT prompt strategy + safety gates (SmolVLM processor)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+from PIL import Image
+from transformers import AutoProcessor
+
+from axolotl.prompt_strategies.multimodal_pretrain import (
+    ImageTokenSpec,
+    MultimodalPretrainTokenizationStrategy,
+    _INCOMPATIBLE_PROCESSOR_REASONS,
+    build_image_token_spec,
+    check_processor_compatibility,
+    load,
+)
+from axolotl.prompt_strategies.pretrain import PretrainTokenizer
+
+
+_SMOLVLM = "HuggingFaceTB/SmolVLM-500M-Instruct"
+
+
+@pytest.fixture(scope="module", name="smolvlm_processor")
+def fixture_smolvlm_processor():
+    return AutoProcessor.from_pretrained(_SMOLVLM)
+
+
+@pytest.fixture(scope="module", name="tiny_image_path")
+def fixture_tiny_image_path(tmp_path_factory) -> Path:
+    d = tmp_path_factory.mktemp("mm_pretrain_imgs")
+    p = d / "dummy.png"
+    arr = np.random.default_rng(0).integers(0, 255, (64, 64, 3)).astype("uint8")
+    Image.fromarray(arr).save(p)
+    return p
+
+
+# ---- build_image_token_spec ------------------------------------------------
+
+
+def test_build_image_token_spec_autodetects_smolvlm(smolvlm_processor):
+    spec = build_image_token_spec(smolvlm_processor)
+    assert isinstance(spec, ImageTokenSpec)
+    assert spec.image_token == "<image>"
+    assert spec.image_token_id > 0
+    assert spec.image_token_id in spec.image_family_token_ids
+
+
+def test_build_image_token_spec_honors_override(smolvlm_processor):
+    # Override with a known-good token ("<image>" is the SmolVLM default).
+    spec = build_image_token_spec(smolvlm_processor, override="<image>")
+    assert spec.image_token == "<image>"
+
+
+def test_build_image_token_spec_rejects_bad_override(smolvlm_processor):
+    with pytest.raises(ValueError, match="not a registered special token"):
+        build_image_token_spec(smolvlm_processor, override="<definitely-not-real>")
+
+
+def test_build_image_token_spec_rejects_plain_word_override(smolvlm_processor):
+    """Review finding R6: an override like "image" BPE-tokenizes to a real
+    id but is NOT a registered special token — accepting it silently
+    breaks placeholder/image count matching."""
+    with pytest.raises(ValueError, match="not a registered special token"):
+        build_image_token_spec(smolvlm_processor, override="image")
+
+
+# ---- check_processor_compatibility (startup-time gate) ---------------------
+
+
+@pytest.mark.parametrize("cls_name", list(_INCOMPATIBLE_PROCESSOR_REASONS.keys()))
+def test_check_processor_compatibility_rejects_incompatible(cls_name):
+    fake = type(cls_name, (), {})()
+    with pytest.raises(ValueError) as exc:
+        check_processor_compatibility(fake)
+    # Error must include the class name + the user-facing reason.
+    assert cls_name in str(exc.value)
+    assert _INCOMPATIBLE_PROCESSOR_REASONS[cls_name] in str(exc.value)
+
+
+def test_check_processor_compatibility_rejects_subclass():
+    """Reviewer finding: must catch user-defined subclasses via MRO, not
+    just exact class-name match."""
+    class BaseMllama:
+        pass
+    BaseMllama.__name__ = "MllamaProcessor"
+
+    class CustomUserProcessor(BaseMllama):
+        pass
+    CustomUserProcessor.__name__ = "CustomUserProcessor"
+
+    with pytest.raises(ValueError, match="MllamaProcessor"):
+        check_processor_compatibility(CustomUserProcessor())
+
+
+def test_check_processor_compatibility_accepts_supported(smolvlm_processor):
+    # Should not raise.
+    check_processor_compatibility(smolvlm_processor)
+
+
+# ---- MultimodalPretrainTokenizationStrategy --------------------------------
+
+
+def _make_strategy(
+    smolvlm_processor: Any,
+    text_column: str = "text",
+    image_column: str = "images",
+) -> MultimodalPretrainTokenizationStrategy:
+    spec = build_image_token_spec(smolvlm_processor)
+    return MultimodalPretrainTokenizationStrategy(
+        PretrainTokenizer(),
+        smolvlm_processor.tokenizer,
+        False,         # train_on_inputs
+        2048,          # sequence_len
+        text_column=text_column,
+        image_column=image_column,
+        image_base_dir=None,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        max_length=2048,
+    )
+
+
+def test_strategy_preserves_images_and_text(smolvlm_processor, tiny_image_path):
+    strat = _make_strategy(smolvlm_processor)
+    out = strat.tokenize_prompt({
+        "text": "<image>\nsample transcription text",
+        "images": [str(tiny_image_path)],
+    })
+    assert "input_ids" in out
+    assert "images" in out and "_mm_text" in out
+    # one chunk -> parallel lists of length 1
+    assert len(out["input_ids"]) == 1
+    assert len(out["images"]) == 1
+    assert len(out["_mm_text"]) == 1
+    assert out["images"][0] == [str(tiny_image_path)]
+    assert out["_mm_text"][0].startswith("<image>")
+
+
+def test_strategy_rejects_placeholder_count_mismatch(smolvlm_processor, tiny_image_path):
+    strat = _make_strategy(smolvlm_processor)
+    # 2 placeholders, 1 image -> must raise
+    with pytest.raises(ValueError, match="occurrence"):
+        strat.tokenize_prompt({
+            "text": "<image><image>\ntwo placeholders one image",
+            "images": [str(tiny_image_path)],
+        })
+
+
+def test_strategy_rejects_non_list_image_column(smolvlm_processor, tiny_image_path):
+    strat = _make_strategy(smolvlm_processor)
+    with pytest.raises(ValueError, match="list"):
+        strat.tokenize_prompt({
+            "text": "<image>\nbad image field",
+            "images": str(tiny_image_path),  # should be a list
+        })
+
+
+# ---- load() factory --------------------------------------------------------
+
+
+def test_load_requires_processor(smolvlm_processor):
+    class _Cfg:
+        train_on_inputs = False
+        sequence_len = 2048
+
+    with pytest.raises(ValueError, match="processor"):
+        load(smolvlm_processor.tokenizer, _Cfg(), ds_cfg={}, processor=None)
+
+
+def test_load_returns_strategy_with_spec(smolvlm_processor):
+    class _Cfg:
+        train_on_inputs = False
+        sequence_len = 2048
+
+    strat = load(
+        smolvlm_processor.tokenizer,
+        _Cfg(),
+        ds_cfg={"text_column": "text", "image_column": "images"},
+        processor=smolvlm_processor,
+    )
+    assert isinstance(strat, MultimodalPretrainTokenizationStrategy)
+    assert hasattr(strat, "image_token_spec")
+    assert strat.image_token_spec.image_token == "<image>"

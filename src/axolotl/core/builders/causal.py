@@ -44,10 +44,27 @@ from axolotl.utils.collators import (
     V2BatchSamplerDataCollatorForSeq2Seq,
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
+from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.import_helper import get_cls_from_module_str
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+def _is_multimodal_cpt(cfg) -> bool:
+    """True iff this config is a raw image+text CPT run (no chat template)."""
+    if not getattr(cfg, "pretraining_dataset", None):
+        return False
+    ds_first = cfg.pretraining_dataset[0]
+    ds_type = None
+    mm_flag = None
+    if hasattr(ds_first, "type"):
+        ds_type = getattr(ds_first, "type", None)
+        mm_flag = getattr(ds_first, "multimodal", None)
+    elif isinstance(ds_first, dict):
+        ds_type = ds_first.get("type")
+        mm_flag = ds_first.get("multimodal")
+    return (ds_type == "multimodal_pretrain") or bool(mm_flag)
 
 
 class HFCausalTrainerBuilder(TrainerBuilderBase):
@@ -458,6 +475,46 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         **kwargs,
     ):
         if training_args.pretraining:
+            # Multimodal CPT: intercept BEFORE the text-only pretraining branches
+            # so our custom collator is wired up correctly.
+            if self.cfg.processor_type and self.processor and _is_multimodal_cpt(
+                self.cfg
+            ):
+                from axolotl.prompt_strategies.multimodal_pretrain import (
+                    build_image_token_spec,
+                )
+
+                pt_cfg = self.cfg.pretraining_dataset[0]
+                image_token_override = (
+                    getattr(pt_cfg, "image_token", None)
+                    if hasattr(pt_cfg, "image_token")
+                    else pt_cfg.get("image_token")
+                    if isinstance(pt_cfg, dict)
+                    else None
+                )
+                image_base_dir = (
+                    getattr(pt_cfg, "image_base_dir", None)
+                    if hasattr(pt_cfg, "image_base_dir")
+                    else pt_cfg.get("image_base_dir")
+                    if isinstance(pt_cfg, dict)
+                    else None
+                )
+                spec = build_image_token_spec(
+                    self.processor, override=image_token_override
+                )
+                # Mirror the kwargs `DataCollatorForSeq2Seq` would have had so
+                # the caller's padding settings still apply.
+                mm_kwargs = {
+                    "pad_to_multiple_of": kwargs.get("pad_to_multiple_of"),
+                }
+                return MultiModalPretrainDataCollator(
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    image_token_spec=spec,
+                    image_base_dir=image_base_dir,
+                    max_length=self.cfg.sequence_len,
+                    **{k: v for k, v in mm_kwargs.items() if v is not None},
+                )
             if (
                 self.cfg.pretraining_sample_concatenation is False
                 or self.cfg.micro_batch_size > 1
@@ -519,7 +576,41 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             else:
                 collator = BatchSamplerDataCollatorForSeq2Seq
         else:
-            if self.cfg.processor_type and self.processor:
+            if self.cfg.processor_type and self.processor and _is_multimodal_cpt(
+                self.cfg
+            ):
+                from axolotl.prompt_strategies.multimodal_pretrain import (
+                    build_image_token_spec,
+                )
+
+                pt_cfg = (
+                    self.cfg.pretraining_dataset[0]
+                    if self.cfg.pretraining_dataset
+                    else {}
+                )
+                image_token_override = (
+                    getattr(pt_cfg, "image_token", None)
+                    if hasattr(pt_cfg, "image_token")
+                    else pt_cfg.get("image_token")
+                    if isinstance(pt_cfg, dict)
+                    else None
+                )
+                image_base_dir = (
+                    getattr(pt_cfg, "image_base_dir", None)
+                    if hasattr(pt_cfg, "image_base_dir")
+                    else pt_cfg.get("image_base_dir")
+                    if isinstance(pt_cfg, dict)
+                    else None
+                )
+                spec = build_image_token_spec(
+                    self.processor, override=image_token_override
+                )
+                collator = MultiModalPretrainDataCollator
+                kwargs["processor"] = self.processor
+                kwargs["image_token_spec"] = spec
+                kwargs["image_base_dir"] = image_base_dir
+                kwargs["max_length"] = self.cfg.sequence_len
+            elif self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
                 kwargs["processing_strategy"] = get_processing_strategy(
                     self.processor,

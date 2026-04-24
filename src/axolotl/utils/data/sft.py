@@ -134,7 +134,9 @@ def _prepare_streaming_dataset(
     """
     if cfg.pretraining_dataset:
         dataset_config = _extract_pretraining_config(cfg)
-        train_dataset = _load_streaming_dataset(dataset_config, cfg, tokenizer)
+        train_dataset = _load_streaming_dataset(
+            dataset_config, cfg, tokenizer, processor=processor
+        )
     elif cfg.sample_packing:
         # TODO(djsaunde): Implement for multiple datasets
         dataset_config = DictDefault(cfg.datasets[0])
@@ -142,7 +144,9 @@ def _prepare_streaming_dataset(
         # Ensure we have a split set - default to 'train' if not specified
         if not hasattr(dataset_config, "split") or not dataset_config.split:
             dataset_config.split = "train"
-        train_dataset = _load_streaming_dataset(dataset_config, cfg, tokenizer)
+        train_dataset = _load_streaming_dataset(
+            dataset_config, cfg, tokenizer, processor=processor
+        )
     else:
         # Use legacy loading function for non-packed streaming datasets
         train_dataset, eval_dataset, prompters = _load_and_prepare_datasets(
@@ -182,11 +186,17 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
         return DictDefault(
             {
                 "path": config["path"],
-                "name": config["name"],
-                "skip": config["skip"],
+                "name": config.get("name"),
+                "skip": config.get("skip"),
                 "split": config.get("split", "train"),
                 "data_files": config.get("data_files"),
                 "type": config.get("type", "pretrain"),
+                "text_column": config.get("text_column", "text"),
+                # Multimodal CPT fields (opt-in; safe defaults for text-only).
+                "multimodal": config.get("multimodal"),
+                "image_column": config.get("image_column", "images"),
+                "image_base_dir": config.get("image_base_dir"),
+                "image_token": config.get("image_token"),
             }
         )
     # Simple string path case
@@ -198,12 +208,20 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
             "split": "train",
             "data_files": None,
             "type": "pretrain",
+            "text_column": "text",
+            "multimodal": None,
+            "image_column": "images",
+            "image_base_dir": None,
+            "image_token": None,
         }
     )
 
 
 def _load_streaming_dataset(
-    pretraining_config: DictDefault, cfg: DictDefault, tokenizer: PreTrainedTokenizer
+    pretraining_config: DictDefault,
+    cfg: DictDefault,
+    tokenizer: PreTrainedTokenizer,
+    processor: ProcessorMixin | None = None,
 ) -> IterableDataset:
     """Load and prepare a streaming dataset for pretraining."""
     # Create dataset wrapper partial function
@@ -213,6 +231,7 @@ def _load_streaming_dataset(
         tokenizer=tokenizer,
         cfg=cfg,
         dataset_base_type=pretraining_config["type"],
+        processor=processor,
     )
 
     # Load the actual dataset
@@ -242,6 +261,7 @@ def _load_streaming_dataset(
         tokenizer,
         cfg,
         dataset_wrapper_partial,
+        processor=processor,
     )
 
     # Format for PyTorch
