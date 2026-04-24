@@ -342,11 +342,16 @@ def run_trace(
     # full rationale.
     steady_fwd_wall_s = 0.0
     steady_bwd_wall_s = 0.0
+    steady_fwd_peak_bytes = 0
     if cuda_available:
         try:
             # Forward-only steady-state: time a single un-hooked forward.
             # The warmup loop above left allocator + kernels warm.
+            # Reset peak stats before the measurement so the recorded
+            # ``max_memory_allocated`` reflects only this forward pass —
+            # not the warmup allocator churn or any prior trace work.
             torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
             pre_sf = torch.cuda.Event(enable_timing=True)
             post_sf = torch.cuda.Event(enable_timing=True)
             pre_sf.record()
@@ -354,6 +359,7 @@ def run_trace(
             post_sf.record()
             torch.cuda.synchronize(device)
             steady_fwd_wall_s = pre_sf.elapsed_time(post_sf) / 1000.0
+            steady_fwd_peak_bytes = int(torch.cuda.max_memory_allocated(device))
 
             if cfg.include_backward:
                 steady_loss = _extract_loss(steady_out)
@@ -376,6 +382,7 @@ def run_trace(
             )
             steady_fwd_wall_s = 0.0
             steady_bwd_wall_s = 0.0
+            steady_fwd_peak_bytes = 0
 
     # --- install hooks on every nn.Module (leaves + composites) --------
     handles: list[Any] = []
@@ -527,6 +534,7 @@ def run_trace(
         hooked_fwd_wall_s=hooked_fwd_wall_s,
         steady_fwd_wall_s=steady_fwd_wall_s,
         steady_bwd_wall_s=steady_bwd_wall_s,
+        steady_fwd_peak_bytes=steady_fwd_peak_bytes,
     )
 
 

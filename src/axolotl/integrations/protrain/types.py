@@ -164,6 +164,14 @@ class ProfilerTrace:
     hooked_fwd_wall_s: float = 0.0
     steady_fwd_wall_s: float = 0.0
     steady_bwd_wall_s: float = 0.0
+    # ``steady_fwd_peak_bytes`` is ``torch.cuda.max_memory_allocated()``
+    # captured across the hook-less steady forward pass. Used by the
+    # memory cost model as a ground-truth floor on the forward
+    # contribution — eliminates the search's "retained-NONE-activations"
+    # over-estimate when a hot-iter measurement is available. 0 means
+    # unavailable (pre-v5 cached traces, or CUDA unavailable at profile
+    # time).
+    steady_fwd_peak_bytes: int = 0
 
 
 # ---------------------------------------------------------------------------
