@@ -216,44 +216,49 @@ def test_protrain_7b_end_to_end() -> None:
         f"actual peak {actual_peak/1e9:.2f} GB exceeded 20 GiB capacity budget"
     )
     assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
-    # Runtime tolerance: 55% ceiling.
+    # Runtime tolerance: 90% ceiling.
     #
-    # After the profiler-records-per-op-latency refactor
-    # (types.ProfilerTrace.op_latencies), the cost model consumes
-    # MEASURED per-block compute when available instead of the pure
-    # activation-byte roofline proxy. Observed steady-state error on
-    # this 7B Llama+LoRA config sits around 50-52% — the floor imposed
-    # by two structural proxies that remain uncalibrated.
+    # Calibration history on this workload:
+    #   * c4811420-era (activation-bytes roofline proxy): ~60% error
+    #   * After per-op-latency refactor (TRACE_VERSION=2): ~52% error
+    #   * After Adam microbench + auto-mode (TRACE_VERSION=3): ~80% error
+    #   * After hook-less steady-state calibration (TRACE_VERSION=4):
+    #     still ~80% — the scale factor is computed and applied, but
+    #     on this 7B workload the raw ratio is ~0.13 (hooks inflate the
+    #     measurement 7-8x, larger than the [0.3, 1.0] clamp range),
+    #     and after clamping to 0.3 the scaled forward compute still
+    #     exceeds 2x the activation-byte roofline — so the secondary
+    #     roofline cap kicks in and collapses the forward compute to
+    #     the same ~9ms the pre-calibration path produced.
     #
-    # Remaining error breakdown (why the tolerance is not tighter):
-    #   - CPU Adam constant (_CPU_ADAM_BYTES_PER_SEC = 1.5e9) and
-    #     GPU Adam constant (_GPU_ADAM_BYTES_PER_SEC = 5e11) are
-    #     order-of-magnitude estimates. Calibrating them requires
-    #     running CPU / GPU Adam directly, which is outside the
-    #     profiler's fwd/bwd + PCIe/NCCL scope (§3.2).
-    #   - The profiler's single-iteration measurement cannot observe
-    #     steady-state per-op cost on a 7B model (cold kernels + hook
-    #     dispatch add ~8x overhead on the profile iter). The cost
-    #     model caps measured forward at 2x the activation-byte
-    #     roofline to prevent this from re-routing the searcher to
-    #     degenerate configs, which means absolute t_fwd still tracks
-    #     the roofline for transformer-sized models.
+    # Why the hook-calibration didn't tighten this workload:
+    # The hook-dispatch overhead on 7B Llama+LoRA is ~8x (not ~2.5x as
+    # assumed in the design). The spec's [0.3, 1.0] clamp holds at 0.3
+    # (more aggressive correction is out of the "safe" range), and even
+    # at the clamped 0.3× the raw op_latencies sum (4.88s) still produces
+    # ~1.46s of forward compute — far above the activation-bytes roofline
+    # (~9ms) that the secondary safety cap enforces. Net effect on the
+    # current 7B search configuration (n_persist=113, n_buffer=8,
+    # n_swap=0, n_checkpoint=31): forward compute is dominated by PCIe
+    # communication for the 17 non-persistent chunks, not by per-block
+    # compute, so the hook calibration has negligible effect on the
+    # chosen config's predicted iteration time.
     #
-    # Tightened from 60% → 55% after the per-op-latency refactor.
-    # RE-LOOSENED to 90% after M4.5 + M7 + auto-mode + Adam-calibration
-    # infrastructure landed: actual iter time on this workload dropped
-    # from 0.277s (c4811420-era) to ~0.23s (current), which the cost
-    # model's priors did not track. The NEW microbench infrastructure
-    # (measure_cpu_adam / measure_gpu_adam via HardwareProfile) IS wired
-    # end-to-end, but on this dev rig DeepSpeedCPUAdam fails to compile
-    # so measure_cpu_adam returns 0.0 and the fallback path is taken.
-    # A proper calibration pass (on a rig where DeepSpeedCPUAdam builds,
-    # plus multi-iter hot-loop profiling for steady-state per-op compute)
-    # is the right next step and is the one remaining calibration gap.
+    # Forward-looking path to tighten below 25% (for a future commit):
+    #   1. Relax the 2x-roofline secondary cap — or replace it with
+    #      "cap at steady_fwd_wall_s" which is both tighter and a real
+    #      ground-truth upper bound.
+    #   2. Plumb ``trace.pcie_h2d_bps`` (measured) into HardwareProfile
+    #      rather than trusting the caller's fixture value. The 7B
+    #      test passes ``pcie_h2d_bps=13e9`` but the trace measures
+    #      ~56e9; at the non-persistent chunk count here that's 4x
+    #      over-estimated communication time.
+    #
     # Peak stays strict at 10% — that is the OOM-safety invariant.
     assert runtime_err < 0.90, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — CPU/GPU Adam "
-        "constants and single-iter profiler measurement limit remain the "
-        "two residual calibration gaps. "
+        f"runtime prediction off by {runtime_err*100:.1f}% — hook-dispatch "
+        "calibration at 0.3 clamp + 2x roofline secondary cap reproduces "
+        "the pre-calibration forward-compute estimate on this 7B workload. "
+        "Residual error now sits in PCIe / activation-roofline priors. "
         f"iter_s_all={iter_s_all}"
     )
