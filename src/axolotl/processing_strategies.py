@@ -190,11 +190,21 @@ class ProcessingStrategy:
                     "Only `messages` and `conversations` message keys are currently supported."
                 )
 
-            processed_example = None
             if "messages" in example and example["messages"] is not None:
-                processed_example = example
-            else:
+                # Deepcopy for symmetry with convert_legacy_format (which
+                # deepcopies internally) so downstream mutations of
+                # processed_example don't leak back to the caller's input.
+                processed_example = deepcopy(example)
+            elif "conversations" in example:
                 processed_example = convert_legacy_format(example)
+            else:
+                # `messages` is present but None, and no `conversations`
+                # fallback exists — convert_legacy_format would KeyError on
+                # ["conversations"]. Surface a clear validation error instead.
+                raise ValueError(
+                    "`messages` is present but None; provide non-null "
+                    "`messages` or a `conversations` field."
+                )
 
             # Required for apply_chat_template compatibility.
             processed_example["messages"] = convert_messages_to_multimedia_messages(

@@ -418,7 +418,10 @@ class _FakeGemma4Tokenizer(_Tokenizer):
     }
 
     def __init__(self):
-        super().__init__(self.VOCAB, pad_id=0, unk_id=3)
+        # Pass a fresh dict so per-instance mutations (should any future
+        # code path introduce them) cannot leak across tests via the
+        # shared class-level VOCAB.
+        super().__init__(dict(self.VOCAB), pad_id=0, unk_id=3)
 
 
 class _FakeGemma4Processor:
