@@ -396,36 +396,71 @@ def run_trace(
                 block.register_forward_hook(_make_post(bid, device))
             )
 
+        # Multi-iter hot-loop measurement. A single forward still carries
+        # allocator-settle cost that a real steady-state training loop
+        # wouldn't pay. Run N=4 un-hooked iters and take the median of
+        # iters 2-3 as the steady value; iter 0/1 soak up any residual
+        # warmup. Per-block peak bytes take the max across all measured
+        # iters to capture the true high-water mark.
+        # Best-effort steady backward: runs inside the same loop (after
+        # each forward) IFF the trace config allows it. Backward on a
+        # 7B-class model without chunking engaged will OOM, so guard
+        # with try/except per-iter and fall back to 0.0 on any failure
+        # (cost model then uses the default bwd_fwd ratio).
+        N_STEADY_ITERS = 4
+        N_STEADY_WARMUP = 2
+        fwd_iter_s: list[float] = []
+        bwd_iter_s: list[float] = []
         try:
-            # Forward-only steady-state: time a single un-hooked forward.
-            # The warmup loop above left allocator + kernels warm.
-            # Reset peak stats before the measurement so the recorded
-            # ``max_memory_allocated`` reflects only this forward pass —
-            # not the warmup allocator churn or any prior trace work.
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            pre_sf = torch.cuda.Event(enable_timing=True)
-            post_sf = torch.cuda.Event(enable_timing=True)
-            pre_sf.record()
-            steady_out = model(**batch)
-            post_sf.record()
-            torch.cuda.synchronize(device)
-            steady_fwd_wall_s = pre_sf.elapsed_time(post_sf) / 1000.0
-            steady_fwd_peak_bytes = int(torch.cuda.max_memory_allocated(device))
+            for i in range(N_STEADY_ITERS):
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                pre_sf = torch.cuda.Event(enable_timing=True)
+                post_sf = torch.cuda.Event(enable_timing=True)
+                pre_sf.record()
+                steady_out = model(**batch)
+                post_sf.record()
+                torch.cuda.synchronize(device)
+                fwd_iter_s.append(pre_sf.elapsed_time(post_sf) / 1000.0)
+                # High-water mark across all iters
+                steady_fwd_peak_bytes = max(
+                    steady_fwd_peak_bytes,
+                    int(torch.cuda.max_memory_allocated(device)),
+                )
 
-            if cfg.include_backward:
-                steady_loss = _extract_loss(steady_out)
+                if cfg.include_backward:
+                    try:
+                        steady_loss = _extract_loss(steady_out)
+                        torch.cuda.synchronize(device)
+                        pre_sb = torch.cuda.Event(enable_timing=True)
+                        post_sb = torch.cuda.Event(enable_timing=True)
+                        pre_sb.record()
+                        steady_loss.backward()
+                        post_sb.record()
+                        torch.cuda.synchronize(device)
+                        bwd_iter_s.append(
+                            pre_sb.elapsed_time(post_sb) / 1000.0
+                        )
+                        model.zero_grad(set_to_none=True)
+                    except Exception as bwd_exc:  # pragma: no cover
+                        LOG.debug(
+                            "profiler steady backward iter %d failed (%s); "
+                            "cost model falls back to bwd_fwd ratio", i, bwd_exc
+                        )
+                        bwd_iter_s.clear()  # drop partial measurements
+                        # Don't raise — continue forward timing
+                del steady_out
                 torch.cuda.synchronize(device)
-                pre_sb = torch.cuda.Event(enable_timing=True)
-                post_sb = torch.cuda.Event(enable_timing=True)
-                pre_sb.record()
-                steady_loss.backward()
-                post_sb.record()
-                torch.cuda.synchronize(device)
-                steady_bwd_wall_s = pre_sb.elapsed_time(post_sb) / 1000.0
-                model.zero_grad(set_to_none=True)
-            del steady_out
-            torch.cuda.synchronize(device)
+
+            # Steady value = median of iters [N_STEADY_WARMUP:]. With
+            # N=4 warmup=2 this is the median of the last 2.
+            import statistics
+            steady_slice = fwd_iter_s[N_STEADY_WARMUP:]
+            if steady_slice:
+                steady_fwd_wall_s = statistics.median(steady_slice)
+            bwd_slice = bwd_iter_s[N_STEADY_WARMUP:] if bwd_iter_s else []
+            if bwd_slice:
+                steady_bwd_wall_s = statistics.median(bwd_slice)
             torch.cuda.empty_cache()
         except Exception as exc:  # pragma: no cover - defensive
             LOG.debug(

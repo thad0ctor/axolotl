@@ -280,7 +280,7 @@ def test_protrain_7b_end_to_end() -> None:
     #      over-estimated communication time.
     #
     # Peak stays strict at 10% — that is the OOM-safety invariant.
-    assert runtime_err < 0.50, (
+    assert runtime_err < 0.25, (
         f"runtime prediction off by {runtime_err*100:.1f}% — hook-dispatch "
         "calibration at 0.3 clamp + 2x roofline secondary cap reproduces "
         "the pre-calibration forward-compute estimate on this 7B workload. "

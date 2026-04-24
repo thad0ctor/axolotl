@@ -222,19 +222,29 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
 def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> float:
     """Return the aggregate backward compute time in seconds.
 
-    ``t_fwd_total * _BWD_FWD_COMPUTE_RATIO`` is the canonical transformer
-    backward/forward compute ratio and is the consistent choice given
-    the forward total is itself clamped by the hook-scale + roofline
-    path in ``_fwd_compute_time_from_trace``. Using a raw
-    ``steady_bwd_wall_s`` measurement here when forward is clamped
-    would produce an inconsistent backward-to-forward ratio.
+    Preferred: measured ``steady_bwd_wall_s / steady_fwd_wall_s`` ratio
+    from the profiler's multi-iter hot-loop (TRACE_VERSION ≥ 7 when
+    ``cfg.include_backward`` is set and backward didn't OOM during
+    measurement). This captures the actual transformer-specific bwd/fwd
+    relationship on the measured hardware — typically 1.5-2.2× depending
+    on the attention implementation and which paths are autograd-traced.
+
+    Fallback: ``t_fwd_total * _BWD_FWD_COMPUTE_RATIO`` (2.0× — canonical
+    transformer prior). Used when backward wasn't measured (7B trace
+    where backward OOMs without chunk offload) or the trace predates v7.
 
     The hooked aggregate ``<backward>`` latency retained in
     ``trace.op_latencies`` is NOT used — autograd holds the hook-saved
     tensors during the forward which materially distorts the hooked
-    backward timing. ``steady_bwd_wall_s`` is captured for future use
-    when the forward clamp is relaxed (see TRACE_VERSION=4 notes).
+    backward timing.
     """
+    if trace.steady_bwd_wall_s > 0.0 and trace.steady_fwd_wall_s > 0.0:
+        measured_ratio = trace.steady_bwd_wall_s / trace.steady_fwd_wall_s
+        # Clamp to a sane range — if the measurement is wildly off
+        # (measurement noise or forward OOM that fell through), don't
+        # let it propagate. Transformers run between 1.2× and 3× bwd/fwd.
+        measured_ratio = max(1.2, min(3.0, measured_ratio))
+        return t_fwd_total * measured_ratio
     return t_fwd_total * _BWD_FWD_COMPUTE_RATIO
 
 
