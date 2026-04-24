@@ -277,16 +277,47 @@ class ChunkManager:
                 continue
 
             # --- Step 1: compute the chunk's actual byte footprint ------
-            chunk_bytes = 0
+            # BUG 2 FIX: each param's byte_offset must be aligned to its
+            # element_size, otherwise ``byte_view.view(dtype)`` raises
+            # ``RuntimeError: offset is not aligned``. This bites when a
+            # chunk contains a mix of 2-byte (fp16/bf16) and 4-byte
+            # (fp32) params — e.g. Llama's fp16 attention weights sitting
+            # next to fp32 RMSNorm scales — because the running offset
+            # lands on an odd multiple of 2 when an fp16 param precedes
+            # an fp32 one. We pad each param's starting offset up to a
+            # multiple of its element_size before laying it down; this
+            # guarantees alignment for any dtype mix up to 8 bytes
+            # (fp64). The padding bytes stay zero (we allocated with
+            # ``torch.empty`` so technically uninitialized, but no code
+            # ever reads a padding region — the only readers are the
+            # per-param typed views and the per-param H2D copy which
+            # only touches ``nbytes``).
+            element_sizes: list[int] = []
             per_param_bytes: list[int] = []
             for pid in param_ids:
                 param = self._params_by_id.get(pid)
                 if param is None:
+                    element_sizes.append(0)
                     per_param_bytes.append(0)
                     continue
                 nbytes = int(param.numel()) * int(param.element_size())
                 per_param_bytes.append(nbytes)
-                chunk_bytes += nbytes
+                element_sizes.append(int(param.element_size()))
+
+            # Running-offset computation with per-param alignment, so
+            # the actual chunk allocation size accounts for any padding
+            # gaps.
+            aligned_offsets: list[int] = []
+            offset = 0
+            for nbytes, esz in zip(per_param_bytes, element_sizes):
+                if nbytes == 0 or esz == 0:
+                    aligned_offsets.append(offset)
+                    continue
+                # Round offset up to the next multiple of esz.
+                offset = ((offset + esz - 1) // esz) * esz
+                aligned_offsets.append(offset)
+                offset += nbytes
+            chunk_bytes = offset
 
             if chunk_bytes == 0:
                 continue
@@ -296,14 +327,16 @@ class ChunkManager:
             # buffer_pool's pinned host region (that was sized to
             # ``n_buffer * S_chunk`` for staging, not persistent storage —
             # collisions mod n_buffer would corrupt data). Sizing is
-            # precise: ``chunk_bytes`` bytes exactly.
+            # precise: ``chunk_bytes`` bytes exactly (including any
+            # per-param alignment padding).
             cpu_bytes = torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True)
 
             # --- Step 3: copy + rebind param.data -----------------------
             slots: list[_CpuParamSlot] = []
-            offset = 0
             trainable_count = 0
-            for pid, nbytes in zip(param_ids, per_param_bytes):
+            for pid, nbytes, off in zip(
+                param_ids, per_param_bytes, aligned_offsets
+            ):
                 param = self._params_by_id.get(pid)
                 if param is None or nbytes == 0:
                     continue
@@ -317,7 +350,7 @@ class ChunkManager:
                 # Slice of the pinned buffer for this param, reinterpret as
                 # the param's dtype, reshape to original shape. The copy is
                 # pinned→pageable with a GPU→CPU D2H.
-                cpu_view = cpu_bytes.narrow(0, offset, nbytes)
+                cpu_view = cpu_bytes.narrow(0, off, nbytes)
                 cpu_param = cpu_view.view(dtype).view(shape)
                 cpu_param.copy_(orig_data)
 
@@ -340,12 +373,11 @@ class ChunkManager:
                         cpu_grad=cpu_grad,
                         shape=shape,
                         dtype=dtype,
-                        byte_offset=offset,
+                        byte_offset=off,
                         numel=numel,
                         element_size=element_size,
                     )
                 )
-                offset += nbytes
                 freed += nbytes
 
             self._cpu_slots[cid] = slots
@@ -409,6 +441,7 @@ class ChunkManager:
             # and we don't do a second per-param reduce here. In a bare
             # non-DDP distributed run the flag is False and this is the
             # sole grad-sync point.
+            import torch as _torch
             import torch.distributed as _dist
             if (
                 _dist.is_available()
@@ -420,6 +453,19 @@ class ChunkManager:
             # copy_ supports cross-device; non_blocking=True is safe
             # because the destination is pinned host memory.
             captured_slot.cpu_grad.copy_(param.grad, non_blocking=True)  # type: ignore[union-attr]
+            # BUG 1 FIX: record a CUDA event on the current stream the
+            # moment the async D2H is dispatched. The CPU Adam worker
+            # thread will synchronize on this event before reading the
+            # pinned grad shard — without the wait, the worker can race
+            # the D2H and read uninitialized/partial bytes the moment
+            # the ThreadPoolExecutor pops its queue (DeepSpeedCPUAdam
+            # holds no implicit CUDA-side ordering). Recording the event
+            # here (after copy_) captures the D2H completion exactly;
+            # the event itself is cheap to record.
+            d2h_event = None
+            if param.grad.is_cuda:
+                d2h_event = _torch.cuda.Event(blocking=True)
+                d2h_event.record()
             # Null the grad so PyTorch frees the GPU storage right away —
             # this is the whole point of the per-param hook.
             param.grad = None
@@ -446,13 +492,62 @@ class ChunkManager:
                 # accumulates the new GPU grad onto the stale CPU grad.
                 if cm.cpu_optim is not None:
                     cm._ensure_cpu_grads_attached(captured_cid)
-                    cm.cpu_optim.step_async(captured_cid)
+                    # BUG 4 FIX: after the worker thread runs
+                    # ``optim.step()`` the CPU shards hold the updated
+                    # weights, but ``param.data`` still points at the
+                    # CPU tensor (we repointed it in
+                    # _ensure_cpu_grads_attached). Install a post_step
+                    # callback that repoints ``param.data`` back to the
+                    # GPU empty placeholder so any intermediate code
+                    # reading ``.data`` between iters (clip_grad_norm_,
+                    # checkpoint save, Trainer metric hooks) sees a
+                    # zero-element GPU tensor — matching the invariant
+                    # the rest of the runtime relies on. The CPU master
+                    # weights are still held by ``slot.cpu_data`` so
+                    # the next gather() flows the updated values back
+                    # to GPU via its H2D copy.
+                    cm.cpu_optim.step_async(
+                        captured_cid,
+                        d2h_event=d2h_event,
+                        post_step=cm._make_post_cpu_step_repoint(captured_cid),
+                    )
                 # Reset the counter now so the next backward fires again.
                 cm._grad_remaining[captured_cid] = cm._grad_initial.get(
                     captured_cid, 0
                 )
 
         return _hook
+
+    def _make_post_cpu_step_repoint(self, chunk_id: ChunkId):
+        """Build the after-step callback that repoints ``.data`` back to GPU.
+
+        BUG 4 FIX: between the end of iter N's optimizer step and the
+        start of iter N+1's gather, ``param.data`` must be a GPU tensor
+        (zero-element is fine — it's the same empty-placeholder used
+        elsewhere in the runtime). If we leave it pointing at the CPU
+        master shard, any caller between iters (clip_grad_norm_, Trainer
+        logging, checkpoint save) sees a CPU tensor where a GPU tensor
+        was expected. The CPU shard continues to hold the post-step
+        weights; the next :meth:`gather` H2D-copies them into the GPU
+        buffer.
+        """
+        cm = self
+        captured_cid = chunk_id
+
+        def _repoint() -> None:
+            slots = cm._cpu_slots.get(captured_cid, [])
+            for slot in slots:
+                param = cm._params_by_id.get(slot.param_id)
+                if param is None:
+                    continue
+                param.data = cm._empty_placeholder(slot.dtype)
+                # Also clear grad: we've consumed it in the CPU step,
+                # and leaving param.grad pointing at the CPU grad shard
+                # means iter N+1's autograd would accumulate new GPU
+                # grad onto a CPU tensor → "expected same device" fail.
+                param.grad = None
+
+        return _repoint
 
     def _ensure_cpu_grads_attached(self, chunk_id: ChunkId) -> None:
         """Prepare the non-persistent chunk for its CPU Adam step.
@@ -531,62 +626,44 @@ class ChunkManager:
         """Copy CPU shards into ``buf`` (if needed) and rebind each param's data.
 
         ``buf`` is the pool-owned GPU uint8 tensor of length ``S_chunk``.
-        For each param slot we slice off ``slot.byte_offset .. +slot.nbytes``,
-        reinterpret it as the param's dtype, reshape to the param's shape,
-        and assign to ``param.data``.
+        For each param slot we slice off
+        ``slot.byte_offset .. +slot.numel*slot.element_size``, reinterpret
+        it as the param's dtype, reshape to the param's shape, and
+        assign to ``param.data``. ``slot.byte_offset`` already includes
+        any per-param alignment padding applied by
+        :meth:`materialize_offload` (BUG 2 fix), so the GPU buffer layout
+        mirrors the pinned CPU layout exactly.
         """
         slots = self._cpu_slots.get(chunk_id, [])
         if not slots:
             return
 
         if needs_copy:
-            # One large H2D per chunk is faster than per-param — the CPU
-            # shards are already laid out contiguously by
-            # materialize_offload, so we copy the whole flat byte region
-            # in a single call.
-            total_bytes = sum(
-                slot.numel * slot.element_size for slot in slots
-            )
-            # Grab the chunk's pinned CPU byte view (all slots share the
-            # same parent storage).
-            first_cpu = slots[0].cpu_data
-            # Reconstruct the flat uint8 view of the parent pinned
-            # allocation: the cpu_data was built from a narrow on a
-            # uint8 tensor, so .untyped_storage() gives us back the flat
-            # bytes without breaking pinning.
-            # Simpler: copy per-slot. These copies are pipelined on the
-            # same H2D engine and the total bytes moved is identical.
-            buf_view = buf.narrow(0, 0, total_bytes)
-            offset = 0
             for slot in slots:
                 nbytes = slot.numel * slot.element_size
-                dst_bytes = buf_view.narrow(0, offset, nbytes)
-                # view into CPU as uint8 for a byte-exact copy.
-                src_bytes = slot.cpu_data.view(slot.dtype)  # already that dtype
-                # Copy as the native dtype — same number of bytes moved,
-                # but avoids dtype mismatch in the copy_ call.
+                # Slice the buffer at this param's recorded
+                # (alignment-padded) byte offset — same offset used for
+                # the pinned CPU layout in materialize_offload — and view
+                # as the param's dtype+shape for an element-typed copy.
+                dst_bytes = buf.narrow(0, slot.byte_offset, nbytes)
                 dst_typed = dst_bytes.view(slot.dtype).view(slot.shape)
                 dst_typed.copy_(slot.cpu_data, non_blocking=True)
-                offset += nbytes
-                # ignore unused
-                _ = src_bytes
 
         # Rebind .data unconditionally — even on the no-copy path, a
         # previous offload() nulled out param.data, and re-acquiring from
         # the pool keeps the GPU bytes but requires re-pointing the
         # param at them.
-        offset = 0
         for slot in slots:
             param = self._params_by_id.get(slot.param_id)
             if param is None:
                 continue
             nbytes = slot.numel * slot.element_size
-            # Slice the chunk buffer at this param's byte offset and view
-            # as (dtype, shape).
-            byte_view = buf.narrow(0, offset, nbytes)
+            # Slice the chunk buffer at this param's byte offset (with
+            # alignment padding already baked in) and view as
+            # (dtype, shape).
+            byte_view = buf.narrow(0, slot.byte_offset, nbytes)
             typed = byte_view.view(slot.dtype).view(slot.shape)
             param.data = typed
-            offset += nbytes
 
     def offload(self, chunk_id: ChunkId) -> None:
         """Release ``chunk_id``'s GPU storage (non-persistent only).

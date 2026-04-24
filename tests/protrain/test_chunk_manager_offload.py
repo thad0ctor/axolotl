@@ -237,6 +237,233 @@ def test_gather_rebinds_param_data() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 2b: materialize_offload under mixed-dtype chunks (BUG 2 regression)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_materialize_offload_mixed_dtype() -> None:
+    """Chunks holding a mix of fp16 + fp32 params must not hit ``view`` alignment.
+
+    Before the fix (BUG 2), a chunk containing fp16 Linear weights
+    followed by fp32 LayerNorm scales tripped
+    ``RuntimeError: offset is not aligned``: the per-param byte offset
+    landed on an odd multiple of 2 after the first fp16 param, and
+    ``byte_view.view(torch.float32)`` rejected the unaligned view.
+
+    The fix pads each slot's starting offset up to a multiple of the
+    param's ``element_size``. This test builds a mixed-dtype module,
+    forces everything into a single non-persistent chunk, and verifies
+    materialize + gather both succeed and that ``param.data.dtype`` is
+    preserved across the round trip.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA runtime")
+
+    torch.cuda.empty_cache()
+
+    class MixedDtype(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # fp16 Linear + fp32 LayerNorm — the exact pattern Llama
+            # emits inside each transformer block when attention
+            # weights are fp16 but RMSNorm scales stay fp32. Put them
+            # inside a ModuleList so layout.build_layout picks them up
+            # as a single "block".
+            attn = nn.Linear(32, 32, bias=False).half()
+            # An fp32 tensor deliberately ordered AFTER the fp16 one
+            # so the running byte offset lands at an odd 2-byte
+            # boundary (32*32*2=2048 bytes — actually aligned, but
+            # add an odd number of fp16 bytes to force misalignment).
+            extra_fp16 = nn.Linear(1, 32, bias=False).half()  # 64 bytes, /=2
+            norm = nn.LayerNorm(32).float()  # fp32 weight+bias
+            layer = nn.Module()
+            layer.attn = attn  # type: ignore[attr-defined]
+            layer.extra = extra_fp16  # type: ignore[attr-defined]
+            layer.norm = norm  # type: ignore[attr-defined]
+
+            def fwd(x: torch.Tensor) -> torch.Tensor:
+                y = layer.attn(x.half())
+                y = layer.norm(y.float())
+                return y
+
+            layer.forward = fwd  # type: ignore[assignment]
+            self.h = nn.ModuleList([layer])
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.h[0](x)
+
+    torch.manual_seed(0)
+    model = MixedDtype().to("cuda")
+
+    # Large enough S_chunk so the whole ModuleList lands in one chunk.
+    S_chunk = 1 << 16  # 64 KB — fits everything
+    mgr, layout, pool, host = _build_chunk_manager(
+        model, n_persist=0, S_chunk=S_chunk, n_buffer=2
+    )
+
+    # Sanity: before the fix, this raised RuntimeError inside
+    # ``byte_view.view(torch.float32)``.
+    freed = mgr.materialize_offload()
+    assert freed > 0, "expected some bytes freed from mixed-dtype chunk"
+
+    # After offload, each param.data should be the empty GPU placeholder
+    # with the ORIGINAL dtype preserved.
+    expected_dtypes = {
+        "h.0.attn.weight": torch.float16,
+        "h.0.extra.weight": torch.float16,
+        "h.0.norm.weight": torch.float32,
+        "h.0.norm.bias": torch.float32,
+    }
+    for name, param in model.named_parameters():
+        assert param.data.dtype == expected_dtypes[name], (
+            f"{name} dtype {param.data.dtype} != expected "
+            f"{expected_dtypes[name]} after offload"
+        )
+        assert param.data.numel() == 0, (
+            f"{name} still has non-empty .data after offload: {param.data.shape}"
+        )
+
+    # Gather every non-persistent chunk and verify dtype+shape survive
+    # the round trip without alignment errors.
+    for cid_int in sorted(mgr._non_persistent_ids):
+        cid = cast(ChunkId, cid_int)
+        mgr.gather(cid)
+
+    for name, param in model.named_parameters():
+        assert param.data.dtype == expected_dtypes[name], (
+            f"{name} dtype changed after gather: {param.data.dtype}"
+        )
+        assert param.data.device.type == "cuda", (
+            f"{name} landed on {param.data.device} after gather"
+        )
+        assert param.data.numel() > 0, (
+            f"{name} still empty after gather"
+        )
+
+    mgr.uninstall()
+    host.close()
+    del pool
+
+
+# ---------------------------------------------------------------------------
+# Test 2c: param.data returns to empty-GPU placeholder between iterations (BUG 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_param_data_empty_between_iters() -> None:
+    """After CPU Adam step, ``param.data`` must be a zero-element GPU tensor.
+
+    BUG 4: before the fix, ``_ensure_cpu_grads_attached`` repointed
+    ``param.data`` at the CPU shard for the CPU Adam step and nothing
+    repointed it back. Between end-of-iter and start-of-next-iter,
+    ``param.data`` was a CPU tensor — any intermediate code reading
+    ``.data`` (``clip_grad_norm_``, Trainer metric hooks, checkpoint
+    save) saw CPU where GPU was expected.
+
+    The fix registers a ``post_step`` callback on ``step_async`` that
+    repoints ``.data`` back to ``_empty_placeholder(dtype)`` after the
+    CPU Adam step resolves. This test runs a full fwd+bwd+step cycle
+    and asserts post-step that every non-persistent param has
+    ``param.data.numel() == 0`` AND ``param.data.device.type == "cuda"``.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA runtime")
+    # DeepSpeedCPUAdam compiles a CUDA extension lazily — import
+    # success doesn't imply it can build. Probe cheaply so the test
+    # gracefully skips in envs where nvcc↔torch CUDA versions
+    # disagree (the runtime path handles the missing adapter; this
+    # test just isolates BUG 4's repointing semantics).
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        _probe = DeepSpeedCPUAdam(
+            [torch.nn.Parameter(torch.zeros(1))], lr=1e-4
+        )
+        del _probe
+    except Exception:  # noqa: BLE001
+        pytest.skip("DeepSpeedCPUAdam unavailable — BUG 4 path requires CPU optim")
+
+    torch.cuda.empty_cache()
+
+    hidden = 64
+    n_layers = 4
+    S_chunk = hidden * hidden * 4 + 4096
+
+    model = _tiny_model(hidden=hidden, n_layers=n_layers).to("cuda")
+    layout_probe = _build_layout_for(model, S_chunk)
+    n_non_persist = layout_probe.N_chunk - 1
+    mgr, layout, pool, host = _build_chunk_manager(
+        model, n_persist=1, S_chunk=S_chunk, n_buffer=n_non_persist
+    )
+    mgr.materialize_offload()
+
+    # Build a CPU Adam adapter so the BUG 4 repoint callback fires.
+    from axolotl.integrations.protrain.chunk.optim import CpuFusedAdamAdapter
+
+    cpu_params_per_chunk: dict = {}
+    for cid_int in sorted(mgr._non_persistent_ids):
+        params = [
+            dict(model.named_parameters())[str(pid)]
+            for pid in layout.chunks[int(cid_int)]
+            if str(pid) in dict(model.named_parameters())
+        ]
+        if params:
+            cpu_params_per_chunk[cid_int] = params
+
+    cpu_optim = CpuFusedAdamAdapter(
+        params_per_chunk=cpu_params_per_chunk, lr=1e-4
+    )
+    mgr.cpu_optim = cpu_optim
+
+    # Drive one fwd+bwd+step cycle. Gather everything manually (no
+    # scheduler in this bare test).
+    for cid_int in range(layout.N_chunk):
+        mgr.gather(cast(ChunkId, cid_int))
+
+    x = torch.randn(2, hidden, device="cuda")
+    y = model(x)
+    loss = y.sum()
+    loss.backward()
+
+    # The per-param hooks fired step_async on the CPU optim. Block
+    # until every future has resolved — the post_step callback runs
+    # inside that wait, so after this line param.data MUST be the
+    # empty GPU placeholder.
+    mgr.wait_cpu_optim_all()
+
+    for cid_int in sorted(mgr._non_persistent_ids):
+        cid = cast(ChunkId, cid_int)
+        slots = mgr._cpu_slots.get(cid, [])
+        for slot in slots:
+            param = dict(model.named_parameters())[str(slot.param_id)]
+            if not param.requires_grad:
+                continue
+            assert param.data.numel() == 0, (
+                f"non-persistent param {slot.param_id}.data non-empty "
+                f"between iters: shape={param.data.shape} "
+                f"device={param.data.device}"
+            )
+            assert param.data.device.type == "cuda", (
+                f"non-persistent param {slot.param_id}.data on "
+                f"{param.data.device} between iters (BUG 4 regression)"
+            )
+
+    cpu_optim.shutdown()
+    mgr.uninstall()
+    host.close()
+    del pool
+
+
+# ---------------------------------------------------------------------------
 # Test 3: per-param grad hooks fire and drain to CPU shards
 # ---------------------------------------------------------------------------
 

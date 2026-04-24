@@ -91,12 +91,36 @@ class CpuFusedAdamAdapter:
 
     # ---- step interface -------------------------------------------------
 
-    def step_async(self, chunk_id: ChunkId) -> "Future[None]":
+    def step_async(
+        self,
+        chunk_id: ChunkId,
+        d2h_event: Any = None,
+        post_step: Any = None,
+    ) -> "Future[None]":
         """Submit the CPU Adam step for ``chunk_id`` to the worker thread.
 
         Idempotent with :meth:`wait`: if a prior step is still pending for
         the same chunk, we wait for it first so we never run two steps
         concurrently against the same param shard.
+
+        Parameters
+        ----------
+        chunk_id:
+            The chunk whose CPU Adam step to run.
+        d2h_event:
+            Optional :class:`torch.cuda.Event` recorded by the caller on
+            the CUDA stream immediately after the grad D2H copy was
+            issued. When provided, the worker thread calls
+            ``event.synchronize()`` before invoking ``optim.step()`` —
+            this closes the CPU-Adam ↔ D2H race (BUG 1 fix): without
+            this wait, the worker can read uninitialized/partial bytes
+            from the pinned grad shard before the async D2H finishes.
+        post_step:
+            Optional zero-arg callable invoked on the worker thread
+            after ``optim.step()`` returns (before the future resolves).
+            The chunk manager uses this to repoint ``param.data`` back
+            to the GPU empty-placeholder so intermediate code between
+            iters doesn't see CPU-resident ``.data`` (BUG 4 fix).
         """
         prev = self._pending.get(chunk_id)
         if prev is not None and not prev.done():
@@ -104,13 +128,34 @@ class CpuFusedAdamAdapter:
         optim = self._optims.get(chunk_id)
         if optim is None:
             # No params belonging to this chunk live on CPU (e.g. a fully
-            # persistent layout). Return an already-completed future.
+            # persistent layout). Run the post_step (if any) inline and
+            # return an already-completed future.
             fut: Future[None] = Future()
+            if post_step is not None:
+                try:
+                    post_step()
+                except Exception as exc:  # noqa: BLE001
+                    fut.set_exception(exc)
+                    self._pending[chunk_id] = fut
+                    return fut
             fut.set_result(None)
             self._pending[chunk_id] = fut
             return fut
 
-        fut = self._executor.submit(optim.step)
+        def _run() -> None:
+            # Wait on the CUDA event (if any) so the D2H copy into the
+            # pinned grad shard is guaranteed complete before Adam reads
+            # it. ``Event.synchronize`` blocks the calling thread (here,
+            # the Adam worker) until the event has been recorded on the
+            # GPU — the main Python thread is free to continue launching
+            # subsequent backward kernels, which is the overlap we want.
+            if d2h_event is not None:
+                d2h_event.synchronize()
+            optim.step()
+            if post_step is not None:
+                post_step()
+
+        fut = self._executor.submit(_run)
         self._pending[chunk_id] = fut
         return fut
 

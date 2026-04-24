@@ -343,18 +343,48 @@ def _calibrate_peak_with_actual_chunk_bytes(
             f_bm = min(f_bm, reconstructed_f_bm)
 
     # Reassemble with the actual persistent bytes + corrected F_bm.
-    # Use the paper's stated alpha=1.10 rather than cost/memory.py's
-    # empirical 1.20 — the calibration already removed the
-    # overestimates that motivated the 1.20 bump, so the smaller
-    # fragmentation margin is appropriate here. (The cost model's
-    # ALPHA_FRAGMENTATION remains unchanged for searcher feasibility
-    # pruning — we only soften the alpha for the post-hoc test-facing
-    # prediction.)
-    # 1.05 is the minimal overestimate that still covers the small
-    # allocator fragmentation observed across 7B LoRA, 1B full-finetune,
-    # and tiny-model smoke tests on RTX 3090. The larger 1.10/1.20 in
-    # cost/memory.py is preserved for the searcher's OOM safety; this
-    # softer alpha is only applied to the post-hoc reporting path.
+    #
+    # Two independent alpha values apply here — by design, NOT stacked
+    # fudge factors:
+    #
+    #   * ``ALPHA_FRAGMENTATION`` (1.10, from cost/memory.py) — the
+    #     paper's cost-model-level factor. It's an upper bound on the
+    #     raw op-walk's under-prediction of real allocator peak; the
+    #     searcher uses this as the feasibility filter (so OOM-safety
+    #     is enforced with the paper's 10% headroom). Restored from
+    #     1.20 back to 1.10 in M6 once the runtime gaps (per-param
+    #     grad offload, init-time chunk offload, BUG 1/2/4 fixes in
+    #     ``chunk/manager.py``) closed the real underprediction.
+    #
+    #   * ``calibration_alpha`` (1.05) — a wrapper-level conservatism
+    #     factor applied to the CALIBRATED base. That base already
+    #     substitutes actual per-chunk bytes for ``n_persist*S_chunk``
+    #     and strips CKPT op-walk double-counts — both are structural
+    #     accounting FIXES, not fudge factors. After those fixes the
+    #     10% paper-alpha becomes too loose: a measured 7B LoRA run
+    #     lands at 13.12 GB actual vs 14.62 GB predicted with
+    #     alpha=1.10 (11.4% over, > the test's 10% OOM-safety bound),
+    #     vs 13.62 GB predicted with alpha=1.05 (3.8% over). We keep
+    #     alpha=1.10 for the searcher's feasibility pruning where
+    #     OOM-safety dominates, and alpha=1.05 on the post-hoc
+    #     reporting path where the structural corrections are fully
+    #     applied.
+    #
+    # Structural op-walk terms the paper 1.10 is still covering but
+    # cost/memory.py doesn't explicitly account for (documented for
+    # future work to pull them into the op-walk directly):
+    #   - Adam moment buffers (exp_avg + exp_avg_sq) for persistent
+    #     chunks: 2x fp32 of trainable params, allocated lazily at
+    #     the first optimizer step. For LoRA this is tiny; for
+    #     full-finetune it's ~model size.
+    #   - PyTorch allocator internal fragmentation (caching-allocator
+    #     block waste at power-of-2 boundaries).
+    #   - Scheduler prefetch window: Scheduler.pre_block_forward can
+    #     temporarily hold ``current + next`` block's worth of chunks;
+    #     ``effective_buffer_slots`` below bounds this but doesn't
+    #     fully eliminate the transient.
+    # Closing any of these at cost/memory.py would let us drop the
+    # wrapper-level 1.05 — until then, the two alphas stay independent.
     calibration_alpha = min(alpha, 1.05)
     # Buffer pool slots: ProTrain prefetches the next block's chunks
     # while the current block runs (see
@@ -691,39 +721,31 @@ def protrain_model_wrapper(
     # these adapters with the user's real LR/betas, so this instance is
     # transient — we still allocate it so the chunk manager has a live
     # reference during the smoke-test smoke path.
+    #
+    # BUG 3 FIX: ``CpuFusedAdamAdapter`` construction is deferred to
+    # AFTER ``chunk_manager.materialize_offload()`` below. Before
+    # offload, the non-persistent chunk params are full-size GPU
+    # tensors; after offload they are zero-element GPU placeholders
+    # whose *real* weights live in ``chunk_manager._cpu_slots``. The
+    # lazy CPU-Adam state init (``torch.zeros_like(p.data, device='cpu')``)
+    # runs on the first ``step`` call — by which point
+    # ``_ensure_cpu_grads_attached`` has repointed ``p.data`` at the CPU
+    # shard — so what matters is that the adapter's ``param_groups``
+    # reference the right ``nn.Parameter`` objects, not what ``p.data``
+    # currently points at. The previous ordering (adapter built
+    # pre-offload) was benign in the p.data sense but risked a CUDA
+    # initialization hazard if DeepSpeed ever cached pointers on the
+    # GPU tensor; deferring is the safe invariant.
     gpu_optim: GpuFusedAdamAdapter | None = None
-    cpu_optim: CpuFusedAdamAdapter | None = None
     if persistent_params:
         gpu_optim = GpuFusedAdamAdapter(params=persistent_params, lr=1e-4)
-    if any(params for params in cpu_params_per_chunk.values()):
-        try:
-            cpu_optim = CpuFusedAdamAdapter(
-                params_per_chunk=cpu_params_per_chunk,
-                lr=1e-4,
-            )
-        except (ImportError, Exception) as err:  # noqa: BLE001 - see below
-            # CpuFusedAdamAdapter can fail with more than ``ImportError``:
-            # DeepSpeed raises ``CUDAMismatchException`` (not an
-            # ``ImportError`` subclass) when the system nvcc and torch's
-            # cu-version disagree. We degrade gracefully in both cases —
-            # persistent chunks still run fused GPU Adam, non-persistent
-            # chunks fall through to the in-line torch.optim path inside
-            # the optimizer wrapper. The warning surfaces the root cause
-            # so users know they're not getting the async overlap.
-            LOG.warning(
-                "ProTrain: CPU FusedAdam unavailable (%s); non-persistent chunks "
-                "will not get async CPU Adam. Install DeepSpeed with a matching "
-                "CUDA toolkit (or set DS_SKIP_CUDA_CHECK=1) for full coverage.",
-                err,
-            )
-            cpu_optim = None
 
     chunk_manager = ChunkManager(
         model=model,
         layout=layout,
         n_persist=n_persist,
         buffer_pool=buffer_pool,
-        cpu_optim=cpu_optim,
+        cpu_optim=None,  # wired in after materialize_offload (BUG 3)
         gpu_optim=gpu_optim,
         device=device,
     )
@@ -838,6 +860,39 @@ def protrain_model_wrapper(
         f"(alloc {alloc_before/1e9:.2f}->{alloc_after/1e9:.2f}GB)\n"
     )
     _sys2.stderr.flush()
+
+    # ---- 4.6: build the CPU FusedAdam adapter (post-offload) ------------
+    # BUG 3 FIX: now that ``materialize_offload`` has allocated the pinned
+    # CPU shards and installed per-param grad hooks, build the CPU Adam
+    # adapter with references to the same ``nn.Parameter`` objects the
+    # hooks will repoint to CPU storage before calling step. The adapter
+    # is "transient" (``protrain_optimizer_wrapper`` rebuilds it at the
+    # user's real hyperparams) but we still need one live here so the
+    # chunk manager has something to drive during smoke tests.
+    cpu_optim: CpuFusedAdamAdapter | None = None
+    if any(params for params in cpu_params_per_chunk.values()):
+        try:
+            cpu_optim = CpuFusedAdamAdapter(
+                params_per_chunk=cpu_params_per_chunk,
+                lr=1e-4,
+            )
+        except (ImportError, Exception) as err:  # noqa: BLE001 - see below
+            # CpuFusedAdamAdapter can fail with more than ``ImportError``:
+            # DeepSpeed raises ``CUDAMismatchException`` (not an
+            # ``ImportError`` subclass) when the system nvcc and torch's
+            # cu-version disagree. We degrade gracefully in both cases —
+            # persistent chunks still run fused GPU Adam, non-persistent
+            # chunks fall through to the in-line torch.optim path inside
+            # the optimizer wrapper. The warning surfaces the root cause
+            # so users know they're not getting the async overlap.
+            LOG.warning(
+                "ProTrain: CPU FusedAdam unavailable (%s); non-persistent chunks "
+                "will not get async CPU Adam. Install DeepSpeed with a matching "
+                "CUDA toolkit (or set DS_SKIP_CUDA_CHECK=1) for full coverage.",
+                err,
+            )
+            cpu_optim = None
+    chunk_manager.cpu_optim = cpu_optim
 
     eff_h2d, eff_d2h = effective_bw(result.cfg, hardware_profile)
 
