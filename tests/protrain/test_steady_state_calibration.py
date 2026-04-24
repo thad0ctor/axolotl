@@ -213,6 +213,71 @@ def test_trace_records_steady_wall_times(gpu_device):
     )
 
 
+@pytest.mark.gpu
+def test_trace_records_per_block_peaks(gpu_device):
+    """``run_trace`` populates ``steady_fwd_block_peak_bytes`` per block.
+
+    The lightweight block-level hooks installed during the hook-less
+    steady forward capture ``torch.cuda.max_memory_allocated`` after each
+    block. Tiny GPT-2 has n_block>=2 transformer blocks; every block
+    should have a recorded peak > 0.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    from axolotl.integrations.protrain.block.layout_rules import discover_blocks
+    from axolotl.integrations.protrain.profiler import run_trace
+    from axolotl.integrations.protrain.types import ProfilerConfig
+
+    device = torch.device(f"cuda:{gpu_device}")
+    _name, tok, model = _load_tiny_gpt2()
+    model = model.to(device)
+
+    n_block_expected = len(discover_blocks(model))
+    assert n_block_expected >= 2, "tiny GPT-2 should have >=2 transformer blocks"
+
+    bs, seq = 2, 64
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token or "<|endoftext|>"
+    enc = tok(
+        ["hello world"] * bs,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=seq,
+    )
+    input_ids = enc["input_ids"].to(device)
+    labels = input_ids.clone()
+    batch = {"input_ids": input_ids, "labels": labels}
+
+    cfg = ProfilerConfig(
+        batch_size=bs,
+        seq_len=seq,
+        device=str(device),
+        include_backward=True,
+        on_demand=False,
+    )
+    trace = run_trace(model, batch, cfg)
+
+    assert len(trace.steady_fwd_block_peak_bytes) == n_block_expected, (
+        f"expected {n_block_expected} per-block peaks, got "
+        f"{len(trace.steady_fwd_block_peak_bytes)}"
+    )
+    for bid, pk in trace.steady_fwd_block_peak_bytes.items():
+        assert pk > 0, f"block {bid} peak bytes should be > 0, got {pk}"
+    # Per-block max must not exceed the aggregate ``steady_fwd_peak_bytes``.
+    max_block = max(trace.steady_fwd_block_peak_bytes.values())
+    assert max_block <= trace.steady_fwd_peak_bytes, (
+        f"per-block max ({max_block}) > aggregate peak "
+        f"({trace.steady_fwd_peak_bytes}) — should be impossible"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CPU-only tests — synthetic traces, scale factor plumbs through cost model
 # ---------------------------------------------------------------------------

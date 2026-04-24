@@ -340,10 +340,62 @@ def run_trace(
     # hooked per-op latencies (~2.5x inflation on ~1000-leaf transformer
     # models). See ``ProfilerTrace.hooked_fwd_wall_s`` docstring for the
     # full rationale.
+    #
+    # During this pass we ALSO install a lightweight pair of pre/post
+    # forward hooks on each TRANSFORMER BLOCK (not every leaf) to capture
+    # per-block peak bytes. The hooks only call
+    # ``torch.cuda.reset_peak_memory_stats`` + ``torch.cuda.max_memory_allocated``
+    # (two allocator reads, ~tens of µs each). Since we only instrument
+    # at block granularity (tens of blocks, not ~1000 leaves), hook
+    # dispatch cost here is negligible relative to the block compute
+    # itself — unlike the per-leaf hooks used later for the full trace,
+    # which inflate wall time ~8x on 7B Llama. The per-block peaks are
+    # consumed by the memory cost model as a ground-truth upper bound
+    # on the forward peak for any NONE/CKPT/SWAP mix.
     steady_fwd_wall_s = 0.0
     steady_bwd_wall_s = 0.0
     steady_fwd_peak_bytes = 0
+    steady_fwd_block_peak_bytes: dict[BlockId, int] = {}
     if cuda_available:
+        # Discover transformer blocks for per-block peak instrumentation.
+        # If discovery fails (non-standard model shape), skip per-block
+        # capture — the aggregate ``steady_fwd_peak_bytes`` below still
+        # fires and preserves backward compat with the v5 cap path.
+        block_handles: list[Any] = []
+        try:
+            from axolotl.integrations.protrain.block.layout_rules import (
+                discover_blocks,
+            )
+
+            blocks = discover_blocks(model)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.debug(
+                "profiler: discover_blocks failed (%s); skipping per-block "
+                "peak capture, aggregate cap only", exc
+            )
+            blocks = []
+
+        def _make_pre(_dev):
+            def _pre(_mod, _inputs):
+                torch.cuda.reset_peak_memory_stats(_dev)
+            return _pre
+
+        def _make_post(bid, _dev):
+            def _post(_mod, _inputs, _output):
+                steady_fwd_block_peak_bytes[bid] = int(
+                    torch.cuda.max_memory_allocated(_dev)
+                )
+            return _post
+
+        for idx, block in enumerate(blocks):
+            bid = BlockId(idx)
+            block_handles.append(
+                block.register_forward_pre_hook(_make_pre(device))
+            )
+            block_handles.append(
+                block.register_forward_hook(_make_post(bid, device))
+            )
+
         try:
             # Forward-only steady-state: time a single un-hooked forward.
             # The warmup loop above left allocator + kernels warm.
@@ -383,6 +435,10 @@ def run_trace(
             steady_fwd_wall_s = 0.0
             steady_bwd_wall_s = 0.0
             steady_fwd_peak_bytes = 0
+            steady_fwd_block_peak_bytes = {}
+        finally:
+            for h in block_handles:
+                h.remove()
 
     # --- install hooks on every nn.Module (leaves + composites) --------
     handles: list[Any] = []
@@ -535,6 +591,7 @@ def run_trace(
         steady_fwd_wall_s=steady_fwd_wall_s,
         steady_bwd_wall_s=steady_bwd_wall_s,
         steady_fwd_peak_bytes=steady_fwd_peak_bytes,
+        steady_fwd_block_peak_bytes=steady_fwd_block_peak_bytes,
     )
 
 

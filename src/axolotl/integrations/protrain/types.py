@@ -173,6 +173,28 @@ class ProfilerTrace:
     # time).
     steady_fwd_peak_bytes: int = 0
 
+    # Per-block peak bytes captured during the hook-less steady forward.
+    # Lightweight forward pre/post hooks installed ONLY at block level (tens
+    # of blocks, not the ~1000 leaves the main profiling path targets) call
+    # ``torch.cuda.reset_peak_memory_stats`` before each block and read
+    # ``torch.cuda.max_memory_allocated`` after. Keys are transformer block
+    # indices discovered via ``discover_blocks``; values are per-block peak
+    # bytes observed during that block's forward.
+    #
+    # The memory cost model consumes ``max(steady_fwd_block_peak_bytes.values())``
+    # as a ground-truth upper bound on the FORWARD peak for any NONE/CKPT/SWAP
+    # mix — unlike ``steady_fwd_peak_bytes`` (which is an aggregate only valid
+    # for all-NONE configs), the per-block max bounds any fractional-NONE
+    # config too: CKPT/SWAP blocks free their activations before the next
+    # block runs, so the forward peak across a mixed configuration cannot
+    # exceed the max per-block peak observed during the all-NONE profile.
+    # Backward CKPT recomputation bumps are added on top because they occur
+    # during backward and weren't measured here.
+    #
+    # Empty dict means unavailable (pre-v6 cached traces, or CUDA unavailable
+    # at profile time). New in TRACE_VERSION=6.
+    steady_fwd_block_peak_bytes: dict[BlockId, int] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)

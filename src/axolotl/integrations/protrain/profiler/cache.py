@@ -28,7 +28,17 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # traces default those fields to 0.0 which would make the cost model fall
 # back to identity scale and regress 7B runtime error to its pre-calibration
 # level; bumping forces a fresh trace.
-TRACE_VERSION = 4
+# Version 5 adds an aggregate ``steady_fwd_peak_bytes`` cap used by the
+# memory cost model when the searcher picks all-NONE.
+# Version 6 adds per-block peaks (``steady_fwd_block_peak_bytes``) captured
+# during the hook-less steady forward via lightweight block-level hooks.
+# Unlike the v5 aggregate — which only applies when n_checkpoint=0 &&
+# n_swap=0 — the per-block max bounds the forward peak for any fractional-
+# NONE config, tightening over-prediction across the search space. v5
+# traces default the per-block dict to empty, so the cost model falls back
+# to the aggregate-only cap (identical v5 behavior); bumping forces a fresh
+# trace so the cap takes effect.
+TRACE_VERSION = 6
 
 
 @dataclass(frozen=True)

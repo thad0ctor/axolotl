@@ -229,6 +229,20 @@ def test_protrain_7b_end_to_end() -> None:
     # searcher shifts toward configs with less CKPT (faster runtime allows
     # trading for more retained activation memory), and α's over-estimate
     # compounds. 35% ceiling acknowledges this without losing the signal.
+    #
+    # Post-per-block-peak-cap state: ``cost/memory.py::estimate_peak`` now
+    # caps the op-walk's raw_peak at
+    # ``max(steady_fwd_block_peak_bytes) + max_ckpt_activation`` when the
+    # v6 per-block dict is populated. This tightens estimate_peak callers
+    # (unit tests + any downstream rebuild) for ALL fractional-NONE
+    # configs — not just all-NONE like the v5 aggregate cap. The 7B
+    # end-to-end pipeline observes only a marginal tightening here
+    # (34% → 33% over-predict) because ``search/exhaustive.py`` uses an
+    # inline ``alpha * (model_state + F_bm)`` fast path that does not
+    # call ``estimate_peak`` (see ``search.exhaustive._block_map_peak_contribution``
+    # — equivalent to estimate_peak's op-walk, but without the cap).
+    # Closing the gap below 25% requires mirroring the cap inside the
+    # search's inline formula, which is out-of-scope for this commit.
     assert peak_err < 0.35, f"peak prediction off by {peak_err*100:.1f}%"
     # Runtime tolerance: 90% ceiling.
     #
