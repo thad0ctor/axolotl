@@ -45,26 +45,30 @@ class ProTrainArgs(BaseModel):
                 "Master enable flag for ProTrain automatic memory management. "
                 "When True, the plugin's post_model_load hook wraps the model "
                 "with the hierarchical chunk manager + interleaved block manager, "
-                "and create_optimizer returns the ProTrain optimizer. "
-                "Requires ``plugins: [axolotl.integrations.protrain]``. "
-                "Mutually exclusive with ``deepspeed:`` and ``fsdp:`` / ``fsdp_config:``."
+                "and post_trainer_create installs the ProTrain optimizer on the "
+                "trainer. Requires "
+                "``plugins: [axolotl.integrations.protrain.ProTrainPlugin]``. "
+                "Mutually exclusive with DeepSpeed, FSDP, gradient_checkpointing, "
+                "TP/CP/SP > 1, and load_in_8bit/load_in_4bit (see "
+                "`_reject_incompatible_features`)."
             )
         },
     )
 
     protrain_force_all_persistent: bool | None = Field(
-        default=True,
+        default=False,
         json_schema_extra={
             "description": (
-                "Override the searcher and force every chunk to stay GPU-resident "
+                "Debug / compatibility override: bypass the 4-knob searcher and "
+                "force every chunk to stay GPU-resident "
                 "(n_persist = N_chunk, n_swap = 0, n_checkpoint = N_block). "
-                "Recommended on 24 GB cards with LoRA until the M4.5 runtime "
-                "primitives (init-time chunk offload, per-param grad offload) land. "
-                "With those gaps in place, search-picked configs that rely on CPU-"
-                "hosted non-persistent chunks OOM on 7B-class models; "
-                "force_all_persistent keeps model state GPU-resident and relies on "
-                "activation checkpointing to trim peak memory — a valid and useful "
-                "ProTrain configuration for LoRA on single 3090s."
+                "The default is False because the paper's exhaustive search over "
+                "(n_persist, n_buffer, n_swap, n_checkpoint) is the core "
+                "contribution of ProTrain; shipping with the searcher disabled "
+                "would hide the feature behind a flag. Set to True only for "
+                "24 GB LoRA workloads that cannot yet survive the search-picked "
+                "CPU-offload path (the M6 true-ZeRO-3 sharding milestone closes "
+                "this gap)."
             )
         },
     )
@@ -149,12 +153,32 @@ class ProTrainArgs(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _reject_deepspeed_fsdp_coexistence(cls, data):
-        """Mutex with DeepSpeed / FSDP — mirror ``spectrum/args.py:32-47``.
+    def _reject_incompatible_features(cls, data):
+        """Mutex with features that conflict with ProTrain's runtime.
 
-        ProTrain owns per-rank memory policy; running it inside a
-        DeepSpeed / FSDP model factory would double-manage model state,
-        grads, and optim state. Refuse the combination at load-time.
+        ProTrain owns per-rank memory policy (chunk placement, activation
+        checkpointing, optimizer-state hosting). Several Axolotl features
+        either duplicate that policy or operate on representations the
+        chunk manager cannot see:
+
+        * ``deepspeed`` / ``fsdp`` / ``fsdp_config`` — alternative
+          per-rank model-state managers; running either alongside
+          ProTrain double-manages params, grads, and optim state.
+        * ``gradient_checkpointing: true`` — ProTrain's M3 block manager
+          installs its own CKPT hooks from ``n_checkpoint``; adding
+          HuggingFace's ckpt wrapper on top double-checkpoints forwards
+          (recomputes twice, doubles activation traffic).
+        * ``tensor_parallel_size`` / ``context_parallel_size`` /
+          ``sequence_parallel_degree`` > 1 — scope-excluded per plan.md
+          (M6 single-3090 focus); the chunk layout does not shard
+          correctly across TP/CP ranks in this milestone.
+        * ``load_in_8bit`` / ``load_in_4bit`` — bnb weight quantization
+          wraps ``nn.Linear.weight`` in a non-owning proxy. The chunk
+          manager reads unquantized storage for gather / offload and
+          cannot reason about the 8-bit / 4-bit packed buffers.
+
+        Each rejection surfaces at config-load time rather than as a
+        silent mis-training run.
         """
         if not isinstance(data, dict):
             return data
@@ -176,6 +200,50 @@ class ProTrainArgs(BaseModel):
                 "ProTrain + FSDP cannot be used together: both manage "
                 "per-rank model-state placement. Remove `fsdp:` / `fsdp_config:` "
                 "or disable `protrain_auto_memory`."
+            )
+        if data.get("gradient_checkpointing"):
+            raise ValueError(
+                "ProTrain is incompatible with gradient_checkpointing=true "
+                "(ProTrain installs its own activation checkpointing per the M3 "
+                "block manager; HuggingFace's gradient_checkpointing on top "
+                "would double-checkpoint the forward pass). Set "
+                "gradient_checkpointing=false or remove the ProTrain plugin."
+            )
+        tp_size = data.get("tensor_parallel_size")
+        if tp_size is not None and int(tp_size) > 1:
+            raise ValueError(
+                "ProTrain is incompatible with tensor_parallel_size > 1 "
+                "(scope-excluded per plan.md — the chunk layout does not shard "
+                "across TP ranks in this milestone). Set tensor_parallel_size=1 "
+                "or remove the ProTrain plugin."
+            )
+        cp_size = data.get("context_parallel_size")
+        if cp_size is not None and int(cp_size) > 1:
+            raise ValueError(
+                "ProTrain is incompatible with context_parallel_size > 1 "
+                "(scope-excluded per plan.md — single-3090 target). Set "
+                "context_parallel_size=1 or remove the ProTrain plugin."
+            )
+        sp_degree = data.get("sequence_parallel_degree")
+        if sp_degree is not None and int(sp_degree) > 1:
+            raise ValueError(
+                "ProTrain is incompatible with sequence_parallel_degree > 1 "
+                "(scope-excluded per plan.md — single-3090 target). Set "
+                "sequence_parallel_degree=1 or remove the ProTrain plugin."
+            )
+        if data.get("load_in_8bit"):
+            raise ValueError(
+                "ProTrain is incompatible with load_in_8bit=true (bitsandbytes "
+                "8-bit quantization wraps nn.Linear.weight in a non-owning proxy; "
+                "the chunk manager operates on unquantized storage for gather / "
+                "offload). Set load_in_8bit=false or remove the ProTrain plugin."
+            )
+        if data.get("load_in_4bit"):
+            raise ValueError(
+                "ProTrain is incompatible with load_in_4bit=true (bitsandbytes "
+                "4-bit quantization wraps nn.Linear.weight in a non-owning proxy; "
+                "the chunk manager operates on unquantized storage for gather / "
+                "offload). Set load_in_4bit=false or remove the ProTrain plugin."
             )
         return data
 

@@ -104,15 +104,34 @@ class ProTrainPlugin(BasePlugin):
     * ``get_input_args`` — dotted path to ``ProTrainArgs``.
     * ``post_model_load`` — builds ``HardwareProfile``, calls
       ``protrain_model_wrapper``, stashes the returned ``WrappedModel``
-      on ``cfg._protrain_wrapped`` for ``create_optimizer`` to pick up.
+      on ``cfg._protrain_wrapped`` for ``post_trainer_create`` to pick up.
     * ``create_optimizer`` — returns the ``_ProTrainOptimizer`` facade
-      constructed from the stashed ``WrappedModel``.
-    * ``post_trainer_create`` — no-op hook reserved for future metric
-      callbacks (keeps the signature stable).
+      constructed from the stashed ``WrappedModel``. Per BasePlugin
+      contract, but NOT the wiring path — Axolotl's ``OptimizerMixin``
+      does not currently dispatch to ``PluginManager.create_optimizer``,
+      so actual optimizer install happens in ``post_trainer_create``.
+    * ``post_trainer_create`` — installs ``_ProTrainOptimizer`` on
+      ``trainer.optimizer`` directly (this is the real wiring). Also
+      auto-detects DDP composition and flips
+      ``skip_internal_grad_reduce``.
     """
 
     def get_input_args(self) -> str:
         return "axolotl.integrations.protrain.args.ProTrainArgs"
+
+    def get_training_args(self, cfg):
+        """Force ``save_only_model=True`` so HF Trainer skips optim state save.
+
+        ``_ProTrainOptimizer.state_dict`` / ``load_state_dict`` raise
+        ``NotImplementedError`` — optimizer-state checkpointing lives
+        in the M6 scope. Without this, ``save_steps`` would trigger a
+        ``NotImplementedError`` at the first checkpoint. Setting
+        ``save_only_model`` skips the ``_save_optimizer_and_scheduler``
+        call entirely; the adapter / model weights still round-trip.
+        """
+        if not _is_plugin_active(cfg):
+            return None
+        return {"save_only_model": True}
 
     def post_model_load(self, cfg, model: "nn.Module") -> None:
         """Wrap the post-adapter model with the ProTrain runtime.
@@ -145,24 +164,6 @@ class ProTrainPlugin(BasePlugin):
             cfg, "protrain_n_checkpoint_override", None
         )
 
-        arch = type(getattr(model, "base_model", model)).__name__
-        LOG.warning(
-            "================ ProTrain: activating =================\n"
-            "  model arch: %s\n"
-            "  bs=%d seq=%d capacity=%s\n"
-            "  force_all_persistent=%s\n"
-            "  Known M4.5 runtime gaps: (1) init-time chunk offload not "
-            "physically moving non-persistent chunks to CPU; (2) per-param "
-            "grad offload not wired. LoRA on 24 GB with "
-            "force_all_persistent=True sidesteps both.\n"
-            "=======================================================",
-            arch,
-            micro_batch_size,
-            seq_len,
-            capacity_bytes if capacity_bytes is not None else "auto",
-            force_all_persistent,
-        )
-
         wrapped = protrain_model_wrapper(
             model,
             model_config=getattr(model, "config", None),
@@ -178,13 +179,20 @@ class ProTrainPlugin(BasePlugin):
             n_checkpoint_override=n_checkpoint_override,
         )
 
-        # Stash on cfg so create_optimizer (which only receives cfg +
+        # Stash on cfg so post_trainer_create (which only receives cfg +
         # trainer) can recover the WrappedModel. Using a leading
         # underscore to signal "runtime state, not YAML-serialisable".
         cfg._protrain_wrapped = wrapped  # type: ignore[attr-defined]
 
+        picked = wrapped.search_result.cfg
         LOG.info(
-            "ProTrain: wrapper installed. config=%s", wrapped.search_result.cfg
+            "ProTrain: %s config picked (n_persist=%d, n_buffer=%d, "
+            "n_checkpoint=%d, force_all_persistent=%s)",
+            type(getattr(model, "base_model", model)).__name__,
+            getattr(picked, "n_persist", -1),
+            getattr(picked, "n_buffer", -1),
+            getattr(picked, "n_checkpoint", -1),
+            force_all_persistent,
         )
 
     def create_optimizer(
@@ -232,13 +240,124 @@ class ProTrainPlugin(BasePlugin):
         )
 
     def post_trainer_create(self, cfg, trainer: "Trainer") -> None:
-        """Reserved for callbacks (metric reporting, hook lifecycle).
+        """Install the ProTrain optimizer on the trainer.
 
-        Kept as a signature-preserving no-op for forward compatibility
-        with the M6 multi-GPU milestone, which may want to attach a
-        throughput-metrics callback here without churning this class.
+        Axolotl's ``OptimizerMixin.create_optimizer`` does not dispatch
+        to ``PluginManager.create_optimizer`` (unlike
+        ``SchedulerMixin.create_scheduler``), so relying on
+        :meth:`create_optimizer` alone leaves the plugin inert and the
+        trainer falls back to vanilla AdamW. HuggingFace ``Trainer``
+        checks ``self.optimizer`` before rebuilding one — setting
+        ``trainer.optimizer`` here intercepts that path.
+
+        Also auto-detects DDP composition and flips
+        ``chunk_manager.skip_internal_grad_reduce`` so the outer DDP
+        wrapper owns the cross-rank grad all-reduce rather than fighting
+        with ProTrain's per-chunk reduce.
         """
-        del cfg, trainer  # intentionally unused
+        if not _is_plugin_active(cfg):
+            return
+
+        wrapped = getattr(cfg, "_protrain_wrapped", None)
+        if wrapped is None:
+            LOG.warning(
+                "ProTrain: post_trainer_create fired without wrapped model; "
+                "skipping optimizer install. post_model_load must have been "
+                "skipped (non-CUDA run?) — falling back to the default "
+                "optimizer."
+            )
+            return
+
+        from axolotl.integrations.protrain.api import protrain_optimizer_wrapper
+
+        args = trainer.args
+        optim = protrain_optimizer_wrapper(
+            wrapped,
+            lr=float(args.learning_rate),
+            betas=(float(args.adam_beta1), float(args.adam_beta2)),
+            eps=float(args.adam_epsilon),
+            weight_decay=float(args.weight_decay),
+        )
+
+        # ``_ProTrainOptimizer.state_dict`` raises NotImplementedError
+        # (optim-state checkpointing is M6 scope). HF Trainer and
+        # Accelerate both call ``state_dict`` unconditionally — HF at
+        # checkpoint save (silenced via ``save_only_model=True`` in
+        # ``get_training_args``) and Accelerate at ``prepare`` time for
+        # device-placement (NOT silenced). Override the two methods on
+        # this instance with safe no-ops so the bring-up path survives
+        # without having to edit the api/ module (out-of-scope per the
+        # fix plan). The safe no-op returns an empty param-state dict
+        # preserving HF's ``{"param_groups": ...}`` shape so
+        # Accelerate's ``move_to_device(state_dict, ...)`` +
+        # ``load_state_dict(state_dict)`` round-trip does not crash.
+        def _empty_state_dict(_self=optim):  # type: ignore[misc]
+            return {
+                "state": {},
+                "param_groups": [
+                    {k: v for k, v in g.items() if k != "params"}
+                    | {"params": [i for i, _ in enumerate(g["params"])]}
+                    for g in _self.param_groups
+                ],
+            }
+
+        def _noop_load_state_dict(_state_dict, _self=optim):  # type: ignore[misc]
+            # Accelerate re-loads the same (device-moved) state we just
+            # returned — since neither adapter owns persistent state on
+            # the torch side, discarding it is safe for the M5 scope.
+            return None
+
+        optim.state_dict = _empty_state_dict  # type: ignore[method-assign]
+        optim.load_state_dict = _noop_load_state_dict  # type: ignore[method-assign]
+
+        trainer.optimizer = optim
+        LOG.info(
+            "ProTrain: installed protrain_optimizer_wrapper on trainer.optimizer "
+            "(lr=%.3e betas=%s eps=%.1e wd=%.3e)",
+            float(args.learning_rate),
+            (float(args.adam_beta1), float(args.adam_beta2)),
+            float(args.adam_epsilon),
+            float(args.weight_decay),
+        )
+
+        # ---- DDP composition detection ----------------------------------
+        # If the trainer's model is wrapped in DistributedDataParallel,
+        # defer cross-rank grad all-reduce to DDP and silence ProTrain's
+        # internal reduce. Conversely, surface the case of multi-rank
+        # init without DDP so the operator knows ProTrain's own reduce
+        # path is still active (which is correct — just unusual).
+        try:
+            import torch
+            from torch.nn.parallel import DistributedDataParallel
+        except ImportError:
+            return
+
+        is_ddp = isinstance(trainer.model, DistributedDataParallel) or (
+            hasattr(trainer, "model_wrapped")
+            and isinstance(
+                getattr(trainer, "model_wrapped", None), DistributedDataParallel
+            )
+        )
+        if is_ddp:
+            wrapped.chunk_manager.skip_internal_grad_reduce = True
+            LOG.info(
+                "ProTrain: detected DDP composition; set "
+                "skip_internal_grad_reduce=True (DDP owns the cross-rank grad "
+                "all-reduce)"
+            )
+        elif (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            LOG.warning(
+                "ProTrain: multi-rank init (world_size=%d) detected but "
+                "trainer.model is not wrapped in DistributedDataParallel; "
+                "ProTrain's internal per-chunk grad all-reduce path remains "
+                "active. This is the correct path for non-DDP multi-rank "
+                "runs, but surface it here because it is unusual.",
+                torch.distributed.get_world_size(),
+            )
 
 
 __all__ = ["ProTrainPlugin"]

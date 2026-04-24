@@ -3,7 +3,7 @@
 Exposed as an Axolotl plugin. User opt-in in YAML:
 
     plugins:
-      - axolotl.integrations.protrain
+      - axolotl.integrations.protrain.ProTrainPlugin
 
 See DESIGN.md for module layout and paper-section references.
 """
