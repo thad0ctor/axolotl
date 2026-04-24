@@ -71,6 +71,45 @@ def _group_ops_by_block(trace: ProfilerTrace) -> dict[BlockId, list[int]]:
     return grouped
 
 
+def hot_iter_peak_cap(
+    trace: ProfilerTrace,
+    block_map: BlockStrategyMap,
+    cfg: CostConfig | None = None,
+) -> int | None:
+    """Measured ground-truth upper bound on the raw op-walk peak, or None.
+
+    Prefers per-block data from TRACE_VERSION ≥ 6:
+    ``max(steady_fwd_block_peak_bytes) + max_ckpt_activation`` under the
+    given ``block_map``. Falls back to the aggregate
+    ``steady_fwd_peak_bytes`` (v5) but only when ``cfg`` is provided AND
+    the config is fully-NONE (the aggregate makes no provision for CKPT
+    recomp bumps). Returns ``None`` when no hot-iter data is available —
+    callers then leave the op-walk raw peak untouched.
+
+    Used by BOTH :func:`estimate_peak` (full op-walk path) and
+    :func:`axolotl.integrations.protrain.search.exhaustive.search`
+    (inline F_bm fast path) so the cap propagates to the searcher's
+    picked config, not just to ``estimate_peak`` callers.
+    """
+    if trace.steady_fwd_block_peak_bytes:
+        forward_max_block_peak = max(trace.steady_fwd_block_peak_bytes.values())
+        ckpt_recomp_bump = 0
+        for bid_raw, act_sz in trace.activation_sizes.items():
+            bid = BlockId(int(bid_raw))
+            if block_map.get(bid, BlockMode.NONE) is BlockMode.CKPT:
+                if act_sz > ckpt_recomp_bump:
+                    ckpt_recomp_bump = act_sz
+        return forward_max_block_peak + ckpt_recomp_bump
+    if (
+        trace.steady_fwd_peak_bytes > 0
+        and cfg is not None
+        and cfg.n_checkpoint == 0
+        and cfg.n_swap == 0
+    ):
+        return trace.steady_fwd_peak_bytes
+    return None
+
+
 def estimate_cpu_footprint(
     cfg: CostConfig,
     layout: ChunkLayout,
@@ -312,29 +351,9 @@ def estimate_peak(
     #   2. Aggregate-only populated (v5, or v6 when discover_blocks failed)
     #      AND all-NONE cfg -> use aggregate
     #   3. Neither -> preserve op-walk raw_peak
-    if trace.steady_fwd_block_peak_bytes:
-        forward_max_block_peak = max(trace.steady_fwd_block_peak_bytes.values())
-        # Max single-CKPT-block activation bytes. Backward replays CKPT
-        # blocks one at a time, so the bump is per-block not summed.
-        # (This mirrors the op-walk's ckpt_extra, which adds a single
-        # block's activation at the first op of each CKPT block and
-        # takes the max across op positions.)
-        ckpt_recomp_bump = 0
-        for bid_raw, act_sz in trace.activation_sizes.items():
-            bid = BlockId(int(bid_raw))
-            if block_map.get(bid, BlockMode.NONE) is BlockMode.CKPT:
-                if act_sz > ckpt_recomp_bump:
-                    ckpt_recomp_bump = act_sz
-        measured_cap = forward_max_block_peak + ckpt_recomp_bump
-        if raw_peak > measured_cap:
-            raw_peak = measured_cap
-    elif (
-        trace.steady_fwd_peak_bytes > 0
-        and cfg.n_checkpoint == 0
-        and cfg.n_swap == 0
-        and raw_peak > trace.steady_fwd_peak_bytes
-    ):
-        raw_peak = trace.steady_fwd_peak_bytes
+    measured_cap = hot_iter_peak_cap(trace, block_map, cfg)
+    if measured_cap is not None and raw_peak > measured_cap:
+        raw_peak = measured_cap
 
     scaled = int(ALPHA_FRAGMENTATION * raw_peak)
     LOG.debug(
