@@ -1,4 +1,4 @@
-"""Config-level validation gates for multimodal CPT (fail-at-load, not mid-train)."""
+"""Multimodal CPT config validation gates."""
 
 from __future__ import annotations
 
@@ -49,19 +49,12 @@ class TestMultimodalCPTGates:
             validate_config(cfg)
 
     def test_multiple_pretraining_dataset_entries_rejected(self, min_base_cfg):
-        """Collator reads image settings from entry[0] only — multi-entry
-        configs would silently miscollate later entries. Reject at load."""
         cfg = _mm_cpt_cfg(min_base_cfg)
-        cfg.pretraining_dataset.append(
-            {"path": "other/ds", "type": "pretrain"}  # innocuous-looking second entry
-        )
+        cfg.pretraining_dataset.append({"path": "other/ds", "type": "pretrain"})
         with pytest.raises(ValueError, match="exactly one `pretraining_dataset`"):
             validate_config(cfg)
 
     def test_multimodal_entry_in_non_first_slot_rejected(self, min_base_cfg):
-        """MM-mode detection keys off entry[0], so an MM entry in slot 1+
-        would be silently demoted to plain text CPT (images ignored). Catch
-        at load instead of letting it train as a text run."""
         cfg = DictDefault(
             **(
                 min_base_cfg
@@ -89,14 +82,11 @@ class TestMultimodalCPTGates:
         cfg = _mm_cpt_cfg(min_base_cfg)
         validated = validate_config(cfg)
         assert validated.remove_unused_columns is False
-        # new schema fields round-trip through the pretraining_dataset entry
         pd = validated.pretraining_dataset[0]
         assert pd.type == "multimodal_pretrain"
         assert pd.image_column == "images"
 
     def test_multimodal_flag_triggers_gates(self, min_base_cfg):
-        """`multimodal: true` on the row should also activate the gates even
-        without `type: multimodal_pretrain`."""
         cfg = _mm_cpt_cfg(min_base_cfg)
         cfg.pretraining_dataset[0]["type"] = "pretrain"
         cfg.pretraining_dataset[0]["multimodal"] = True
@@ -105,7 +95,6 @@ class TestMultimodalCPTGates:
             validate_config(cfg)
 
     def test_non_mm_pretraining_dataset_unaffected(self, min_base_cfg):
-        """Pure text pretraining_dataset should remain valid without the new fields."""
         cfg = DictDefault(
             **(
                 min_base_cfg
@@ -118,4 +107,4 @@ class TestMultimodalCPTGates:
                 }
             )
         )
-        validate_config(cfg)  # must not raise
+        validate_config(cfg)

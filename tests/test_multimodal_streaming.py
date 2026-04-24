@@ -1,4 +1,4 @@
-"""Tests for streaming encoder + collator for multimodal CPT."""
+"""Multimodal CPT streaming encoder + collator tests."""
 
 from __future__ import annotations
 
@@ -12,7 +12,11 @@ from transformers import AutoProcessor
 
 from axolotl.prompt_strategies.multimodal_pretrain import build_image_token_spec
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
-from axolotl.utils.data.streaming import encode_streaming_multimodal
+from axolotl.utils.data.streaming import (
+    encode_streaming_multimodal,
+    wrap_streaming_dataset,
+)
+from axolotl.utils.dict import DictDefault
 
 from tests.hf_offline_utils import enable_hf_offline
 
@@ -100,6 +104,108 @@ def test_encode_rejects_row_without_list(smolvlm_processor, two_tiny_images):
         )
 
 
+def test_encode_counts_placeholders_on_full_text(smolvlm_processor, two_tiny_images):
+    # All 3 placeholders must be counted even when text would have been truncated.
+    spec = build_image_token_spec(smolvlm_processor)
+    long_filler = "lorem ipsum " * 20
+    text = f"{spec.image_token} {long_filler} {spec.image_token} {long_filler} {spec.image_token}"
+    examples = {
+        "text": [text],
+        "images": [[str(two_tiny_images[0])] * 3],
+    }
+    out = encode_streaming_multimodal(
+        examples,
+        tokenizer=smolvlm_processor.tokenizer,
+        max_tokens=4096,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+    )
+    assert sum(1 for t in out["input_ids"][0] if t == spec.image_token_id) == 3
+
+
+def test_encode_rejects_row_exceeding_max_tokens(smolvlm_processor, two_tiny_images):
+    spec = build_image_token_spec(smolvlm_processor)
+    huge = "word " * 5000
+    examples = {
+        "text": [f"{spec.image_token} {huge}"],
+        "images": [[str(two_tiny_images[0])]],
+    }
+    with pytest.raises(ValueError, match="exceeds sequence_len"):
+        encode_streaming_multimodal(
+            examples,
+            tokenizer=smolvlm_processor.tokenizer,
+            max_tokens=512,
+            image_token=spec.image_token,
+            image_token_id=spec.image_token_id,
+        )
+
+
+# ---- wrap_streaming_dataset routing --------------------------------------
+
+
+def test_wrap_streaming_dataset_uses_pretraining_config_arg(
+    smolvlm_processor, monkeypatch
+):
+    # Eval path passes a per-entry config that may differ from cfg.pretraining_dataset[0].
+    # The MM-CPT branch must read from that arg, not re-resolve from cfg.
+    captured = {}
+
+    def fake_partial(fn, **kwargs):
+        captured["encode_fn"] = fn
+        captured["kwargs"] = kwargs
+        return lambda batch: batch
+
+    monkeypatch.setattr("axolotl.utils.data.streaming.functools.partial", fake_partial)
+
+    class _Dataset:
+        features = {"text": None, "images": None}
+
+        def shuffle(self, **_):
+            return self
+
+        def map(self, *_args, **_kwargs):
+            return self
+
+    cfg = DictDefault(
+        {
+            "sample_packing": False,
+            "pretraining_dataset": [
+                {
+                    "path": "train/ds",
+                    "type": "multimodal_pretrain",
+                    "text_column": "wrong_train_col",
+                    "image_column": "wrong_train_imgs",
+                }
+            ],
+            "sequence_len": 256,
+            "shuffle_merged_datasets": False,
+            "streaming_multipack_buffer_size": 1000,
+            "seed": 42,
+        }
+    )
+    eval_entry = DictDefault(
+        {
+            "path": "test/ds",
+            "type": "multimodal_pretrain",
+            "text_column": "eval_text",
+            "image_column": "eval_imgs",
+        }
+    )
+
+    wrap_streaming_dataset(
+        _Dataset(),
+        smolvlm_processor.tokenizer,
+        cfg,
+        ds_wrapper_fn=None,
+        processor=smolvlm_processor,
+        pretraining_config=eval_entry,
+    )
+
+    assert captured["encode_fn"] is encode_streaming_multimodal
+    assert captured["kwargs"]["text_column"] == "eval_text"
+    assert captured["kwargs"]["image_column"] == "eval_imgs"
+
+
 # ---- MultiModalPretrainDataCollator ---------------------------------------
 
 
@@ -163,12 +269,6 @@ def test_collator_raises_on_missing_columns(smolvlm_processor):
 def test_collator_rejects_path_traversal_with_base_dir(
     smolvlm_processor, two_tiny_images, tmp_path
 ):
-    """With image_base_dir set, absolute paths + ../ escapes must be refused
-    BEFORE any PIL.open call (review finding: path traversal).
-
-    Outer RuntimeError carries a sanitized message (basename only). The
-    chained `__cause__` carries the full security-relevant reason.
-    """
     spec = build_image_token_spec(smolvlm_processor)
     base = tmp_path / "images"
     base.mkdir()
@@ -191,7 +291,6 @@ def test_collator_rejects_path_traversal_with_base_dir(
 
 
 def test_collator_rejects_remote_urls(smolvlm_processor):
-    """Review finding: v1 must not fetch remote images; reject explicitly."""
     spec = build_image_token_spec(smolvlm_processor)
     collator = MultiModalPretrainDataCollator(
         tokenizer=smolvlm_processor.tokenizer,
@@ -204,7 +303,7 @@ def test_collator_rejects_remote_urls(smolvlm_processor):
         "file:///etc/passwd",
         "ftp://x/y.png",
         "data:image/png;base64,xxx",
-        # Case-variant bypass attempts (round-3 finding)
+        # Case-variant bypass attempts.
         "HTTP://evil.com/x.png",
         "Https://x/y.jpg",
         "FILE:///etc/passwd",
@@ -217,7 +316,6 @@ def test_collator_rejects_remote_urls(smolvlm_processor):
 
 
 def test_collator_rejects_nul_byte_paths(smolvlm_processor):
-    """Adversarial review R1: NUL-byte injection must be rejected early."""
     spec = build_image_token_spec(smolvlm_processor)
     collator = MultiModalPretrainDataCollator(
         tokenizer=smolvlm_processor.tokenizer,
@@ -230,8 +328,6 @@ def test_collator_rejects_nul_byte_paths(smolvlm_processor):
 
 
 def test_collator_rejects_non_string_image_entries(smolvlm_processor, two_tiny_images):
-    """Adversarial review R4: non-string image entries must fail with
-    a clear type error, not a cryptic PIL message."""
     spec = build_image_token_spec(smolvlm_processor)
     collator = MultiModalPretrainDataCollator(
         tokenizer=smolvlm_processor.tokenizer,
@@ -249,8 +345,6 @@ def test_collator_rejects_non_string_image_entries(smolvlm_processor, two_tiny_i
 
 
 def test_collator_rejects_bytes_mm_text(smolvlm_processor, two_tiny_images):
-    """Adversarial review R5: `_mm_text` from a Parquet BINARY column could
-    arrive as bytes. Surface that as a clear type error."""
     spec = build_image_token_spec(smolvlm_processor)
     collator = MultiModalPretrainDataCollator(
         tokenizer=smolvlm_processor.tokenizer,
@@ -268,8 +362,6 @@ def test_collator_rejects_bytes_mm_text(smolvlm_processor, two_tiny_images):
 
 
 def test_collator_sanitizes_error_message(smolvlm_processor, tmp_path):
-    """Review finding #3: error messages must not leak the resolved full
-    path (could expose cluster layout / user dirs to log aggregators)."""
     spec = build_image_token_spec(smolvlm_processor)
     collator = MultiModalPretrainDataCollator(
         tokenizer=smolvlm_processor.tokenizer,
@@ -286,7 +378,6 @@ def test_collator_sanitizes_error_message(smolvlm_processor, tmp_path):
 
 
 def test_collator_rejects_too_many_images(smolvlm_processor, two_tiny_images):
-    """Review finding: per-row image count cap (DoS defense in depth)."""
     spec = build_image_token_spec(smolvlm_processor)
     collator = MultiModalPretrainDataCollator(
         tokenizer=smolvlm_processor.tokenizer,

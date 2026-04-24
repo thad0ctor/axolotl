@@ -168,12 +168,7 @@ def _prepare_streaming_dataset(
         first_test_dict = (
             first_test if isinstance(first_test, dict) else dict(first_test)
         )
-        # Multimodal CPT eval MUST go through the same streaming encoder as
-        # training so rows carry `input_ids`/`labels`/`images`/`_mm_text` —
-        # the SFT loader does not register `multimodal_pretrain` and with
-        # `skip_prepare_dataset: true` (auto-set for MM configs) it would
-        # return raw rows, causing the model forward to fail with "must
-        # specify input_ids or inputs_embeds" at the first eval step.
+        # MM CPT eval must use the streaming encoder so rows carry _mm_text/images.
         is_mm_cpt_eval = (
             first_test_dict.get("type") == "multimodal_pretrain"
             or bool(first_test_dict.get("multimodal"))
@@ -198,12 +193,6 @@ def _prepare_streaming_dataset(
 
 
 def _pretraining_config_from_entry(entry: dict) -> DictDefault:
-    """Build the iterable-pretraining config from a single dataset entry dict.
-
-    Shared between `_extract_pretraining_config` (for `pretraining_dataset`)
-    and the multimodal-CPT eval branch in `_prepare_streaming_dataset`
-    (for `test_datasets`), so both sides produce identically-shaped configs.
-    """
     return DictDefault(
         {
             "path": entry["path"],
@@ -213,7 +202,6 @@ def _pretraining_config_from_entry(entry: dict) -> DictDefault:
             "data_files": entry.get("data_files"),
             "type": entry.get("type", "pretrain"),
             "text_column": entry.get("text_column", "text"),
-            # Multimodal CPT fields (opt-in; safe defaults for text-only).
             "multimodal": entry.get("multimodal"),
             "image_column": entry.get("image_column", "images"),
             "image_base_dir": entry.get("image_base_dir"),
@@ -291,6 +279,7 @@ def _load_streaming_dataset(
         cfg,
         dataset_wrapper_partial,
         processor=processor,
+        pretraining_config=pretraining_config,
     )
 
     # Format for PyTorch

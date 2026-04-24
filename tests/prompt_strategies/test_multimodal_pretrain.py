@@ -1,4 +1,4 @@
-"""Tests for the multimodal CPT prompt strategy + safety gates (SmolVLM processor)."""
+"""Multimodal CPT prompt strategy + safety gate tests."""
 
 from __future__ import annotations
 
@@ -54,7 +54,6 @@ def test_build_image_token_spec_autodetects_smolvlm(smolvlm_processor):
 
 
 def test_build_image_token_spec_honors_override(smolvlm_processor):
-    # Override with a known-good token ("<image>" is the SmolVLM default).
     spec = build_image_token_spec(smolvlm_processor, override="<image>")
     assert spec.image_token == "<image>"
 
@@ -65,9 +64,7 @@ def test_build_image_token_spec_rejects_bad_override(smolvlm_processor):
 
 
 def test_build_image_token_spec_rejects_plain_word_override(smolvlm_processor):
-    """Review finding R6: an override like "image" BPE-tokenizes to a real
-    id but is NOT a registered special token — accepting it silently
-    breaks placeholder/image count matching."""
+    # Plain words BPE-tokenize but aren't placeholders.
     with pytest.raises(ValueError, match="not a registered special token"):
         build_image_token_spec(smolvlm_processor, override="image")
 
@@ -80,15 +77,12 @@ def test_check_processor_compatibility_rejects_incompatible(cls_name):
     fake = type(cls_name, (), {})()
     with pytest.raises(ValueError) as exc:
         check_processor_compatibility(fake)
-    # Error must include the class name + the user-facing reason.
     assert cls_name in str(exc.value)
     assert _INCOMPATIBLE_PROCESSOR_REASONS[cls_name] in str(exc.value)
 
 
 def test_check_processor_compatibility_rejects_subclass():
-    """Reviewer finding: must catch user-defined subclasses via MRO, not
-    just exact class-name match."""
-
+    # MRO-name fallback must catch user-defined subclasses.
     class BaseMllama:
         pass
 
@@ -104,7 +98,6 @@ def test_check_processor_compatibility_rejects_subclass():
 
 
 def test_check_processor_compatibility_accepts_supported(smolvlm_processor):
-    # Should not raise.
     check_processor_compatibility(smolvlm_processor)
 
 
@@ -141,7 +134,6 @@ def test_strategy_preserves_images_and_text(smolvlm_processor, tiny_image_path):
     )
     assert "input_ids" in out
     assert "images" in out and "_mm_text" in out
-    # one chunk -> parallel lists of length 1
     assert len(out["input_ids"]) == 1
     assert len(out["images"]) == 1
     assert len(out["_mm_text"]) == 1
@@ -153,11 +145,34 @@ def test_strategy_rejects_placeholder_count_mismatch(
     smolvlm_processor, tiny_image_path
 ):
     strat = _make_strategy(smolvlm_processor)
-    # 2 placeholders, 1 image -> must raise
     with pytest.raises(ValueError, match="occurrence"):
         strat.tokenize_prompt(
             {
                 "text": "<image><image>\ntwo placeholders one image",
+                "images": [str(tiny_image_path)],
+            }
+        )
+
+
+def test_strategy_rejects_row_exceeding_max_length(smolvlm_processor, tiny_image_path):
+    spec = build_image_token_spec(smolvlm_processor)
+    strat = MultimodalPretrainTokenizationStrategy(
+        PretrainTokenizer(),
+        smolvlm_processor.tokenizer,
+        False,
+        128,
+        text_column="text",
+        image_column="images",
+        image_base_dir=None,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        max_length=128,
+    )
+    huge = "word " * 5000
+    with pytest.raises(ValueError, match="exceeds sequence_len"):
+        strat.tokenize_prompt(
+            {
+                "text": f"{spec.image_token} {huge}",
                 "images": [str(tiny_image_path)],
             }
         )

@@ -1,4 +1,4 @@
-"""Collator for multimodal CPT — re-runs processor on the batch, masks image tokens."""
+"""Collator for multimodal CPT."""
 
 from __future__ import annotations
 
@@ -20,20 +20,13 @@ from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 
-# Raised by PIL (elevated to ValueError below) when a decoded image exceeds
-# this pixel count. 50M is ~7070×7070 — generous for document crops, but
-# blocks gigapixel decompression-bomb inputs well before they blow up RAM.
+# Decompression-bomb cap (~7070×7070).
 _DEFAULT_MAX_IMAGE_PIXELS = 50_000_000
-
-# Default cap on images per row — defense in depth against malicious datasets
-# containing thousands of placeholders in a single row. Override via config.
 _DEFAULT_MAX_IMAGES_PER_ROW = 32
 
 
 @dataclass
 class MultiModalPretrainDataCollator(DataCollatorMixin):
-    """Collator for raw image+text CPT (no chat template)."""
-
     tokenizer: PreTrainedTokenizerBase
     processor: ProcessorMixin
     image_token_spec: ImageTokenSpec
@@ -41,19 +34,11 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
     return_tensors: Literal["pt"] = "pt"
     padding: Union[bool, str, PaddingStrategy] = True
     pad_to_multiple_of: Optional[int] = None
-    # Cap the token length the processor produces — without this a few images
-    # can silently produce 10k+ tokens of placeholders and OOM the model.
     max_length: Optional[int] = None
-    # Allow bad-image rows to be skipped instead of crashing the run. Off by
-    # default — fail loud unless the user explicitly opts in.
     skip_bad_images: bool = False
-    # Decompression-bomb guard. PIL raises DecompressionBombWarning above
-    # this; we elevate it to a hard error.
     max_image_pixels: int = _DEFAULT_MAX_IMAGE_PIXELS
     max_images_per_row: int = _DEFAULT_MAX_IMAGES_PER_ROW
 
-    # Populated in __post_init__. Kept on the instance so workers can mask
-    # without re-probing the tokenizer.
     _image_family_token_ids: set[int] = field(init=False, default_factory=set)
     _base_dir_real: Optional[str] = field(init=False, default=None)
 
@@ -68,19 +53,11 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
         if self.image_base_dir is not None:
             self._base_dir_real = os.path.realpath(self.image_base_dir)
 
-    # --- helpers ---------------------------------------------------------
-
     def _resolve_image_path(self, p: str) -> str:
-        """Canonicalize path and enforce `image_base_dir` containment if set."""
         if not isinstance(p, str):
             raise ValueError(f"Image path must be str, got {type(p).__name__}.")
-        # Embedded NUL bytes are a classic filesystem-trick vector; most
-        # syscalls stop at the NUL but some libc/tools don't.
         if "\x00" in p:
             raise ValueError("Image path contains embedded NUL byte.")
-        # Reject non-local schemes explicitly (v1 = local files only).
-        # Scheme-check is case-insensitive (HTTP:// and ftp:// both fail).
-        # UNC paths on Windows (`\\host\share\...`) are also non-local.
         p_lower = p.lower()
         if p_lower.startswith(
             ("http://", "https://", "ftp://", "ftps://", "file://", "data:")
@@ -97,16 +74,13 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                     f"relative to the configured base directory."
                 )
             resolved = os.path.realpath(os.path.join(self._base_dir_real, p))
-            # Containment check (post-symlink). commonpath handles root-dir
-            # base values ("/", "C:\\") correctly; a raw startswith on
-            # `base + os.sep` would reject valid children there.
+            # commonpath (not startswith) so root-dir bases like "/" work.
             try:
                 within_base = (
                     os.path.commonpath([self._base_dir_real, resolved])
                     == self._base_dir_real
                 )
             except ValueError:
-                # Different drives on Windows, or otherwise uncomparable.
                 within_base = False
             if not within_base:
                 raise ValueError(
@@ -114,17 +88,10 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                     f"after symlink resolution. Refusing to load."
                 )
             return resolved
-        # No base dir → trust absolute paths as-is but still canonicalize.
         return os.path.realpath(p) if os.path.isabs(p) else p
 
     def _open_image_hardened(self, resolved: str) -> Image.Image:
-        """Open, check pixel+frame caps, load, return RGB. fd-safe via `with`."""
-        # O_NOFOLLOW refuses a terminal symlink at the final path component.
-        # `realpath` has already resolved any symlinks on the path, so this
-        # only catches the narrow TOCTOU window where a symlink appears AT
-        # the resolved location between `realpath` and `os.open`. It does
-        # NOT protect against ancestor-directory symlink swaps — for those,
-        # `image_base_dir` itself is assumed to be under admin control.
+        # O_NOFOLLOW closes the realpath→open TOCTOU window for the final component.
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(resolved, os.O_RDONLY | nofollow)
@@ -132,9 +99,6 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             raise ValueError(
                 f"Cannot open image (os.open failed: {type(exc).__name__})."
             ) from exc
-        # Wrap fd in a file object so PIL's `Image.open` gets the read/seek
-        # interface it expects. `os.fdopen` transfers ownership — closing
-        # the file object closes the fd.
         file_obj = os.fdopen(fd, "rb")
         try:
             with Image.open(file_obj) as src:
@@ -144,9 +108,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                         f"Image pixels ({w}×{h}) exceed "
                         f"max_image_pixels ({self.max_image_pixels})."
                     )
-                # GIF/TIFF/WebP multi-frame bomb guard: decoding frame 0
-                # is cheap, but an attacker can stuff 10k frames. We only
-                # need frame 0 for static VLM input.
+                # Multi-frame bomb guard (GIF/TIFF/WebP).
                 n_frames = getattr(src, "n_frames", 1)
                 if n_frames > 1:
                     raise ValueError(
@@ -156,9 +118,6 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 img.load()
                 return img
         finally:
-            # Image.open's context manager closes `src`, which also closes
-            # `file_obj` in recent Pillow — but we defensively close here
-            # to cover the error-before-with-entry case.
             if not file_obj.closed:
                 file_obj.close()
 
@@ -177,10 +136,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 resolved = self._resolve_image_path(raw)
                 img = self._open_image_hardened(resolved)
             except Exception as exc:
-                # Only leak the basename to the top-level log — full resolved
-                # paths can contain cluster layout / user dirs that end up in
-                # third-party log aggregators. Full path stays on the DEBUG
-                # stream and in the chained exception.
+                # Top-level log gets basename only; full path stays on DEBUG.
                 basename = os.path.basename(str(raw))
                 msg = (
                     f"Row {row_index}: failed to load image {basename!r} "
@@ -193,8 +149,6 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 raise RuntimeError(msg) from exc
             out.append(img)
         return out
-
-    # --- DataCollatorMixin -----------------------------------------------
 
     def torch_call(self, examples: list[dict]) -> dict[str, Any]:
         if not examples:
@@ -227,8 +181,6 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                     f"Row {i}: `images` must be a list (or None), got "
                     f"{type(raw).__name__}."
                 )
-            # Enforce str type at the boundary — the dataset can hold dicts
-            # or None; we want a clear error, not a confusing PIL failure.
             for j, rp in enumerate(raw_paths):
                 if not isinstance(rp, str):
                     raise TypeError(
@@ -238,9 +190,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             texts.append(mm_text)
             loaded = self._load_images_for_row(raw_paths, row_index=i)
             if self.skip_bad_images and len(loaded) != len(raw_paths):
-                # Drop the row entirely rather than leave a placeholder/image
-                # count mismatch for the processor (which would silently
-                # corrupt alignment on LLaVA/Qwen families).
+                # Drop the row to avoid silent placeholder/image count mismatch.
                 LOG.warning(
                     "Row %d: %d/%d images failed to load; dropping row.",
                     i,
@@ -257,17 +207,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 "failures. Check dataset integrity."
             )
 
-        # Re-tokenize + encode pixels on the whole batch. Each processor
-        # knows its own layout (flat [sum_patches, D] for Qwen,
-        # [B, tiles, C, H, W] for SmolVLM, [B, C, H, W] for LLaVA/Gemma-3).
-        #
-        # NOTE: we do NOT pass `truncation=True` here. Truncation would chop
-        # `input_ids` mid-placeholder-expansion while `pixel_values` retains
-        # every image — producing a silent text/pixel alignment mismatch
-        # (round-3 finding). A too-small `sequence_len` instead produces a
-        # visible failure at forward time (position-embedding overflow or OOM),
-        # which is the safer failure mode. If `max_length` is set, we warn
-        # post-hoc when the produced input_ids exceed it.
+        # No truncation: it chops input_ids mid-placeholder while pixel_values
+        # keep every image — silent text/pixel mismatch. We warn post-hoc instead.
         proc_kwargs: dict[str, Any] = {
             "text": texts,
             "images": images,
@@ -279,12 +220,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
         try:
             batch = self.processor(**proc_kwargs)
         except Exception as exc:
-            # Narrow the error — pinpoint the problematic row by retrying
-            # one-by-one. Use `isinstance` instead of exact-type match so a
-            # subclass raise in a row still counts as the same failure. If
-            # a retry raises a *different* exception class (e.g. OOM that
-            # wasn't in the original), we mark the retry inconclusive
-            # rather than false-blame a row.
+            # Pinpoint the bad row; bail to "inconclusive" if retry raises a different class.
             offender_idx: Optional[int] = None
             retry_ok = True
             retry_kwargs: dict[str, Any] = {
@@ -320,8 +256,6 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 f"mismatch, or an unsupported processor class."
             ) from exc
 
-        # Post-hoc length warning — informational, not a corruption guard
-        # (since we removed truncation there's no silent-corruption path).
         input_ids_len = batch["input_ids"].shape[-1]
         if self.max_length is not None and input_ids_len > self.max_length:
             LOG.warning(
@@ -332,19 +266,14 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 self.max_length,
             )
 
-        # Build labels from the processor's (re-)tokenized input_ids.
-        # CPT trains on all text tokens → start from input_ids.clone().
         input_ids: Tensor = batch["input_ids"]
         labels = input_ids.clone()
 
-        # Mask padding.
         pad_id = getattr(self.tokenizer, "pad_token_id", None)
         if pad_id is not None:
             labels[labels == pad_id] = -100
 
-        # Mask image-family tokens — essential: these ids never correspond to
-        # a predicted text token, so including them in the loss dominates
-        # gradient signal and blows up training loss ~10× in practice.
+        # Without this, image-family ids dominate loss and blow it up ~10×.
         for tid in self._image_family_token_ids:
             labels[labels == tid] = -100
 

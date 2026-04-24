@@ -185,7 +185,6 @@ def encode_streaming_multimodal(
     text_column: str = "text",
     image_column: str = "images",
 ) -> Dict[str, List]:
-    """Pre-tokenize text, pass raw text + image paths through to the collator."""
     texts: List[str] = examples[text_column]
     imgs_list: List[List[str]] = examples[image_column]
 
@@ -220,17 +219,13 @@ def encode_streaming_multimodal(
                     f"encode_streaming_multimodal: image {j} in row must be "
                     f"str, got {type(ip).__name__}."
                 )
-        enc = tokenizer(
-            text,
-            truncation=True,
-            max_length=max_tokens - 1,
-            add_special_tokens=True,
-        )
+        # No truncation: counting on truncated ids and storing untruncated text
+        # (which the collator re-tokenizes without truncation) silently produces
+        # oversize batches and confusing placeholder/image-count mismatches.
+        enc = tokenizer(text, add_special_tokens=True)
         ids = list(enc["input_ids"]) + [tokenizer.eos_token_id]
         mask = list(enc["attention_mask"]) + [1]
-        # Count placeholders by token id (prefix-safe: `<image>` substring
-        # inside `<image_soft_token>` would have false-matched with
-        # `text.count`).
+        # Count by id — `text.count` substring-matches `<image>` in `<image_soft_token>`.
         n_placeholders = sum(1 for t in ids if t == image_token_id)
         if n_placeholders != len(imgs):
             raise ValueError(
@@ -238,10 +233,14 @@ def encode_streaming_multimodal(
                 f"{image_token!r} in text but {len(imgs)} image path(s). "
                 f"Text and image count must match (one placeholder per image)."
             )
-        # CPT: train on all tokens. The collator masks image-family ids to
-        # -100 before computing loss — we can't do it here because the
-        # processor may re-expand the placeholder into many patch tokens at
-        # collation time, invalidating any pre-computed label positions.
+        if len(ids) > max_tokens:
+            raise ValueError(
+                f"Multimodal CPT row tokenizes to {len(ids)} tokens which "
+                f"exceeds sequence_len={max_tokens}. Pre-chunk your text or "
+                f"raise sequence_len (image patch expansion at the processor "
+                f"may push the final length even higher)."
+            )
+        # Labels = ids; collator masks image-family ids after re-tokenization.
         input_ids.append(ids)
         labels.append(list(ids))
         attention_mask.append(mask)
@@ -263,6 +262,7 @@ def wrap_streaming_dataset(
     cfg,
     ds_wrapper_fn,
     processor: Optional[ProcessorMixin] = None,
+    pretraining_config=None,
 ):
     if cfg.sample_packing:
         # For SFT (non-pretraining) datasets, always use multipack_attn=True to ensure
@@ -295,10 +295,15 @@ def wrap_streaming_dataset(
         # NOTE: This is not reachable for SFT datasets since we use the pre-existing
         # loading function for non-packed streaming datasets. Refer to
         # _prepare_streaming_datasets in sft.py for that code path.
-        ds_first = cfg.pretraining_dataset[0] if cfg.pretraining_dataset else {}
-        # Support both plain-dict and object-shaped config entries (pydantic
-        # models, DictDefault). A pure `getattr` path silently returns the
-        # default on a plain dict, which would miss `type: multimodal_pretrain`.
+        # Prefer the resolved per-entry config so eval (test_datasets) doesn't
+        # silently inherit the training entry's columns/image_token.
+        if pretraining_config is not None:
+            ds_first = pretraining_config
+        elif cfg.pretraining_dataset:
+            ds_first = cfg.pretraining_dataset[0]
+        else:
+            ds_first = {}
+        # Plain dicts need `.get`; pydantic/DictDefault need `getattr`.
         get_ds_value = (
             ds_first.get
             if isinstance(ds_first, dict)

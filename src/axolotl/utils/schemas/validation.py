@@ -1343,14 +1343,6 @@ class PretrainingValidationMixin:
     @model_validator(mode="before")
     @classmethod
     def check_multimodal_cpt(cls, data):
-        """Gate multimodal CPT at config-load time.
-
-        Rejects incompatible combinations before any model/dataset is touched
-        so the user sees a clear message instead of a cryptic mid-training
-        error. Model-level architecture rejection (Mllama/Pixtral/InternVL)
-        happens when the processor is actually loaded — see
-        `check_processor_compatibility` in `prompt_strategies/multimodal_pretrain.py`.
-        """
         pd = data.get("pretraining_dataset")
         if not pd:
             return data
@@ -1366,13 +1358,7 @@ class PretrainingValidationMixin:
                 mm_flag_ = getattr(entry, "multimodal", None)
             return ds_type_ == "multimodal_pretrain" or bool(mm_flag_)
 
-        # Multimodal CPT is a single-dataset mode: builder/collator/encoder
-        # resolve MM config and MM-mode detection from `pretraining_dataset[0]`
-        # only. Multi-entry configs either miscollate (MM in entry[0] leaks
-        # its image settings onto the other entries' rows) or silently demote
-        # (MM in a later entry is ignored because entry[0] drives detection
-        # → run trains as plain text CPT). Reject both, whichever slot the
-        # MM entry lives in.
+        # MM config resolves from entry[0] only; multi-entry runs miscollate or silently demote.
         if len(pd_list) > 1 and any(_entry_is_mm(e) for e in pd_list):
             raise ValueError(
                 "Multimodal CPT supports exactly one `pretraining_dataset` "
@@ -1414,8 +1400,7 @@ class PretrainingValidationMixin:
                 "conversational scaffolding entirely. Remove `chat_template` "
                 "or switch to chat-template SFT."
             )
-        # Force-disable column stripping so the `images` and `_mm_text`
-        # columns survive through to the collator.
+        # Keep `images` and `_mm_text` columns alive for the collator.
         if data.get("remove_unused_columns") is not False:
             data["remove_unused_columns"] = False
 

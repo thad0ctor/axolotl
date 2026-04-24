@@ -52,7 +52,6 @@ LOG = get_logger(__name__)
 
 
 def _is_multimodal_cpt(cfg) -> bool:
-    """True iff this config is a raw image+text CPT run (no chat template)."""
     if not getattr(cfg, "pretraining_dataset", None):
         return False
     ds_first = cfg.pretraining_dataset[0]
@@ -68,8 +67,6 @@ def _is_multimodal_cpt(cfg) -> bool:
 
 
 def _mm_cpt_get(pt_cfg, key, default=None):
-    """Read a field from a pretraining_dataset entry that may be dict, pydantic
-    model, or DictDefault."""
     if isinstance(pt_cfg, dict):
         return pt_cfg.get(key, default)
     return getattr(pt_cfg, key, default)
@@ -477,9 +474,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         return trainer
 
     def _build_mm_pretrain_collator(self, pad_to_multiple_of=None):
-        """Construct the multimodal CPT collator with pt_cfg-derived spec
-        and image_base_dir. Shared between the pretraining and non-pretraining
-        dispatch branches in `build_collator`."""
         from axolotl.prompt_strategies.multimodal_pretrain import (
             build_image_token_spec,
         )
@@ -506,12 +500,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         **kwargs,
     ):
         if training_args.pretraining:
-            # Multimodal CPT: intercept BEFORE the text-only pretraining branches
-            # so our custom collator is wired up correctly for BOTH training
-            # and eval. MM CPT eval is routed through `_load_streaming_dataset`
-            # in `utils/data/sft.py` so eval rows carry `_mm_text` / `images`
-            # just like training rows, which is what MultiModalPretrainDataCollator
-            # requires.
+            # Intercept MM CPT before the text-only pretraining branches.
             if (
                 self.cfg.processor_type
                 and self.processor

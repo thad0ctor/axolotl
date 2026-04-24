@@ -114,8 +114,7 @@ def download_smollm2_135m_instruct_model():
 
 @pytest.fixture(scope="session", autouse=True)
 def download_smolvlm_500m_instruct_model():
-    # Tests only exercise the processor/tokenizer — skip the ~1 GB of weight
-    # shards with an allow_patterns filter.
+    # Processor/tokenizer only — skip ~1 GB of weight shards.
     snapshot_download_w_retry(
         "HuggingFaceTB/SmolVLM-500M-Instruct",
         repo_type="model",
