@@ -191,9 +191,7 @@ class ProcessingStrategy:
                 )
 
             processed_example = None
-            if (
-                "messages" in example and example["messages"] is not None
-            ):
+            if "messages" in example and example["messages"] is not None:
                 processed_example = example
             else:
                 processed_example = convert_legacy_format(example)
@@ -360,9 +358,8 @@ def _apply_role_boundaries(
             best_match: Optional[RoleBoundary] = None
             for b in role_boundaries:
                 if _match_prefix(label, j, b.start_tokens):
-                    if (
-                        best_match is None
-                        or len(b.start_tokens) > len(best_match.start_tokens)
+                    if best_match is None or len(b.start_tokens) > len(
+                        best_match.start_tokens
                     ):
                         best_match = b
             if best_match is None:
@@ -404,11 +401,7 @@ def _apply_role_boundaries(
             # marker (Pixtral / Mistral V7 Tekken share [/INST] between
             # user-end and assistant-start). Requires end_tokens non-empty and
             # actually found.
-            if (
-                found_end
-                and not best_match.include_end
-                and best_match.end_tokens
-            ):
+            if found_end and not best_match.include_end and best_match.end_tokens:
                 j = end_after - len(best_match.end_tokens)
             else:
                 j = end_after
@@ -432,9 +425,7 @@ def _encode_markers(tokenizer, marker_strs: list[str]) -> list[list[int]]:
     return result
 
 
-def _resolve_role_boundary_override(
-    specs: list[dict], tokenizer
-) -> list[RoleBoundary]:
+def _resolve_role_boundary_override(specs: list[dict], tokenizer) -> list[RoleBoundary]:
     """Resolve user ``cfg.role_boundaries`` specs into RoleBoundary objects.
 
     The sentinel ``end == "eos_token"`` resolves to ``eos_token_id`` (used by
@@ -631,9 +622,9 @@ class Gemma3ProcessingStrategy(_GemmaTurnStrategy):
             role_boundaries_override=role_boundaries_override,
         )
         # Gemma3 uses boi_token as the image placeholder.
-        special_tokens_map = getattr(
-            processor.tokenizer, "special_tokens_map", {}
-        ) or {}
+        special_tokens_map = (
+            getattr(processor.tokenizer, "special_tokens_map", {}) or {}
+        )
         boi = special_tokens_map.get("boi_token")
         if boi is not None:
             self.image_token = boi
@@ -653,7 +644,12 @@ class Gemma3nProcessingStrategy(_GemmaTurnStrategy):
         labels = super().process_labels(input_ids)
         tok = self.processor.tokenizer
         # Follows huggingface-gemma-recipes fine_tune_gemma3n_on_t4 notebook.
-        for attr in ("image_token_id", "audio_token_id", "boi_token_id", "eoi_token_id"):
+        for attr in (
+            "image_token_id",
+            "audio_token_id",
+            "boi_token_id",
+            "eoi_token_id",
+        ):
             tok_id = getattr(tok, attr, None)
             if tok_id is not None:
                 labels[labels == tok_id] = -100
@@ -756,9 +752,7 @@ class Llama4ProcessingStrategy(ProcessingStrategy):
         end_ids = end[0]
         boundaries = []
         for role in ("system", "user", "assistant", "ipython", "tool"):
-            start = _encode_markers(
-                tok, [f"<|header_start|>{role}<|header_end|>\n\n"]
-            )
+            start = _encode_markers(tok, [f"<|header_start|>{role}<|header_end|>\n\n"])
             if start:
                 boundaries.append(
                     RoleBoundary(role=role, start_tokens=start[0], end_tokens=end_ids)

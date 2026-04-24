@@ -1,11 +1,13 @@
 """Tests for ``axolotl.processing_strategies`` using fake tokenizers (offline/CI-safe)."""
 
+import logging
+
 import pytest
 import torch
 
 from axolotl.processing_strategies import (
-    Gemma3ProcessingStrategy,
     Gemma3nProcessingStrategy,
+    Gemma3ProcessingStrategy,
     Gemma4ProcessingStrategy,
     Llama3_2VisionProcessingStrategy,
     Llama4ProcessingStrategy,
@@ -20,6 +22,28 @@ from axolotl.processing_strategies import (
 )
 
 
+@pytest.fixture
+def axolotl_caplog(caplog):
+    """caplog that also captures records from the ``axolotl`` logger.
+
+    The axolotl logger sets ``propagate=False`` once ``configure_logging()`` is
+    called (which happens indirectly in many CI test paths), so the default
+    caplog handler installed on the root logger never sees these records.
+    Attaching ``caplog.handler`` to ``axolotl.processing_strategies`` directly
+    makes assertions reliable regardless of whether ``configure_logging`` has
+    already run on this worker.
+    """
+    logger = logging.getLogger("axolotl.processing_strategies")
+    logger.addHandler(caplog.handler)
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(previous_level)
+
+
 # --------------------------------------------------------------------------- #
 # Generic fake tokenizer/processor scaffold
 # --------------------------------------------------------------------------- #
@@ -28,8 +52,13 @@ from axolotl.processing_strategies import (
 class _Tokenizer:
     """Minimal tokenizer stub; ``vocab`` maps marker strings to their id lists."""
 
-    def __init__(self, vocab: dict[str, list[int]], pad_id: int = 0,
-                 unk_id: int = 3, eos_id: int | None = None):
+    def __init__(
+        self,
+        vocab: dict[str, list[int]],
+        pad_id: int = 0,
+        unk_id: int = 3,
+        eos_id: int | None = None,
+    ):
         self.vocab = vocab
         self._reverse = {}
         for tok, ids in vocab.items():
@@ -178,16 +207,15 @@ def test_strategy_accepts_all_supported_train_on_eos_values():
         )
 
 
-def test_strategy_init_logs_resolved_masking_config_builtin(caplog):
-    import logging
+def test_strategy_init_logs_resolved_masking_config_builtin(axolotl_caplog):
     vocab = {
         "<|im_start|>assistant\n": [101, 102, 103],
         "<|im_start|>user\n": [101, 106, 103],
         "<|im_end|>": [104],
     }
-    with caplog.at_level(logging.INFO, logger="axolotl.processing_strategies"):
+    with axolotl_caplog.at_level(logging.INFO, logger="axolotl.processing_strategies"):
         Qwen2VLProcessingStrategy(_Processor(_Tokenizer(vocab, pad_id=0)))
-    msgs = [r.getMessage() for r in caplog.records]
+    msgs = [r.getMessage() for r in axolotl_caplog.records]
     assert any(
         "ProcessingStrategy init" in m
         and "Qwen2VLProcessingStrategy" in m
@@ -196,17 +224,16 @@ def test_strategy_init_logs_resolved_masking_config_builtin(caplog):
     )
 
 
-def test_strategy_init_logs_resolved_masking_config_override(caplog):
-    import logging
+def test_strategy_init_logs_resolved_masking_config_override(axolotl_caplog):
     vocab = {"BOA": [50, 51], "EOT": [60]}
-    with caplog.at_level(logging.INFO, logger="axolotl.processing_strategies"):
+    with axolotl_caplog.at_level(logging.INFO, logger="axolotl.processing_strategies"):
         ProcessingStrategy(
             _Processor(_Tokenizer(vocab, pad_id=0)),
             role_boundaries_override=[
                 {"role": "assistant", "start": "BOA", "end": "EOT"},
             ],
         )
-    msgs = [r.getMessage() for r in caplog.records]
+    msgs = [r.getMessage() for r in axolotl_caplog.records]
     # Resolved start/end ids must appear in the log so users can verify what
     # was actually matched.
     assert any(
@@ -225,9 +252,7 @@ def test_process_labels_no_warning_when_image_token_id_none():
     vocab = {"BOA": [50], "EOT": [60]}
     strategy = ProcessingStrategy(
         _Processor(_Tokenizer(vocab, pad_id=0)),
-        role_boundaries_override=[
-            {"role": "assistant", "start": "BOA", "end": "EOT"}
-        ],
+        role_boundaries_override=[{"role": "assistant", "start": "BOA", "end": "EOT"}],
     )
     assert strategy.image_token_id is None
     with warnings.catch_warnings():
@@ -241,9 +266,7 @@ def test_roles_to_train_empty_list_masks_everything():
     strategy = ProcessingStrategy(
         _Processor(_Tokenizer(vocab, pad_id=0)),
         roles_to_train=[],
-        role_boundaries_override=[
-            {"role": "assistant", "start": "BOA", "end": "EOT"}
-        ],
+        role_boundaries_override=[{"role": "assistant", "start": "BOA", "end": "EOT"}],
     )
     assert strategy.roles_to_train == []
     seq = [1, 50, 7, 8, 60, 9]
@@ -277,9 +300,22 @@ def _make_qwen2vl():
 def test_qwen2vl_masks_user_keeps_assistant_and_image_pad():
     strategy = _make_qwen2vl()
     seq = [
-        101, 105, 103, 77, 104,
-        101, 106, 103, 7, 104,
-        101, 102, 103, 200, 8, 104,
+        101,
+        105,
+        103,
+        77,
+        104,
+        101,
+        106,
+        103,
+        7,
+        104,
+        101,
+        102,
+        103,
+        200,
+        8,
+        104,
     ]
     labels = strategy.process_labels(torch.tensor([seq]))
     out = labels.tolist()[0]
@@ -329,7 +365,20 @@ def test_gemma3_scanner_plus_soft_image_token():
     seq = [1, 10, 3, 7, 4, 1, 2, 3, 50, 8, 262144, 4]
     labels = strategy.process_labels(torch.tensor([seq]))
     # boi(50) and soft-image-token(262144) masked post-scan.
-    assert labels.tolist()[0] == [-100, -100, -100, -100, -100, -100, -100, -100, -100, 8, -100, 4]
+    assert labels.tolist()[0] == [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        8,
+        -100,
+        4,
+    ]
 
 
 def test_gemma3n_masks_image_and_audio_attrs():
@@ -397,15 +446,20 @@ def test_gemma4_masks_everything_outside_assistant_span():
     turn_end = V["<turn|>"][0]
     seq = [
         0,
-        *user_start, 4444, turn_end,
-        *model_start, 5555, turn_end,
+        *user_start,
+        4444,
+        turn_end,
+        *model_start,
+        5555,
+        turn_end,
         9999,
     ]
     labels = strategy.process_labels(torch.tensor([seq]))
-    expected = (
-        [-100] * (1 + len(user_start) + 1 + 1 + len(model_start))
-        + [5555, turn_end, -100]
-    )
+    expected = [-100] * (1 + len(user_start) + 1 + 1 + len(model_start)) + [
+        5555,
+        turn_end,
+        -100,
+    ]
     assert labels.tolist()[0] == expected
 
 
@@ -414,9 +468,13 @@ def test_gemma4_masks_media_tokens_inside_assistant_span():
     V = strategy.processor.tokenizer.vocab
     model_start = V["<|turn>model\n"]
     media = [
-        V["<|image|>"][0], V["<|video|>"][0], V["<|audio|>"][0],
-        V["<|image>"][0], V["<image|>"][0],
-        V["<|audio>"][0], V["<audio|>"][0],
+        V["<|image|>"][0],
+        V["<|video|>"][0],
+        V["<|audio|>"][0],
+        V["<|image>"][0],
+        V["<image|>"][0],
+        V["<|audio>"][0],
+        V["<audio|>"][0],
     ]
     turn_end = V["<turn|>"][0]
     seq = [*model_start, *media, 9999, turn_end]
@@ -588,7 +646,9 @@ def test_dispatch_mistral_v7_tekken(_mistral_common_stub):
         "[SYSTEM_PROMPT]": [40],
         "[/SYSTEM_PROMPT]": [41],
     }
-    s = _dispatch(_Processor(_Tokenizer(vocab, pad_id=0, eos_id=99)), "mistral_v7_tekken")
+    s = _dispatch(
+        _Processor(_Tokenizer(vocab, pad_id=0, eos_id=99)), "mistral_v7_tekken"
+    )
     assert isinstance(s, MistralV7TekkenProcessingStrategy)
 
 
@@ -622,8 +682,16 @@ def test_role_boundaries_override_replaces_built_in():
         ],
     )
     seq = [
-        101, 106, 103, 7, 104,
-        200, 201, 9, 9, 210,
+        101,
+        106,
+        103,
+        7,
+        104,
+        200,
+        201,
+        9,
+        9,
+        210,
     ]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [-100, -100, -100, -100, -100, -100, -100, 9, 9, 210]
@@ -721,18 +789,21 @@ def test_role_boundaries_override_accepts_pydantic_models():
     assert strategy.role_boundaries[0].end_tokens == [60]
 
 
-def test_base_strategy_warns_when_no_boundaries(caplog):
+def test_base_strategy_warns_when_no_boundaries(axolotl_caplog):
     """No boundaries + train_on_inputs=False: one-shot warning, labels unchanged."""
     import axolotl.processing_strategies as mod
+
     mod._ROLE_MASK_WARNED.discard("ProcessingStrategy")
 
     vocab = {"dummy": [1]}
     s = ProcessingStrategy(_Processor(_Tokenizer(vocab, pad_id=0)))
-    import logging
-    with caplog.at_level(logging.WARNING, logger="axolotl.processing_strategies"):
+
+    with axolotl_caplog.at_level(
+        logging.WARNING, logger="axolotl.processing_strategies"
+    ):
         labels = s.process_labels(torch.tensor([[1, 2, 3]]))
     assert labels.tolist() == [[1, 2, 3]]
-    assert any("role boundaries" in rec.message for rec in caplog.records)
+    assert any("role boundaries" in rec.message for rec in axolotl_caplog.records)
 
 
 # --------------------------------------------------------------------------- #
@@ -751,9 +822,7 @@ def test_scanner_batch_size_greater_than_one():
             [1, 2, 5, 5, 9, 0, 0, 0],
         ]
     )
-    out = _apply_role_boundaries(
-        labels, boundaries, {"assistant"}, "turn"
-    ).tolist()
+    out = _apply_role_boundaries(labels, boundaries, {"assistant"}, "turn").tolist()
     assert out[0] == [-100, -100, -100, -100, -100, -100, 8, 9]
     assert out[1] == [-100, -100, 5, 5, 9, -100, -100, -100]
 
@@ -775,8 +844,22 @@ def test_scanner_train_on_eos_none_multi_turn():
     seq = [1, 3, 7, 9, 1, 2, 8, 9, 1, 3, 7, 9, 1, 2, 6, 9]
     out = _scan(boundaries, seq, train_on_eos="none")
     assert out == [
-        -100, -100, -100, -100, -100, -100, 8, -100,
-        -100, -100, -100, -100, -100, -100, 6, -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        8,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        6,
+        -100,
     ]
 
 
@@ -858,8 +941,16 @@ def test_qwen2vl_multiple_consecutive_assistant_turns():
     seq = [101, 102, 103, 8, 104, 101, 102, 103, 9, 104]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [
-        -100, -100, -100, 8, 104,
-        -100, -100, -100, 9, 104,
+        -100,
+        -100,
+        -100,
+        8,
+        104,
+        -100,
+        -100,
+        -100,
+        9,
+        104,
     ]
 
 
@@ -939,5 +1030,3 @@ def test_multimodal_config_parses_dict_role_boundaries_to_specs():
     seq = [51, 7, 60, 50, 8, 60]
     out = strategy.process_labels(torch.tensor([seq])).tolist()[0]
     assert out == [-100, -100, -100, -100, 8, 60]
-
-
