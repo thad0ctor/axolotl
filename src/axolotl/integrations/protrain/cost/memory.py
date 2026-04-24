@@ -288,6 +288,24 @@ def estimate_peak(
     if raw_peak == 0:
         raw_peak = model_state_present + retained_none_bytes
 
+    # Ground-truth forward cap from the profiler's hook-less steady pass.
+    # The op-walk's ``live_none + ckpt_extra + intra + inter`` can over-
+    # estimate the retained-activation set for all-NONE configurations —
+    # the real peak during the un-hooked forward (``steady_fwd_peak_bytes``)
+    # is a strictly tighter upper bound when it's available. Replace the
+    # retained-activations portion (everything after model_state_present)
+    # with the measured value when we have it AND the config keeps every
+    # block in NONE (n_checkpoint == 0 && n_swap == 0). For CKPT/SWAP
+    # configs the measurement doesn't apply (no CKPT recompute peaks in
+    # the hot-iter forward), so we preserve the op-walk estimate.
+    if (
+        trace.steady_fwd_peak_bytes > 0
+        and cfg.n_checkpoint == 0
+        and cfg.n_swap == 0
+        and raw_peak > trace.steady_fwd_peak_bytes
+    ):
+        raw_peak = trace.steady_fwd_peak_bytes
+
     scaled = int(ALPHA_FRAGMENTATION * raw_peak)
     LOG.debug(
         "estimate_peak: n_persist=%d n_buffer=%d n_swap=%d n_ckpt=%d raw=%dB alpha=%.2f -> %dB",
