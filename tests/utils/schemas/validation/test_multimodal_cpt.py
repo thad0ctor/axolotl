@@ -48,6 +48,16 @@ class TestMultimodalCPTGates:
         with pytest.raises(ValueError, match="chat_template"):
             validate_config(cfg)
 
+    def test_multiple_pretraining_dataset_entries_rejected(self, min_base_cfg):
+        """Collator reads image settings from entry[0] only — multi-entry
+        configs would silently miscollate later entries. Reject at load."""
+        cfg = _mm_cpt_cfg(min_base_cfg)
+        cfg.pretraining_dataset.append(
+            {"path": "other/ds", "type": "pretrain"}  # innocuous-looking second entry
+        )
+        with pytest.raises(ValueError, match="exactly one `pretraining_dataset`"):
+            validate_config(cfg)
+
     def test_valid_cfg_passes_and_disables_remove_unused_columns(self, min_base_cfg):
         cfg = _mm_cpt_cfg(min_base_cfg)
         validated = validate_config(cfg)

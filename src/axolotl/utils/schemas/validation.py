@@ -1324,6 +1324,20 @@ class PretrainingValidationMixin:
         if not is_mm_cpt:
             return data
 
+        # The collator and streaming encoder read image_base_dir / image_token
+        # from `pretraining_dataset[0]` only. Mixing a multimodal CPT entry
+        # with other pretraining entries would silently apply entry[0]'s
+        # image settings to the wrong rows (or the wrong placeholder family).
+        # Require exactly one entry in multimodal CPT mode.
+        if isinstance(pd, list) and len(pd) > 1:
+            raise ValueError(
+                "Multimodal CPT supports exactly one `pretraining_dataset` "
+                "entry (found {n}). Image settings (`image_base_dir`, "
+                "`image_token`) are resolved from entry[0] only, so additional "
+                "entries would be silently miscollated. Split multimodal CPT "
+                "into its own run.".format(n=len(pd))
+            )
+
         if not data.get("processor_type"):
             raise ValueError(
                 "Multimodal CPT (type: multimodal_pretrain) requires "

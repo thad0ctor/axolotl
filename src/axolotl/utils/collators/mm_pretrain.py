@@ -263,6 +263,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             "return_tensors": self.return_tensors,
             "padding": self.padding,
         }
+        if self.pad_to_multiple_of is not None:
+            proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         try:
             batch = self.processor(**proc_kwargs)
         except Exception as exc:
@@ -274,14 +276,15 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             # rather than false-blame a row.
             offender_idx: Optional[int] = None
             retry_ok = True
+            retry_kwargs: dict[str, Any] = {
+                "return_tensors": self.return_tensors,
+                "padding": self.padding,
+            }
+            if self.pad_to_multiple_of is not None:
+                retry_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
             for i, (t, imgs) in enumerate(zip(texts, images, strict=True)):
                 try:
-                    self.processor(
-                        text=[t],
-                        images=[imgs],
-                        return_tensors=self.return_tensors,
-                        padding=self.padding,
-                    )
+                    self.processor(text=[t], images=[imgs], **retry_kwargs)
                 except Exception as retry_exc:
                     if isinstance(retry_exc, type(exc)) or isinstance(
                         exc, type(retry_exc)
