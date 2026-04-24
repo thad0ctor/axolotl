@@ -238,6 +238,34 @@ class PretrainingDataset(BaseModel):
     data_files: str | None = None
     skip: int | None = None
 
+    # Multimodal CPT fields. Opt-in via `type: multimodal_pretrain` (or by
+    # setting `multimodal: true`). Each row of the dataset must contain the
+    # image-placeholder token in `text_column` once per image in `image_column`.
+    multimodal: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Opt in to multimodal CPT (raw image+text pretraining, no chat template). Requires processor_type to be set. Auto-enabled when type='multimodal_pretrain'."
+        },
+    )
+    image_column: str | None = Field(
+        default="images",
+        json_schema_extra={
+            "description": "Column name holding a list of image paths/URLs per row (multimodal CPT only)."
+        },
+    )
+    image_base_dir: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Optional base directory for resolving relative image paths (multimodal CPT only)."
+        },
+    )
+    image_token: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override the placeholder token the row's text uses for each image. If unset, autodetect from processor (e.g. '<image>', '<|image_pad|>', '<start_of_image>')."
+        },
+    )
+
 
 class UserDefinedDPOType(BaseModel):
     """User defined typing for DPO"""
