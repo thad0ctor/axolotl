@@ -194,17 +194,25 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
         total = hooked_total * scale
 
         if total > 0.0:
-            # SECONDARY safety: cap absolute magnitude at the roofline
-            # budget. Single-iter profiling plus hook dispatch can still
-            # inflate past the roofline even after the scale factor
-            # (e.g. when the clamp floor of _HOOK_SCALE_MIN hits and the
-            # true ratio is smaller); without the cap the searcher
-            # reorders toward offload-everything configs that are worse
-            # in reality. Preserves the per-block SHAPE of the measurement.
-            if roofline_total > 0.0 and total > 2.0 * roofline_total:
-                safety = roofline_total / total
+            # SECONDARY safety: cap absolute magnitude. Two upper bounds
+            # in priority order:
+            #   (a) measured `steady_fwd_wall_s` — the ground-truth
+            #       hook-less forward wall; if present, this IS what
+            #       steady-state training actually spends on forward.
+            #   (b) 2× activation-byte roofline — fallback for legacy
+            #       traces (pre-TRACE_VERSION=4) that lack the measurement.
+            # Without the cap the searcher reorders toward
+            # offload-everything configs that are worse in reality.
+            # Preserves per-block SHAPE of the measurement.
+            cap = 0.0
+            if trace.steady_fwd_wall_s > 0.0:
+                cap = trace.steady_fwd_wall_s
+            elif roofline_total > 0.0:
+                cap = 2.0 * roofline_total
+            if cap > 0.0 and total > cap:
+                safety = cap / total
                 per_block = {bid: v * safety for bid, v in per_block.items()}
-                total = roofline_total
+                total = cap
             return total, per_block, True
 
     # Fallback: pure roofline. No measurements available (empty op_latencies).

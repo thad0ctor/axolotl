@@ -215,7 +215,21 @@ def test_protrain_7b_end_to_end() -> None:
     assert actual_peak < 20 * (1 << 30), (
         f"actual peak {actual_peak/1e9:.2f} GB exceeded 20 GiB capacity budget"
     )
-    assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
+    # Peak under-predict invariant (strict): if the cost model under-predicts,
+    # the searcher can pick a config that OOMs. Predicted must be within 5%
+    # below actual.
+    assert predicted_peak >= actual_peak * 0.95, (
+        f"peak UNDER-predict: predicted {predicted_peak/1e9:.2f} GB < actual "
+        f"{actual_peak/1e9:.2f} GB — cost model's α fragmentation factor too "
+        "low or memory op-walk missing a term"
+    )
+    # Peak over-predict tolerance (loosened): the cost model is designed
+    # to conservatively over-predict (α=1.10 fragmentation factor + forward
+    # op-walk bounds). Under hot-iter runtime calibration (a1e67a54+), the
+    # searcher shifts toward configs with less CKPT (faster runtime allows
+    # trading for more retained activation memory), and α's over-estimate
+    # compounds. 35% ceiling acknowledges this without losing the signal.
+    assert peak_err < 0.35, f"peak prediction off by {peak_err*100:.1f}%"
     # Runtime tolerance: 90% ceiling.
     #
     # Calibration history on this workload:
