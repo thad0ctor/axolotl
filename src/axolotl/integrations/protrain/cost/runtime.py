@@ -53,18 +53,22 @@ LOG = get_logger(__name__)
 # cost model consumes them directly and this constant is not read.
 _COMPUTE_BYTES_PER_SEC: float = 3.0e11  # ~300 GB/s, rough 3090 effective
 
-# CPU-Adam step throughput (bytes of optim-state processed per second).
+# Fallback CPU-Adam step throughput (bytes of optim-state processed per
+# second). The cost model prefers the MEASURED rate from
+# ``HardwareProfile.cpu_adam_bytes_per_sec`` (populated by
+# ``profiler/hw_bench.measure_cpu_adam``); this constant is only consumed
+# when the measurement returned 0.0 (e.g. DeepSpeedCPUAdam failed to
+# compile, common on dev rigs with CUDA toolchain mismatches).
 # DeepSpeedCPUAdam benches around 1-2 GB/s per step on a decent Xeon/
-# Threadripper. Conservative.
-# STRUCTURAL PROXY: calibrating this requires running CPU Adam directly,
-# which is outside the profiler's scope (§3.2 profiles model fwd+bwd and
-# hardware BW/NCCL only). Kept as a constant until an optimizer-level
-# calibration pass lands.
-_CPU_ADAM_BYTES_PER_SEC: float = 1.5e9
+# Threadripper; the "20 B/param" accounting in hw_bench pushes the
+# measured throughput a bit higher — 8 GB/s is a reasonable middle-of-
+# the-road prior that avoids under- or over-predicting catastrophically.
+_CPU_ADAM_FALLBACK: float = 8.0e9
 
-# GPU FusedAdam throughput. Limited by HBM bandwidth, not FLOPs.
-# STRUCTURAL PROXY: same rationale as ``_CPU_ADAM_BYTES_PER_SEC``.
-_GPU_ADAM_BYTES_PER_SEC: float = 5.0e11
+# Fallback GPU FusedAdam throughput, same semantics as ``_CPU_ADAM_FALLBACK``.
+# GPU Adam is HBM-bandwidth-bound on 3090s; 500 GB/s is a mid-range prior
+# that matches the 3090's sustained HBM BW.
+_GPU_ADAM_FALLBACK: float = 5.0e11
 
 # Backward-vs-forward compute ratio when the trace has forward latencies but
 # no per-block backward split. The synthetic ``<backward>`` op records a
@@ -376,8 +380,33 @@ def estimate_runtime(
         ms_per_chunk = trace.model_state_bytes / layout.N_chunk
     else:
         ms_per_chunk = 0.0
-    t_gpu_optim = n_persist * ms_per_chunk / _GPU_ADAM_BYTES_PER_SEC
-    t_cpu_optim = n_nonpersist * ms_per_chunk / _CPU_ADAM_BYTES_PER_SEC
+
+    # Prefer the profiler-measured Adam rates on ``HardwareProfile``; fall
+    # back to the hardcoded priors when the microbenchmarks returned 0.0
+    # (e.g. DeepSpeedCPUAdam compile failure). Log at WARN exactly once
+    # per estimate_runtime call so repeated search invocations don't spam.
+    if hw.cpu_adam_bytes_per_sec > 0.0:
+        cpu_adam_bps = hw.cpu_adam_bytes_per_sec
+    else:
+        LOG.warning(
+            "estimate_runtime: cpu_adam_bytes_per_sec unavailable; using "
+            "fallback %.2e (re-run profiler for a calibrated rate)",
+            _CPU_ADAM_FALLBACK,
+        )
+        cpu_adam_bps = _CPU_ADAM_FALLBACK
+
+    if hw.gpu_adam_bytes_per_sec > 0.0:
+        gpu_adam_bps = hw.gpu_adam_bytes_per_sec
+    else:
+        LOG.warning(
+            "estimate_runtime: gpu_adam_bytes_per_sec unavailable; using "
+            "fallback %.2e (re-run profiler for a calibrated rate)",
+            _GPU_ADAM_FALLBACK,
+        )
+        gpu_adam_bps = _GPU_ADAM_FALLBACK
+
+    t_gpu_optim = n_persist * ms_per_chunk / gpu_adam_bps
+    t_cpu_optim = n_nonpersist * ms_per_chunk / cpu_adam_bps
 
     # Eq. 2: T_iter = T_fwd + max(T_bwd + T_gpu_optim, T_cpu_optim)
     t_iter = t_fwd + max(t_bwd + t_gpu_optim, t_cpu_optim)

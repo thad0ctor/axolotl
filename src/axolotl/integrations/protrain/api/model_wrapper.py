@@ -777,9 +777,31 @@ def protrain_model_wrapper(
         _zero3_for_hw = bool(zero3_shard) and (_ws_early > 1)
     # Propagate into the hardware_profile the searcher consumes. Replace
     # is cheap; HardwareProfile is frozen so we can't mutate in place.
+    # We also plumb the trace's measured Adam throughputs into the
+    # hardware_profile so ``cost/runtime.py`` consumes the empirical
+    # rates rather than the hardcoded prior.
+    from dataclasses import replace as _replace
+
+    _hw_updates: dict = {}
     if _zero3_for_hw != hardware_profile.zero3_shard:
-        from dataclasses import replace as _replace
-        hardware_profile = _replace(hardware_profile, zero3_shard=_zero3_for_hw)
+        _hw_updates["zero3_shard"] = _zero3_for_hw
+    # Only overwrite Adam rates when the caller-provided profile doesn't
+    # already carry them (i.e. tests that hand-craft a profile with a
+    # specific rate keep their value). Non-zero trace measurement wins
+    # over the default 0.0; 0.0 from the trace means the benchmark
+    # couldn't run, and the runtime cost model will fall back.
+    if (
+        hardware_profile.cpu_adam_bytes_per_sec <= 0.0
+        and trace.cpu_adam_bytes_per_sec > 0.0
+    ):
+        _hw_updates["cpu_adam_bytes_per_sec"] = trace.cpu_adam_bytes_per_sec
+    if (
+        hardware_profile.gpu_adam_bytes_per_sec <= 0.0
+        and trace.gpu_adam_bytes_per_sec > 0.0
+    ):
+        _hw_updates["gpu_adam_bytes_per_sec"] = trace.gpu_adam_bytes_per_sec
+    if _hw_updates:
+        hardware_profile = _replace(hardware_profile, **_hw_updates)
 
     n_block = max(1, len(trace.activation_sizes))
     # Max chunks seen in any one transformer block — used for the

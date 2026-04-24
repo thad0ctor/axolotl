@@ -17,11 +17,12 @@ LOG = get_logger(__name__)
 _CACHE_SUBDIR = Path("protrain") / "profiler"
 
 # Bump when the ProfilerTrace schema changes in a way that invalidates existing
-# cached traces. Version 2 adds per-op wall-clock latencies (``op_latencies``)
-# — traces from v1 have no latency data, so the runtime cost model would fall
-# back to the hardcoded roofline proxy. Bumping the version forces a re-profile
-# rather than silently degrading accuracy.
-TRACE_VERSION = 2
+# cached traces. Version 2 adds per-op wall-clock latencies (``op_latencies``);
+# version 3 adds measured Adam throughputs (``cpu_adam_bytes_per_sec`` /
+# ``gpu_adam_bytes_per_sec``) — traces from v2 have 0.0 for those fields, so
+# the runtime cost model would fall back to the hardcoded prior. Bumping the
+# version forces a re-profile rather than silently degrading accuracy.
+TRACE_VERSION = 3
 
 
 @dataclass(frozen=True)

@@ -337,6 +337,74 @@ def test_estimate_runtime_ckpt_adds_recompute(toy_trace, toy_layout, toy_hw):
     )
 
 
+def test_estimate_runtime_falls_back_when_adam_bps_zero(toy_trace, toy_layout):
+    """HardwareProfile with ``cpu_adam_bytes_per_sec=0.0`` must trigger the
+    fallback path in ``estimate_runtime`` (and likewise for GPU Adam). The
+    output must be a finite positive number; the fallback constants live in
+    ``cost/runtime.py`` as ``_CPU_ADAM_FALLBACK`` / ``_GPU_ADAM_FALLBACK``.
+    """
+    hw_no_adam = _make_hw()  # defaults: cpu_adam=0.0, gpu_adam=0.0
+    cfg = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, len(toy_trace.activation_sizes))
+
+    t = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_no_adam)
+
+    assert t > 0.0
+    import math
+
+    assert math.isfinite(t)
+
+
+def test_estimate_runtime_uses_measured_adam_when_provided(toy_trace, toy_layout):
+    """A 10x larger ``cpu_adam_bytes_per_sec`` on the HardwareProfile must
+    translate to a ~10x smaller CPU-optim contribution in the runtime
+    estimate.
+
+    Picks a CPU-Adam-dominated config (all chunks non-persistent) so
+    ``t_cpu_optim`` shows up on the critical path via the ``max()`` in
+    Eq. 2. The ratio-assertion avoids needing to know the other terms
+    exactly — we only care that the Adam rate IS the knob controlling
+    the CPU-optim contribution.
+    """
+    from dataclasses import replace
+
+    n_block = len(toy_trace.activation_sizes)
+    # Force CPU-Adam onto the critical path: n_persist=0 moves all chunks
+    # to the CPU-Adam branch, n_checkpoint=0 keeps t_bwd small so
+    # t_cpu_optim > t_bwd + t_gpu_optim.
+    cfg = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+
+    hw_slow = _make_hw()
+    hw_slow = replace(hw_slow, cpu_adam_bytes_per_sec=1e9)  # 1 GB/s
+    hw_fast = replace(hw_slow, cpu_adam_bytes_per_sec=1e10)  # 10 GB/s
+
+    t_slow = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_slow)
+    t_fast = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_fast)
+
+    # The CPU-Adam contribution scales inversely with the rate. Since
+    # this config puts CPU-Adam on the critical path (see docstring), the
+    # iteration time drop should approach 10x on the CPU-optim term.
+    # Other terms (t_fwd forward-only) are small and identical between
+    # runs, so the total ratio is ~10 but loosely so; assert >5 as a
+    # robust sanity threshold.
+    assert t_fast < t_slow
+    # Compute the t_cpu_optim contribution alone: for the same config,
+    # everything except the Adam term is constant. Use the difference:
+    delta_slow_vs_fast = t_slow - t_fast
+    # Reconstruct the implicit t_cpu_optim term from the rate change:
+    # t_cpu_optim_slow = X / 1e9; t_cpu_optim_fast = X / 1e10;
+    # their difference = 0.9 * X / 1e9 = 0.9 * t_cpu_optim_slow.
+    # So delta_slow_vs_fast == 0.9 * t_cpu_optim_slow — this means the
+    # ratio delta/t_slow should be close to 0.9 when CPU-optim
+    # dominates. Allow a generous 0.5 floor to tolerate non-dominating
+    # configs without masking regressions.
+    assert delta_slow_vs_fast / t_slow > 0.5, (
+        f"10x faster CPU Adam barely moved the needle: "
+        f"t_slow={t_slow:.6f} t_fast={t_fast:.6f}"
+    )
+
+
 def test_effective_bw_derates_with_n_swap(toy_hw):
     cfg_no_swap = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
     cfg_swap = CostConfig(n_persist=0, n_buffer=0, n_swap=3, n_checkpoint=0)
