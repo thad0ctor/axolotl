@@ -58,6 +58,33 @@ class TestMultimodalCPTGates:
         with pytest.raises(ValueError, match="exactly one `pretraining_dataset`"):
             validate_config(cfg)
 
+    def test_multimodal_entry_in_non_first_slot_rejected(self, min_base_cfg):
+        """MM-mode detection keys off entry[0], so an MM entry in slot 1+
+        would be silently demoted to plain text CPT (images ignored). Catch
+        at load instead of letting it train as a text run."""
+        cfg = DictDefault(
+            **(
+                min_base_cfg
+                | {
+                    "datasets": None,
+                    "pretraining_dataset": [
+                        {"path": "text/ds", "type": "pretrain"},
+                        {
+                            "path": "mm/ds",
+                            "type": "multimodal_pretrain",
+                            "image_column": "images",
+                        },
+                    ],
+                    "streaming": True,
+                    "max_steps": 10,
+                    "processor_type": "AutoProcessor",
+                    "sequence_len": 2048,
+                }
+            )
+        )
+        with pytest.raises(ValueError, match="exactly one `pretraining_dataset`"):
+            validate_config(cfg)
+
     def test_valid_cfg_passes_and_disables_remove_unused_columns(self, min_base_cfg):
         cfg = _mm_cpt_cfg(min_base_cfg)
         validated = validate_config(cfg)

@@ -1315,7 +1315,36 @@ class PretrainingValidationMixin:
         pd = data.get("pretraining_dataset")
         if not pd:
             return data
-        first = pd[0] if isinstance(pd, list) else {}
+
+        pd_list = pd if isinstance(pd, list) else [pd]
+
+        def _entry_is_mm(entry) -> bool:
+            if isinstance(entry, dict):
+                ds_type_ = entry.get("type")
+                mm_flag_ = entry.get("multimodal")
+            else:
+                ds_type_ = getattr(entry, "type", None)
+                mm_flag_ = getattr(entry, "multimodal", None)
+            return ds_type_ == "multimodal_pretrain" or bool(mm_flag_)
+
+        # Multimodal CPT is a single-dataset mode: builder/collator/encoder
+        # resolve MM config and MM-mode detection from `pretraining_dataset[0]`
+        # only. Multi-entry configs either miscollate (MM in entry[0] leaks
+        # its image settings onto the other entries' rows) or silently demote
+        # (MM in a later entry is ignored because entry[0] drives detection
+        # → run trains as plain text CPT). Reject both, whichever slot the
+        # MM entry lives in.
+        if len(pd_list) > 1 and any(_entry_is_mm(e) for e in pd_list):
+            raise ValueError(
+                "Multimodal CPT supports exactly one `pretraining_dataset` "
+                f"entry (found {len(pd_list)}). Image settings "
+                "(`image_base_dir`, `image_token`) and MM-mode detection "
+                "both resolve from entry[0] only, so additional entries "
+                "would be silently miscollated or drop their MM config. "
+                "Split multimodal CPT into its own run."
+            )
+
+        first = pd_list[0]
         if not isinstance(first, dict):
             return data
 
@@ -1323,20 +1352,6 @@ class PretrainingValidationMixin:
         is_mm_cpt = ds_type == "multimodal_pretrain" or bool(first.get("multimodal"))
         if not is_mm_cpt:
             return data
-
-        # The collator and streaming encoder read image_base_dir / image_token
-        # from `pretraining_dataset[0]` only. Mixing a multimodal CPT entry
-        # with other pretraining entries would silently apply entry[0]'s
-        # image settings to the wrong rows (or the wrong placeholder family).
-        # Require exactly one entry in multimodal CPT mode.
-        if isinstance(pd, list) and len(pd) > 1:
-            raise ValueError(
-                "Multimodal CPT supports exactly one `pretraining_dataset` "
-                "entry (found {n}). Image settings (`image_base_dir`, "
-                "`image_token`) are resolved from entry[0] only, so additional "
-                "entries would be silently miscollated. Split multimodal CPT "
-                "into its own run.".format(n=len(pd))
-            )
 
         if not data.get("processor_type"):
             raise ValueError(
