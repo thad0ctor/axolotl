@@ -131,6 +131,40 @@ class ProfilerTrace:
     cpu_adam_bytes_per_sec: float = 0.0
     gpu_adam_bytes_per_sec: float = 0.0
 
+    # Hook-dispatch calibration fields — new in TRACE_VERSION=4.
+    #
+    # The profiler installs pre/post forward hooks on every ``nn.Module`` to
+    # record per-op memory deltas + latencies. On transformer-sized models
+    # (~1000 leaf modules) the hook dispatch alone inflates measured forward
+    # wall time ~2.5x over a steady-state (hook-less) forward. The cost
+    # model consumes this ratio to scale the hooked per-op latencies down
+    # to a realistic prior:
+    #
+    #   scale = steady_fwd_wall_s / hooked_fwd_wall_s
+    #   t_fwd_calibrated = sum(per_block_latencies) * scale
+    #
+    # ``hooked_fwd_wall_s`` is the total wall-clock of the hooked forward
+    # (measured via a ``torch.cuda.Event`` pair around the full forward
+    # pass, NOT summed from per-op latencies — that sum misses inter-op
+    # Python overhead).
+    #
+    # ``steady_fwd_wall_s`` is the same forward measured BEFORE hooks are
+    # installed, on the same warm model + batch, with a pair of un-hooked
+    # warmup passes first so allocator state is representative.
+    #
+    # ``steady_bwd_wall_s`` is the hook-less backward wall-clock, captured
+    # on a separately-timed un-hooked backward (optional; 0.0 means
+    # "unavailable" — the cost model falls back to ``bwd_fwd_ratio`` of
+    # the scaled forward).
+    #
+    # Traces loaded from cache that predate v4 have 0.0 defaults here; the
+    # cost model detects the 0.0 and falls back to the unscaled per-op
+    # sum (identity scale factor), preserving backward compatibility until
+    # the cache is refreshed.
+    hooked_fwd_wall_s: float = 0.0
+    steady_fwd_wall_s: float = 0.0
+    steady_bwd_wall_s: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)

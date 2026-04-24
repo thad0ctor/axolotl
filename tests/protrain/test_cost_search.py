@@ -77,6 +77,7 @@ def _make_trace(
     inter_delta_bytes: int = 2 * MB,
     world: int = 1,
     op_latency_s: float = 0.0002,   # 200 µs per forward op; toy but >0
+    hook_scale_ratio: float = 1.0,   # steady/hooked forward wall ratio; 1.0 = no-op
 ) -> ProfilerTrace:
     op_order = _make_op_order(n_block, ops_per_block)
     intra_op_delta: dict[OpId, int] = {op.op_id: intra_delta_bytes for op in op_order}
@@ -89,6 +90,11 @@ def _make_trace(
     # keeps the synthetic invariants (monotonicity in n_buffer, CKPT-adds-
     # recompute, etc.) easy to reason about.
     op_latencies: dict[OpId, float] = {op.op_id: op_latency_s for op in op_order}
+    # Hooked/steady forward wall-time fields (TRACE_VERSION=4). Default 1:1
+    # ratio so the cost model's scale factor is identity and existing
+    # invariants still hold. Individual tests can pass a non-default
+    # ratio to exercise the scale path.
+    hooked_sum = sum(op_latencies.values())
     return ProfilerTrace(
         op_order=op_order,
         intra_op_delta=intra_op_delta,
@@ -105,6 +111,9 @@ def _make_trace(
         sku="RTX 3090 (synthetic)",
         world=world,
         op_latencies=op_latencies,
+        hooked_fwd_wall_s=hooked_sum,
+        steady_fwd_wall_s=hooked_sum * hook_scale_ratio,
+        steady_bwd_wall_s=0.0,
     )
 
 

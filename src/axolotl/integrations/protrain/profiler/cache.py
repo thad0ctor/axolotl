@@ -22,7 +22,13 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # ``gpu_adam_bytes_per_sec``) — traces from v2 have 0.0 for those fields, so
 # the runtime cost model would fall back to the hardcoded prior. Bumping the
 # version forces a re-profile rather than silently degrading accuracy.
-TRACE_VERSION = 3
+# Version 4 adds hook-dispatch calibration fields (``hooked_fwd_wall_s`` /
+# ``steady_fwd_wall_s`` / ``steady_bwd_wall_s``) that the cost model consumes
+# to scale the hooked per-op latencies down to a steady-state prior. v3
+# traces default those fields to 0.0 which would make the cost model fall
+# back to identity scale and regress 7B runtime error to its pre-calibration
+# level; bumping forces a fresh trace.
+TRACE_VERSION = 4
 
 
 @dataclass(frozen=True)

@@ -333,6 +333,50 @@ def run_trace(
                 LOG.debug("profiler warmup pass failed (%s); continuing cold", exc)
                 break
 
+    # --- steady-state (hook-less) wall-time measurement ---------------
+    # Captured BEFORE hooks are installed. The scalar ratio
+    # ``steady_fwd_wall_s / hooked_fwd_wall_s`` is the calibration factor
+    # the cost model applies to strip hook dispatch overhead out of the
+    # hooked per-op latencies (~2.5x inflation on ~1000-leaf transformer
+    # models). See ``ProfilerTrace.hooked_fwd_wall_s`` docstring for the
+    # full rationale.
+    steady_fwd_wall_s = 0.0
+    steady_bwd_wall_s = 0.0
+    if cuda_available:
+        try:
+            # Forward-only steady-state: time a single un-hooked forward.
+            # The warmup loop above left allocator + kernels warm.
+            torch.cuda.synchronize(device)
+            pre_sf = torch.cuda.Event(enable_timing=True)
+            post_sf = torch.cuda.Event(enable_timing=True)
+            pre_sf.record()
+            steady_out = model(**batch)
+            post_sf.record()
+            torch.cuda.synchronize(device)
+            steady_fwd_wall_s = pre_sf.elapsed_time(post_sf) / 1000.0
+
+            if cfg.include_backward:
+                steady_loss = _extract_loss(steady_out)
+                torch.cuda.synchronize(device)
+                pre_sb = torch.cuda.Event(enable_timing=True)
+                post_sb = torch.cuda.Event(enable_timing=True)
+                pre_sb.record()
+                steady_loss.backward()
+                post_sb.record()
+                torch.cuda.synchronize(device)
+                steady_bwd_wall_s = pre_sb.elapsed_time(post_sb) / 1000.0
+                model.zero_grad(set_to_none=True)
+            del steady_out
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.debug(
+                "profiler hook-less steady-state measurement failed (%s); "
+                "cost model will fall back to identity scale", exc
+            )
+            steady_fwd_wall_s = 0.0
+            steady_bwd_wall_s = 0.0
+
     # --- install hooks on every nn.Module (leaves + composites) --------
     handles: list[Any] = []
     for sub in model.modules():
@@ -350,11 +394,26 @@ def run_trace(
     # For M1 the wrapper is a no-op fast path; replay mode is M4.
     on_demand_mgr.disabled = True  # M1 override: full fwd+bwd always.
 
+    # Record total wall-clock of the HOOKED forward pass. Event-timed so
+    # hook dispatch gaps (Python overhead between ops) are included — the
+    # sum of per-op ``op_latencies`` would miss those gaps and understate
+    # the hook penalty. Paired with ``steady_fwd_wall_s`` above, this is
+    # what the cost model's scale factor consumes.
+    hooked_fwd_wall_s = 0.0
+    hooked_fwd_pre_event = None
+    hooked_fwd_post_event = None
+
     try:
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
         with on_demand_mgr:
+            if cuda_available:
+                hooked_fwd_pre_event = torch.cuda.Event(enable_timing=True)
+                hooked_fwd_pre_event.record()
             output = model(**batch)
+            if cuda_available and hooked_fwd_pre_event is not None:
+                hooked_fwd_post_event = torch.cuda.Event(enable_timing=True)
+                hooked_fwd_post_event.record()
 
             if cfg.include_backward:
                 loss = _extract_loss(output)
@@ -416,6 +475,20 @@ def run_trace(
                 continue
             op_latencies[op_id] = elapsed_ms / 1000.0
 
+        # Resolve the whole-forward hooked wall time from the pair of
+        # events wrapping the hooked forward call (see above). Must
+        # happen after the ``torch.cuda.synchronize`` that ends the
+        # traced iter so both events are complete.
+        if hooked_fwd_pre_event is not None and hooked_fwd_post_event is not None:
+            try:
+                hooked_fwd_wall_s = (
+                    hooked_fwd_pre_event.elapsed_time(hooked_fwd_post_event)
+                    / 1000.0
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                LOG.debug("hooked forward Event.elapsed_time failed: %s", exc)
+                hooked_fwd_wall_s = 0.0
+
     # --- hardware microbenchmarks --------------------------------------
     # PCIe is measured here (post-trace) rather than pre-trace because the
     # copy engines are unaffected by the earlier Adam microbenchmarks and
@@ -451,6 +524,9 @@ def run_trace(
         op_latencies=op_latencies,
         cpu_adam_bytes_per_sec=cpu_adam_bps,
         gpu_adam_bytes_per_sec=gpu_adam_bps,
+        hooked_fwd_wall_s=hooked_fwd_wall_s,
+        steady_fwd_wall_s=steady_fwd_wall_s,
+        steady_bwd_wall_s=steady_bwd_wall_s,
     )
 
 

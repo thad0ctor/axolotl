@@ -76,6 +76,47 @@ _GPU_ADAM_FALLBACK: float = 5.0e11
 # heuristic factor, and the code below prefers it when present.
 _BWD_FWD_COMPUTE_RATIO: float = 2.0
 
+# Clamp bounds for the hook-less / hooked forward wall-time calibration
+# scale (see ``_hook_scale_factor``). An absurdly small scale (< 0.3) would
+# over-correct the per-block sum into unrealistic territory; a scale > 1.0
+# means "hooked forward was FASTER than un-hooked", which should not happen
+# on any well-formed trace (the hook path strictly adds work). Both cases
+# indicate a measurement glitch — clamp and WARN instead of propagating.
+_HOOK_SCALE_MIN: float = 0.3
+_HOOK_SCALE_MAX: float = 1.0
+
+
+def _hook_scale_factor(trace: ProfilerTrace) -> float:
+    """Return the steady/hooked forward wall-time ratio, clamped to a sane range.
+
+    The profiler records both a ``hooked_fwd_wall_s`` (total wall-clock of
+    the hooked forward pass — inflated by pre/post forward hook dispatch)
+    and a ``steady_fwd_wall_s`` (the same forward, timed BEFORE hooks were
+    installed). On transformer-sized models the ratio lands around 0.3-0.5
+    (i.e. the hooked pass is 2-3x slower than steady-state), and that
+    ratio is the scalar correction the cost model needs to apply to the
+    hooked per-op latencies when predicting steady-state ``t_fwd``.
+
+    Backward compatibility: traces older than ``TRACE_VERSION=4`` have
+    both fields at 0.0 — this function returns 1.0 (identity) for those,
+    matching pre-calibration behavior. No warning is logged to keep
+    legacy traces quiet; the cache-version bump is the corrective path.
+    """
+    if trace.hooked_fwd_wall_s <= 0.0 or trace.steady_fwd_wall_s <= 0.0:
+        return 1.0
+    raw = trace.steady_fwd_wall_s / trace.hooked_fwd_wall_s
+    if raw > _HOOK_SCALE_MAX or raw < _HOOK_SCALE_MIN:
+        LOG.warning(
+            "hook-scale ratio out of sane range (%.3f = steady %.4fs / hooked "
+            "%.4fs); clamping to [%.2f, %.2f]",
+            raw,
+            trace.steady_fwd_wall_s,
+            trace.hooked_fwd_wall_s,
+            _HOOK_SCALE_MIN,
+            _HOOK_SCALE_MAX,
+        )
+    return max(_HOOK_SCALE_MIN, min(_HOOK_SCALE_MAX, raw))
+
 
 def _compute_time(activation_bytes: int) -> float:
     """Rough compute time proxy — used only as a fallback for traces that
@@ -104,20 +145,18 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
     """Return (total_fwd_compute_s, per_block_compute_s, used_measured).
 
     Behavior:
-    - If the trace carries ``op_latencies`` AND the measured total is not
-      larger than the activation-size roofline by more than 2x (which
-      indicates the measurement was inflated by cold-start + pre/post-hook
-      overhead that the roofline prices out), return the measured
-      per-block compute.
-    - If measured totals are inflated (common for 7B+ on a single-iter
-      profile where JIT + hook dispatch adds multiple seconds of Python
-      overhead), fall back to the measured-total rescaled so the
-      aggregate matches the roofline budget — this keeps the per-block
-      shape from the measurement while bounding absolute magnitude to
-      a physically plausible range.
-    - If the trace has no measured latencies, use the activation-size
-      roofline proxy and return ``used_measured=False`` so the caller
-      can log a warning.
+    - If the trace carries ``op_latencies``, apply the hook-dispatch
+      calibration scale (``steady_fwd_wall_s / hooked_fwd_wall_s``,
+      clamped to ``[_HOOK_SCALE_MIN, _HOOK_SCALE_MAX]``) to the per-op
+      sum. On transformer-sized models this strips ~2.5-8x hook
+      inflation from the measurement.
+    - If the scaled total is still larger than 2x the activation-size
+      roofline (defensive secondary cap), collapse the total to the
+      roofline budget while preserving the per-block shape. Protects
+      against runaway measurements on stale traces (pre-v4) where the
+      scale is 1.0 identity.
+    - If the trace has no measured latencies, fall back to the pure
+      activation-size roofline and return ``used_measured=False``.
     """
     per_block: dict[BlockId, float] = {}
     total = 0.0
@@ -131,27 +170,40 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
         roofline_total += t
 
     if trace.op_latencies:
+        hooked_per_block: dict[BlockId, float] = {}
+        hooked_total = 0.0
         for op in trace.op_order:
             if not op.is_forward or op.block_id is None:
                 continue
             lat = trace.op_latencies.get(op.op_id)
             if lat is None:
                 continue
-            per_block[op.block_id] = per_block.get(op.block_id, 0.0) + lat
-            total += lat
+            hooked_per_block[op.block_id] = (
+                hooked_per_block.get(op.block_id, 0.0) + lat
+            )
+            hooked_total += lat
         for bid_raw in trace.activation_sizes:
             bid = BlockId(int(bid_raw))
-            per_block.setdefault(bid, 0.0)
+            hooked_per_block.setdefault(bid, 0.0)
+
+        # PRIMARY correction: apply the clamped hook-dispatch scale.
+        # Legacy (pre-v4) traces have 0.0 wall-times — the scale function
+        # returns 1.0 (identity) in that case, matching old behavior.
+        scale = _hook_scale_factor(trace)
+        per_block = {bid: v * scale for bid, v in hooked_per_block.items()}
+        total = hooked_total * scale
 
         if total > 0.0:
-            # Cap absolute magnitude at the roofline budget. Single-iter
-            # profiling on 7B+ inflates measurements ~8x due to cold kernels
-            # and hook dispatch; without the cap the searcher reorders
-            # toward offload-everything configs that are worse in reality.
-            # Preserve the measurement's per-block SHAPE by scaling uniformly.
+            # SECONDARY safety: cap absolute magnitude at the roofline
+            # budget. Single-iter profiling plus hook dispatch can still
+            # inflate past the roofline even after the scale factor
+            # (e.g. when the clamp floor of _HOOK_SCALE_MIN hits and the
+            # true ratio is smaller); without the cap the searcher
+            # reorders toward offload-everything configs that are worse
+            # in reality. Preserves the per-block SHAPE of the measurement.
             if roofline_total > 0.0 and total > 2.0 * roofline_total:
-                scale = roofline_total / total
-                per_block = {bid: v * scale for bid, v in per_block.items()}
+                safety = roofline_total / total
+                per_block = {bid: v * safety for bid, v in per_block.items()}
                 total = roofline_total
             return total, per_block, True
 
@@ -162,20 +214,18 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
 def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> float:
     """Return the aggregate backward compute time in seconds.
 
-    The profiler's pre/post-forward hooks inflate the measured aggregate
-    ``<backward>`` latency by a large factor on transformer-sized models
-    (autograd holds the hook-saved tensors, and cpu-side hook dispatch
-    during the forward materializes extra intermediates that make the
-    backward pass artificially slow on the profile iteration). Using that
-    measurement directly steers the searcher toward n_persist=0 configs
-    because it inflates ``T_bwd`` uniformly across all configs without
-    shifting their ranking.
+    ``t_fwd_total * _BWD_FWD_COMPUTE_RATIO`` is the canonical transformer
+    backward/forward compute ratio and is the consistent choice given
+    the forward total is itself clamped by the hook-scale + roofline
+    path in ``_fwd_compute_time_from_trace``. Using a raw
+    ``steady_bwd_wall_s`` measurement here when forward is clamped
+    would produce an inconsistent backward-to-forward ratio.
 
-    For this reason we prefer ``t_fwd_total * _BWD_FWD_COMPUTE_RATIO`` as
-    the aggregate backward estimate — the 2x ratio is the canonical
-    transformer-block backward/forward rule and is free of hook bias.
-    The measured ``<backward>`` latency is retained in ``trace.op_latencies``
-    for future calibration (e.g. a non-hook warmup pass).
+    The hooked aggregate ``<backward>`` latency retained in
+    ``trace.op_latencies`` is NOT used — autograd holds the hook-saved
+    tensors during the forward which materially distorts the hooked
+    backward timing. ``steady_bwd_wall_s`` is captured for future use
+    when the forward clamp is relaxed (see TRACE_VERSION=4 notes).
     """
     return t_fwd_total * _BWD_FWD_COMPUTE_RATIO
 
