@@ -225,6 +225,24 @@ def test_estimate_peak_increases_with_n_persist_until_activations_dominate(
 # ---------------------------------------------------------------------------
 
 
+def test_estimate_runtime_monotonic_in_n_buffer(toy_trace, toy_layout, toy_hw):
+    """Searcher relies on the invariant that runtime is non-increasing in n_buffer
+    (cached chunks skip re-gather). If this ever flips, the searcher's O(N_chunk)
+    optimization in exhaustive.py picks the wrong n_buffer."""
+    prev_iter_s = float("inf")
+    for nb in range(toy_layout.N_chunk - 1):
+        cfg = CostConfig(n_persist=1, n_buffer=nb, n_swap=0, n_checkpoint=0)
+        block_map = assign_modes(
+            cfg.n_swap, cfg.n_checkpoint, len(toy_trace.activation_sizes)
+        )
+        iter_s = estimate_runtime(cfg, toy_trace, toy_layout, block_map, toy_hw)
+        assert iter_s <= prev_iter_s + 1e-9, (
+            f"non-monotonic: n_buffer={nb} broke invariant "
+            f"(prev={prev_iter_s:.6f}, now={iter_s:.6f})"
+        )
+        prev_iter_s = iter_s
+
+
 def test_estimate_runtime_ckpt_adds_recompute(toy_trace, toy_layout, toy_hw):
     # When CPU-Adam dominates the iteration (all chunks non-persistent)
     # it masks backward-side changes via the T_iter max() in Eq. 2. Put
@@ -263,6 +281,44 @@ def test_effective_bw_derates_with_n_swap(toy_hw):
     # And the derate should be strict when n_swap > 0.
     assert h2d_0 > h2d_k
     assert d2h_0 > d2h_k
+
+
+def test_effective_bw_multi_gpu_derate():
+    """Multi-GPU derate is WEAKER than single-GPU for the same n_swap.
+
+    Current formula: eff_bw = raw / (1 + 0.5 * min(1, n_swap / gpu_count)).
+    * world=1, n_swap=2 → min(1, 2/1)=1 → factor 1.5 → eff = raw * (2/3)
+    * world=4, n_swap=2 → min(1, 2/4)=0.5 → factor 1.25 → eff = raw * (0.8)
+    So at identical n_swap, the 4-GPU case retains more bandwidth per rank.
+    Guards against a refactor silently swapping the ratio direction or
+    dropping the gpu_count clamp.
+    """
+    from dataclasses import replace
+
+    hw_1gpu = _make_hw(gpu_count=1)
+    hw_4gpu = replace(hw_1gpu, gpu_count=4)
+
+    cfg = CostConfig(n_persist=0, n_buffer=4, n_swap=2, n_checkpoint=0)
+
+    h2d_1, d2h_1 = effective_bw(cfg, hw_1gpu)
+    h2d_4, d2h_4 = effective_bw(cfg, hw_4gpu)
+
+    # Multi-GPU bandwidth should be HIGHER (less derated) than single-GPU
+    # with the same n_swap because the contention is spread across ranks.
+    assert h2d_4 > h2d_1, (
+        f"multi-GPU H2D must derate less than single-GPU for same n_swap: "
+        f"h2d_1={h2d_1:.2e} h2d_4={h2d_4:.2e}"
+    )
+    assert d2h_4 > d2h_1, (
+        f"multi-GPU D2H must derate less than single-GPU for same n_swap: "
+        f"d2h_1={d2h_1:.2e} d2h_4={d2h_4:.2e}"
+    )
+
+    # Spot-check absolute ratios against the formula.
+    expected_h2d_1 = hw_1gpu.pcie_h2d_bps / 1.5
+    expected_h2d_4 = hw_4gpu.pcie_h2d_bps / 1.25
+    assert abs(h2d_1 - expected_h2d_1) / expected_h2d_1 < 1e-6
+    assert abs(h2d_4 - expected_h2d_4) / expected_h2d_4 < 1e-6
 
 
 # ---------------------------------------------------------------------------

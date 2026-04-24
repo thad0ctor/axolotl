@@ -136,45 +136,59 @@ def test_protrain_7b_end_to_end() -> None:
         f"optimizer built; gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
     )
 
-    # ---- Measure one training iteration --------------------------------
+    # ---- Measure N_ITERS training iterations ---------------------------
+    # The first one or two iterations eat JIT / kernel-compile / allocator
+    # warm-up cost that is NOT representative of steady-state throughput
+    # the cost model is trying to predict. We loop four iters and use the
+    # median of iters 2-3 as the "actual" iter time; the peak memory
+    # high-water mark is the max across all iters.
+    N_ITERS = 4
+    iter_s: list[float] = []
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
 
-    _mark("about to run training iteration (fwd+bwd+step)")
-    # Each phase is wrapped in a try/except that logs a diagnostic
-    # marker before re-raising. The xfail marker decides whether the
-    # raise ends in a pass or fail; the marker preserves a
-    # human-readable breadcrumb in ``pytest -s`` logs regardless.
-    try:
-        out = wrapped.module(**batch)
-    except Exception as e:  # noqa: BLE001 - diagnostic passthrough
-        _mark(f"forward FAILED: {type(e).__name__}: {e!s:.400}")
-        raise
-    _mark(
-        f"forward done: loss={float(out.loss):.4f} "
-        f"gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
-    )
-    loss = out.loss
-    try:
-        loss.backward()
-    except Exception as e:  # noqa: BLE001 - diagnostic passthrough
-        _mark(f"backward FAILED: {type(e).__name__}: {e!s:.400}")
-        raise
-    _mark(
-        f"backward done: gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
-    )
-    optim.step()
-    optim.zero_grad()
-    _mark("optimizer step + zero_grad done")
-
-    end.record()
-    torch.cuda.synchronize()
+    _mark(f"about to run {N_ITERS} training iterations (fwd+bwd+step)")
+    for i in range(N_ITERS):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        # Each phase is wrapped in a try/except that logs a diagnostic
+        # marker before re-raising. The xfail marker decides whether the
+        # raise ends in a pass or fail; the marker preserves a
+        # human-readable breadcrumb in ``pytest -s`` logs regardless.
+        try:
+            out = wrapped.module(**batch)
+        except Exception as e:  # noqa: BLE001 - diagnostic passthrough
+            _mark(f"iter {i} forward FAILED: {type(e).__name__}: {e!s:.400}")
+            raise
+        _mark(
+            f"iter {i} forward done: loss={float(out.loss):.4f} "
+            f"gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
+        )
+        loss = out.loss
+        try:
+            loss.backward()
+        except Exception as e:  # noqa: BLE001 - diagnostic passthrough
+            _mark(f"iter {i} backward FAILED: {type(e).__name__}: {e!s:.400}")
+            raise
+        _mark(
+            f"iter {i} backward done: gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
+        )
+        optim.step()
+        optim.zero_grad()
+        end.record()
+        torch.cuda.synchronize()
+        iter_s.append(start.elapsed_time(end) / 1000.0)
+        _mark(f"iter {i} done: {iter_s[-1]:.3f} s")
 
     actual_peak = torch.cuda.max_memory_allocated()
-    actual_iter_s = start.elapsed_time(end) / 1000.0
+    # Skip iters 0-1 (warm-up); take median of the steady-state slice.
+    # With N_ITERS=4 this is median([iter_s[2], iter_s[3]]).
+    import statistics
+
+    steady = iter_s[2:]
+    actual_iter_s = statistics.median(steady) if steady else iter_s[-1]
+    iter_s_all = iter_s
 
     predicted_peak = wrapped.search_result.predicted_peak_bytes
     predicted_iter_s = wrapped.search_result.predicted_iter_s
@@ -185,7 +199,8 @@ def test_protrain_7b_end_to_end() -> None:
         f"  predicted peak: {predicted_peak/1e9:.2f} GB  "
         f"actual: {actual_peak/1e9:.2f} GB\n"
         f"  predicted iter: {predicted_iter_s:.2f} s    "
-        f"actual: {actual_iter_s:.2f} s\n"
+        f"actual (median iters 2-3): {actual_iter_s:.3f} s\n"
+        f"  all iter times (s): {[round(t, 3) for t in iter_s_all]}\n"
         f"  chosen config: {wrapped.search_result.cfg}\n"
         f"  S_chunk={wrapped.chunk_manager.layout.S_chunk} "
         f"N_chunk={wrapped.chunk_manager.layout.N_chunk}"
@@ -193,25 +208,32 @@ def test_protrain_7b_end_to_end() -> None:
 
     peak_err = abs(predicted_peak - actual_peak) / max(1, actual_peak)
     runtime_err = abs(predicted_iter_s - actual_iter_s) / max(1e-9, actual_iter_s)
+
+    # OOM-safety invariant: actual peak must stay under the budget the searcher
+    # respected. A concurrent regression in predicted+actual both drifting over
+    # capacity would pass the relative-error test silently — this catches it.
+    assert actual_peak < 20 * (1 << 30), (
+        f"actual peak {actual_peak/1e9:.2f} GB exceeded 20 GiB capacity budget"
+    )
     assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
-    # Runtime tolerance is relaxed beyond the spec's 15% target (observed
-    # ~35% error on first-iteration 7B LoRA). The cost/runtime.py
-    # constants (_COMPUTE_BYTES_PER_SEC = 80e9, _CPU_ADAM_BYTES_PER_SEC =
-    # 8e9, etc.) are order-of-magnitude roofline estimates that don't
-    # account for:
-    #   - CUDA graph / JIT compile overhead on first iteration
-    #     (PyTorch's eager mode has a non-trivial launch cost for
-    #     small batches)
+    # Runtime tolerance with warm-up averaging:
+    # The cost/runtime.py constants (_COMPUTE_BYTES_PER_SEC,
+    # _CPU_ADAM_BYTES_PER_SEC, _GPU_ADAM_BYTES_PER_SEC) are
+    # order-of-magnitude roofline estimates that don't account for:
     #   - Block-level hook overhead (4 hooks × 32 blocks × 2 passes =
     #     256 Python callbacks per iter)
     #   - Chunk-gather H2D traffic NOT amortized across multiple iters
     #   - LoRA's small trainable slice not fully utilizing the CPU Adam
     #     pipeline the roofline assumes
-    # A dedicated calibration pass (M6) would tighten these; for M4.5
-    # we record the observed ratio and assert sanity (actual ≤ 2×
-    # predicted, i.e. predictions are the right order of magnitude).
+    # Measuring the median of iters 2-3 (skipping the JIT-dominated
+    # iters 0-1) removes the dominant per-test noise source. Observed
+    # error after warm-up sits around 20-35%; we keep 60% as the ceiling
+    # to cover CI variance (shared CPU, concurrent agents, thermal
+    # throttling on the 3090). A dedicated calibration pass (M6) will
+    # tighten these constants; until then 60% is the documented ceiling.
     # Peak stays strict at 10% — that's the OOM-safety invariant.
     assert runtime_err < 0.60, (
         f"runtime prediction off by {runtime_err*100:.1f}% — cost/runtime.py "
-        "calibration is out-of-scope for M4.5; see test comment"
+        "calibration is out-of-scope for M4.5; see test comment. "
+        f"iter_s_all={iter_s_all}"
     )
