@@ -14,12 +14,16 @@ from axolotl.prompt_strategies.multimodal_pretrain import build_image_token_spec
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.streaming import encode_streaming_multimodal
 
+from tests.hf_offline_utils import enable_hf_offline
 
 _SMOLVLM = "HuggingFaceTB/SmolVLM-500M-Instruct"
 
 
 @pytest.fixture(scope="module", name="smolvlm_processor")
-def fixture_smolvlm_processor():
+@enable_hf_offline
+def fixture_smolvlm_processor(
+    download_smolvlm_500m_instruct_model,  # pylint: disable=unused-argument
+):
     return AutoProcessor.from_pretrained(_SMOLVLM)
 
 
@@ -58,10 +62,12 @@ def test_encode_preserves_images_and_text(smolvlm_processor, two_tiny_images):
     assert len(out["input_ids"]) == 2
     assert out["images"] == [[str(two_tiny_images[0])], [str(two_tiny_images[1])]]
     # EOS appended -> input_ids len equals attention_mask len and > text
-    for ids, mask in zip(out["input_ids"], out["attention_mask"]):
+    for ids, mask in zip(
+        out["input_ids"], out["attention_mask"], strict=True
+    ):
         assert len(ids) == len(mask) and len(ids) > 0
     # CPT: labels == input_ids pre-masking.
-    for ids, lbls in zip(out["input_ids"], out["labels"]):
+    for ids, lbls in zip(out["input_ids"], out["labels"], strict=True):
         assert ids == lbls
 
 

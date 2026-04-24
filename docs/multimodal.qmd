@@ -443,10 +443,14 @@ be rejected when their processor is loaded:
 - **Pixtral** — requires `mistral_common` and a different API.
 - **InternVL** — ships a custom processor that doesn't produce `pixel_values`.
 
-Per-row validation: each row's `text.count(placeholder) == len(images)` is
-enforced at encode time. This is a critical guardrail — LLaVA and Qwen-VL
-processors silently accept rows without placeholders and drop the image,
-which looks like successful training but teaches nothing.
+Per-row validation: at encode time the row's text is tokenized once and the
+number of `image_token_id` occurrences in the resulting token-id list must
+equal `len(images)`. Counting by token id (not by substring) avoids false
+matches — e.g., `<image>` would substring-match inside `<image_soft_token>`.
+This is a critical guardrail — LLaVA and Qwen-VL processors silently
+accept rows without placeholders and drop the image, which looks like
+successful training but teaches nothing. If a row fails this check,
+inspect the tokenized ids rather than the raw string.
 
 ### Why masking image tokens in labels is automatic
 

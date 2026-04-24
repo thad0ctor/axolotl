@@ -477,8 +477,15 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         if training_args.pretraining:
             # Multimodal CPT: intercept BEFORE the text-only pretraining branches
             # so our custom collator is wired up correctly.
-            if self.cfg.processor_type and self.processor and _is_multimodal_cpt(
-                self.cfg
+            # Training batches only — eval datasets from `test_datasets` are
+            # loaded through the regular path and don't carry the
+            # `_mm_text` / `images` columns MultiModalPretrainDataCollator
+            # requires, so an eval step would hard-fail in its torch_call.
+            if (
+                not is_eval
+                and self.cfg.processor_type
+                and self.processor
+                and _is_multimodal_cpt(self.cfg)
             ):
                 from axolotl.prompt_strategies.multimodal_pretrain import (
                     build_image_token_spec,
@@ -576,8 +583,11 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             else:
                 collator = BatchSamplerDataCollatorForSeq2Seq
         else:
-            if self.cfg.processor_type and self.processor and _is_multimodal_cpt(
-                self.cfg
+            if (
+                not is_eval
+                and self.cfg.processor_type
+                and self.processor
+                and _is_multimodal_cpt(self.cfg)
             ):
                 from axolotl.prompt_strategies.multimodal_pretrain import (
                     build_image_token_spec,

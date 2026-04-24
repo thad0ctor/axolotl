@@ -277,7 +277,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             # rather than false-blame a row.
             offender_idx: Optional[int] = None
             retry_ok = True
-            for i, (t, imgs) in enumerate(zip(texts, images)):
+            for i, (t, imgs) in enumerate(zip(texts, images, strict=True)):
                 try:
                     self.processor(
                         text=[t], images=[imgs],

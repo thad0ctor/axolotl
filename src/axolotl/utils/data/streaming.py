@@ -201,7 +201,7 @@ def encode_streaming_multimodal(
     keep_images: List[List[str]] = []
     keep_text: List[str] = []
 
-    for text, imgs in zip(texts, imgs_list):
+    for text, imgs in zip(texts, imgs_list, strict=True):
         if not isinstance(text, str):
             raise TypeError(
                 f"encode_streaming_multimodal: `{text_column}` must be str, "

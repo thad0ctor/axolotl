@@ -20,12 +20,16 @@ from axolotl.prompt_strategies.multimodal_pretrain import (
 )
 from axolotl.prompt_strategies.pretrain import PretrainTokenizer
 
+from tests.hf_offline_utils import enable_hf_offline
 
 _SMOLVLM = "HuggingFaceTB/SmolVLM-500M-Instruct"
 
 
 @pytest.fixture(scope="module", name="smolvlm_processor")
-def fixture_smolvlm_processor():
+@enable_hf_offline
+def fixture_smolvlm_processor(
+    download_smolvlm_500m_instruct_model,  # pylint: disable=unused-argument
+):
     return AutoProcessor.from_pretrained(_SMOLVLM)
 
 

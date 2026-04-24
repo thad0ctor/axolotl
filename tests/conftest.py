@@ -113,6 +113,14 @@ def download_smollm2_135m_instruct_model():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def download_smolvlm_500m_instruct_model():
+    # used by multimodal-CPT tests (processor only, no model weights loaded)
+    snapshot_download_w_retry(
+        "HuggingFaceTB/SmolVLM-500M-Instruct", repo_type="model"
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
 def download_smollm2_135m_gptq_model():
     # download the model
     snapshot_download_w_retry("lilmeaty/SmolLM2-135M-Instruct-GPTQ", repo_type="model")
