@@ -207,6 +207,31 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 "failures. Check dataset integrity."
             )
 
+        # All-text batch: bypass the processor and tokenize directly.
+        if all(len(im) == 0 for im in images):
+            LOG.debug(
+                "MultiModalPretrainDataCollator: all-text batch (%d rows); "
+                "using tokenizer-only fallback (no pixel_values).",
+                len(texts),
+            )
+            tok_kwargs: dict[str, Any] = {
+                "text": texts,
+                "return_tensors": self.return_tensors,
+                "padding": self.padding,
+            }
+            if self.pad_to_multiple_of is not None:
+                tok_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
+            batch = self.tokenizer(**tok_kwargs)
+            tok_input_ids: Tensor = batch["input_ids"]
+            tok_labels = tok_input_ids.clone()
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+            if pad_id is not None:
+                tok_labels[tok_labels == pad_id] = -100
+            for tid in self._image_family_token_ids:
+                tok_labels[tok_labels == tid] = -100
+            batch["labels"] = tok_labels
+            return dict(batch)
+
         # No truncation: it chops input_ids mid-placeholder while pixel_values
         # keep every image — silent text/pixel mismatch. We warn post-hoc instead.
         proc_kwargs: dict[str, Any] = {

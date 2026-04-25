@@ -1401,8 +1401,29 @@ class PretrainingValidationMixin:
                 "or switch to chat-template SFT."
             )
         # Keep `images` and `_mm_text` columns alive for the collator.
-        if data.get("remove_unused_columns") is not False:
+        prev_remove_unused = data.get("remove_unused_columns")
+        if prev_remove_unused is not False:
+            LOG.info(
+                "Auto-set `remove_unused_columns: false` for multimodal CPT "
+                "to preserve `images` and `_mm_text` columns (previous value: %r)",
+                prev_remove_unused,
+            )
             data["remove_unused_columns"] = False
+
+        test_datasets = data.get("test_datasets") or []
+        mm_test = [t for t in test_datasets if isinstance(t, dict) and _entry_is_mm(t)]
+        if len(mm_test) > 1:
+            for key in ("image_base_dir", "image_token"):
+                values = {t.get(key) for t in mm_test}
+                if len(values) > 1:
+                    raise ValueError(
+                        f"Multimodal CPT eval requires `{key}` to be either "
+                        f"unset on all `test_datasets` entries or identical "
+                        f"across them. The eval collator resolves "
+                        f"`image_base_dir` and `image_token` once from the "
+                        f"first entry, so heterogeneous values would silently "
+                        f"miscollate later entries. Got: {sorted(map(str, values))}."
+                    )
 
         return data
 

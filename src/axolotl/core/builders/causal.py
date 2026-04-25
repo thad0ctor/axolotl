@@ -473,12 +473,17 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
 
         return trainer
 
-    def _build_mm_pretrain_collator(self, pad_to_multiple_of=None):
+    def _build_mm_pretrain_collator(self, pad_to_multiple_of=None, is_eval=False):
         from axolotl.prompt_strategies.multimodal_pretrain import (
             build_image_token_spec,
         )
 
-        pt_cfg = self.cfg.pretraining_dataset[0] if self.cfg.pretraining_dataset else {}
+        if is_eval and self.cfg.test_datasets:
+            pt_cfg = self.cfg.test_datasets[0]
+        elif self.cfg.pretraining_dataset:
+            pt_cfg = self.cfg.pretraining_dataset[0]
+        else:
+            pt_cfg = {}
         spec = build_image_token_spec(
             self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
         )
@@ -508,6 +513,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             ):
                 return self._build_mm_pretrain_collator(
                     pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+                    is_eval=is_eval,
                 )
             if (
                 self.cfg.pretraining_sample_concatenation is False
@@ -577,6 +583,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             ):
                 return self._build_mm_pretrain_collator(
                     pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+                    is_eval=is_eval,
                 )
             if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator

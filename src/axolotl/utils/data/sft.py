@@ -10,6 +10,7 @@ from datasets import (
     DatasetDict,
     IterableDataset,
     IterableDatasetDict,
+    concatenate_datasets,
     load_dataset,
 )
 from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -164,19 +165,34 @@ def _prepare_streaming_dataset(
     # Load evaluation dataset if specified
     eval_dataset = None
     if cfg.test_datasets:
-        first_test = cfg.test_datasets[0]
-        first_test_dict = (
-            first_test if isinstance(first_test, dict) else dict(first_test)
-        )
-        # MM CPT eval must use the streaming encoder so rows carry _mm_text/images.
-        is_mm_cpt_eval = (
-            first_test_dict.get("type") == "multimodal_pretrain"
-            or bool(first_test_dict.get("multimodal"))
+        test_dicts = [t if isinstance(t, dict) else dict(t) for t in cfg.test_datasets]
+        is_mm_cpt_eval = any(
+            t.get("type") == "multimodal_pretrain" or bool(t.get("multimodal"))
+            for t in test_dicts
         )
         if is_mm_cpt_eval:
-            eval_config = _pretraining_config_from_entry(first_test_dict)
-            eval_dataset = _load_streaming_dataset(
-                eval_config, cfg, tokenizer, processor=processor
+            eval_streams = []
+            for entry in test_dicts:
+                if not (
+                    entry.get("type") == "multimodal_pretrain"
+                    or bool(entry.get("multimodal"))
+                ):
+                    raise ValueError(
+                        "Mixing multimodal and non-multimodal entries in "
+                        "`test_datasets` is not supported. All eval entries "
+                        "must be MM (type: multimodal_pretrain or "
+                        "multimodal: true) when training is MM CPT."
+                    )
+                eval_config = _pretraining_config_from_entry(entry)
+                eval_streams.append(
+                    _load_streaming_dataset(
+                        eval_config, cfg, tokenizer, processor=processor
+                    )
+                )
+            eval_dataset = (
+                eval_streams[0]
+                if len(eval_streams) == 1
+                else concatenate_datasets(eval_streams)
             )
         else:
             _, eval_dataset, _ = _load_and_prepare_datasets(
@@ -257,7 +273,7 @@ def _load_streaming_dataset(
         and cfg.accelerator_config.dispatch_batches
         and not is_local_main_process()
     ):
-        iter_dataset = _create_placeholder_dataset()
+        iter_dataset = _create_placeholder_dataset(pretraining_config)
     else:
         iter_dataset = load_dataset(
             pretraining_config["path"],
@@ -286,13 +302,31 @@ def _load_streaming_dataset(
     return train_dataset.with_format("torch")
 
 
-def _create_placeholder_dataset() -> IterableDataset:
+def _create_placeholder_dataset(
+    pretraining_config: DictDefault | None = None,
+) -> IterableDataset:
     """Create a minimal placeholder dataset for non-main processes."""
-    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
-        f.write("text\n")
-        f.write("lorem ipsum dolor sit amet\n")
-        f.seek(0)
-        return load_dataset("csv", data_files=f.name, split="train", streaming=True)
+    text_column = "text"
+    image_column: str | None = None
+    if pretraining_config is not None:
+        text_column = pretraining_config.get("text_column") or "text"
+        is_mm = pretraining_config.get("type") == "multimodal_pretrain" or bool(
+            pretraining_config.get("multimodal")
+        )
+        if is_mm:
+            image_column = pretraining_config.get("image_column") or "images"
+
+    if image_column is None:
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+            f.write(f"{text_column}\n")
+            f.write("lorem ipsum dolor sit amet\n")
+            f.seek(0)
+            return load_dataset("csv", data_files=f.name, split="train", streaming=True)
+
+    def _gen():
+        yield {text_column: "lorem ipsum dolor sit amet", image_column: []}
+
+    return IterableDataset.from_generator(_gen)
 
 
 def _load_tokenized_prepared_datasets(

@@ -375,17 +375,16 @@ The `text` must contain the model's placeholder token **once per image**,
 placed immediately before the text it describes, followed by a newline:
 
 ```json
-{"text": "<image>\nפתאום מאימת שר ירושלים...", "images": ["/dataset/crops/doc_14_p2.png"]}
-{"text": "<image>\nהגדולים למהרחיד\"א...", "images": ["/dataset/crops/doc_14_p3.png"]}
+{"text": "<image>\nInvoice number: 10427. Total due: 148.32 USD.", "images": ["/dataset/crops/doc_14_p2.png"]}
+{"text": "<image>\nChapter 3 begins with a description of the storm over the harbor.", "images": ["/dataset/crops/doc_14_p3.png"]}
 ```
 
 Notes:
 
-- Never wrap the row in `User:` / `Assistant:` / `Transcribe this:` scaffolding — this is
-  the whole point of the CPT path.
+- Never wrap the row in `User:` / `Assistant:` / `Transcribe this:` scaffolding. That is the whole point of the CPT path.
 - Do not manually append an EOS token. Axolotl appends one during tokenization.
 - The newline between the placeholder and the real text preserves the BPE
-  boundary — without it, some tokenizers merge the visual-token boundary with
+  boundary. Without it, some tokenizers merge the visual-token boundary with
   the first real character.
 
 ### The placeholder token varies by model
@@ -426,6 +425,15 @@ micro_batch_size: 1
 gradient_accumulation_steps: 8
 ```
 
+### Eval datasets
+
+`test_datasets` accepts multimodal entries (`type: multimodal_pretrain` or
+`multimodal: true`). Per-entry `text_column` and `image_column` are honored
+independently. When more than one multimodal entry is provided,
+`image_base_dir` and `image_token` must be either unset on every entry or
+identical across them, because the eval collator resolves both once for the
+merged eval stream.
+
 ### Gates and rejections
 
 The following combinations are rejected at config-load time with a clear error:
@@ -434,6 +442,7 @@ The following combinations are rejected at config-load time with a clear error:
   between text placeholders and `pixel_values`.
 - `chat_template` set to anything — defeats the purpose of the CPT path.
 - `processor_type` unset — no processor means no image tensors.
+- Multiple MM `test_datasets` entries with mismatched `image_base_dir` or `image_token`.
 
 In addition, the following model families are **not supported** in v1 and will
 be rejected when their processor is loaded:
@@ -454,11 +463,16 @@ inspect the tokenized ids rather than the raw string.
 
 ### Why masking image tokens in labels is automatic
 
-The patch masks every image-family token id (`<image>`, `<\|image_pad\|>`,
-`<\|vision_start\|>`, `<\|vision_end\|>`, `<start_of_image>`, `<end_of_image>`,
-`<image_soft_token>`, `<\|image\|>`, etc.) to `-100` in the labels tensor.
-Without this, loss is ~10× higher and training diverges — the model is
-forced to predict tokens that correspond to patch embeddings, not real text.
+For this multimodal CPT path, the collator masks every image-family token id
+(`<image>`, `<\|image_pad\|>`, `<\|vision_start\|>`, `<\|vision_end\|>`,
+`<start_of_image>`, `<end_of_image>`, `<image_soft_token>`, `<\|image\|>`,
+etc.) to `-100` in the labels tensor.
+
+Supported processors expand image placeholders into vision-specific token ids.
+If those ids contribute to loss, the model is trained to predict patch or
+marker tokens rather than only the target text. On architectures like
+Qwen-VL and SmolVLM, leaving them unmasked substantially increases loss and can
+destabilize training.
 
 ## FAQ
 

@@ -189,6 +189,31 @@ def test_strategy_rejects_non_list_image_column(smolvlm_processor, tiny_image_pa
         )
 
 
+@pytest.mark.parametrize("bad_value", ["", 0, False])
+def test_strategy_rejects_falsy_non_none_image_column(smolvlm_processor, bad_value):
+    """Falsy non-None image cells (e.g. "") are rejected, not coerced to []."""
+    strat = _make_strategy(smolvlm_processor)
+    with pytest.raises(ValueError, match="list"):
+        strat.tokenize_prompt(
+            {
+                "text": "no placeholder, but bad images cell",
+                "images": bad_value,
+            }
+        )
+
+
+def test_strategy_treats_none_image_column_as_empty(smolvlm_processor):
+    """images=None is the only falsy value treated as a text-only row."""
+    strat = _make_strategy(smolvlm_processor)
+    out = strat.tokenize_prompt(
+        {
+            "text": "plain text-only row, no placeholder",
+            "images": None,
+        }
+    )
+    assert out["images"][0] == []
+
+
 # ---- load() factory --------------------------------------------------------
 
 

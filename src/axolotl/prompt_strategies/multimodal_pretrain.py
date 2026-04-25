@@ -219,11 +219,15 @@ class MultimodalPretrainTokenizationStrategy(PretrainTokenizationStrategy):
 
     def tokenize_prompt(self, prompt: dict[str, Any]) -> dict[str, list]:
         text = prompt[self.text_column]
-        images = prompt.get(self.image_column) or []
-        if not isinstance(images, (list, tuple)):
+        raw_images = prompt.get(self.image_column)
+        if raw_images is None:
+            images: list = []
+        elif isinstance(raw_images, (list, tuple)):
+            images = list(raw_images)
+        else:
             raise ValueError(
                 f"Row's `{self.image_column}` must be a list of image paths, "
-                f"got {type(images).__name__}."
+                f"got {type(raw_images).__name__}."
             )
 
         res = self._tokenize(text)

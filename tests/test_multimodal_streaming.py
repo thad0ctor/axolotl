@@ -388,3 +388,61 @@ def test_collator_rejects_too_many_images(smolvlm_processor, two_tiny_images):
     paths = [str(two_tiny_images[0])] * 3
     with pytest.raises(ValueError, match="max_images_per_row"):
         collator._load_images_for_row(paths, row_index=0)
+
+
+# ---- mixed / all-text batches --------------------------------------------
+
+
+def test_collator_all_text_batch_uses_tokenizer_fallback(smolvlm_processor):
+    """A batch where every row has images=[] tokenizes via the tokenizer; no pixel_values."""
+    spec = build_image_token_spec(smolvlm_processor)
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+    )
+    rows = [
+        {"_mm_text": "first text-only row", "images": []},
+        {"_mm_text": "second text-only row, slightly longer", "images": []},
+    ]
+    batch = collator.torch_call(rows)
+    for k in ("input_ids", "attention_mask", "labels"):
+        assert k in batch, f"missing batch key {k}"
+    assert "pixel_values" not in batch
+    assert isinstance(batch["input_ids"], torch.Tensor)
+    pad_id = smolvlm_processor.tokenizer.pad_token_id
+    if pad_id is not None:
+        assert int((batch["labels"] == pad_id).sum().item()) == 0
+
+
+def test_collator_mixed_batch_still_succeeds(smolvlm_processor, two_tiny_images):
+    """A batch with one imaged row and one text-only row still produces pixel_values."""
+    spec = build_image_token_spec(smolvlm_processor)
+    encoded = encode_streaming_multimodal(
+        {
+            "text": [
+                f"{spec.image_token}\nimaged row",
+                "text-only row",
+            ],
+            "images": [[str(two_tiny_images[0])], []],
+        },
+        tokenizer=smolvlm_processor.tokenizer,
+        max_tokens=2048,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+    )
+    rows = [
+        {
+            k: encoded[k][i]
+            for k in ("input_ids", "labels", "attention_mask", "images", "_mm_text")
+        }
+        for i in range(2)
+    ]
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+    )
+    batch = collator.torch_call(rows)
+    for k in ("input_ids", "attention_mask", "pixel_values", "labels"):
+        assert k in batch, f"missing batch key {k}"
