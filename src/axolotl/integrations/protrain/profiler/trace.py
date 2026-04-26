@@ -52,13 +52,20 @@ DEFAULT_OPTIM_STATE_BYTES_PER_PARAM = 16
 DEFAULT_PARAM_GRAD_BYTES_PER_PARAM = 4  # fp16 param + fp16 grad
 
 # Fraction of total GPU memory above which the profiler auto-engages
-# on-demand mode (param offload + saved-for-backward CPU spill). At 60%, a
-# 24 GB card auto-engages once params exceed ~14.4 GB — i.e. 13B-class fp16
-# models and up. Below the threshold the profiler stays on the fast path
-# so the cost model's calibration (captured against fast-path traces)
-# remains valid. Exposed as a module-level constant so tests can monkey-
-# patch it down to force on-demand engagement on small models.
-ON_DEMAND_PARAM_BYTES_FRACTION: float = 0.60
+# on-demand mode (param offload + saved-for-backward CPU spill). The
+# comparison is against the FULL model-state footprint (params + grads +
+# optimizer master + 2x momenta), not just the param tensors — for full-
+# finetune Adam the optimizer state alone is ~4x param bytes, so a model
+# whose params alone fit in 60% of device memory can still OOM during
+# warmup as the optimizer state allocates. At 60%, a 24 GB card auto-
+# engages once total state exceeds ~14.4 GB — fp16 + Adam, that's roughly
+# a 1.5B-param model and up (1.5B params * (2+2+4+4+4) B/param ≈ 24 GB
+# total state, half of which fits comfortably in 14.4 GB). Below the
+# threshold the profiler stays on the fast path so the cost model's
+# calibration (captured against fast-path traces) remains valid. Exposed
+# as a module-level constant so tests can monkey-patch it down to force
+# on-demand engagement on small models.
+ON_DEMAND_STATE_BYTES_FRACTION: float = 0.60
 
 
 @dataclass
@@ -329,18 +336,30 @@ def run_trace(
             gpu_total = int(
                 torch.cuda.get_device_properties(device).total_memory
             )
-            param_bytes = sum(
-                p.numel() * p.element_size()
-                for p in model.parameters()
+            # State-aware footprint: params (all of them) + grads + fp32
+            # master + two fp32 Adam momenta for trainable params. Using
+            # param-bytes alone misses the optimizer state, which dominates
+            # the total — a 7B fp16 model is 14 GB params but ~70 GB total
+            # state with Adam, so params=58% of a 24 GB card fits the old
+            # check yet OOMs on the optimizer-state allocation during
+            # warmup. Per-param: fp16 grad (2 B) + fp32 master (4 B) +
+            # fp32 momentum (4 B) + fp32 variance (4 B) = 14 B above the
+            # raw param tensor (which is ~p.element_size()).
+            state_bytes = sum(
+                p.numel() * p.element_size() for p in model.parameters()
             )
-            if param_bytes > ON_DEMAND_PARAM_BYTES_FRACTION * gpu_total:
+            state_bytes += sum(
+                p.numel() * 14 for p in model.parameters() if p.requires_grad
+            )
+            if state_bytes > ON_DEMAND_STATE_BYTES_FRACTION * gpu_total:
                 engage_on_demand = True
                 LOG.info(
-                    "Profiler engaging on-demand mode: params=%.2f GB exceed "
-                    "%.0f%% of %.2f GB device memory; offloading params + "
-                    "saved-for-backward tensors to CPU between modules.",
-                    param_bytes / 1e9,
-                    ON_DEMAND_PARAM_BYTES_FRACTION * 100,
+                    "Profiler engaging on-demand mode: model state=%.2f GB "
+                    "(param + grad + optim) exceeds %.0f%% of %.2f GB device "
+                    "memory; offloading params + saved-for-backward tensors "
+                    "to CPU between modules.",
+                    state_bytes / 1e9,
+                    ON_DEMAND_STATE_BYTES_FRACTION * 100,
                     gpu_total / 1e9,
                 )
         except Exception as exc:  # pragma: no cover - defensive
