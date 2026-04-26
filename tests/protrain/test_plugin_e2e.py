@@ -200,11 +200,14 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
     # Decreasing-loss windowed-average check. Per-step loss is too noisy
     # on alpaca (huge length variance, bf16 rounding); compare the mean
     # of the first 10 logged losses against the mean of the last 10.
-    # Optimization is "working" if the last window mean is below the
-    # first window mean — i.e. learning happened, even with a constant
-    # LR and no LR scheduler. The 5% margin avoids tripping on
-    # near-flat-but-trending-down runs (a 0% margin is brittle to a
-    # single high-loss tail sample).
+    # Optimization is "working" if the last window mean is strictly below
+    # the first window mean — i.e. learning happened, even with a
+    # constant LR and no LR scheduler. The bar deliberately uses strict
+    # ``<`` (no margin) because the test's job is to catch the specific
+    # silent-regression failure mode where the optimizer step is a no-op
+    # (broken hook wiring, accelerate-wrapper indirection that never
+    # touches grads, etc.); ANY real training should see at least one
+    # bit of loss reduction across a 6th-of-the-run window.
     if len(losses) >= 20:
         window = max(5, len(losses) // 6)
         first_avg = sum(losses[:window]) / window
