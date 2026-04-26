@@ -4,7 +4,9 @@ A fresh-init Llama-7B architecture (no weight download, no HF token) is
 wrapped end-to-end through the ProTrain runtime on a single RTX 3090 and
 one training iteration is executed. The test validates that the cost
 model's peak-memory and iteration-time predictions match reality within
-tolerance (10% on peak, 5% on runtime).
+tolerance: 10% on peak (paper spec, OOM-safety invariant) and 35% on
+runtime (loosened from the paper's 5% to absorb 3090-vs-3090Ti SKU
+compute-throughput variance, ~10%, on top of cost-model residual error).
 
 Marked ``slow`` — excluded from the default pytest suite by the
 ``-m 'not slow'`` addopts clause in ``pyproject.toml``. Requires a free
@@ -239,51 +241,33 @@ def test_protrain_7b_end_to_end() -> None:
     # per-block peak is a strict ground-truth upper bound on what
     # steady-state forward can allocate.
     #
-    # Ceiling tightened 0.35 → 0.10 to match the paper's original spec.
+    # Peak stays strict at 10% — that is the OOM-safety invariant
+    # (paper Eqs. 8-11 with ALPHA_FRAGMENTATION = 1.10).
     assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
-    # Runtime tolerance: 90% ceiling.
+    # Runtime tolerance: 35% ceiling.
     #
-    # Calibration history on this workload:
-    #   * c4811420-era (activation-bytes roofline proxy): ~60% error
-    #   * After per-op-latency refactor (TRACE_VERSION=2): ~52% error
-    #   * After Adam microbench + auto-mode (TRACE_VERSION=3): ~80% error
-    #   * After hook-less steady-state calibration (TRACE_VERSION=4):
-    #     still ~80% — the scale factor is computed and applied, but
-    #     on this 7B workload the raw ratio is ~0.13 (hooks inflate the
-    #     measurement 7-8x, larger than the [0.3, 1.0] clamp range),
-    #     and after clamping to 0.3 the scaled forward compute still
-    #     exceeds 2x the activation-byte roofline — so the secondary
-    #     roofline cap kicks in and collapses the forward compute to
-    #     the same ~9ms the pre-calibration path produced.
+    # Calibration history on this workload (TRACE_VERSION → measured error):
+    #   * v2 (per-op latencies):                    ~52%
+    #   * v3 (Adam microbench + auto-mode):         ~80%
+    #   * v4 (hook-less steady-state scale factor): ~80% (still capped by
+    #     the 2x-roofline secondary safety cap)
+    #   * v5 (steady_fwd_wall_s as ground-truth cap, replaces 2x roofline) +
+    #     PCIe rate plumb-through from trace.pcie_h2d_bps:                ~50%
+    #   * v6 (per-block steady peaks for fractional-NONE configs):        ~32%
+    #   * v7 (multi-iter hot-loop median + measured bwd/fwd ratio):  12%-32%
+    #     depending on SKU (3090 Ti ~12%, plain 3090 ~32%; the per-op
+    #     compute rate is calibrated to whichever SKU produced the trace,
+    #     and a discover-time SKU flip nudges measured iter time on replay).
     #
-    # Why the hook-calibration didn't tighten this workload:
-    # The hook-dispatch overhead on 7B Llama+LoRA is ~8x (not ~2.5x as
-    # assumed in the design). The spec's [0.3, 1.0] clamp holds at 0.3
-    # (more aggressive correction is out of the "safe" range), and even
-    # at the clamped 0.3× the raw op_latencies sum (4.88s) still produces
-    # ~1.46s of forward compute — far above the activation-bytes roofline
-    # (~9ms) that the secondary safety cap enforces. Net effect on the
-    # current 7B search configuration (n_persist=113, n_buffer=8,
-    # n_swap=0, n_checkpoint=31): forward compute is dominated by PCIe
-    # communication for the 17 non-persistent chunks, not by per-block
-    # compute, so the hook calibration has negligible effect on the
-    # chosen config's predicted iteration time.
-    #
-    # Forward-looking path to tighten below 25% (for a future commit):
-    #   1. Relax the 2x-roofline secondary cap — or replace it with
-    #      "cap at steady_fwd_wall_s" which is both tighter and a real
-    #      ground-truth upper bound.
-    #   2. Plumb ``trace.pcie_h2d_bps`` (measured) into HardwareProfile
-    #      rather than trusting the caller's fixture value. The 7B
-    #      test passes ``pcie_h2d_bps=13e9`` but the trace measures
-    #      ~56e9; at the non-persistent chunk count here that's 4x
-    #      over-estimated communication time.
-    #
-    # Peak stays strict at 10% — that is the OOM-safety invariant.
+    # The 35% ceiling cleanly absorbs the 3090-vs-3090Ti SKU spread on top
+    # of the residual cost-model error. Tightening below 25% would require
+    # per-SKU calibration profiles or a longer steady-state hot loop — both
+    # are engineering investments out of scope for this milestone.
     assert runtime_err < 0.35, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — hook-dispatch "
-        "calibration at 0.3 clamp + 2x roofline secondary cap reproduces "
-        "the pre-calibration forward-compute estimate on this 7B workload. "
-        "Residual error now sits in PCIe / activation-roofline priors. "
+        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=7 "
+        "calibration (multi-iter hot-loop median + measured bwd/fwd ratio + "
+        "steady_fwd_wall_s ground-truth cap + measured PCIe). Above 35% "
+        "indicates either a regression in the calibration path or a "
+        "per-SKU compute-rate mismatch larger than the budgeted ~10%. "
         f"iter_s_all={iter_s_all}"
     )
