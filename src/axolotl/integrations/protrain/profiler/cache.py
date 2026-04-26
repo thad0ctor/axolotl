@@ -38,7 +38,13 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # traces default the per-block dict to empty, so the cost model falls back
 # to the aggregate-only cap (identical v5 behavior); bumping forces a fresh
 # trace so the cap takes effect.
-TRACE_VERSION = 6
+# Version 7 changes the steady-state measurement methodology from a single
+# iteration to a 4-iter hot loop (2 warmup + 2 measured, median of measured)
+# and adds a best-effort steady_bwd_wall_s in the same loop. The recorded
+# fields are unchanged but the *values* shift (single-iter carried allocator-
+# settle cost the multi-iter median eliminates), so the cost model's measured
+# bwd/fwd ratio path requires a fresh trace under the new methodology.
+TRACE_VERSION = 7
 
 
 @dataclass(frozen=True)
