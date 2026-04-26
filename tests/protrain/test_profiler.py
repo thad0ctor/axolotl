@@ -169,6 +169,29 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
     assert load_cached_trace(other) is None
 
 
+def test_measure_nccl_single_rank_returns_empty_tuple():
+    """Single-rank fast path: ``({}, {})`` so the searcher's collective term collapses."""
+    from axolotl.integrations.protrain.profiler.hw_bench import measure_nccl
+
+    gather, reduce = measure_nccl(world_size=1)
+    assert gather == {}
+    assert reduce == {}
+
+
+def test_measure_nccl_multi_rank_without_dist_raises():
+    """world_size>1 without an initialized process group must fail loudly."""
+    import torch.distributed as dist
+    from axolotl.integrations.protrain.profiler.hw_bench import measure_nccl
+
+    if dist.is_available() and dist.is_initialized():
+        pytest.skip(
+            "torch.distributed is initialized in this environment; "
+            "cannot validate the not-initialized error path."
+        )
+    with pytest.raises(RuntimeError, match="not initialized|torchrun"):
+        measure_nccl(world_size=2)
+
+
 @pytest.mark.gpu
 def test_hw_bench_pcie_returns_positive(gpu_device):
     import torch

@@ -649,7 +649,26 @@ def run_trace(
     # populated above, BEFORE the tracker baseline was captured, so
     # their allocator footprint does not perturb op-delta accounting.
 
-    nccl_table = measure_nccl(world_size=1)  # M1 is single-rank.
+    # Resolve world size: prefer cfg.world_size, fall back to the live
+    # torch.distributed group, default to 1.
+    resolved_world = cfg.world_size
+    if resolved_world is None:
+        try:
+            import torch.distributed as _dist
+            resolved_world = (
+                _dist.get_world_size() if _dist.is_initialized() else 1
+            )
+        except Exception:  # noqa: BLE001 - defensive
+            resolved_world = 1
+
+    try:
+        gather_table, reduce_table = measure_nccl(world_size=resolved_world)
+    except Exception as exc:  # pragma: no cover - distributed-only paths
+        LOG.warning(
+            "measure_nccl failed (%s); recording empty collective tables. "
+            "Cost model's communication term will degrade to 0.", exc,
+        )
+        gather_table, reduce_table = ({}, {})
 
     return ProfilerTrace(
         op_order=tuple(op_records),
@@ -659,13 +678,13 @@ def run_trace(
         model_state_bytes=model_state_bytes,
         pcie_h2d_bps=pcie_h2d_bps,
         pcie_d2h_bps=pcie_d2h_bps,
-        nccl_gather_s=nccl_table,
-        nccl_reduce_s=nccl_table,
+        nccl_gather_s=gather_table,
+        nccl_reduce_s=reduce_table,
         arch_hash=_arch_hash(model),
         bs=cfg.batch_size,
         seq=cfg.seq_len,
         sku=_sku(device),
-        world=1,
+        world=resolved_world,
         op_latencies=op_latencies,
         cpu_adam_bytes_per_sec=cpu_adam_bps,
         gpu_adam_bytes_per_sec=gpu_adam_bps,

@@ -337,21 +337,195 @@ def measure_gpu_adam(
     return float(bps)
 
 
-def measure_nccl(world_size: int) -> dict[int, tuple[float, float]]:
-    """Measure NCCL gather/reduce latencies per payload size.
+# Payload sizes (bytes) swept by the multi-rank NCCL benchmark. Chosen to
+# bracket the realistic ProTrain chunk sizes — S_chunk is selected from
+# {32, 64, 128, 256} MiB per ``chunk/sizing.py``, so 64 MiB and 256 MiB sit
+# at the centre of the sweep. The 1/4/16 MiB end captures the small-collective
+# regime where launch latency dominates over bandwidth.
+NCCL_PAYLOAD_SIZES_BYTES: tuple[int, ...] = (
+    1 << 20,        # 1 MiB
+    4 << 20,        # 4 MiB
+    16 << 20,       # 16 MiB
+    64 << 20,       # 64 MiB
+    256 << 20,      # 256 MiB
+)
 
-    Single-rank fast path returns an empty dict — there is no NCCL traffic on
-    ``world_size == 1`` and the searcher simply skips the collective term.
 
-    Multi-rank path requires a proper ``torch.distributed`` rendezvous (env
-    vars ``MASTER_ADDR``, ``MASTER_PORT``, ``WORLD_SIZE``, ``RANK``). That
-    plumbing is scheduled for M6 — today we raise to make the gap explicit.
+def measure_nccl(
+    world_size: int,
+    *,
+    payload_sizes_bytes: tuple[int, ...] = NCCL_PAYLOAD_SIZES_BYTES,
+    n_iters: int = 8,
+    n_warmup: int = 2,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Measure NCCL gather + reduce latencies per payload size.
+
+    Returns ``(gather_table, reduce_table)`` where each table maps payload
+    bytes -> median collective time in seconds. Used by ``cost/runtime.py``
+    to predict per-chunk all_gather / reduce_scatter cost for a given
+    ``S_chunk`` choice.
+
+    Single-rank fast path returns ``({}, {})`` — no NCCL traffic on
+    ``world_size == 1`` and the searcher's communication term collapses.
+
+    Multi-rank path requires the caller to have already initialized
+    ``torch.distributed`` (any backend that supports the collectives below;
+    NCCL is the only one ProTrain actually targets, but Gloo will also
+    work for CPU-only smoke testing). Running under ``torchrun`` is the
+    standard way; ``scripts/protrain/measure_nccl.py`` is a standalone
+    driver that bootstraps a rendezvous on-demand.
+
+    The benchmark uses ``all_gather_into_tensor`` (gather) and
+    ``reduce_scatter_tensor`` (reduce) — these are the exact collectives
+    ProTrain's M7 ZeRO-3 sharding path issues per chunk, so the measured
+    times are directly applicable. ``n_warmup`` iterations bring the NCCL
+    communicator + GPU IPC handles into steady state; the remaining
+    ``n_iters`` are timed and the median is recorded.
+
+    Parameters
+    ----------
+    world_size:
+        Expected distributed world size. Sanity-checked against
+        ``torch.distributed.get_world_size()`` to surface configuration
+        bugs early (e.g. caller passed ``world_size=4`` but the rendezvous
+        only sees 2 ranks).
+    payload_sizes_bytes:
+        Payload sizes to benchmark, in bytes. Default sweeps 1 MiB →
+        256 MiB which brackets the typical S_chunk range.
+    n_iters:
+        Timed iterations per payload. Median is recorded.
+    n_warmup:
+        Warm-up iterations per payload (discarded).
+
+    Returns
+    -------
+    tuple[dict[int, float], dict[int, float]]
+        ``(gather_seconds_by_size, reduce_seconds_by_size)``.
     """
     if world_size == 1:
-        return {}
-    raise NotImplementedError(
-        "measure_nccl requires a distributed rendezvous — M6 will exercise this."
+        return ({}, {})
+
+    import torch
+    import torch.distributed as dist
+
+    if not dist.is_available():
+        raise RuntimeError(
+            "measure_nccl: torch.distributed unavailable — rebuild PyTorch "
+            "with NCCL/Gloo support to use multi-rank profiling."
+        )
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "measure_nccl: torch.distributed not initialized. Run under "
+            "torchrun, or use scripts/protrain/measure_nccl.py which "
+            "bootstraps the rendezvous itself. "
+            f"Caller passed world_size={world_size}."
+        )
+    actual_world = dist.get_world_size()
+    if actual_world != world_size:
+        raise RuntimeError(
+            f"measure_nccl: caller passed world_size={world_size} but "
+            f"torch.distributed reports world_size={actual_world}. Check "
+            "your launcher / environment for a misconfiguration."
+        )
+
+    rank = dist.get_rank()
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "measure_nccl requires CUDA — NCCL collectives need GPU tensors."
+        )
+    device = torch.device(
+        f"cuda:{torch.cuda.current_device()}"
+        if torch.cuda.is_available()
+        else "cpu"
     )
 
+    gather_table: dict[int, float] = {}
+    reduce_table: dict[int, float] = {}
 
-__all__ = ["measure_pcie", "measure_nccl", "measure_cpu_adam", "measure_gpu_adam"]
+    for payload_bytes in payload_sizes_bytes:
+        # all_gather_into_tensor: each rank contributes one shard of size
+        # payload/world_size, output is the full payload on every rank.
+        # We size the SHARD to ``payload_bytes // world_size`` (rounded up
+        # to multiple of ``element_size``) so the COMBINED output is
+        # payload_bytes — keys the table by the per-payload size that
+        # matches how cost/runtime.py thinks about chunk transfers.
+        element_size = 4  # float32
+        elements_per_shard = max(1, (payload_bytes // world_size) // element_size)
+        shard = torch.zeros(
+            elements_per_shard, dtype=torch.float32, device=device
+        )
+        gathered = torch.zeros(
+            elements_per_shard * world_size,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # Warmup
+        for _ in range(n_warmup):
+            dist.all_gather_into_tensor(gathered, shard)
+        torch.cuda.synchronize(device)
+
+        # Timed
+        gather_times: list[float] = []
+        for _ in range(n_iters):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            dist.all_gather_into_tensor(gathered, shard)
+            end.record()
+            torch.cuda.synchronize(device)
+            gather_times.append(start.elapsed_time(end) / 1000.0)
+        gather_table[payload_bytes] = statistics.median(gather_times)
+
+        # reduce_scatter_tensor: input is full payload on every rank,
+        # output is one shard per rank. Inverse of all_gather; same-shape
+        # buffers reused.
+        full_payload = torch.zeros(
+            elements_per_shard * world_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        reduced = torch.zeros(
+            elements_per_shard, dtype=torch.float32, device=device
+        )
+
+        # Warmup
+        for _ in range(n_warmup):
+            dist.reduce_scatter_tensor(reduced, full_payload)
+        torch.cuda.synchronize(device)
+
+        # Timed
+        reduce_times: list[float] = []
+        for _ in range(n_iters):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            dist.reduce_scatter_tensor(reduced, full_payload)
+            end.record()
+            torch.cuda.synchronize(device)
+            reduce_times.append(start.elapsed_time(end) / 1000.0)
+        reduce_table[payload_bytes] = statistics.median(reduce_times)
+
+        del shard, gathered, full_payload, reduced
+
+        if rank == 0:
+            LOG.debug(
+                "measure_nccl payload=%dMiB gather=%.3fms reduce=%.3fms "
+                "(world=%d, %d iters)",
+                payload_bytes >> 20,
+                gather_table[payload_bytes] * 1000,
+                reduce_table[payload_bytes] * 1000,
+                world_size,
+                n_iters,
+            )
+
+    return gather_table, reduce_table
+
+
+__all__ = [
+    "measure_pcie",
+    "measure_nccl",
+    "measure_cpu_adam",
+    "measure_gpu_adam",
+    "NCCL_PAYLOAD_SIZES_BYTES",
+]
