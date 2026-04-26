@@ -135,6 +135,14 @@ _BENCH_JSON_PATH = (
     / "multi_gpu_benchmark_results.json"
 )
 
+# The recorded thresholds below were calibrated on the canonical 4x RTX 3090
+# rig listed in the JSON's ``workload.gpus`` field. A developer running the
+# benchmark on a different GPU mix (different SKU, different count, mixed
+# bandwidth) and committing the new JSON would silently regress these tests
+# against thresholds that no longer apply. Skip the JSON-comparison tests
+# unless the workload matches the canonical rig.
+_CANONICAL_BENCH_GPUS = "1,4,5,7 (RTX 3090)"
+
 
 def _load_summaries() -> dict[str, dict]:
     if not _BENCH_JSON_PATH.exists():
@@ -144,6 +152,16 @@ def _load_summaries() -> dict[str, dict]:
             "generate it (~150s)."
         )
     raw = json.loads(_BENCH_JSON_PATH.read_text())
+    recorded_gpus = raw.get("workload", {}).get("gpus")
+    if recorded_gpus != _CANONICAL_BENCH_GPUS:
+        pytest.skip(
+            f"benchmark JSON workload.gpus={recorded_gpus!r} != "
+            f"canonical {_CANONICAL_BENCH_GPUS!r}; the recorded thresholds "
+            "in this file were calibrated on the canonical 4x RTX 3090 rig "
+            "and don't apply to other GPU mixes. Re-run the benchmark on "
+            "the canonical rig to refresh the JSON, or adjust thresholds "
+            "explicitly if you're changing the calibration target."
+        )
     return {s["mode"]: s for s in raw.get("summaries", [])}
 
 
