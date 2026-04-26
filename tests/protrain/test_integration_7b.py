@@ -5,8 +5,29 @@ wrapped end-to-end through the ProTrain runtime on a single RTX 3090 and
 one training iteration is executed. The test validates that the cost
 model's peak-memory and iteration-time predictions match reality within
 tolerance: 10% on peak (paper spec, OOM-safety invariant) and 35% on
-runtime (loosened from the paper's 5% to absorb 3090-vs-3090Ti SKU
-compute-throughput variance, ~10%, on top of cost-model residual error).
+runtime.
+
+The paper claims 5% on iter-time accuracy under their lab conditions
+(A100 / H100, larger batch, longer hot-loop). On consumer 3090 hardware
+the achievable accuracy is bounded by:
+
+* same-SKU iter-to-iter variance ~5-9% (allocator settle, CPU scheduling
+  jitter, thermal throttling) — measurable via the existing 4-iter median
+* trace-to-trace measurement noise ~3-4% on the predicted side (steady
+  measurement runs over 4 iters with median-of-2; different runs pick
+  slightly different configs from the same model, so the prediction
+  itself is non-deterministic)
+* cost-model residual systematic over-prediction ~15-20% on 7B-LoRA
+  (the bwd/fwd ratio fallback to 2.0× over-counts LoRA's near-frozen
+  backward; tightening would need real per-arch backward measurement
+  on a chunk-offloaded harness, which today OOMs in the profiler)
+
+Per-SKU compute-rate calibration (TRACE_VERSION 8) absorbs the cross-SKU
+~10% spread when traces are replayed across 3090 / 3090 Ti — same-SKU
+runs see scale ≈ 1.0 and the calibration is a no-op. The 35% ceiling
+absorbs measured 23-34% same-SKU error across runs; tightening below
+30% reliably is blocked on fixing the LoRA bwd/fwd-ratio fallback (a
+separate engineering investment).
 
 Marked ``slow`` — excluded from the default pytest suite by the
 ``-m 'not slow'`` addopts clause in ``pyproject.toml``. Requires a free
@@ -255,19 +276,21 @@ def test_protrain_7b_end_to_end() -> None:
     #     PCIe rate plumb-through from trace.pcie_h2d_bps:                ~50%
     #   * v6 (per-block steady peaks for fractional-NONE configs):        ~32%
     #   * v7 (multi-iter hot-loop median + measured bwd/fwd ratio):  12%-32%
-    #     depending on SKU (3090 Ti ~12%, plain 3090 ~32%; the per-op
-    #     compute rate is calibrated to whichever SKU produced the trace,
-    #     and a discover-time SKU flip nudges measured iter time on replay).
+    #     depending on SKU.
+    #   * v8 (per-SKU compute-rate calibration via measure_compute_rate +
+    #     real multi-rank NCCL tables): same-SKU 23-34% with noise floor
+    #     dominated by LoRA bwd/fwd-ratio fallback over-prediction;
+    #     cross-SKU now calibrated at the cost-model layer rather than
+    #     absorbed by the test tolerance.
     #
-    # The 35% ceiling cleanly absorbs the 3090-vs-3090Ti SKU spread on top
-    # of the residual cost-model error. Tightening below 25% would require
-    # per-SKU calibration profiles or a longer steady-state hot loop — both
-    # are engineering investments out of scope for this milestone.
+    # Above 35% indicates a regression in the calibration path or a new
+    # systematic bias. Tightening below 30% reliably is blocked on real
+    # measured-bwd-on-chunked-7B (the profiler's measured backward
+    # currently OOMs without chunk-offload engaged), which would replace
+    # the 2.0× bwd/fwd fallback with measured ~1.3× for LoRA — a
+    # separate engineering investment.
     assert runtime_err < 0.35, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=7 "
-        "calibration (multi-iter hot-loop median + measured bwd/fwd ratio + "
-        "steady_fwd_wall_s ground-truth cap + measured PCIe). Above 35% "
-        "indicates either a regression in the calibration path or a "
-        "per-SKU compute-rate mismatch larger than the budgeted ~10%. "
+        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=8 "
+        "calibration. Above 35% indicates a regression. "
         f"iter_s_all={iter_s_all}"
     )

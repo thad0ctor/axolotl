@@ -46,6 +46,7 @@ from axolotl.integrations.protrain.profiler import (
     save_cached_trace,
 )
 from axolotl.integrations.protrain.profiler.cache import ProfilerCacheKey
+from axolotl.integrations.protrain.profiler.hw_bench import measure_compute_rate
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
 from axolotl.integrations.protrain.runtime.scheduler import Scheduler
 from axolotl.integrations.protrain.search import search
@@ -801,6 +802,19 @@ def protrain_model_wrapper(
         and trace.gpu_adam_bytes_per_sec > 0.0
     ):
         _hw_updates["gpu_adam_bytes_per_sec"] = trace.gpu_adam_bytes_per_sec
+    # Live SKU compute rate — measured fresh on the training device so the
+    # cost model can scale per-op latencies when the trace was captured on
+    # a different SKU (3090 vs 3090 Ti, etc.). Same-SKU runs see the same
+    # value here as in trace.compute_rate_tflops, so the ratio is ~1.0.
+    if hardware_profile.gpu_compute_tflops <= 0.0:
+        try:
+            _live_tflops = measure_compute_rate(
+                int(getattr(device, "index", 0) or 0)
+            )
+            if _live_tflops > 0.0:
+                _hw_updates["gpu_compute_tflops"] = _live_tflops
+        except Exception as _e:  # noqa: BLE001 - defensive
+            LOG.debug("measure_compute_rate live failed (%s); skipping SKU calibration", _e)
     # PCIe rates: overwrite the caller's hardcoded prior (usually 13e9 =
     # Gen3) with the profiler's measured H2D/D2H. A 3090 on PCIe Gen4 x16
     # sits around 50-56 GB/s — 4× the conservative default — and the

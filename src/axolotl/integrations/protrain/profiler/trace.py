@@ -22,6 +22,7 @@ from axolotl.integrations.protrain.types import (
 )
 
 from axolotl.integrations.protrain.profiler.hw_bench import (
+    measure_compute_rate,
     measure_cpu_adam,
     measure_gpu_adam,
     measure_nccl,
@@ -649,6 +650,36 @@ def run_trace(
     # populated above, BEFORE the tracker baseline was captured, so
     # their allocator footprint does not perturb op-delta accounting.
 
+    # Trainable-param fraction. LoRA training has ~0.1% trainable; the cost
+    # model uses this to pick a tighter bwd/fwd-ratio fallback (LoRA backward
+    # is ~1× forward, vs the 2× canonical full-finetune ratio).
+    try:
+        n_trainable = sum(
+            int(p.numel()) for p in model.parameters() if p.requires_grad
+        )
+        n_total = sum(int(p.numel()) for p in model.parameters())
+        trainable_param_fraction = (
+            n_trainable / n_total if n_total > 0 else 0.0
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.debug("trainable_param_fraction probe failed (%s)", exc)
+        trainable_param_fraction = 0.0
+
+    # Per-SKU compute rate, captured on the trace SKU so cross-SKU replays
+    # can scale per-op latencies. Same-SKU runs see ratio ≈ 1.0 and the
+    # calibration is a no-op. Recorded post-PCIe so allocator state is settled.
+    try:
+        dev_idx_for_compute = device.index if device.index is not None else 0
+        compute_rate_tflops = (
+            measure_compute_rate(dev_idx_for_compute) if cuda_available else 0.0
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.warning(
+            "measure_compute_rate failed (%s); recording 0.0 — cost model "
+            "will skip SKU calibration", exc,
+        )
+        compute_rate_tflops = 0.0
+
     # Resolve world size: prefer cfg.world_size, fall back to the live
     # torch.distributed group, default to 1.
     resolved_world = cfg.world_size
@@ -693,6 +724,8 @@ def run_trace(
         steady_bwd_wall_s=steady_bwd_wall_s,
         steady_fwd_peak_bytes=steady_fwd_peak_bytes,
         steady_fwd_block_peak_bytes=steady_fwd_block_peak_bytes,
+        compute_rate_tflops=compute_rate_tflops,
+        trainable_param_fraction=trainable_param_fraction,
     )
 
 

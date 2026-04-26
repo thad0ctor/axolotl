@@ -1,4 +1,5 @@
-"""Hardware microbenchmarks: PCIe H2D/D2H + NCCL collectives + Adam throughput."""
+"""Hardware microbenchmarks: PCIe H2D/D2H + NCCL collectives + Adam throughput +
+per-SKU compute rate."""
 
 from __future__ import annotations
 
@@ -8,6 +9,14 @@ import time
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+# Reference compute rate (TFLOPS, fp16) used to scale per-SKU calibration ratios
+# when neither the trace nor the live HardwareProfile reports a measurement.
+# 71 TFLOPS is the published RTX 3090 fp16-tensor-core peak (a 3090 Ti is
+# nominally ~80 TFLOPS) — sustained throughput measured by ``measure_compute_rate``
+# typically lands around 60-65% of peak under the GEMM workload.
+DEFAULT_COMPUTE_RATE_TFLOPS: float = 50.0
 
 
 # Bytes-per-param accounting used by the Adam microbenchmarks below.
@@ -522,10 +531,95 @@ def measure_nccl(
     return gather_table, reduce_table
 
 
+def measure_compute_rate(
+    device_idx: int = 0,
+    *,
+    matrix_size: int = 4096,
+    n_iters: int = 10,
+    n_warmup: int = 3,
+) -> float:
+    """Return sustained fp16 compute throughput in TFLOPS for ``device_idx``.
+
+    Runs a square fp16 matmul (``matrix_size`` × ``matrix_size``) over
+    ``n_iters`` timed iterations and reports the median throughput in
+    fp16-TFLOPS. The 3090 family lands around 45–55 TFLOPS sustained on
+    a 4K GEMM (compared with the 71-TFLOPS peak rated number); a 3090 Ti
+    is typically 5–10% faster on the same workload, which is exactly the
+    spread the cost-model SKU calibration needs to absorb.
+
+    Used by ``cost/runtime.py`` to scale per-op latencies when the cached
+    trace was captured on a different SKU than the live training device:
+    ``scale = trace.compute_rate_tflops / hw.gpu_compute_tflops``. Same-SKU
+    runs see ``scale ≈ 1.0`` (the GEMM benchmark has ~2% noise floor) and
+    the calibration is a no-op.
+
+    Returns 0.0 on CUDA outage; the caller falls back to the trace's
+    recorded value or the global default.
+
+    Parameters
+    ----------
+    device_idx:
+        CUDA device ordinal.
+    matrix_size:
+        Square matrix size for the synthetic GEMM. 4096 keeps a single
+        matmul under ~270 MB (fp16 4096²) — well within any 3090's HBM
+        and large enough that the kernel is firmly compute-bound.
+    n_iters:
+        Timed iterations. Median is reported.
+    n_warmup:
+        Warmup iterations (discarded). The first iter typically pays
+        cuBLAS handle init + JIT cost.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        LOG.warning("measure_compute_rate: CUDA unavailable; returning 0.0")
+        return 0.0
+
+    device = torch.device(f"cuda:{device_idx}")
+    a = torch.randn(matrix_size, matrix_size, dtype=torch.float16, device=device)
+    b = torch.randn(matrix_size, matrix_size, dtype=torch.float16, device=device)
+
+    # Warmup
+    for _ in range(n_warmup):
+        c = a @ b
+    torch.cuda.synchronize(device)
+    del c
+
+    # Timed
+    iter_s: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(n_iters):
+        start.record()
+        c = a @ b
+        end.record()
+        torch.cuda.synchronize(device)
+        iter_s.append(start.elapsed_time(end) / 1000.0)
+    median_iter = statistics.median(iter_s)
+
+    # FLOP count for a square matmul: 2 * N^3 (one multiply + one add per
+    # element of the output, summed over the inner dim).
+    flops_per_iter = 2.0 * (matrix_size ** 3)
+    tflops = flops_per_iter / median_iter / 1e12
+
+    LOG.debug(
+        "measure_compute_rate device=%d N=%d median_iter=%.4fs throughput=%.2f TFLOPS",
+        device_idx, matrix_size, median_iter, tflops,
+    )
+
+    # Cleanup
+    del a, b, c
+    torch.cuda.synchronize(device)
+    return float(tflops)
+
+
 __all__ = [
     "measure_pcie",
     "measure_nccl",
     "measure_cpu_adam",
     "measure_gpu_adam",
+    "measure_compute_rate",
     "NCCL_PAYLOAD_SIZES_BYTES",
+    "DEFAULT_COMPUTE_RATE_TFLOPS",
 ]
