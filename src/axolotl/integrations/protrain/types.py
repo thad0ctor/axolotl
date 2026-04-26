@@ -201,6 +201,28 @@ class ProfilerTrace:
     # at profile time). New in TRACE_VERSION=6.
     steady_fwd_block_peak_bytes: dict[BlockId, int] = field(default_factory=dict)
 
+    # Sustained fp16 compute throughput (TFLOPS) on the trace SKU, measured
+    # by ``profiler.hw_bench.measure_compute_rate``. Consumed by
+    # ``cost/runtime.py`` to scale per-op latencies when the live training
+    # device's SKU differs from the cached trace's SKU — e.g. trace captured
+    # on 3090 Ti, replayed on plain 3090. Same-SKU traces see ``scale ≈ 1.0``
+    # and the calibration is a no-op. ``0.0`` means unavailable (pre-v8
+    # caches, CUDA unavailable, or measurement failed); the cost model
+    # then falls back to ``hw_bench.DEFAULT_COMPUTE_RATE_TFLOPS``. New in
+    # TRACE_VERSION=8.
+    compute_rate_tflops: float = 0.0
+
+    # Fraction of model parameters with ``requires_grad=True`` at trace time
+    # (range [0.0, 1.0]). LoRA / adapter training has very low trainable
+    # fractions (~0.1% on 7B-LoRA-r8) — backward compute is then ~1× forward
+    # rather than the canonical 2× full-finetune ratio, because autograd
+    # skips frozen subgraphs. The cost model's ``_bwd_compute_time_from_trace``
+    # consults this fraction to pick a tighter fallback ratio when the
+    # measured ``steady_bwd_wall_s`` is unavailable (7B-class profiler runs
+    # OOM the backward without chunk offload engaged). 0.0 means unmeasured
+    # (pre-v8) — falls back to the canonical 2× ratio. New in TRACE_VERSION=8.
+    trainable_param_fraction: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)
@@ -288,10 +310,12 @@ class HardwareProfile:
     # TRACE_VERSION=3 (see profiler/cache.py).
     cpu_adam_bytes_per_sec: float = 0.0
     gpu_adam_bytes_per_sec: float = 0.0
-
-
-# ---------------------------------------------------------------------------
-# Wrapped model handle (api/)
+    # Live compute rate (fp16 TFLOPS) on the training device, used to scale
+    # cached traces captured on a different SKU. ``0.0`` means "unmeasured";
+    # ``cost/runtime.py`` then assumes same-SKU and applies an identity
+    # scale. Populated by ``profiler.hw_bench.measure_compute_rate`` from
+    # the model_wrapper just before the searcher runs.
+    gpu_compute_tflops: float = 0.0
 # ---------------------------------------------------------------------------
 
 

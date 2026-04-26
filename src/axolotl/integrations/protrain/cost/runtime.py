@@ -90,6 +90,48 @@ _BWD_FWD_COMPUTE_RATIO: float = 2.0
 _HOOK_SCALE_MIN: float = 0.3
 _HOOK_SCALE_MAX: float = 1.0
 
+# Clamp bounds for the per-SKU compute-rate calibration scale. The 3090 vs
+# 3090 Ti compute spread on a 4K fp16 GEMM is ~5-10%; bigger ratios (e.g.
+# 0.5 or 2.0) almost certainly indicate a measurement glitch (cold cuBLAS
+# handle, thermal throttling on one of the cards, etc.) rather than a real
+# SKU difference, and applying them would distort predictions more than
+# leaving them at 1.0. Clamp + WARN.
+_SKU_SCALE_MIN: float = 0.5
+_SKU_SCALE_MAX: float = 2.0
+
+
+def _sku_compute_scale(trace: ProfilerTrace, hw: HardwareProfile) -> float:
+    """Return the trace-vs-live compute-rate ratio, clamped.
+
+    Cached traces capture ``compute_rate_tflops`` on the trace SKU; the
+    live HardwareProfile carries ``gpu_compute_tflops`` for the device the
+    searcher is currently planning for. When both are non-zero, this
+    function returns ``trace.compute_rate_tflops / hw.gpu_compute_tflops``
+    — the factor the cost model multiplies into per-op forward time so a
+    trace from a faster card predicts a slower iter on a slower card and
+    vice versa.
+
+    Identity (1.0) is returned when either side is unmeasured (pre-v8
+    cache, hw_bench measurement glitch). The clamp keeps a single noisy
+    measurement from blowing the prediction up — the noise floor on the
+    GEMM bench is ~2%, so 0.5/2.0 bounds are extremely loose.
+    """
+    if trace.compute_rate_tflops <= 0.0 or hw.gpu_compute_tflops <= 0.0:
+        return 1.0
+    raw = trace.compute_rate_tflops / hw.gpu_compute_tflops
+    if raw < _SKU_SCALE_MIN or raw > _SKU_SCALE_MAX:
+        LOG.warning(
+            "SKU compute-rate scale out of sane range (%.3f = trace %.1f / "
+            "live %.1f TFLOPS); clamping to [%.2f, %.2f]. Treat with "
+            "suspicion — likely a measurement glitch on one of the two SKUs.",
+            raw,
+            trace.compute_rate_tflops,
+            hw.gpu_compute_tflops,
+            _SKU_SCALE_MIN,
+            _SKU_SCALE_MAX,
+        )
+    return max(_SKU_SCALE_MIN, min(_SKU_SCALE_MAX, raw))
+
 
 def _hook_scale_factor(trace: ProfilerTrace) -> float:
     """Return the steady/hooked forward wall-time ratio, clamped to a sane range.
@@ -247,9 +289,17 @@ def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> fl
         measured_ratio = trace.steady_bwd_wall_s / trace.steady_fwd_wall_s
         # Clamp to a sane range — if the measurement is wildly off
         # (measurement noise or forward OOM that fell through), don't
-        # let it propagate. Transformers run between 1.2× and 3× bwd/fwd.
-        measured_ratio = max(1.2, min(3.0, measured_ratio))
+        # let it propagate. Transformers run between 1.0× (LoRA, autograd
+        # skips frozen subgraphs) and 3× (full-finetune with attention recomp).
+        measured_ratio = max(1.0, min(3.0, measured_ratio))
         return t_fwd_total * measured_ratio
+    # Fallback: trainable-fraction-aware. LoRA / adapter training has
+    # ~0.1% trainable; backward only flows through those params, so the
+    # ratio is ~1.0. Full finetune sees the canonical 2.0×. Threshold
+    # 5% — anything below is "mostly frozen" (LoRA r=8/16/32 on a 7B
+    # base lands around 0.05-0.5%).
+    if 0.0 < trace.trainable_param_fraction < 0.05:
+        return t_fwd_total * 1.0
     return t_fwd_total * _BWD_FWD_COMPUTE_RATIO
 
 
@@ -369,6 +419,20 @@ def estimate_runtime(
         LOG.warning(
             "ProTrain: using approximate compute-rate proxy; re-run profiler "
             "for measured latencies"
+        )
+
+    # Per-SKU compute-rate calibration. When the cached trace was captured
+    # on a different SKU than the live training device (e.g. trace from
+    # 3090 Ti, live 3090), the per-op latencies need to be scaled by the
+    # ratio of measured TFLOPS. Same-SKU runs see ratio ≈ 1.0.
+    sku_scale = _sku_compute_scale(trace, hw)
+    if sku_scale != 1.0:
+        t_fwd_compute_total *= sku_scale
+        per_block_compute = {bid: v * sku_scale for bid, v in per_block_compute.items()}
+        LOG.debug(
+            "estimate_runtime: applied per-SKU compute scale %.3f (trace=%s "
+            "live_TFLOPS=%.1f trace_TFLOPS=%.1f)",
+            sku_scale, trace.sku, hw.gpu_compute_tflops, trace.compute_rate_tflops,
         )
     t_fwd_swap_transfer = 0.0
     for bid_raw, act_sz in trace.activation_sizes.items():

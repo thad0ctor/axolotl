@@ -529,6 +529,72 @@ def test_estimate_runtime_uses_measured_adam_when_provided(toy_trace, toy_layout
     )
 
 
+def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
+    """SKU compute-rate calibration scales forward compute proportionally.
+
+    Trace captured on a faster SKU (higher TFLOPS) replayed on a slower SKU
+    (lower TFLOPS) → the cost model must scale forward-time UP by the ratio.
+    Picks an all-persistent config so forward compute is on the critical
+    path with no comm dominance, making the scale visible end-to-end.
+    """
+    from dataclasses import replace
+
+    n_block = len(toy_trace.activation_sizes)
+    n_chunk = toy_layout.N_chunk
+    cfg = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+
+    # Trace says "I was captured on a 60 TFLOPS card."
+    fast_trace = replace(toy_trace, compute_rate_tflops=60.0)
+
+    # Live SKU is 60 TFLOPS — same card. Scale = 1.0.
+    hw_same = _make_hw()
+    hw_same = replace(hw_same, gpu_compute_tflops=60.0)
+    t_same = estimate_runtime(cfg, fast_trace, toy_layout, block_map, hw_same)
+
+    # Live SKU is 30 TFLOPS — half the speed. Scale = 60/30 = 2.0; forward
+    # compute should roughly double.
+    hw_slow = _make_hw()
+    hw_slow = replace(hw_slow, gpu_compute_tflops=30.0)
+    t_slow = estimate_runtime(cfg, fast_trace, toy_layout, block_map, hw_slow)
+
+    # The forward term should grow by ~2x; total iter time ratio should be
+    # >1.4 (allowing for non-fwd terms diluting the signal). When backward
+    # is roughly proportional to forward (default 2x ratio), total scales
+    # ~ proportionally, so >1.4 is a robust threshold.
+    assert t_slow > t_same * 1.4, (
+        f"per-SKU calibration didn't scale t_iter: t_same={t_same:.6f} "
+        f"t_slow={t_slow:.6f} (expected >1.4x)"
+    )
+
+
+def test_estimate_runtime_sku_scale_identity_when_unmeasured(toy_trace, toy_layout, toy_hw):
+    """0.0 on either side of the SKU ratio falls back to identity scale."""
+    from dataclasses import replace
+
+    cfg = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, len(toy_trace.activation_sizes))
+
+    # Both unmeasured → identity scale → unchanged result.
+    t_baseline = estimate_runtime(cfg, toy_trace, toy_layout, block_map, toy_hw)
+
+    # Trace measured but live not measured → still identity (HW info missing).
+    trace_with = replace(toy_trace, compute_rate_tflops=60.0)
+    t_trace_only = estimate_runtime(cfg, trace_with, toy_layout, block_map, toy_hw)
+    assert abs(t_trace_only - t_baseline) < 1e-9, (
+        f"identity scale violated when only trace had a measurement: "
+        f"baseline={t_baseline:.6f} with={t_trace_only:.6f}"
+    )
+
+    # Live measured but trace not → also identity.
+    hw_with = replace(toy_hw, gpu_compute_tflops=60.0)
+    t_hw_only = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_with)
+    assert abs(t_hw_only - t_baseline) < 1e-9, (
+        f"identity scale violated when only hw had a measurement: "
+        f"baseline={t_baseline:.6f} with={t_hw_only:.6f}"
+    )
+
+
 def test_effective_bw_derates_with_n_swap(toy_hw):
     cfg_no_swap = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
     cfg_swap = CostConfig(n_persist=0, n_buffer=0, n_swap=3, n_checkpoint=0)

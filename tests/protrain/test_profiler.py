@@ -169,6 +169,26 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
     assert load_cached_trace(other) is None
 
 
+@pytest.mark.gpu
+def test_measure_compute_rate_returns_sane_tflops(gpu_device):
+    """measure_compute_rate must return a positive TFLOPS measurement."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    from axolotl.integrations.protrain.profiler.hw_bench import (
+        measure_compute_rate,
+    )
+
+    tflops = measure_compute_rate(gpu_device, matrix_size=2048, n_iters=4)
+    # 3090 / 3090 Ti sustained fp16 GEMM lands in 30-60 TFLOPS at 2048x2048
+    # (hits cuBLAS warm-up cost slightly more than 4096x4096). Bracket loose.
+    assert 5.0 < tflops < 200.0, (
+        f"compute rate {tflops:.1f} TFLOPS outside expected 3090-class range"
+    )
+
+
 def test_measure_nccl_single_rank_returns_empty_tuple():
     """Single-rank fast path: ``({}, {})`` so the searcher's collective term collapses."""
     from axolotl.integrations.protrain.profiler.hw_bench import measure_nccl
