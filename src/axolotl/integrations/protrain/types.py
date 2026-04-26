@@ -79,6 +79,12 @@ class ProfilerConfig:
     device: str                                       # e.g. "cuda:2"
     include_backward: bool = True
     on_demand: bool = True                            # OnDemandTensorMgr for models > single-GPU
+    # Distributed world size. ``None`` (default) means "auto-detect" — the
+    # tracer probes ``torch.distributed.get_world_size()`` if a process
+    # group is initialized and falls back to 1 otherwise. Pass an explicit
+    # int to force a specific size (sanity-checked against the live group
+    # by ``measure_nccl``).
+    world_size: int | None = None
 
 
 @dataclass(frozen=True)

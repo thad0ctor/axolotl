@@ -679,6 +679,7 @@ def protrain_model_wrapper(
             device=str(device),
             include_backward=False,
             on_demand=True,
+            world_size=int(hardware_profile.gpu_count),
         )
         batch = _dummy_batch(model, batch_size, seq_len, device)
         trace = run_trace(model, batch, profiler_cfg)

@@ -44,7 +44,15 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # fields are unchanged but the *values* shift (single-iter carried allocator-
 # settle cost the multi-iter median eliminates), so the cost model's measured
 # bwd/fwd ratio path requires a fresh trace under the new methodology.
-TRACE_VERSION = 7
+# Version 8 makes ``world`` and the NCCL collective tables real for
+# world_size > 1: ``measure_nccl(world_size>1)`` now actually runs
+# all_gather_into_tensor / reduce_scatter_tensor sweeps over a payload-size
+# grid instead of raising NotImplementedError, and ``run_trace`` plumbs
+# ``cfg.world_size`` (or auto-detects from the live process group) into
+# both the trace's ``world`` field and the per-payload tables. Single-rank
+# traces are unaffected (collective tables stay empty); multi-rank traces
+# captured under v7 had ``world=1`` hard-coded and must be re-run.
+TRACE_VERSION = 8
 
 
 @dataclass(frozen=True)
