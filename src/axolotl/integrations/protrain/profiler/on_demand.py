@@ -152,22 +152,34 @@ class OnDemandTensorMgr:
         )
 
         # 1. Spill every parameter to pinned CPU; replace .data with empty.
-        for _name, param in self.model.named_parameters():
-            self._spill_param_to_cpu(param, target_device)
+        # 2. Install module-level pre/post-forward hooks.
+        # 3. Enter saved_tensors_hooks for activation spill.
+        # If ANY of these raises (e.g. OOM during GPU->CPU copy of param N),
+        # Python does NOT call ``__exit__`` because we never finished entering.
+        # Wrap the entire setup in try/except: on failure, undo everything
+        # we've already done (restore spilled params, remove hooks, exit
+        # saved_tensors_hooks if entered) so the model is left in its
+        # original state, then re-raise.
+        try:
+            for _name, param in self.model.named_parameters():
+                self._spill_param_to_cpu(param, target_device)
 
-        # 2. Hook every module so leaf forwards gather their direct params.
-        for sub in self.model.modules():
-            self._handles.append(sub.register_forward_pre_hook(self._pre_gather))
-            self._handles.append(sub.register_forward_hook(self._post_release))
+            for sub in self.model.modules():
+                self._handles.append(sub.register_forward_pre_hook(self._pre_gather))
+                self._handles.append(sub.register_forward_hook(self._post_release))
 
-        # 3. Spill saved-for-backward tensors to CPU. This is what makes
-        #    post_release's ``p.data = empty()`` actually reclaim memory:
-        #    without this, autograd would keep the gathered GPU param alive
-        #    via the saved-for-backward slot of the linear's grad_fn.
-        self._sthook_ctx = torch.autograd.graph.saved_tensors_hooks(
-            self._pack_hook, self._unpack_hook
-        )
-        self._sthook_ctx.__enter__()
+            # Saved-for-backward tensors spill to CPU. Without this, autograd
+            # would keep the gathered GPU param alive via the saved-for-
+            # backward slot of the linear's grad_fn, defeating post_release.
+            self._sthook_ctx = torch.autograd.graph.saved_tensors_hooks(
+                self._pack_hook, self._unpack_hook
+            )
+            self._sthook_ctx.__enter__()
+        except BaseException:
+            # Mirror __exit__'s teardown path so partial setup leaves no
+            # wedged params with empty .data slots.
+            self._restore_after_partial_setup()
+            raise
 
         if self._n_pin_failures:
             LOG.debug(
@@ -178,6 +190,62 @@ class OnDemandTensorMgr:
             )
 
         return self
+
+    def _restore_after_partial_setup(self) -> None:
+        """Undo whatever portion of __enter__ succeeded.
+
+        Mirrors __exit__'s teardown but is callable from a partially-
+        constructed enabled-mode state (some params spilled, some hooks
+        registered, saved_tensors_hooks possibly entered). Best-effort:
+        every step is independently try/except'd because we're already
+        on an exception path and must not mask the original failure.
+        """
+        # Remove any hooks that were registered.
+        for h in self._handles:
+            try:
+                h.remove()
+            except Exception:  # noqa: BLE001 - defensive
+                pass
+        self._handles.clear()
+
+        # Exit saved_tensors_hooks if it was entered.
+        if self._sthook_ctx is not None:
+            try:
+                self._sthook_ctx.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 - defensive
+                pass
+            self._sthook_ctx = None
+
+        # Restore every already-spilled param using __exit__'s logic.
+        try:
+            import torch
+        except Exception:  # noqa: BLE001 - defensive (torch import never fails in practice)
+            torch = None  # type: ignore[assignment]
+
+        for spill in self._spills.values():
+            try:
+                if spill.original_data is not None:
+                    spill.original_data.copy_(
+                        spill.cpu_storage.to(
+                            spill.original_data.device, non_blocking=True
+                        )
+                    )
+                    spill.param.data = spill.original_data
+                else:
+                    # CPU-original: cpu_storage IS the original tensor.
+                    spill.param.data = spill.cpu_storage
+            except Exception as _e:  # noqa: BLE001 - defensive
+                LOG.warning(
+                    "OnDemandTensorMgr: failed to restore param to %s during "
+                    "partial-setup unwind (%s); param may be left wedged",
+                    spill.original_device, _e,
+                )
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:  # noqa: BLE001 - defensive
+                pass
+        self._spills.clear()
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._entered = False
