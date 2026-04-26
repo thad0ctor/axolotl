@@ -1,13 +1,18 @@
 """Runtime (wall-clock) cost estimator for the ProTrain searcher (§3.3, App A.1).
 
-Implements Eqs. 2-7 from the paper:
+Implements the per-chunk runtime model from the paper. The communication
+sub-terms map directly onto numbered equations; the compute and optimizer
+sub-terms are described in prose in App A.1 but not numbered:
 
-    T_iter    = T_fwd + max(T_bwd + T_gpu_optim, T_cpu_optim)
-    T_fwd     = sum_chunks  max(T_compute_chunk, T_comm_chunk)     [Eq. 2-3]
+    T_iter    = T_fwd + max(T_bwd + T_gpu_optim, T_cpu_optim)      [Eq. 2]
+    T_fwd     = sum_chunks  max(T_compute_chunk, T_comm_chunk)     [Eq. 3]
     T_bwd     = sum_chunks  max(T_compute_chunk + T_recomp_chunk,
-                                T_comm_chunk)                      [Eq. 4-5]
-    T_gpu_opt = sum_{persistent chunks} T_step(chunk)              [Eq. 6]
-    T_cpu_opt = sum_{non-persistent chunks} T_step(chunk)          [Eq. 7]
+                                T_comm_chunk)                      [Eq. 5]
+    T_FWD-prefetch_comm    (per-chunk, fwd)                        [Eq. 4]
+    T_reduce-offload_comm  (per-chunk, bwd, non-persistent)        [Eq. 6]
+    T_BWD-prefetch_comm    (per-chunk, bwd, evicted-from-buffer)   [Eq. 7]
+    T_gpu_opt = sum_{persistent chunks} T_step(chunk)              [App A.1, prose]
+    T_cpu_opt = sum_{non-persistent chunks} T_step(chunk)          [App A.1, prose]
 
 Key accounting rules (summary §3.3, paper §3.3.1):
 

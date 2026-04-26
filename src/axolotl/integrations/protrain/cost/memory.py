@@ -134,9 +134,15 @@ def estimate_cpu_footprint(
     Parameters
     ----------
     cfg:
-        Candidate knob configuration. Only ``n_persist`` is consumed —
-        ``n_buffer``/``n_swap``/``n_checkpoint`` do not change pinned
-        CPU footprint.
+        Candidate knob configuration. Only ``n_persist`` is consumed.
+        ``n_buffer``/``n_checkpoint`` never change pinned CPU footprint.
+        ``n_swap`` would, in principle, allocate ``n_swap *
+        max_block_activation_bytes`` of pinned CPU staging — but the
+        SWAP block path is feature-gated (``PROTRAIN_ENABLE_SWAP`` env
+        in ``block/swap.py``) and the searcher therefore never picks
+        ``n_swap > 0`` in production. When SWAP is unstubbed this
+        function must be updated to add the activation-swap term;
+        until then the omission is documented dead code.
     layout:
         Chunk layout. ``S_chunk`` and ``N_chunk`` are read directly.
     hw:
