@@ -50,6 +50,15 @@ LOG = get_logger(__name__)
 DEFAULT_OPTIM_STATE_BYTES_PER_PARAM = 16
 DEFAULT_PARAM_GRAD_BYTES_PER_PARAM = 4  # fp16 param + fp16 grad
 
+# Fraction of total GPU memory above which the profiler auto-engages
+# on-demand mode (param offload + saved-for-backward CPU spill). At 60%, a
+# 24 GB card auto-engages once params exceed ~14.4 GB — i.e. 13B-class fp16
+# models and up. Below the threshold the profiler stays on the fast path
+# so the cost model's calibration (captured against fast-path traces)
+# remains valid. Exposed as a module-level constant so tests can monkey-
+# patch it down to force on-demand engagement on small models.
+ON_DEMAND_PARAM_BYTES_FRACTION: float = 0.60
+
 
 @dataclass
 class _OpFrame:
@@ -306,6 +315,39 @@ def run_trace(
                 stack.extend(item.values())
         return total
 
+    # --- decide on-demand engagement up front --------------------------
+    # The decision must happen before warmups + steady-state, because for
+    # 13B+ models the very first un-offloaded forward will OOM. When on-
+    # demand is engaged we SKIP warmups and steady-state — those passes
+    # depend on running a normal full-forward without offload, which is
+    # exactly what doesn't fit. The cost model falls back to defaults
+    # (identity scale, default bwd_fwd ratio) for traces marked on-demand.
+    engage_on_demand = False
+    if cfg.on_demand and cuda_available:
+        try:
+            gpu_total = int(
+                torch.cuda.get_device_properties(device).total_memory
+            )
+            param_bytes = sum(
+                p.numel() * p.element_size()
+                for p in model.parameters()
+            )
+            if param_bytes > ON_DEMAND_PARAM_BYTES_FRACTION * gpu_total:
+                engage_on_demand = True
+                LOG.info(
+                    "Profiler engaging on-demand mode: params=%.2f GB exceed "
+                    "%.0f%% of %.2f GB device memory; offloading params + "
+                    "saved-for-backward tensors to CPU between modules.",
+                    param_bytes / 1e9,
+                    ON_DEMAND_PARAM_BYTES_FRACTION * 100,
+                    gpu_total / 1e9,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.debug(
+                "On-demand size check failed (%s); falling back to fast path",
+                exc,
+            )
+
     # --- warmup passes (no hooks) to JIT-compile kernels ---------------
     # Without warmup, the ``op_latencies`` captured in the traced pass
     # below measure COLD-start kernel times (JIT compile + allocator
@@ -316,8 +358,8 @@ def run_trace(
     # budget §3.2 quotes for 7-20B models and closes most of the
     # cold-vs-warm gap (the second hot iter is ~2x faster than the
     # first, diminishing-returns after).
-    N_WARMUP = 2
-    if cuda_available:
+    N_WARMUP = 0 if engage_on_demand else 2
+    if cuda_available and N_WARMUP > 0:
         for _i in range(N_WARMUP):
             try:
                 torch.cuda.synchronize(device)
@@ -356,7 +398,10 @@ def run_trace(
     steady_bwd_wall_s = 0.0
     steady_fwd_peak_bytes = 0
     steady_fwd_block_peak_bytes: dict[BlockId, int] = {}
-    if cuda_available:
+    # Skip steady-state when on-demand engaged — running full-forward
+    # without offload is exactly what we can't do for these models. Cost
+    # model falls back to identity scale + default bwd/fwd ratio.
+    if cuda_available and not engage_on_demand:
         # Discover transformer blocks for per-block peak instrumentation.
         # If discovery fails (non-standard model shape), skip per-block
         # capture — the aggregate ``steady_fwd_peak_bytes`` below still
@@ -487,10 +532,12 @@ def run_trace(
         optim_state_bytes_per_param=optim_state_bytes_per_param,
     )
 
-    # --- execute the single iteration under the on-demand wrapper ------
-    on_demand_mgr = OnDemandTensorMgr(device=device, disabled=not cfg.on_demand)
-    # For M1 the wrapper is a no-op fast path; replay mode is M4.
-    on_demand_mgr.disabled = True  # M1 override: full fwd+bwd always.
+    # --- on-demand wrapper for the traced forward ----------------------
+    # The engage decision was made up-front (before warmups). Wrapper
+    # honours that — fast path stays a no-op context manager.
+    on_demand_mgr = OnDemandTensorMgr(
+        device=device, disabled=not engage_on_demand, model=model
+    )
 
     # Record total wall-clock of the HOOKED forward pass. Event-timed so
     # hook dispatch gaps (Python overhead between ops) are included — the
