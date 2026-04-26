@@ -395,7 +395,7 @@ def test_on_demand_engaged_path_in_run_trace(gpu_device, monkeypatch):
     # Force on-demand to engage by dropping the threshold to 0%.
     from axolotl.integrations.protrain.profiler import trace as trace_mod
 
-    monkeypatch.setattr(trace_mod, "ON_DEMAND_PARAM_BYTES_FRACTION", 0.0)
+    monkeypatch.setattr(trace_mod, "ON_DEMAND_STATE_BYTES_FRACTION", 0.0)
 
     cfg = ProfilerConfig(
         batch_size=2,
