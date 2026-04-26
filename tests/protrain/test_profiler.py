@@ -415,3 +415,42 @@ def test_on_demand_engaged_path_in_run_trace(gpu_device, monkeypatch):
     assert len(trace.activation_sizes) >= 1, (
         "on-demand trace did not record any activation sizes"
     )
+
+
+@pytest.mark.gpu
+def test_on_demand_backward_under_unpack_hook(gpu_device):
+    """Backward under on-demand must not crash on CPU/CUDA mismatch.
+
+    Regression: ``_unpack_hook`` previously returned the spilled CPU tensor
+    as-is, so a CUDA backward landed on a CPU saved tensor and exploded
+    deep in autograd C++. The fix routes the unpack copy through
+    ``self.device`` so backward sees a CUDA tensor.
+    """
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    device = torch.device(f"cuda:{gpu_device}")
+    model = nn.Sequential(
+        nn.Linear(32, 64),
+        nn.ReLU(),
+        nn.Linear(64, 16),
+    ).to(device)
+
+    mgr = OnDemandTensorMgr(device=device, disabled=False, model=model)
+
+    # x must require grad so the full_backward_pre_hooks fire on the first
+    # Linear (PyTorch skips them when no input gradient flow is needed).
+    x = torch.randn(2, 32, device=device, requires_grad=True)
+
+    with mgr:
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+
+    # Every trainable param must have a finite, non-None grad after backward.
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"{name} has no grad after backward"
+        assert torch.isfinite(p.grad).all(), f"{name} grad is not finite"
