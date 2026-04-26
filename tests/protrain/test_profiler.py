@@ -418,6 +418,130 @@ def test_on_demand_engaged_path_in_run_trace(gpu_device, monkeypatch):
 
 
 @pytest.mark.gpu
+def test_on_demand_engaged_cost_model_finite(gpu_device, monkeypatch):
+    """Cost model must produce a finite, positive iter-time on an on-demand trace.
+
+    Smoke-test, not calibration: assert ``estimate_runtime`` is in
+    ``(0, 60s)`` so we catch the "roofline collapse predicts hours"
+    failure mode when on-demand traces feed inflated peak / activation /
+    delta numbers into the cost model. The 60s ceiling is loose enough
+    to absorb measurement noise on tiny models without ever masking the
+    nonsense-prediction regression.
+    """
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    device = torch.device(f"cuda:{gpu_device}")
+
+    # Same shape as test_on_demand_engaged_path_in_run_trace — two stacked
+    # tiny blocks so block-id inference picks them up at indices 0, 1.
+    class TinyBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(32, 64)
+            self.fc2 = nn.Linear(64, 32)
+
+        def forward(self, x):
+            return self.fc2(torch.relu(self.fc1(x)))
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([TinyBlock(), TinyBlock()])
+
+        def forward(self, input_ids=None, **kwargs):
+            x = input_ids.to(torch.float32)
+            for layer in self.layers:
+                x = layer(x)
+            return type("Out", (), {"loss": x.sum()})()
+
+    model = TinyModel().to(device)
+    batch = {"input_ids": torch.randn(2, 32, device=device)}
+
+    # Force on-demand engagement after Fix 3's rename.
+    from axolotl.integrations.protrain.profiler import trace as trace_mod
+
+    monkeypatch.setattr(trace_mod, "ON_DEMAND_STATE_BYTES_FRACTION", 0.0)
+
+    cfg_profile = ProfilerConfig(
+        batch_size=2,
+        seq_len=32,
+        device=str(device),
+        include_backward=False,
+        on_demand=True,
+    )
+    trace = run_trace(model, batch, cfg_profile)
+
+    # Build a tiny synthetic ChunkLayout that's consistent with the trace's
+    # block count. The cost model only cares that block_to_chunks covers
+    # every block in trace.activation_sizes; a 1-chunk-per-block layout is
+    # the simplest valid topology for this smoke test.
+    from axolotl.integrations.protrain.types import (
+        BlockId as _BlockId,
+        ChunkLayout,
+        CostConfig,
+        HardwareProfile,
+        ParamId,
+    )
+    from axolotl.integrations.protrain.cost import estimate_runtime
+    from axolotl.integrations.protrain.block.layout_rules import assign_modes
+
+    block_ids = sorted(trace.activation_sizes.keys())
+    n_block = len(block_ids)
+    assert n_block >= 1, "trace must have at least one inferred block"
+
+    n_chunk = max(n_block, 1)
+    chunks = tuple((ParamId(f"p.{i}"),) for i in range(n_chunk))
+    param_to_chunk = {ParamId(f"p.{i}"): i for i in range(n_chunk)}
+    block_to_chunks = {
+        _BlockId(int(bid)): (i,) for i, bid in enumerate(block_ids)
+    }
+    layout = ChunkLayout(
+        S_chunk=4 * (1 << 20),  # 4 MiB; tiny but positive
+        N_chunk=n_chunk,
+        chunks=chunks,
+        param_to_chunk=param_to_chunk,
+        block_to_chunks=block_to_chunks,
+    )
+
+    hw = HardwareProfile(
+        gpu_sku=trace.sku,
+        gpu_memory_bytes=int(
+            torch.cuda.get_device_properties(device).total_memory
+        ),
+        gpu_count=1,
+        pcie_h2d_bps=trace.pcie_h2d_bps if trace.pcie_h2d_bps > 0 else 12e9,
+        pcie_d2h_bps=trace.pcie_d2h_bps if trace.pcie_d2h_bps > 0 else 12e9,
+        has_nvlink=False,
+        cpu_adam_bytes_per_sec=trace.cpu_adam_bytes_per_sec,
+        gpu_adam_bytes_per_sec=trace.gpu_adam_bytes_per_sec,
+        gpu_compute_tflops=trace.compute_rate_tflops,
+    )
+
+    cost_cfg = CostConfig(n_persist=1, n_buffer=1, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+
+    iter_s = estimate_runtime(cost_cfg, trace, layout, block_map, hw)
+
+    import math
+
+    assert math.isfinite(iter_s), f"iter_s is not finite: {iter_s}"
+    assert iter_s > 0.0, f"iter_s must be positive, got {iter_s}"
+    # 60s ceiling: a tiny model on a 3090 should never predict more than
+    # seconds. Trips if on-demand traces feed inflated peak / activation
+    # numbers into the cost model and the roofline collapses to hours.
+    assert iter_s < 60.0, (
+        f"iter_s={iter_s:.2f}s exceeds 60s ceiling — on-demand trace "
+        "may have produced inflated activation/delta numbers that broke "
+        "the cost model's roofline. Inspect trace.activation_sizes / "
+        "intra_op_delta / inter_op_delta."
+    )
+
+
+@pytest.mark.gpu
 def test_on_demand_backward_under_unpack_hook(gpu_device):
     """Backward under on-demand must not crash on CPU/CUDA mismatch.
 
