@@ -454,10 +454,13 @@ def measure_nccl(
     for payload_bytes in payload_sizes_bytes:
         # all_gather_into_tensor: each rank contributes one shard of size
         # payload/world_size, output is the full payload on every rank.
-        # We size the SHARD to ``payload_bytes // world_size`` (rounded up
-        # to multiple of ``element_size``) so the COMBINED output is
-        # payload_bytes — keys the table by the per-payload size that
-        # matches how cost/runtime.py thinks about chunk transfers.
+        # We size the SHARD to ``payload_bytes // world_size`` (rounded
+        # DOWN to a multiple of ``element_size`` — both divisions are
+        # integer floor) so the COMBINED output is at most payload_bytes.
+        # ``world_size ∈ {2, 4, 8}`` for production use, all power-of-two,
+        # so the rounding error is zero on the canonical payload grid;
+        # the table is still keyed by the requested payload_bytes since
+        # the cost model thinks in chunk-transfer units.
         element_size = 4  # float32
         elements_per_shard = max(1, (payload_bytes // world_size) // element_size)
         shard = torch.zeros(
