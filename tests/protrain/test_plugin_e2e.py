@@ -100,12 +100,13 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
             # test's coverage of Mode A under auto-select breaks.
             "gradient_accumulation_steps": 1,
             "micro_batch_size": 1,
-            # 30 steps trades a few more wall-seconds for averaging out
-            # bf16-LoRA step-to-step noise. At max_steps=10 the "loss
-            # decreased" trend check was flaky regardless of optimizer
-            # (confirmed against the AdamW baseline): some seeds land
-            # in a cluster that happens to rise on the tail.
-            "max_steps": 30,
+            # 60 steps gives enough samples for a 10-step window-average
+            # comparison (first window vs last window) that absorbs the
+            # bf16-LoRA + alpaca-length-variance step-to-step noise
+            # without being too long for CI. At max_steps=10/30 a
+            # per-step trend check was flaky on the AdamW baseline too;
+            # the windowed comparison below is robust at 60.
+            "max_steps": 60,
             "optimizer": "adamw_torch",
             "lr_scheduler": "constant",
             # Lower LR than the default Axolotl LoRA recipe — the 135M
@@ -183,14 +184,7 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
         f"expected at least 2 training-loss log entries, got {losses}"
     )
 
-    # Sanity: training produced finite, bounded losses. The original
-    # "decreasing-trend" check was flaky on BOTH the AdamW baseline and
-    # the ProTrain path (alpaca samples vary hugely in length, so the
-    # per-step loss signal over a short run is dominated by example
-    # difficulty rather than optimization progress). The real FIX 1
-    # regression guard is the ``isinstance(_ProTrainOptimizer)``
-    # assertion below; the loss-trend check here would need ~1 epoch of
-    # averaging to be reliable, which is outside the smoke-test budget.
+    # Sanity: training produced finite, bounded losses.
     import math
 
     for i, loss in enumerate(losses):
@@ -202,6 +196,27 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
             f"losses={losses}"
         )
     _marker(f"losses={losses}")
+
+    # Decreasing-loss windowed-average check. Per-step loss is too noisy
+    # on alpaca (huge length variance, bf16 rounding); compare the mean
+    # of the first 10 logged losses against the mean of the last 10.
+    # Optimization is "working" if the last window mean is below the
+    # first window mean — i.e. learning happened, even with a constant
+    # LR and no LR scheduler. The 5% margin avoids tripping on
+    # near-flat-but-trending-down runs (a 0% margin is brittle to a
+    # single high-loss tail sample).
+    if len(losses) >= 20:
+        window = max(5, len(losses) // 6)
+        first_avg = sum(losses[:window]) / window
+        last_avg = sum(losses[-window:]) / window
+        assert last_avg < first_avg, (
+            f"plugin training did not reduce loss: "
+            f"first {window}-window avg={first_avg:.4f}, "
+            f"last {window}-window avg={last_avg:.4f}. "
+            f"This indicates the plugin's optimizer step is not actually "
+            f"updating params (silent regression — train() returned, "
+            f"checkpoint exists, but no learning happened). losses={losses}"
+        )
 
     # Checkpoint directory check — adapter safetensors for LoRA runs.
     adapter_file = Path(cfg.output_dir) / "adapter_model.safetensors"
@@ -244,15 +259,6 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
 
 @pytest.mark.slow
 @pytest.mark.gpu
-@pytest.mark.skip(
-    reason=(
-        "Real 7B weight download requires internet + HuggingFace cache "
-        "(Mistral-7B-v0.3 is ~14 GB). Kept as documentation of the intended "
-        "axolotl-train invocation; run manually with "
-        "`pytest tests/protrain/test_plugin_e2e.py::test_plugin_e2e_7b_lora_smoke "
-        "--runslow -s` after prefetching weights."
-    )
-)
 def test_plugin_e2e_7b_lora_smoke(tmp_path: Path) -> None:
     """Smoke-test the real 3090-7b-lora.yml example.
 
@@ -260,10 +266,26 @@ def test_plugin_e2e_7b_lora_smoke(tmp_path: Path) -> None:
 
         axolotl train examples/protrain/3090-7b-lora.yml --max-steps 4
 
-    with ``output_dir`` rerouted to a pytest tmp_path. Intentionally
-    skipped in CI; unlocking this test is the manual-validation step
-    once M4.5 lands.
+    with ``output_dir`` rerouted to a pytest tmp_path. Skipped by
+    default — set ``PROTRAIN_RUN_7B_E2E=1`` in the environment to run
+    (requires the Mistral-7B-v0.3 weights, ~14 GB, prefetched into
+    HuggingFace cache).
+
+    Run with::
+
+        PROTRAIN_RUN_7B_E2E=1 \\
+            CUDA_VISIBLE_DEVICES=2 CUDA_DEVICE_ORDER=PCI_BUS_ID \\
+            pytest tests/protrain/test_plugin_e2e.py::test_plugin_e2e_7b_lora_smoke \\
+            -m slow -x -s --tb=short -o addopts=
     """
+    import os
+
+    if os.environ.get("PROTRAIN_RUN_7B_E2E") != "1":
+        pytest.skip(
+            "PROTRAIN_RUN_7B_E2E not set — 7B YAML E2E requires the Mistral-7B-v0.3 "
+            "weights prefetched into HuggingFace cache (~14 GB). Set the env var "
+            "to 1 to opt in."
+        )
     pytest.importorskip("torch")
 
     from axolotl.cli.config import load_cfg

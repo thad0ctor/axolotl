@@ -30,19 +30,20 @@ def _nvidia_smi_gpu_count() -> int:
     return sum(1 for line in out.splitlines() if line.strip())
 
 
-# Skipped by default — full benchmark takes ~2.5 min end-to-end, and
-# the assertions validate mode-engagement not hardware-specific throughput
-# targets (those live in the README / DESIGN.md for reference).
-# Users opt in with:
-#   CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID \
-#       python scripts/benchmark_multi_gpu.py
+# Skipped by default — full benchmark takes ~2.5 min end-to-end and
+# needs a 4-GPU rig. Set PROTRAIN_RUN_MULTI_GPU_BENCH=1 to opt in:
+#   PROTRAIN_RUN_MULTI_GPU_BENCH=1 \
+#       CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+#       pytest tests/protrain/test_multi_gpu_benchmark.py -m slow
 @pytest.mark.slow
 @pytest.mark.gpu
-@pytest.mark.skip(
-    reason="full benchmark, run manually via scripts/benchmark_multi_gpu.py; "
-    "assertions validate mode-engagement, not throughput targets"
-)
 def test_benchmark_multi_gpu_runs(tmp_path) -> None:
+    if os.environ.get("PROTRAIN_RUN_MULTI_GPU_BENCH") != "1":
+        pytest.skip(
+            "PROTRAIN_RUN_MULTI_GPU_BENCH not set — full multi-GPU "
+            "benchmark takes ~2.5 min and needs a 4-GPU rig. Set the "
+            "env var to 1 to opt in."
+        )
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     pytest.importorskip("peft")
@@ -113,4 +114,105 @@ def test_benchmark_multi_gpu_runs(tmp_path) -> None:
     ddp_tp = summaries["ddp"]["throughput_samples_per_s"]
     assert ddp_tp > 2.5 * single_tp, (
         f"DDP throughput {ddp_tp:.2f} not > 2.5 x single-rank {single_tp:.2f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight JSON-validation tests
+# ---------------------------------------------------------------------------
+#
+# Run on every CI invocation. Validate the LATEST checked-in benchmark
+# results against the design-target scaling thresholds (DESIGN.md). When
+# the JSON is missing — typically a fresh checkout — the tests skip
+# rather than fail. Operators run ``scripts/benchmark_multi_gpu.py``
+# periodically (after any Mode A/B/C path change) to refresh the JSON,
+# and these tests certify the recorded numbers still meet the
+# thresholds before the change is shipped.
+
+_BENCH_JSON_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "multi_gpu_benchmark_results.json"
+)
+
+
+def _load_summaries() -> dict[str, dict]:
+    if not _BENCH_JSON_PATH.exists():
+        pytest.skip(
+            f"{_BENCH_JSON_PATH.name} not found — run "
+            "`scripts/benchmark_multi_gpu.py` on a 4-GPU rig first to "
+            "generate it (~150s)."
+        )
+    raw = json.loads(_BENCH_JSON_PATH.read_text())
+    return {s["mode"]: s for s in raw.get("summaries", [])}
+
+
+def test_recorded_mode_a_ddp_scaling_at_least_3x() -> None:
+    """DDP composition: recorded throughput >= 3.0x single-rank.
+
+    The plugin's job in Mode A is to NOT interfere with DDP's bucketed
+    all-reduce. A regression here typically means the per-param
+    all_reduce path is firing twice (DDP + chunk manager) — burning
+    bandwidth for double-counted gradient sync.
+    """
+    summaries = _load_summaries()
+    if "single" not in summaries or "ddp" not in summaries:
+        pytest.skip("benchmark JSON missing 'single' or 'ddp' mode")
+    baseline = summaries["single"]["throughput_samples_per_s"]
+    ddp_tp = summaries["ddp"]["throughput_samples_per_s"]
+    s = ddp_tp / baseline
+    assert s >= 3.0, (
+        f"recorded Mode A (DDP) scaling regressed: {s:.2f}x vs >=3.0x "
+        "target. Re-run scripts/benchmark_multi_gpu.py and inspect the "
+        "iter_times — the ``skip_internal_grad_reduce=True`` plumb-through "
+        "may have broken."
+    )
+
+
+def test_recorded_mode_b_replicated_scaling_at_least_1_2x() -> None:
+    """Replicated CPU offload: recorded throughput >= 1.2x single-rank."""
+    summaries = _load_summaries()
+    if "single" not in summaries or "replicated" not in summaries:
+        pytest.skip("benchmark JSON missing 'single' or 'replicated' mode")
+    baseline = summaries["single"]["throughput_samples_per_s"]
+    rep_tp = summaries["replicated"]["throughput_samples_per_s"]
+    s = rep_tp / baseline
+    assert s >= 1.2, (
+        f"recorded Mode B (replicated CPU offload) scaling regressed: "
+        f"{s:.2f}x vs >=1.2x target."
+    )
+
+
+def test_recorded_mode_c_zero3_functional() -> None:
+    """ZeRO-3 sharded must produce positive throughput (no scaling floor)."""
+    summaries = _load_summaries()
+    if "zero3" not in summaries:
+        pytest.skip("benchmark JSON missing 'zero3' mode")
+    tp = summaries["zero3"]["throughput_samples_per_s"]
+    assert tp > 0.0, (
+        f"Mode C (ZeRO-3 sharded) throughput non-positive: {tp}. "
+        "The path failed to make forward progress."
+    )
+
+
+def test_recorded_pinned_cpu_drops_with_sharding() -> None:
+    """Replicated/sharded pinned-CPU ratio >= 3x on 4 GPUs.
+
+    Replicated holds each non-persistent chunk on every rank; sharded
+    holds 1/world_size. On 4x 3090 the recorded ratio is ~4.0x. Below
+    3x means sharding stopped partitioning chunks correctly.
+    """
+    summaries = _load_summaries()
+    if "replicated" not in summaries or "zero3" not in summaries:
+        pytest.skip("benchmark JSON missing 'replicated' or 'zero3' mode")
+    rep_pinned = summaries["replicated"]["cpu_pinned_bytes_max"]
+    z3_pinned = summaries["zero3"]["cpu_pinned_bytes_max"]
+    if z3_pinned == 0:
+        pytest.fail(
+            "zero3 pinned-CPU dropped to 0 — sharded chunks not allocated"
+        )
+    ratio = rep_pinned / z3_pinned
+    assert ratio >= 3.0, (
+        f"replicated/sharded pinned-CPU ratio regressed: {ratio:.2f}x "
+        f"vs >=3.0x target."
     )
