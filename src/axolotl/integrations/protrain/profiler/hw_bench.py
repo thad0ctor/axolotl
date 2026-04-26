@@ -519,6 +519,16 @@ def measure_nccl(
         reduce_table[payload_bytes] = statistics.median(reduce_times)
 
         del shard, gathered, full_payload, reduced
+        # Free the four buffers' caching-allocator blocks before the next
+        # payload bumps up. At world=4 / 256 MiB peak we hold ~640 MiB
+        # live across the four; without empty_cache the allocator keeps
+        # them reserved for a different stream's reuse, fragmenting the
+        # pool for any future payload-grid expansion.
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 - defensive, no behavior change
+                pass
 
         if rank == 0:
             LOG.debug(
