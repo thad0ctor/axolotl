@@ -246,3 +246,129 @@ def test_on_demand_disabled_fast_path():
         mgr.allocate_inputs(fake_op)
         mgr.free_after(fake_op)
     assert tuple(mgr.live_tensor_ids()) == ()
+
+
+def test_on_demand_enabled_requires_model():
+    """Enabled mode must reject construction without a model."""
+    mgr = OnDemandTensorMgr(device="cuda:0", disabled=False)
+    with pytest.raises(ValueError, match="requires a model"):
+        mgr.__enter__()
+
+
+@pytest.mark.gpu
+def test_on_demand_enabled_param_offload_and_restore(gpu_device):
+    """Enabled OnDemandTensorMgr offloads params and restores them byte-exact."""
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    device = torch.device(f"cuda:{gpu_device}")
+    model = nn.Sequential(
+        nn.Linear(64, 128),
+        nn.ReLU(),
+        nn.Linear(128, 32),
+    ).to(device)
+
+    # Snapshot original params so we can verify byte-exact restore later.
+    original_state = {
+        name: p.detach().clone() for name, p in model.named_parameters()
+    }
+
+    from axolotl.integrations.protrain.profiler.on_demand import (
+        OnDemandTensorMgr,
+    )
+
+    mgr = OnDemandTensorMgr(device=device, disabled=False, model=model)
+
+    x = torch.randn(4, 64, device=device)
+    with mgr:
+        # Inside the context, before any forward, params should be empty
+        # placeholders (storage of size 0). The pre-forward hooks will
+        # gather them just before each Linear's forward.
+        for _name, p in model.named_parameters():
+            assert p.data.numel() == 0, (
+                f"expected empty placeholder under on-demand, got "
+                f"{p.data.numel()} elements"
+            )
+
+        out = model(x)
+        # Forward must produce a sane output of the right shape.
+        assert out.shape == (4, 32)
+        assert torch.isfinite(out).all()
+
+    # After exiting, params restored to GPU with original values.
+    for name, p in model.named_parameters():
+        assert p.device.type == "cuda"
+        assert torch.allclose(p, original_state[name], atol=0, rtol=0), (
+            f"param {name} did not restore byte-exact under OnDemandTensorMgr"
+        )
+
+
+@pytest.mark.gpu
+def test_on_demand_engaged_path_in_run_trace(gpu_device, monkeypatch):
+    """run_trace engages on-demand when params exceed the size threshold.
+
+    Forces the threshold down to ~0% so a tiny model takes the on-demand
+    branch. The trace must still complete and populate op records.
+    """
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    device = torch.device(f"cuda:{gpu_device}")
+
+    # Simple two-block "transformer" — enough to exercise multiple modules
+    # under the on-demand gather/release path. Use a non-Linear container
+    # so the trace's block heuristic still picks it up.
+    class TinyBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(32, 64)
+            self.fc2 = nn.Linear(64, 32)
+
+        def forward(self, x):
+            return self.fc2(torch.relu(self.fc1(x)))
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([TinyBlock(), TinyBlock()])
+
+        def forward(self, input_ids=None, **kwargs):
+            x = input_ids.to(torch.float32)
+            for layer in self.layers:
+                x = layer(x)
+            return type("Out", (), {"loss": x.sum()})()
+
+    model = TinyModel().to(device)
+    batch = {
+        "input_ids": torch.randn(2, 32, device=device),
+    }
+
+    # Force on-demand to engage by dropping the threshold to 0%.
+    from axolotl.integrations.protrain.profiler import trace as trace_mod
+
+    monkeypatch.setattr(trace_mod, "ON_DEMAND_PARAM_BYTES_FRACTION", 0.0)
+
+    cfg = ProfilerConfig(
+        batch_size=2,
+        seq_len=32,
+        device=str(device),
+        include_backward=False,
+        on_demand=True,
+    )
+    trace = run_trace(model, batch, cfg)
+
+    # Trace must have op records — the on-demand path didn't drop ops.
+    assert len(trace.op_order) > 0
+    # Forward-only trace: no <backward> op record expected.
+    assert all(op.is_forward for op in trace.op_order)
+    # Activation sizes captured for at least the inferred blocks (the layers
+    # ModuleList children get block_id=0, 1 via the ``layers.<i>`` heuristic).
+    assert len(trace.activation_sizes) >= 1, (
+        "on-demand trace did not record any activation sizes"
+    )
