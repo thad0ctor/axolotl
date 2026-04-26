@@ -2,6 +2,14 @@
 
 This package is a from-scratch Python implementation of the ProTrain memory manager (MLSys 2026, arXiv 2406.08334), shipped as an **Axolotl plugin** (`BasePlugin` subclass). It owns per-rank memory policy on top of ZeRO-3: hierarchical chunk management for model states (params / grads / optim states), interleaved block management for activations, a memory-aware profiler, a 4-knob cost model, and an automatic searcher. It does NOT own data parallelism collectives (delegates to `torch.distributed`), training-loop control flow, trainer orchestration, TP/PP, FP8, or any changes to Axolotl core files. Activation is opt-in via `plugins: [axolotl.integrations.protrain]` in the user YAML; mutual exclusion with `deepspeed:` and `fsdp:` is enforced by a pydantic validator in `args.py`.
 
+## Workstream-shape ratifications (drift from `plan.md`)
+
+Two intentional deviations from the original plan, both ratified after M5 review:
+
+1. **Package path: `src/axolotl/integrations/protrain/` (not `src/axolotl/memory/protrain/`)**. Plan specified the latter; we landed on the former. The driver is Axolotl's own convention — `src/axolotl/integrations/` is the canonical home for `BasePlugin` subclasses (`spectrum`, `kd`, `cut_cross_entropy`, etc.), and ProTrain ships as a plugin. Putting it under `memory/` would have required teaching `prepare_plugins` a non-standard discovery path, plus diverging from the test conventions every other integration follows (`tests/integrations/<name>/`). The functional contract of "no edits to Axolotl core" is preserved unchanged.
+
+2. **DESIGN.md length: ~250 lines (plan said "under 200")**. The plan's 200-line bound was an M0 hygiene target before M7 ZeRO-3 sharding and the Mode A/B/C auto-selector existed — those sections account for most of the over-budget content (~50 lines of multi-GPU spec + benchmark results that didn't exist when the plan was written). Trimming would lose multi-GPU integration documentation that operators actively reference. Length cap formally raised to 350 lines; sections must continue to map 1:1 onto subpackages (no narrative essays).
+
 ## Directory Layout
 
 ```
