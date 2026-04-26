@@ -52,7 +52,14 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # both the trace's ``world`` field and the per-payload tables. Single-rank
 # traces are unaffected (collective tables stay empty); multi-rank traces
 # captured under v7 had ``world=1`` hard-coded and must be re-run.
-TRACE_VERSION = 8
+# Version 9 folds ``requires_grad`` into the arch_hash so that toggling
+# freeze-layer config invalidates the cache. Previously a v8 trace
+# captured under one freezing pattern would replay against a different
+# freezing pattern with the same arch, returning stale
+# ``trainable_param_fraction`` / ``model_state_bytes`` and steering the
+# cost model into the wrong bwd/fwd-ratio fallback. v8 traces remain on
+# disk but never look up under v9 keys.
+TRACE_VERSION = 9
 
 
 @dataclass(frozen=True)

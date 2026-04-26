@@ -132,10 +132,22 @@ def _count_model_state_bytes(
 
 
 def _arch_hash(model: "nn.Module") -> str:
-    """Deterministic hash of the model architecture for the cache key."""
+    """Deterministic hash of the model architecture for the cache key.
+
+    Includes ``requires_grad`` per parameter so that toggling freezing
+    (e.g. ``freeze_layers`` config) produces a new cache key. Without
+    this, full-finetune callers who flip a layer from frozen to trainable
+    would get a stale trace whose ``trainable_param_fraction`` and
+    ``model_state_bytes`` reflect the OLD freezing pattern, and the cost
+    model would pick the wrong bwd/fwd ratio fallback. PEFT/LoRA users
+    are unaffected — adapters change the param list itself, which already
+    invalidates the hash.
+    """
     parts: list[str] = [type(model).__name__]
     for name, p in model.named_parameters():
-        parts.append(f"{name}:{tuple(p.shape)}:{p.dtype}")
+        parts.append(
+            f"{name}:{tuple(p.shape)}:{p.dtype}:requires_grad={p.requires_grad}"
+        )
     for name, b in model.named_buffers():
         parts.append(f"B:{name}:{tuple(b.shape)}:{b.dtype}")
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
