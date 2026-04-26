@@ -13,11 +13,13 @@ this with two coordinated mechanisms (paper §3.2):
 
 2. **Saved-activation spill** — ``torch.autograd.graph.saved_tensors_hooks``
    intercepts every tensor that autograd would retain for backward, copies
-   it to CPU at save time, restores to GPU at unpack time. Since the
-   profiler's traced pass is forward-only (the wrapper calls
-   :func:`run_trace` with ``include_backward=False`` on large models),
-   the unpack path is never exercised — the spill side alone is enough
-   to keep retained activations off the GPU during forward.
+   it to CPU at save time, and copies it back to ``self.device`` at unpack
+   time. Backward under on-demand IS supported (CPU->GPU copy in unpack
+   adds ~saved_activation_bytes / pcie_bw latency to the backward pass);
+   the trace driver currently passes ``include_backward=False`` when on-
+   demand engages because the bwd peak still exceeds device memory for the
+   target models, but the hook path is correct for callers that want to
+   run backward themselves.
 
 Together these bound peak GPU at roughly ``max_leaf_param_bytes +
 activation_workspace_per_op``, which is small enough that 13B / 70B-class
@@ -167,6 +169,18 @@ class OnDemandTensorMgr:
             for sub in self.model.modules():
                 self._handles.append(sub.register_forward_pre_hook(self._pre_gather))
                 self._handles.append(sub.register_forward_hook(self._post_release))
+                # Backward path: re-gather params before each module's bwd
+                # and release them after. Forward-only callers pay nothing
+                # (the hooks never fire). Backward callers pay one extra
+                # H2D copy of the param + one D2H release per module per
+                # backward pass — the same per-module cost the forward
+                # path already pays.
+                self._handles.append(
+                    sub.register_full_backward_pre_hook(self._pre_gather_bwd)
+                )
+                self._handles.append(
+                    sub.register_full_backward_hook(self._post_release_bwd)
+                )
 
             # Saved-for-backward tensors spill to CPU. Without this, autograd
             # would keep the gathered GPU param alive via the saved-for-
@@ -416,10 +430,38 @@ class OnDemandTensorMgr:
             except Exception as exc:  # noqa: BLE001 - defensive
                 LOG.debug("OnDemandTensorMgr post-release no-op (%s)", exc)
 
-    # ---- saved-tensors spill / restore ---------------------------------
+    def _pre_gather_bwd(self, module: "nn.Module", grad_output: Any) -> None:
+        """Backward-pre hook: gather direct params before this module's bwd.
 
-    @staticmethod
-    def _pack_hook(tensor: Any) -> Any:
+        Linear's autograd computes ``grad_input = grad_output @ weight`` —
+        the weight tensor's full data must be live, but ``_post_release``
+        already cleared it to an empty placeholder. Re-running the gather
+        here makes backward see the real param. Mirrors ``_pre_gather``
+        but takes the backward-hook signature.
+        """
+        # Reuse the forward-gather logic; ``inputs`` is unused there.
+        self._pre_gather(module, grad_output)
+
+    def _post_release_bwd(
+        self, module: "nn.Module", grad_input: Any, grad_output: Any
+    ) -> None:
+        """Backward-post hook: release direct params after this module's bwd."""
+        # Reuse the forward-release logic; ``inputs``/``output`` unused there.
+        self._post_release(module, grad_input, grad_output)
+
+    # ---- saved-tensors spill / restore ---------------------------------
+    #
+    # Backward IS supported under on-demand: the unpack hook copies CPU-
+    # spilled tensors back to ``self.device`` before returning, so autograd
+    # receives a CUDA tensor on a CUDA backward. The H2D copy adds latency
+    # proportional to the saved-tensor footprint (a 7B forward saves on the
+    # order of a few GB of activations -> a few hundred ms of PCIe time
+    # per backward pass on a 26 GB/s link); the trace driver currently
+    # passes ``include_backward=False`` when on-demand engages, so this
+    # path is dormant in production but no longer a footgun for callers
+    # that want to run backward under on-demand themselves.
+
+    def _pack_hook(self, tensor: Any) -> Any:
         """Spill autograd-retained GPU tensors to CPU at save time."""
         try:
             if not getattr(tensor, "is_cuda", False):
@@ -428,18 +470,37 @@ class OnDemandTensorMgr:
         except Exception:  # noqa: BLE001 - defensive
             return tensor
 
-    @staticmethod
-    def _unpack_hook(packed: Any) -> Any:
-        """Restore a spilled tensor — only fires if backward runs."""
-        # The traced forward in run_trace is forward-only when on_demand=True,
-        # so this path is not exercised. Implemented for completeness in case
-        # future callers want to run backward under on-demand.
+    def _unpack_hook(self, packed: Any) -> Any:
+        """Restore a spilled tensor on the configured GPU device.
+
+        If ``packed`` is a CPU tensor and we know the target device
+        (``self.device`` set), copy it back to GPU before returning.
+        Backward under on-demand otherwise gets a CPU tensor on a CUDA
+        backward and fails deep in autograd C++.
+        """
         try:
-            if not getattr(packed, "is_cpu", True):
+            # Non-tensor or already on GPU: nothing to do.
+            is_cpu = getattr(packed, "is_cpu", None)
+            if is_cpu is False:
                 return packed
-            # Without explicit device knowledge we just return the CPU tensor;
-            # caller's grad_fn knows the right device.
-            return packed
+            if is_cpu is None:
+                return packed
+            if self.device is None:
+                # No target device known — autograd will surface the CPU/CUDA
+                # mismatch itself if it matters.
+                return packed
+            try:
+                import torch
+            except Exception:  # noqa: BLE001 - defensive
+                return packed
+            target = (
+                self.device
+                if isinstance(self.device, torch.device)
+                else torch.device(self.device)
+            )
+            if target.type == "cpu":
+                return packed
+            return packed.to(target, non_blocking=True)
         except Exception:  # noqa: BLE001 - defensive
             return packed
 
