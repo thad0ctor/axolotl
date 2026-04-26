@@ -76,7 +76,7 @@ Every entry: Inputs · Outputs · Paper ref · Milestone.
 - `memory_deltas.py` — `intra_op_delta(op) -> int`, `inter_op_delta(prev, curr) -> int` from `torch.cuda.memory_stats()`. Catches the ~17% invisible peak. §3.2, App A.2.
 - `on_demand.py` — `class OnDemandTensorMgr` context; `allocate_inputs(op)` / `free_after(op)`. Enables profiling models larger than single-GPU. §3.2.
 - `hw_bench.py` — `measure_pcie() -> BW`, `measure_nccl(world_size) -> NcclTable`. §3.2.
-- `cache.py` — `load(key) -> ProfilerTrace | None`, `save(key, trace)`. Key = `(arch_hash, bs, seq, sku, world)`. §7.
+- `cache.py` — `load(key) -> ProfilerTrace | None`, `save(key, trace)`. Key = `(arch_hash, bs, seq, sku, world)`. §7. The `TRACE_VERSION` constant prefixes the cache key, so a bump invalidates all prior entries silently. Versions: v2 added per-op latencies, v3 added measured Adam throughput, v4 added hook-dispatch calibration (hooked/steady fwd-wall), v5 added the aggregate steady-fwd peak, v6 added per-block steady peaks (tighter cap for fractional-NONE configs), v7 changed the steady-state methodology from a single iteration to a 4-iter hot loop (2 warmup + 2 measured, median) and added a best-effort steady_bwd_wall. The fields list didn't change at v7 but the recorded *values* shifted, so the cost model's measured bwd/fwd-ratio path requires a fresh trace under the new methodology.
 
 ### chunk/ (M2)
 
