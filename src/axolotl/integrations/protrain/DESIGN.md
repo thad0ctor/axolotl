@@ -227,6 +227,14 @@ The user can override via the `protrain_zero3_shard: true/false` field on `ProTr
 
 **Memory-safety contract.** GPU peak is unchanged by sharding (the gather reconstructs the full chunk on GPU via `all_gather_into_tensor` regardless), so `cost/memory.py::estimate_peak` ignores `HardwareProfile.zero3_shard`. The per-rank pinned CPU footprint DOES scale with sharding — `cost/memory.py::estimate_cpu_footprint` returns `(N_chunk - n_persist) * S_chunk / world_size` under sharding vs. the full product under replication. The searcher's GPU-capacity gate (the only feasibility filter today) is therefore sharding-agnostic; the explicit `zero3_shard` plumbing on `HardwareProfile` exists so future CPU-budget filters (if added) can consult it.
 
+#### NCCL measurement gap
+
+`protrain_model_wrapper` runs from `plugin.post_model_load`, which fires during model loading at `loaders/model.py:191` — BEFORE the Trainer / Accelerate path initializes the distributed process group. So when the profiler calls `measure_nccl(world_size>1)`, `dist.is_initialized()` is False, the call falls through to empty `nccl_gather_s` / `nccl_reduce_s` tables, and the trace records `world=1` regardless of actual world size.
+
+This gap is functionally inert in the auto-selected Mode A and Mode B paths. Mode A (DDP) keeps every chunk persistent — DDP itself owns the cross-rank allreduce, and ProTrain issues no per-chunk collectives, so the cost model never reads the NCCL tables. Mode B (replicated CPU offload) likewise issues no per-chunk collectives. Only Mode C (ZeRO-3 sharded) actually consumes `nccl_gather_s` / `nccl_reduce_s` — and the auto-selector picks Mode C last (only when per-rank CPU RAM can't hold the replicated non-persistent set).
+
+Workaround for Mode C operators: run `scripts/protrain/measure_nccl.py` once on the target rig under a real distributed launcher (it inits the process group itself and writes a JSON of `{payload_bytes: seconds}` for both gather and reduce-scatter). The output can be hand-loaded into the trace before search runs, or — more practically — used to validate that Mode C predictions match the standalone benchmark on the operator's interconnect.
+
 #### Multi-GPU — Measured Throughput (4x 3090)
 
 Benchmark: fresh-init Llama-3B + LoRA r=8, bs=2 per rank, seq=256, fp16. 6 iterations per mode, 2 warm-up discarded, median of the remaining 4 is reported. GPUs 1, 4, 5, 7 on a PCIe-Gen3 test rig (no NVLink). Reproduce with `CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID python scripts/benchmark_multi_gpu.py`; full JSON at `scripts/multi_gpu_benchmark_results.json`.
