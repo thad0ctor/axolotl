@@ -578,3 +578,103 @@ def test_on_demand_backward_under_unpack_hook(gpu_device):
     for name, p in model.named_parameters():
         assert p.grad is not None, f"{name} has no grad after backward"
         assert torch.isfinite(p.grad).all(), f"{name} grad is not finite"
+
+
+@pytest.mark.gpu
+def test_on_demand_intra_delta_excludes_gather(gpu_device, monkeypatch):
+    """Regression: on-demand pre-gather hook must fire BEFORE trace's pre_forward.
+
+    Pre-fix, the trace driver registered its ``_pre_forward`` hook on every
+    module before ``OnDemandTensorMgr.__enter__`` ran. PyTorch fires
+    forward_pre hooks in registration order, so the trace's
+    ``allocated_before`` snapshot was taken BEFORE on-demand's ``_pre_gather``
+    materialized the GPU param. ``intra_op_delta = peak − allocated_before``
+    therefore absorbed the gather bytes (full weight + bias) for every leaf
+    op, inflating the cost model's peak reconstruction.
+
+    The fix: register the on-demand pre-gather hook with ``prepend=True`` so
+    it fires first; the trace's baseline then already includes the gather,
+    and intra_op_delta captures only workspace + output.
+
+    This test forces on-demand engagement on a tiny model whose Linear
+    weight bytes (256 * 256 * 4 = 256 KiB) dwarf the per-op output bytes
+    (2 * 256 * 4 = 2 KiB). After the fix, at least one leaf-Linear op must
+    have ``intra_op_delta`` strictly less than the per-leaf gather bytes —
+    something that was structurally impossible pre-fix because every leaf
+    op's delta included the gather as a floor.
+    """
+    import torch
+    from torch import nn
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    device = torch.device(f"cuda:{gpu_device}")
+
+    # Param-heavy / output-light Linear so the gather signal dwarfs the
+    # legitimate workspace + output. Two stacked layers so the SECOND
+    # Linear's intra_op_delta (post cuBLAS workspace warmup) drops to
+    # near-zero in the post-fix world but stays >= gather_bytes pre-fix.
+    class TinyBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(256, 256)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([TinyBlock(), TinyBlock()])
+
+        def forward(self, input_ids=None, **kwargs):
+            x = input_ids.to(torch.float32)
+            for layer in self.layers:
+                x = layer(x)
+            return type("Out", (), {"loss": x.sum()})()
+
+    model = TinyModel().to(device)
+    batch = {"input_ids": torch.randn(2, 256, device=device)}
+
+    # Force on-demand to engage on this tiny model.
+    from axolotl.integrations.protrain.profiler import trace as trace_mod
+
+    monkeypatch.setattr(trace_mod, "ON_DEMAND_STATE_BYTES_FRACTION", 0.0)
+
+    cfg = ProfilerConfig(
+        batch_size=2,
+        seq_len=256,
+        device=str(device),
+        include_backward=False,
+        on_demand=True,
+    )
+    trace = run_trace(model, batch, cfg)
+
+    # Per-leaf gather floor: weight (256 * 256 * 4) + bias (256 * 4)
+    # = 263168 bytes. Pre-fix every leaf op's intra_op_delta absorbed at
+    # least this. Post-fix, leaf ops past the cuBLAS workspace warmup
+    # carry only output + scratch (~2 KiB).
+    gather_bytes_floor = 256 * 256 * 4 + 256 * 4
+
+    # Pull intra_op_delta values for every leaf-Linear op in the trace.
+    leaf_intra = [
+        trace.intra_op_delta[op.op_id]
+        for op in trace.op_order
+        if op.qualified_name == "Linear" and op.is_forward
+    ]
+    assert len(leaf_intra) >= 2, (
+        f"expected >=2 leaf Linear ops in trace, got {len(leaf_intra)}: "
+        f"{[op.qualified_name for op in trace.op_order]}"
+    )
+
+    # Sanity ceiling: at least one leaf-Linear's intra_op_delta must be
+    # strictly less than the gather floor. Pre-fix every leaf op had at
+    # least gather_bytes worth of inflation; post-fix the second leaf
+    # (after cuBLAS workspace warmup) lands at ~output bytes only.
+    assert min(leaf_intra) < gather_bytes_floor, (
+        f"leaf-Linear intra_op_delta values {leaf_intra} all exceed the "
+        f"per-leaf gather floor of {gather_bytes_floor} bytes — on-demand "
+        f"pre-gather hook is firing AFTER the trace's pre_forward (regression "
+        f"of the prepend=True fix)."
+    )
