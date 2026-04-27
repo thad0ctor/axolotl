@@ -12,10 +12,14 @@ Algorithm:
 
 3. For each candidate, compute ``block_map = assign_modes(...)``.
 4. Evaluate ``estimate_peak``; drop candidates above ``capacity_bytes``.
-5. If ``cpu_capacity_bytes`` is not None, evaluate
+5. Drop runtime-inadmissible candidates: any block whose parameter
+   chunks are not all persistent must use CKPT, because the current
+   runtime releases non-persistent chunk storage after forward and
+   relies on checkpoint recomputation to re-gather it for backward.
+6. If ``cpu_capacity_bytes`` is not None, evaluate
    ``estimate_cpu_footprint``; drop candidates above the host-RAM gate.
-6. Among survivors, evaluate ``estimate_runtime`` and pick argmin.
-7. Raise ``RuntimeError`` if no candidate fits — the message
+7. Among survivors, evaluate ``estimate_runtime`` and pick argmin.
+8. Raise ``RuntimeError`` if no candidate fits — the message
    distinguishes GPU-pressure failure (no cfg cleared the GPU gate)
    from CPU-pressure failure (some cleared GPU but all busted CPU).
 
@@ -87,6 +91,34 @@ def _min_n_buffer_for(layout: ChunkLayout, n_persist: int) -> int:
     # Every pool allocator path requires at least 1 buffer when any
     # non-persistent chunk exists, even if block_to_chunks is sparse.
     return max(1, need)
+
+
+def _block_map_runtime_admissible(
+    layout: ChunkLayout,
+    block_map: BlockStrategyMap,
+    n_persist: int,
+) -> bool:
+    """Return True iff the block strategy is safe for current chunk offload.
+
+    Current runtime correctness constraint: if a block owns any
+    non-persistent parameter chunk, that block must be CKPT. The forward
+    scheduler releases non-persistent chunk storage after the block runs,
+    and PyTorch's saved tensors for a normal NONE/SWAP block are not a
+    safe persistence mechanism once ``param.data`` is rebound to the
+    empty sentinel. CKPT blocks recompute their forward during backward,
+    so the scheduler can re-gather chunks immediately before recompute.
+
+    Fully persistent blocks may use NONE/SWAP because their parameter
+    storage is never nulled or recycled.
+    """
+    persistent = {ChunkId(i) for i in range(max(0, int(n_persist)))}
+    for bid, chunks in layout.block_to_chunks.items():
+        mode = block_map.get(bid, BlockMode.NONE)
+        if mode is BlockMode.CKPT:
+            continue
+        if any(ChunkId(int(cid)) not in persistent for cid in chunks):
+            return False
+    return True
 
 
 def _iter_candidates(bounds: Bounds) -> Iterator[CostConfig]:
@@ -355,6 +387,10 @@ def search(
                 # minimum within the capacity budget.
                 min_buffer = _min_n_buffer_for(layout, n_persist)
                 if min_buffer > max_buffer:
+                    continue
+                if not _block_map_runtime_admissible(
+                    layout, block_map, n_persist
+                ):
                     continue
 
                 # Optimum n_buffer is the max feasible: cached chunks

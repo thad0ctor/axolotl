@@ -4,7 +4,7 @@ A fresh-init Llama-7B architecture (no weight download, no HF token) is
 wrapped end-to-end through the ProTrain runtime on a single RTX 3090 and
 one training iteration is executed. The test validates that the cost
 model's peak-memory and iteration-time predictions match reality within
-tolerance: 10% on peak (paper spec, OOM-safety invariant) and 35% on
+tolerance: 10% on peak (paper spec, OOM-safety invariant) and 10% on
 runtime.
 
 The paper claims 5% on iter-time accuracy under their lab conditions
@@ -17,17 +17,15 @@ the achievable accuracy is bounded by:
   measurement runs over 4 iters with median-of-2; different runs pick
   slightly different configs from the same model, so the prediction
   itself is non-deterministic)
-* cost-model residual systematic over-prediction ~15-20% on 7B-LoRA
-  (the bwd/fwd ratio fallback to 2.0× over-counts LoRA's near-frozen
-  backward; tightening would need real per-arch backward measurement
-  on a chunk-offloaded harness, which today OOMs in the profiler)
+* residual variance in the phase-2 chunked measurement and the
+  four-iteration validation loop; TRACE_VERSION 15 measures forward,
+  backward, and peak under the low-persistence all-CKPT runtime.
 
 Per-SKU compute-rate calibration (TRACE_VERSION 8) absorbs the cross-SKU
 ~10% spread when traces are replayed across 3090 / 3090 Ti — same-SKU
-runs see scale ≈ 1.0 and the calibration is a no-op. The 35% ceiling
-absorbs measured 23-34% same-SKU error across runs; tightening below
-30% reliably is blocked on fixing the LoRA bwd/fwd-ratio fallback (a
-separate engineering investment).
+runs see scale ≈ 1.0 and the calibration is a no-op. The 10% ceiling
+is now mostly a variance guard; the canonical v15 run lands around
+1% runtime error on this 3090 lane.
 
 Marked ``slow`` — excluded from the default pytest suite by the
 ``-m 'not slow'`` addopts clause in ``pyproject.toml``. Requires a free
@@ -265,7 +263,7 @@ def test_protrain_7b_end_to_end() -> None:
     # Peak stays strict at 10% — that is the OOM-safety invariant
     # (paper Eqs. 8-11 with ALPHA_FRAGMENTATION = 1.10).
     assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
-    # Runtime tolerance: 32% ceiling.
+    # Runtime tolerance: 10% ceiling.
     #
     # Calibration history on this workload (TRACE_VERSION → measured error):
     #   * v2 (per-op latencies):                    ~52%
@@ -305,23 +303,17 @@ def test_protrain_7b_end_to_end() -> None:
     #     already accounts for chunk-prefetch / gather overhead that
     #     the per-chunk max(compute, comm) roofline OVERESTIMATES under
     #     no-overlap assumptions): same-SKU 27-30% on 7B-LoRA on this
-    #     rig. Drops the prediction by ~0.07-0.08s vs v10 (forward
-    #     only — see the BACKWARD residual note below).
+    #     rig. Drops the prediction by ~0.07-0.08s vs v10, but leaves a
+    #     backward residual.
+    #   * v15 (checkpoint replay re-gathers chunks; phase-2 bootstraps a
+    #     low-persistence all-CKPT config; backward consumes the measured
+    #     chunked wall directly; measured phase-2 peak calibrates the
+    #     same-config peak): ~1% runtime error on this 3090 lane.
     #
-    # The remaining ~28% residual is BACKWARD per-chunk-roofline
-    # over-prediction. The chunked backward measurement is consumed
-    # via ``_bwd_compute_time_from_trace`` but the result still feeds
-    # the per-chunk max(compute, comm) distribution that adds
-    # chunk-comm time on top — same shape as the forward
-    # over-prediction v11 closed. Closing it would mirror the v11
-    # forward bypass on the backward path; that's a separate
-    # engineering investment (the task scoping was forward-only).
-    #
-    # Above 32% indicates a regression in the v11 calibration path or
-    # a new systematic bias.
-    assert runtime_err < 0.32, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=11 "
-        "calibration with phase-2 chunked forward + backward measurement. "
-        "Above 32% indicates a regression. "
+    # Above 10% indicates a regression in phase-2 measurement, cache
+    # invalidation, or the checkpoint replay gather path.
+    assert runtime_err < 0.10, (
+        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=15 "
+        "phase-2 chunked runtime calibration. Above 10% indicates a regression. "
         f"iter_s_all={iter_s_all}"
     )

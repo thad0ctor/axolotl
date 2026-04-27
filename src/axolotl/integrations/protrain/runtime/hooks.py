@@ -41,6 +41,19 @@ if TYPE_CHECKING:
 LOG = get_logger(__name__)
 
 
+class _RecomputePreHookHandle:
+    """Small removable handle for CheckpointedBlock recompute callbacks."""
+
+    def __init__(self, module: nn.Module) -> None:
+        self._module: nn.Module | None = module
+
+    def remove(self) -> None:
+        module = self._module
+        if module is not None and hasattr(module, "set_recompute_pre_hook"):
+            module.set_recompute_pre_hook(None)
+        self._module = None
+
+
 def _make_forward_pre_hook(scheduler: "Scheduler", block_id: BlockId):
     def _hook(module: nn.Module, inputs):  # noqa: ARG001 — signature required
         scheduler.pre_block_forward(block_id)
@@ -132,6 +145,11 @@ def install_hooks(
                 _make_backward_post_hook(scheduler, block_id)
             )
         )
+        if hasattr(block, "set_recompute_pre_hook"):
+            block.set_recompute_pre_hook(
+                lambda block_id=block_id: scheduler.ensure_block_resident(block_id)
+            )
+            handles.append(_RecomputePreHookHandle(block))  # type: ignore[arg-type]
 
     LOG.debug(
         "install_hooks: attached %d handles across %d transformer blocks",

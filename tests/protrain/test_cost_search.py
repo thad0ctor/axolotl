@@ -31,6 +31,7 @@ from axolotl.integrations.protrain.types import (
     OpRecord,
     ParamId,
     ProfilerTrace,
+    SearchResult,
 )
 
 
@@ -826,6 +827,42 @@ def test_estimate_runtime_phase2_bwd_bypasses_chunk_comm_but_keeps_recompute():
     assert t_ckpt - t_uncached == pytest.approx(per_op_sum, abs=1e-9)
 
 
+def test_phase2_bootstrap_uses_low_persistence_all_ckpt(
+    toy_trace, toy_layout, toy_hw
+):
+    """Phase-2 should measure the low-persistence offload family."""
+    from axolotl.integrations.protrain.profiler.phase2 import (
+        select_bootstrap_config,
+    )
+
+    n_block = len(toy_trace.activation_sizes)
+    initial = SearchResult(
+        cfg=CostConfig(
+            n_persist=toy_layout.N_chunk - 1,
+            n_buffer=1,
+            n_swap=0,
+            n_checkpoint=0,
+        ),
+        block_map=assign_modes(0, 0, n_block),
+        predicted_peak_bytes=0,
+        predicted_iter_s=0.0,
+    )
+
+    cfg, block_map = select_bootstrap_config(
+        initial_result=initial,
+        layout=toy_layout,
+        n_block=n_block,
+        capacity_bytes=12 * GB,
+        trace=toy_trace,
+        hw=toy_hw,
+    )
+
+    assert cfg.n_persist == 0
+    assert cfg.n_checkpoint == n_block
+    assert cfg.n_buffer >= 2  # adjacent one-chunk blocks need two buffers
+    assert all(mode.value == "ckpt" for mode in block_map.values())
+
+
 def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
     """SKU compute-rate calibration scales forward compute proportionally.
 
@@ -975,6 +1012,41 @@ def test_search_picks_feasible_config(toy_trace, toy_layout, toy_hw):
     assert result.predicted_iter_s > 0
     # And the block map should cover every block.
     assert len(result.block_map) == len(toy_trace.activation_sizes)
+
+
+def test_search_requires_ckpt_for_blocks_with_nonpersistent_chunks(
+    toy_trace, toy_layout, toy_hw
+):
+    """Search must not pick NONE/SWAP for blocks whose chunks are offloaded.
+
+    The current runtime releases non-persistent chunk storage after
+    forward; non-CKPT blocks can only be correct when all chunks they
+    own are persistent. Phase-2 calibration makes low-CKPT configs
+    look fast, so this is an admissibility constraint rather than a
+    runtime-cost preference.
+    """
+    from dataclasses import replace
+
+    n_block = len(toy_trace.activation_sizes)
+    trace = replace(
+        toy_trace,
+        steady_fwd_chunked_wall_s=0.05,
+        steady_bwd_chunked_wall_s=0.10,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.001,
+    )
+
+    # Tight enough that the all-persistent all-NONE configuration is
+    # GPU-infeasible, so the searcher must use offload.
+    result = search(trace, toy_layout, 700 * MB, toy_hw)
+    persistent = set(range(result.cfg.n_persist))
+    for bid, mode in result.block_map.items():
+        chunks = toy_layout.block_to_chunks.get(bid, ())
+        if any(int(cid) not in persistent for cid in chunks):
+            assert mode.value == "ckpt", (
+                f"block {bid} owns non-persistent chunks {chunks} but "
+                f"search picked mode={mode} cfg={result.cfg}"
+            )
 
 
 def test_search_raises_when_nothing_fits(toy_trace, toy_layout, toy_hw):
