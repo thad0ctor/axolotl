@@ -27,6 +27,7 @@ from torch import nn
 from axolotl.integrations.protrain.block import (
     assign_modes,
     discover_blocks,
+    unwrap_block,
     wrap_block,
 )
 from axolotl.integrations.protrain.chunk import (
@@ -370,7 +371,23 @@ def _calibrate_peak_with_actual_chunk_bytes(
             reconstructed_f_bm = non_ckpt_act + one_ckpt_act + max_op_delta
             # Use the smaller of the two estimates — never INCREASE the
             # prediction (cost model is already upper-bounding).
-            f_bm = min(f_bm, reconstructed_f_bm)
+            #
+            # Exception: when ``f_bm`` clamped to 0 because the
+            # calibration's *effective* n_persist (post non-block-chunk
+            # pinning) exceeds the search's raw n_persist, the
+            # ``original_peak / alpha - original_model_state`` arithmetic
+            # subtracts more than the original raw_peak budgeted. The
+            # search's predicted_peak was computed with the raw n_persist,
+            # so ``original_peak / alpha`` reflects that smaller model
+            # state plus activations + deltas. The differential between
+            # raw and effective n_persist eats into the activation
+            # headroom and leaves f_bm at 0 — but the trace-derived
+            # reconstructed_f_bm is still a valid independent activation
+            # estimate. Use it when f_bm has degenerated to 0.
+            if f_bm > 0:
+                f_bm = min(f_bm, reconstructed_f_bm)
+            else:
+                f_bm = reconstructed_f_bm
 
     # Reassemble with the actual persistent bytes + corrected F_bm.
     #
@@ -1390,17 +1407,230 @@ def protrain_model_wrapper(
             )
 
     # ---- 4. construct runtime ------------------------------------------
-    chunk_manager, scheduler, handles, result = _construct_runtime(
-        model=model,
-        blocks=blocks,
-        layout=layout,
-        result=result,
-        hardware_profile=hardware_profile,
-        capacity_bytes=capacity_bytes,
-        trace=trace,
-        zero3_shard=zero3_shard,
-        device=device,
+    # When phase-2 is enabled (default on cache-miss profiles where the
+    # backward was skipped), build under a CONSERVATIVE bootstrap config
+    # first, take a chunked-runtime backward measurement, splice it into
+    # the trace, persist, re-run search, and — if the new pick differs
+    # from the bootstrap — tear down + rebuild under the post-research
+    # cfg. The optimizer state slots are NOT yet wired into the trainer
+    # at this point (the plugin's create_optimizer / post_trainer_create
+    # pass haven't fired), so a rebuild here is safe.
+    n_block = len(trace.activation_sizes)
+    use_phase2 = (
+        torch.cuda.is_available()
+        and trace.steady_bwd_chunked_wall_s == 0.0
+        and n_block > 0
     )
+    if use_phase2:
+        from axolotl.integrations.protrain.profiler.phase2 import (
+            estimate_per_block_recompute_s,
+            measure_chunked_steady,
+            select_bootstrap_config,
+        )
+
+        boot_cfg, boot_block_map = select_bootstrap_config(
+            initial_result=result,
+            layout=layout,
+            n_block=n_block,
+            capacity_bytes=capacity_bytes,
+            trace=trace,
+            hw=hardware_profile,
+        )
+        boot_result = SearchResult(
+            cfg=boot_cfg,
+            block_map=boot_block_map,
+            predicted_peak_bytes=result.predicted_peak_bytes,
+            predicted_iter_s=result.predicted_iter_s,
+        )
+        chunk_manager, scheduler, handles, boot_result = _construct_runtime(
+            model=model,
+            blocks=blocks,
+            layout=layout,
+            result=boot_result,
+            hardware_profile=hardware_profile,
+            capacity_bytes=capacity_bytes,
+            trace=trace,
+            zero3_shard=zero3_shard,
+            device=device,
+        )
+
+        # Build a transient WrappedModel + optimizer for the measurement.
+        boot_wrapped = WrappedModel(
+            module=model,
+            search_result=boot_result,
+            chunk_manager=chunk_manager,
+            scheduler=scheduler,
+            _hook_handles=list(handles),
+        )
+        from axolotl.integrations.protrain.api.optim_wrapper import (
+            protrain_optimizer_wrapper,
+        )
+
+        boot_optim = protrain_optimizer_wrapper(boot_wrapped, lr=1e-4)
+        boot_batch = _dummy_batch(model, batch_size, seq_len, device)
+
+        measurement_failed = False
+        bwd_s = 0.0
+        step_s = 0.0
+        try:
+            bwd_s, step_s = measure_chunked_steady(
+                model=model, batch=boot_batch, optimizer=boot_optim
+            )
+        except Exception as exc:  # noqa: BLE001 — measurement is best-effort
+            LOG.warning(
+                "Phase-2 chunked measurement raised %s; falling back to "
+                "the v8 cost-model path under the searcher's original "
+                "pick. Tighten or disable the phase-2 gate if the "
+                "failure is reproducible.", exc,
+            )
+            measurement_failed = True
+
+        if measurement_failed:
+            # Tear down the bootstrap runtime and rebuild under the
+            # original search's pick. Phase-2 must be transparent on
+            # failure — callers should see the same wrapper behavior
+            # they'd get with phase-2 disabled. Unwrap blocks so the
+            # rebuild's _build_block_spans sees the original param
+            # names that match layout.chunks (see the cfg-changed
+            # teardown branch for the full explanation).
+            for h in handles:
+                try:
+                    h.remove()  # type: ignore[attr-defined]
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    LOG.debug(
+                        "phase-2 fallback teardown: hook handle "
+                        "remove failed: %s", exc,
+                    )
+            module_list_unwrap = _find_parent_module_list(model, blocks)
+            for idx, block in enumerate(blocks):
+                unwrapped = unwrap_block(block)
+                if unwrapped is not block and module_list_unwrap is not None:
+                    module_list_unwrap[idx] = unwrapped
+                    blocks[idx] = unwrapped
+            chunk_manager.restore_to_gpu()
+            del boot_wrapped, boot_optim, chunk_manager, scheduler, handles
+            chunk_manager, scheduler, handles, result = _construct_runtime(
+                model=model,
+                blocks=blocks,
+                layout=layout,
+                result=result,
+                hardware_profile=hardware_profile,
+                capacity_bytes=capacity_bytes,
+                trace=trace,
+                zero3_shard=zero3_shard,
+                device=device,
+            )
+        if not measurement_failed:
+            per_block_recompute_s = estimate_per_block_recompute_s(
+                trace, n_block
+            )
+            from dataclasses import replace as _replace
+
+            new_trace = _replace(
+                trace,
+                steady_bwd_chunked_wall_s=bwd_s,
+                steady_step_overlap_s=step_s,
+                phase2_n_checkpoint=boot_cfg.n_checkpoint,
+                phase2_per_block_recompute_s=per_block_recompute_s,
+            )
+            try:
+                save_cached_trace(cache_key, new_trace)
+            except OSError as exc:
+                LOG.warning(
+                    "Phase-2: failed to persist updated trace (%s); the "
+                    "in-memory trace is still updated for this run.", exc,
+                )
+            trace = new_trace
+
+            # Re-run search with phase-2 fields populated.
+            new_result = search(
+                trace, layout, capacity_bytes, hardware_profile
+            )
+            # Compare the SEARCH's raw pick (boot_cfg) against the
+            # search's raw new pick (new_result.cfg) — NOT the
+            # calibrated boot_result.cfg. _construct_runtime's
+            # peak-calibration path widens cfg.n_persist to include the
+            # non-block-chunk pin set (typically +1-2 chunks beyond the
+            # search's raw pick), so boot_result.cfg.n_persist != boot_cfg.n_persist
+            # whenever any non-block chunk got pinned. Comparing
+            # against boot_result.cfg would treat that bookkeeping
+            # delta as a cfg change and trigger an unnecessary rebuild
+            # whose calibration produces the wrong peak (the new
+            # SearchResult's predicted_peak_bytes was estimated with
+            # the search's RAW n_persist, which is smaller than the
+            # rebuild's effective post-pinning n_persist, collapsing
+            # f_bm to 0 in the calibration arithmetic).
+            cfg_changed = (
+                new_result.cfg != boot_cfg
+                or new_result.block_map != boot_block_map
+            )
+            if not cfg_changed:
+                LOG.info(
+                    "Phase-2: post-measurement search picked the same cfg "
+                    "(predicted_iter_s %.4f -> %.4f); keeping bootstrap "
+                    "runtime in place.",
+                    boot_result.predicted_iter_s,
+                    new_result.predicted_iter_s,
+                )
+                result = new_result
+                wrapped = boot_wrapped
+                wrapped.search_result = result
+            else:
+                LOG.info(
+                    "Phase-2: post-measurement search picked a different "
+                    "cfg (%s -> %s); tearing down bootstrap runtime and "
+                    "rebuilding under the new pick.",
+                    boot_result.cfg,
+                    new_result.cfg,
+                )
+                # Teardown: uninstall hooks, unwrap blocks (so the
+                # rebuild's calibration sees the original parameter
+                # names that match layout.chunks — wrap_block inserts a
+                # ``.block.`` infix into named_parameters() paths which
+                # would otherwise make _build_block_spans miss every
+                # block param), restore params to standalone GPU
+                # storage, drop the bootstrap chunk_manager. The next
+                # _construct_runtime re-wraps under the new block_map
+                # via wrap_block (which is itself idempotent).
+                for h in handles:
+                    try:
+                        h.remove()  # type: ignore[attr-defined]
+                    except Exception as exc:  # noqa: BLE001 — best-effort
+                        LOG.debug(
+                            "phase-2 teardown: hook handle remove "
+                            "failed: %s", exc,
+                        )
+                module_list_unwrap = _find_parent_module_list(model, blocks)
+                for idx, block in enumerate(blocks):
+                    unwrapped = unwrap_block(block)
+                    if unwrapped is not block and module_list_unwrap is not None:
+                        module_list_unwrap[idx] = unwrapped
+                        blocks[idx] = unwrapped
+                chunk_manager.restore_to_gpu()
+                del boot_wrapped, boot_optim, chunk_manager, scheduler, handles
+                chunk_manager, scheduler, handles, result = _construct_runtime(
+                    model=model,
+                    blocks=blocks,
+                    layout=layout,
+                    result=new_result,
+                    hardware_profile=hardware_profile,
+                    capacity_bytes=capacity_bytes,
+                    trace=trace,
+                    zero3_shard=zero3_shard,
+                    device=device,
+                )
+    else:
+        chunk_manager, scheduler, handles, result = _construct_runtime(
+            model=model,
+            blocks=blocks,
+            layout=layout,
+            result=result,
+            hardware_profile=hardware_profile,
+            capacity_bytes=capacity_bytes,
+            trace=trace,
+            zero3_shard=zero3_shard,
+            device=device,
+        )
 
     LOG.info(
         "ProTrain config: n_persist=%d n_buffer=%d n_swap=%d n_checkpoint=%d "

@@ -71,17 +71,54 @@ class CpuFusedAdamAdapter:
         self.weight_decay = float(weight_decay)
 
         # One DeepSpeedCPUAdam per chunk — cheap; shares no state.
+        # DeepSpeedCPUAdam silently constructs a half-initialized object
+        # when the C++ adam_bindings extension fails to compile (e.g.
+        # under a system CUDA / torch CUDA version mismatch — the
+        # warning surfaces from `deepspeed.ops.op_builder` but the
+        # constructor doesn't raise). The half-init object lacks
+        # ``ds_opt_adam`` and crashes later in both ``.step()`` and
+        # ``__del__``. We probe for the attribute right after each
+        # construction; missing means the extension isn't loaded and we
+        # raise so callers' try/except can fall back to the inline GPU
+        # optimizer path. Without this guard the bad objects survive,
+        # their ``__del__`` AttributeErrors propagate as
+        # PytestUnraisableExceptionWarning and accumulate into test
+        # failures whenever multiple adapter constructions happen
+        # (phase-2 profiler bootstrap → rebuild → user optim wrapper).
         self._optims: dict[ChunkId, Any] = {}
         for cid, params in self._params_per_chunk.items():
             if not params:
                 continue
-            self._optims[cid] = DeepSpeedCPUAdam(
+            opt = DeepSpeedCPUAdam(
                 params,
                 lr=self.lr,
                 betas=self.betas,
                 eps=self.eps,
                 weight_decay=self.weight_decay,
             )
+            if not hasattr(opt, "ds_opt_adam"):
+                # Suppress this object's __del__ AttributeError so the
+                # raise below propagates cleanly. DeepSpeed's destructor
+                # calls ``self.ds_opt_adam.destroy_adam(self.opt_id)``;
+                # planting a no-op stub keeps the destructor harmless
+                # without monkey-patching the special __del__ slot.
+                class _NoopDsAdam:  # noqa: N801 — internal stub
+                    def destroy_adam(self, _opt_id):
+                        return None
+                try:
+                    opt.ds_opt_adam = _NoopDsAdam()  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+                raise RuntimeError(
+                    "DeepSpeedCPUAdam C++ extension (adam_bindings) is not "
+                    "loaded — the constructed object is missing "
+                    "`ds_opt_adam` and will crash on .step(). Common "
+                    "cause: system nvcc CUDA version differs from the "
+                    "version PyTorch was compiled with. Either install a "
+                    "matching CUDA toolkit or set DS_SKIP_CUDA_CHECK=1 "
+                    "and rebuild DeepSpeed."
+                )
+            self._optims[cid] = opt
 
         # Single-worker executor — see module docstring for rationale.
         self._executor = ThreadPoolExecutor(
