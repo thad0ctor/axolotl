@@ -876,6 +876,29 @@ class ChunkManager:
         ``S_chunk``). This is the foundation for the phase-2 profiler's
         bootstrap-then-rebuild flow (paper §3.2 calibration loop).
 
+        Sharded path (``zero3_shard=True``)
+        -----------------------------------
+        For sharded chunks ``slot.cpu_data is None`` — the bytes live
+        in per-rank slices across ``self._chunk_shards``. Each chunk
+        is reassembled by issuing one
+        :func:`torch.distributed.all_gather_into_tensor` per
+        :class:`_DtypeRegion`: this rank's pinned CPU shard is
+        H2D-staged into a GPU buffer (mirroring the materialize-time
+        partition step), every rank's contribution is gathered into a
+        ``region_bytes_padded``-sized GPU scratch, and the valid
+        ``region_bytes`` prefix is copied into the chunk's reassembly
+        buffer at the region's recorded ``chunk_offset``. Once every
+        region is in place the chunk-sized buffer holds the same byte
+        layout the replicated path would have produced; per-slot
+        rebind then proceeds exactly as in the non-sharded branch.
+
+        The collective is a no-op when ``world_size == 1`` (every shard
+        IS the full region) but ``materialize_offload`` does not engage
+        the sharded path under ``world_size == 1`` to begin with — see
+        ``__init__``'s ``self.zero3_shard = ... and self.world_size > 1``
+        guard — so this method only runs the all_gather when there are
+        actually peer ranks to talk to.
+
         Returns
         -------
         int
@@ -884,25 +907,15 @@ class ChunkManager:
 
         Raises
         ------
-        NotImplementedError
-            When ``zero3_shard`` is True on this manager. The phase-2
-            measurement runs single-rank by construction (it's invoked
-            from ``protrain_model_wrapper`` BEFORE Trainer brings up
-            distributed), so a sharded restore is not on any code path
-            we need today. Adding it would require an ``all_gather`` to
-            reconstruct full-chunk bytes from per-rank shards before the
-            copy-and-rebind step.
+        RuntimeError
+            When ``zero3_shard`` is True but ``torch.distributed`` is
+            not initialized. The sharded path requires a live process
+            group to issue the per-region ``all_gather_into_tensor``;
+            calling restore on a manager whose distributed context has
+            already been torn down is a programmer error.
 
         Idempotent: a second call with no offload materialized is a no-op.
         """
-        if self.zero3_shard and (self._cpu_slots or self._chunk_shards):
-            raise NotImplementedError(
-                "ChunkManager.restore_to_gpu: sharded teardown not "
-                "implemented (would need an all_gather per chunk to "
-                "reassemble bytes before rebind). Phase-2 runs "
-                "single-rank by construction so this code path is "
-                "unreachable from the wrapper today."
-            )
         if not self._cpu_slots and not self._persistent_buffers:
             LOG.debug(
                 "ChunkManager.restore_to_gpu: nothing offloaded "
@@ -912,15 +925,38 @@ class ChunkManager:
 
         import torch
 
+        # Pre-flight: sharded restore needs a live process group for
+        # the per-region all_gather. Catch the misuse here with a clean
+        # error rather than letting torch.distributed raise an opaque
+        # "default process group not initialized" deep in the call stack.
+        if self.zero3_shard and self._chunk_shards:
+            if not (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                raise RuntimeError(
+                    "ChunkManager.restore_to_gpu: zero3_shard=True but "
+                    "torch.distributed is not initialized. Sharded "
+                    "teardown needs a live process group to all_gather "
+                    "the per-rank shards back into full chunks before "
+                    "rebinding param.data. Call restore_to_gpu BEFORE "
+                    "destroy_process_group()."
+                )
+
         moved = 0
 
         # ---- Non-persistent chunks: copy from pinned CPU slots --------
+        # For sharded chunks ``slot.cpu_data is None`` — those are
+        # handled by the sharded reassembly block below. For replicated
+        # (non-sharded) chunks, slot.cpu_data is the full-shape pinned
+        # tensor and the per-slot copy is the inverse of materialize.
         for cid, slots in self._cpu_slots.items():
+            if cid in self._chunk_shards:
+                # Defer to the sharded reassembly pass below.
+                continue
             for slot in slots:
                 param = self._params_by_id.get(slot.param_id)
                 if param is None or slot.cpu_data is None:
-                    # cpu_data is None on sharded slots; the guard above
-                    # already short-circuited that case but be defensive.
                     continue
                 gpu_tensor = torch.empty(
                     slot.shape, dtype=slot.dtype, device=self.device
@@ -928,6 +964,99 @@ class ChunkManager:
                 gpu_tensor.copy_(slot.cpu_data)
                 param.data = gpu_tensor
                 moved += slot.numel * slot.element_size
+
+        # ---- Sharded chunks: per-region all_gather, then per-slot rebind
+        # Reverses ``materialize_offload``'s shard-time partition (lines
+        # ~753-836). For each region we reconstruct the full
+        # ``region_bytes_padded`` byte image on GPU via
+        # ``all_gather_into_tensor``, then copy the valid
+        # ``[0, region_bytes)`` prefix into a chunk-sized GPU scratch at
+        # the region's ``chunk_offset``. After every region for the
+        # chunk is in place, walk the chunk's slots and rebind each
+        # param.data to a fresh standalone GPU tensor sliced from the
+        # scratch at ``slot.byte_offset``. This is the exact inverse of
+        # the materialize-time
+        #   "full chunk_bytes -> per-region scratch -> per-rank shard"
+        # data flow.
+        if self.zero3_shard and self._chunk_shards:
+            import torch.distributed as dist
+
+            for cid, shard_state in self._chunk_shards.items():
+                # Chunk-sized GPU scratch holding the reassembled bytes.
+                # Must use the manager's device so the per-slot rebind
+                # below produces tensors on the same device as the
+                # rest of the model.
+                chunk_buf = torch.empty(
+                    shard_state.chunk_bytes,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+
+                for region in shard_state.regions:
+                    # Stage this rank's CPU shard onto GPU. Mirrors the
+                    # gather-time copy in ``_gather_sharded`` but drives
+                    # the all_gather directly into a freshly allocated
+                    # transient (we do NOT consult the buffer pool here
+                    # — restore is a one-shot teardown and the pool may
+                    # already be torn down by the caller).
+                    my_shard_gpu = torch.empty(
+                        region.shard_bytes,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    my_shard_gpu.copy_(
+                        region.cpu_shard_bytes, non_blocking=True
+                    )
+
+                    # Padded gather output: region_bytes_padded ==
+                    # shard_bytes * world_size, so this matches the
+                    # all_gather_into_tensor contract exactly (output
+                    # length == input length * world_size).
+                    gather_scratch = torch.empty(
+                        region.region_bytes_padded,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    dist.all_gather_into_tensor(gather_scratch, my_shard_gpu)
+
+                    # Copy only the VALID prefix into the chunk
+                    # reassembly buffer at the region's chunk offset.
+                    # The trailing pad bytes (region_bytes_padded -
+                    # region_bytes) are never read by any slot's
+                    # byte_offset slice, so leaving them
+                    # uninitialized in chunk_buf is correct.
+                    chunk_buf.narrow(
+                        0, region.chunk_offset, region.region_bytes
+                    ).copy_(gather_scratch.narrow(0, 0, region.region_bytes))
+
+                # All regions are in place: rebind each slot to a
+                # fresh standalone GPU tensor. Per-slot fresh
+                # allocation matches the non-sharded branch's
+                # invariant — every param owns its own storage after
+                # restore so the next ChunkManager can rebuild from
+                # scratch under a new layout. We could keep params
+                # pointing into ``chunk_buf`` to save bytes, but a
+                # subsequent materialize_offload would then see params
+                # whose .data aliases each other and corrupt its
+                # alignment-padding pass.
+                slots = self._cpu_slots.get(cid, [])
+                for slot in slots:
+                    param = self._params_by_id.get(slot.param_id)
+                    if param is None:
+                        continue
+                    nbytes = slot.numel * slot.element_size
+                    if nbytes == 0:
+                        continue
+                    byte_view = chunk_buf.narrow(
+                        0, slot.byte_offset, nbytes
+                    )
+                    typed = byte_view.view(slot.dtype).view(slot.shape)
+                    gpu_tensor = torch.empty(
+                        slot.shape, dtype=slot.dtype, device=self.device
+                    )
+                    gpu_tensor.copy_(typed)
+                    param.data = gpu_tensor
+                    moved += nbytes
 
         # ---- Persistent chunks: extract from the resident pool buffer
         # back into standalone GPU storage. The pool buffer itself can
