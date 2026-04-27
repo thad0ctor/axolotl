@@ -109,6 +109,20 @@ class ProTrainArgs(BaseModel):
         },
     )
 
+    protrain_cpu_capacity_bytes: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": (
+                "Per-rank pinned CPU RAM budget (bytes) the searcher uses as a "
+                "HARD feasibility filter. Configs whose estimated per-rank "
+                "non-persistent chunk footprint exceeds this are dropped before "
+                "runtime evaluation. When None, the wrapper auto-derives "
+                "``psutil.virtual_memory().available // gpu_count - 2 GiB`` "
+                "(disabled with a warning if psutil isn't installed)."
+            )
+        },
+    )
+
     protrain_cache_dir: str | None = Field(
         default=None,
         json_schema_extra={
