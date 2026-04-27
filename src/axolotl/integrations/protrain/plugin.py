@@ -163,8 +163,14 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
     # gpu_count was already correct at wrapper time (hw.gpu_count was
     # set from torch.cuda.device_count(), which under torchrun is the
     # per-rank device count, not the world size; the searcher reads
-    # ``trace.world`` for the comm-cost gate).
-    new_result = search(new_trace, layout, capacity, hw)
+    # ``trace.world`` for the comm-cost gate). Reuse the same per-rank
+    # CPU feasibility budget the original search consumed; ``None``
+    # means the wrapper deferred to the GPU-only filter (e.g. psutil
+    # missing) and the re-search should mirror that.
+    cpu_capacity = getattr(wrapped, "_cpu_capacity_bytes", None)
+    new_result = search(
+        new_trace, layout, capacity, hw, cpu_capacity_bytes=cpu_capacity
+    )
 
     cfg_changed = (
         new_result.cfg != wrapped.search_result.cfg
@@ -326,6 +332,7 @@ class ProTrainPlugin(BasePlugin):
         micro_batch_size = int(getattr(cfg, "micro_batch_size", 1) or 1)
         seq_len = int(getattr(cfg, "sequence_len", 1024) or 1024)
         capacity_bytes = getattr(cfg, "protrain_capacity_bytes", None)
+        cpu_capacity_bytes = getattr(cfg, "protrain_cpu_capacity_bytes", None)
         cache_dir = getattr(cfg, "protrain_cache_dir", None)
         force_all_persistent = bool(
             getattr(cfg, "protrain_force_all_persistent", False)
@@ -357,6 +364,7 @@ class ProTrainPlugin(BasePlugin):
             batch_size=micro_batch_size,
             seq_len=seq_len,
             capacity_bytes=capacity_bytes,
+            cpu_capacity_bytes=cpu_capacity_bytes,
             cache_dir=cache_dir,
             force_all_persistent=force_all_persistent,
             n_persist_override=n_persist_override,

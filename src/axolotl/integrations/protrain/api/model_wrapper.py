@@ -73,6 +73,12 @@ LOG = get_logger(__name__)
 # context + PyTorch allocator overhead, matching the M4 task spec.
 _DEFAULT_HEADROOM_BYTES = 2 * (1 << 30)
 
+# Per-rank safety margin subtracted from probed CPU available bytes when
+# auto-deriving the search-time CPU capacity filter. Leaves slack for
+# allocator fragmentation, framework working set, and dataloader workers
+# that the per-rank divide doesn't explicitly model.
+_DEFAULT_CPU_HEADROOM_BYTES = 2 * (1 << 30)
+
 
 def _sku(device: "torch.device | str") -> str:
     import torch
@@ -495,6 +501,44 @@ def _cpu_ram_per_rank_bytes(world_size: int) -> int:
     # gap and pick the safest fit-on-GPU path. Callers can log a warning
     # at the call site.
     return 0
+
+
+def _default_cpu_capacity_for_search(gpu_count: int) -> int | None:
+    """Derive the per-rank CPU capacity used as a search-time hard filter.
+
+    Returns ``psutil.virtual_memory().available // gpu_count - 2 GiB`` when
+    psutil is importable; ``None`` otherwise. ``None`` means "no CPU
+    feasibility filter" — the search behaves exactly as it did before
+    the M-follow-up CPU filter landed, which is the safe behaviour when
+    we can't even probe how much RAM is available.
+
+    Distinct from :func:`_cpu_ram_per_rank_bytes` (which auto-mode uses
+    to pick between Mode B and Mode C and prefers a 0 fallback): the
+    SEARCH filter is a HARD gate that rejects configs outright, so a
+    bogus 0 from a missing-psutil environment would falsely reject every
+    candidate. Returning ``None`` keeps the searcher unconstrained
+    instead.
+    """
+    gc = max(1, int(gpu_count))
+    try:
+        import psutil
+    except ImportError:
+        LOG.warning(
+            "psutil not installed; ProTrain search-time CPU feasibility "
+            "filter is disabled. Install psutil to enable host-RAM "
+            "filtering of search candidates."
+        )
+        return None
+    try:
+        available = int(psutil.virtual_memory().available)
+    except Exception as exc:  # noqa: BLE001 — defensive on exotic platforms
+        LOG.warning(
+            "psutil.virtual_memory() raised %s; ProTrain search-time CPU "
+            "feasibility filter is disabled for this run.", exc,
+        )
+        return None
+    per_rank = available // gc - _DEFAULT_CPU_HEADROOM_BYTES
+    return max(0, int(per_rank))
 
 
 def _select_mode(
@@ -940,6 +984,7 @@ def protrain_model_wrapper(
     batch_size: int,
     seq_len: int,
     capacity_bytes: int | None = None,
+    cpu_capacity_bytes: int | None = None,
     cache_dir: str | None = None,  # noqa: ARG001 — reserved for future cache redirection
     force_all_persistent: bool = False,
     n_persist_override: int | None = None,
@@ -970,6 +1015,23 @@ def protrain_model_wrapper(
         When ``None``, defaults to
         ``hardware_profile.gpu_memory_bytes - 2 GiB`` to leave headroom
         for the CUDA context + PyTorch allocator.
+    cpu_capacity_bytes:
+        Per-rank pinned CPU RAM budget the searcher should treat as a
+        HARD feasibility filter. Configs whose
+        :func:`~axolotl.integrations.protrain.cost.memory.estimate_cpu_footprint`
+        exceeds this value are dropped before runtime evaluation, so
+        the picked config is guaranteed to fit BOTH the GPU and CPU
+        envelopes. When ``None`` (default), the wrapper auto-derives
+        ``psutil.virtual_memory().available // hw.gpu_count - 2 GiB``;
+        if psutil is not installed, the filter is disabled and a
+        warning is logged. Pass an explicit ``int`` to override the
+        auto-derivation, or pass an explicit ``int(<huge>)`` (or a
+        negative dummy value via the wrapping plugin) to deactivate
+        when the auto value over-restricts on machines with NUMA-aware
+        allocators. Complements the :func:`_select_mode` auto-mode
+        layer: the SEARCH filter gates which configs are even
+        evaluable; auto-mode then picks between feasible cfgs that
+        already passed both gates.
     cache_dir:
         Reserved. Profiler cache directory resolution currently lives
         in ``profiler.cache._cache_root`` via the ``XDG_CACHE_HOME`` env
@@ -1118,6 +1180,19 @@ def protrain_model_wrapper(
     if capacity_bytes is None:
         capacity_bytes = max(
             0, int(hardware_profile.gpu_memory_bytes) - _DEFAULT_HEADROOM_BYTES
+        )
+
+    # Auto-derive the search-time CPU feasibility budget when the caller
+    # did not provide one. This is a HARD search filter (configs whose
+    # estimated per-rank pinned CPU footprint exceeds this value are
+    # dropped before runtime evaluation), distinct from and complementary
+    # to the auto-mode selector below — see ``_select_mode``.
+    # ``_default_cpu_capacity_for_search`` returns ``None`` when psutil
+    # isn't installed (logs a warning) so the searcher falls back to its
+    # GPU-only behaviour.
+    if cpu_capacity_bytes is None:
+        cpu_capacity_bytes = _default_cpu_capacity_for_search(
+            hardware_profile.gpu_count
         )
 
     # Early world-size probe — the mode selector + zero3_shard plumbing
@@ -1335,7 +1410,13 @@ def protrain_model_wrapper(
             f"N_block={n_block})\n"
         )
         _sys2.stderr.flush()
-        result = search(trace, layout, int(capacity_bytes), hardware_profile)
+        result = search(
+            trace,
+            layout,
+            int(capacity_bytes),
+            hardware_profile,
+            cpu_capacity_bytes=cpu_capacity_bytes,
+        )
         _sys2.stderr.write(
             f"[protrain] search done: cfg={result.cfg} "
             f"peak={result.predicted_peak_bytes/1e9:.2f}GB "
@@ -1560,9 +1641,16 @@ def protrain_model_wrapper(
                 )
             trace = new_trace
 
-            # Re-run search with phase-2 fields populated.
+            # Re-run search with phase-2 fields populated. Reuse the
+            # same CPU feasibility budget — phase-2 only refines runtime
+            # estimates, not memory accounting, so the CPU envelope
+            # binding doesn't change.
             new_result = search(
-                trace, layout, capacity_bytes, hardware_profile
+                trace,
+                layout,
+                capacity_bytes,
+                hardware_profile,
+                cpu_capacity_bytes=cpu_capacity_bytes,
             )
             # Compare the SEARCH's raw pick (boot_cfg) against the
             # search's raw new pick (new_result.cfg) — NOT the
@@ -1680,6 +1768,12 @@ def protrain_model_wrapper(
     wrapped._trace = trace  # type: ignore[attr-defined]
     wrapped._layout = layout  # type: ignore[attr-defined]
     wrapped._capacity_bytes = int(capacity_bytes)  # type: ignore[attr-defined]
+    # Carry the CPU feasibility budget through so the plugin's
+    # post_trainer_create remeasure path can reuse the same hard filter
+    # when it re-runs the search after dist init.
+    wrapped._cpu_capacity_bytes = (  # type: ignore[attr-defined]
+        int(cpu_capacity_bytes) if cpu_capacity_bytes is not None else None
+    )
     wrapped._hardware_profile = hardware_profile  # type: ignore[attr-defined]
     wrapped._cache_key = cache_key  # type: ignore[attr-defined]
     return wrapped

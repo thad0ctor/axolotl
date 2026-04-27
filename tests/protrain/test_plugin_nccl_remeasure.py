@@ -236,7 +236,7 @@ def test_remeasure_splices_nccl_and_keeps_search_result_when_unchanged(
 
     search_calls: list[ProfilerTrace] = []
 
-    def fake_search(trace, layout, capacity_bytes, hw):
+    def fake_search(trace, layout, capacity_bytes, hw, cpu_capacity_bytes=None):
         search_calls.append(trace)
         return new_result
 

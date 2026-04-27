@@ -827,6 +827,136 @@ def test_search_raises_when_nothing_fits(toy_trace, toy_layout, toy_hw):
         search(toy_trace, toy_layout, 0, toy_hw)
 
 
+def test_search_cpu_capacity_filter_excludes_high_offload_configs(
+    toy_trace, toy_layout, toy_hw
+):
+    """CPU feasibility filter must drop configs whose CPU footprint exceeds the budget.
+
+    Toy layout: N_chunk=12, S_chunk=64MB → CPU footprint =
+    ``(12 - n_persist) * S_chunk`` per rank under the replicated
+    (``zero3_shard=False``) path.
+
+    Setup: a tight GPU capacity forces the unfiltered searcher to pick
+    a CPU-heavy cfg (the lowest n_persist that still clears the GPU
+    gate is also the highest n_persist the runtime model can pick,
+    because the runtime favours fewer CPU-resident chunks). With a
+    LOOSE CPU budget (>= baseline footprint) the same cfg is picked.
+    With a TIGHT CPU budget (< baseline footprint) the searcher must
+    either pick a different cfg or raise — and on this synthetic
+    fixture every higher-n_persist alternative is GPU-infeasible, so
+    the filter exposes the no-fit case. That last branch is covered
+    by ``test_search_raises_cpu_pressure_specific_message_when_no_cfg_fits_both``;
+    here we assert (a) loose-budget = baseline pick, (b) tighter-but-
+    still-feasible budget = baseline still picked, (c) budget below
+    baseline footprint excludes baseline (verified via the picked
+    cfg's footprint).
+    """
+    capacity = 600 * MB
+    # Sanity: unfiltered pick has non-zero CPU footprint on this fixture.
+    baseline = search(toy_trace, toy_layout, capacity, toy_hw)
+    baseline_cpu = (
+        toy_layout.N_chunk - baseline.cfg.n_persist
+    ) * toy_layout.S_chunk
+    assert baseline_cpu > 0, (
+        f"fixture sanity: baseline must offload >0B to CPU for the "
+        f"filter to have anything to reject; got cfg={baseline.cfg}"
+    )
+
+    # (a) Loose CPU budget (matches baseline footprint) -> same pick.
+    loose = search(
+        toy_trace,
+        toy_layout,
+        capacity,
+        toy_hw,
+        cpu_capacity_bytes=baseline_cpu,
+    )
+    assert loose.cfg == baseline.cfg, (
+        f"CPU budget == baseline footprint should not change the pick; "
+        f"baseline={baseline.cfg} loose={loose.cfg}"
+    )
+
+    # (b) CPU budget strictly above baseline footprint -> same pick.
+    above = search(
+        toy_trace,
+        toy_layout,
+        capacity,
+        toy_hw,
+        cpu_capacity_bytes=baseline_cpu + 10 * MB,
+    )
+    assert above.cfg == baseline.cfg
+
+    # (c) CPU budget BELOW baseline footprint -> baseline excluded.
+    # On this fixture every n_persist >= baseline.n_persist that would
+    # reduce CPU footprint is GPU-infeasible at capacity=600MB, so the
+    # search must raise — covered by the dedicated CPU-pressure test
+    # below. Here we just assert the boundary: at exactly
+    # ``baseline_cpu - 1`` the search no longer admits the baseline cfg.
+    with pytest.raises(RuntimeError, match=r"no ProTrain config fits in"):
+        search(
+            toy_trace,
+            toy_layout,
+            capacity,
+            toy_hw,
+            cpu_capacity_bytes=baseline_cpu - 1,
+        )
+
+
+def test_search_cpu_capacity_none_matches_pre_filter_behaviour(
+    toy_trace, toy_layout, toy_hw
+):
+    """Backward-compat: ``cpu_capacity_bytes=None`` -> identical pick.
+
+    The pre-filter signature ``search(trace, layout, capacity, hw)`` and
+    the new signature ``search(..., cpu_capacity_bytes=None)`` must
+    produce byte-identical SearchResults. Same cfg, same block_map,
+    same predicted peak, same predicted iter_s.
+    """
+    capacity = 12 * GB
+    pre_filter = search(toy_trace, toy_layout, capacity, toy_hw)
+    explicit_none = search(
+        toy_trace, toy_layout, capacity, toy_hw, cpu_capacity_bytes=None
+    )
+    assert pre_filter.cfg == explicit_none.cfg
+    assert pre_filter.block_map == explicit_none.block_map
+    assert pre_filter.predicted_peak_bytes == explicit_none.predicted_peak_bytes
+    assert pre_filter.predicted_iter_s == explicit_none.predicted_iter_s
+
+
+def test_search_raises_cpu_pressure_specific_message_when_no_cfg_fits_both(
+    toy_trace, toy_layout, toy_hw
+):
+    """When at least one cfg clears the GPU gate but every one busts the
+    CPU envelope, the failure message must explicitly cite the host RAM
+    budget so the user knows to scale up RAM, not GPU memory.
+    """
+    capacity = 12 * GB  # roomy GPU — many configs clear the GPU gate
+    # Tight CPU budget: 0 bytes means only the all-persistent
+    # (n_persist=N_chunk → 0 non-persistent chunks on CPU) cfg could
+    # fit. But the toy layout's _min_n_buffer_for at n_persist=N_chunk
+    # is 0, so n_persist=N_chunk is itself feasible only if the
+    # GPU capacity admits the full model-state. We block that by
+    # picking a CPU budget that's strictly less than ``S_chunk`` —
+    # so even a single non-persistent chunk on CPU busts it — AND
+    # combine with a GPU capacity that prevents fully-on-GPU
+    # configs from clearing the GPU gate.
+    #
+    # Calibration: the all-persistent cfg's GPU peak ~= alpha *
+    # (N_chunk * S_chunk + activations + intra/inter). With
+    # 768 MB of model state alone, capping GPU at 600 MB ensures
+    # the all-persistent cfg fails the GPU gate, while leaving
+    # some room for partially-offloaded cfgs to clear it. CPU
+    # budget = 1 byte then makes them all bust the CPU gate.
+    tight_capacity = 600 * MB
+    with pytest.raises(RuntimeError, match=r"no ProTrain config fits in"):
+        search(
+            toy_trace,
+            toy_layout,
+            tight_capacity,
+            toy_hw,
+            cpu_capacity_bytes=1,
+        )
+
+
 def test_search_picks_zero_swap_on_3090_like_hw(toy_trace, toy_layout):
     # 3090-like hardware: 12 GB/s PCIe, 24 GB memory, single GPU. On
     # such hardware the swap path should never be selected — backward

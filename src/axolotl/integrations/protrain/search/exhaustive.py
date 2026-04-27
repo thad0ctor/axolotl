@@ -12,8 +12,12 @@ Algorithm:
 
 3. For each candidate, compute ``block_map = assign_modes(...)``.
 4. Evaluate ``estimate_peak``; drop candidates above ``capacity_bytes``.
-5. Among survivors, evaluate ``estimate_runtime`` and pick argmin.
-6. Raise ``RuntimeError`` if no candidate fits.
+5. If ``cpu_capacity_bytes`` is not None, evaluate
+   ``estimate_cpu_footprint``; drop candidates above the host-RAM gate.
+6. Among survivors, evaluate ``estimate_runtime`` and pick argmin.
+7. Raise ``RuntimeError`` if no candidate fits — the message
+   distinguishes GPU-pressure failure (no cfg cleared the GPU gate)
+   from CPU-pressure failure (some cleared GPU but all busted CPU).
 
 The search space is tiny (~10^4 at most on realistic models) — no
 pruning cleverness is needed for correctness. We do sort candidates
@@ -28,7 +32,10 @@ from typing import Iterator
 from collections import defaultdict
 
 from axolotl.integrations.protrain.block.layout_rules import assign_modes
-from axolotl.integrations.protrain.cost.memory import estimate_peak  # noqa: F401 - re-exported for test back-compat
+from axolotl.integrations.protrain.cost.memory import (  # noqa: F401 - re-exported for test back-compat
+    estimate_cpu_footprint,
+    estimate_peak,
+)
 from axolotl.integrations.protrain.cost.runtime import estimate_runtime
 from axolotl.integrations.protrain.search.knobs import derive_bounds
 from axolotl.integrations.protrain.types import (
@@ -215,14 +222,33 @@ def search(
     layout: ChunkLayout,
     capacity_bytes: int,
     hw: HardwareProfile,
+    cpu_capacity_bytes: int | None = None,
 ) -> SearchResult:
     """Return the minimum-runtime ``SearchResult`` fitting under
-    ``capacity_bytes``.
+    ``capacity_bytes`` (and ``cpu_capacity_bytes`` when provided).
+
+    Parameters
+    ----------
+    trace, layout, hw:
+        See module docstring.
+    capacity_bytes:
+        GPU per-rank memory budget. Configs whose predicted peak
+        exceeds this are dropped before runtime evaluation.
+    cpu_capacity_bytes:
+        Optional per-rank pinned CPU RAM budget. When provided,
+        configs whose ``estimate_cpu_footprint`` exceeds this are
+        also dropped — the searcher then guarantees its pick fits
+        BOTH the GPU and CPU envelopes. ``None`` (the default)
+        preserves the pre-CPU-filter behaviour for backward
+        compatibility.
 
     Raises
     ------
     RuntimeError
-        If no candidate has ``predicted_peak_bytes <= capacity_bytes``.
+        If no candidate clears both the GPU capacity gate and the
+        optional CPU capacity gate. The message distinguishes the two
+        failure modes so callers can tell whether to scale up GPU
+        memory or host RAM.
 
     Notes
     -----
@@ -263,6 +289,8 @@ def search(
 
     n_total = 0
     n_feasible = 0
+    n_gpu_feasible = 0  # cleared GPU gate (used to disambiguate failure mode)
+    n_cpu_rejected = 0  # cleared GPU gate but failed CPU gate
     best_iter_s: float = float("inf")
     best_cfg: CostConfig | None = None
     best_block_map: BlockStrategyMap | None = None
@@ -359,13 +387,25 @@ def search(
                     )
                     if predicted_peak > capacity_bytes:
                         continue
-                    n_feasible += 1
+                    n_gpu_feasible += 1
                     cfg = CostConfig(
                         n_persist=n_persist,
                         n_buffer=n_buffer,
                         n_swap=n_swap,
                         n_checkpoint=n_ckpt,
                     )
+                    # Hard CPU-RAM feasibility gate. Skipped when
+                    # ``cpu_capacity_bytes`` is None (caller opted out
+                    # of host-side filtering — backward-compatible
+                    # default). Estimated bytes are per-rank pinned
+                    # CPU; sharding is reflected via hw.zero3_shard
+                    # inside ``estimate_cpu_footprint``.
+                    if cpu_capacity_bytes is not None:
+                        cpu_footprint = estimate_cpu_footprint(cfg, layout, hw)
+                        if cpu_footprint > cpu_capacity_bytes:
+                            n_cpu_rejected += 1
+                            continue
+                    n_feasible += 1
                     predicted_iter_s = estimate_runtime(
                         cfg, trace, layout, block_map, hw
                     )
@@ -376,20 +416,52 @@ def search(
                         best_peak = predicted_peak
 
     if best_cfg is None or best_block_map is None:
+        # Disambiguate the failure mode for the caller. If at least one
+        # candidate cleared the GPU gate but every such candidate
+        # exceeded the CPU envelope, the binding constraint is host RAM,
+        # not GPU memory — surface that explicitly so the user knows to
+        # add nodes / system RAM rather than larger cards.
+        if (
+            cpu_capacity_bytes is not None
+            and n_gpu_feasible > 0
+            and n_cpu_rejected == n_gpu_feasible
+        ):
+            raise RuntimeError(
+                f"no ProTrain config fits in {cpu_capacity_bytes / 1e9:.1f} GB "
+                f"host RAM (per-rank CPU budget); {n_gpu_feasible} configs "
+                f"cleared the GPU capacity gate but all exceeded the CPU "
+                f"footprint limit. Evaluated {n_total} configs total. "
+                "Scale up: more nodes, more system RAM, or a smaller model."
+            )
         raise RuntimeError(
             "no feasible ProTrain config under capacity_bytes="
             f"{capacity_bytes} (evaluated {n_total} configs)"
         )
 
-    LOG.info(
-        "ProTrain search: evaluated %d configs, %d feasible, picked %s "
-        "predicted=%dMB %.3fs",
-        n_total,
-        n_feasible,
-        best_cfg,
-        best_peak // (1 << 20),
-        best_iter_s,
-    )
+    if cpu_capacity_bytes is not None:
+        LOG.info(
+            "ProTrain search: evaluated %d configs, %d cleared GPU gate, "
+            "%d rejected by CPU gate, %d feasible, picked %s "
+            "predicted=%dMB %.3fs (cpu_budget=%.1f GB)",
+            n_total,
+            n_gpu_feasible,
+            n_cpu_rejected,
+            n_feasible,
+            best_cfg,
+            best_peak // (1 << 20),
+            best_iter_s,
+            cpu_capacity_bytes / 1e9,
+        )
+    else:
+        LOG.info(
+            "ProTrain search: evaluated %d configs, %d feasible, picked %s "
+            "predicted=%dMB %.3fs",
+            n_total,
+            n_feasible,
+            best_cfg,
+            best_peak // (1 << 20),
+            best_iter_s,
+        )
     return SearchResult(
         cfg=best_cfg,
         block_map=best_block_map,
