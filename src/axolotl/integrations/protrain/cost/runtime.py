@@ -191,19 +191,35 @@ def _block_compute_time(trace: ProfilerTrace, block_id: BlockId) -> float:
 def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[BlockId, float], bool]:
     """Return (total_fwd_compute_s, per_block_compute_s, used_measured).
 
-    Behavior:
-    - If the trace carries ``op_latencies``, apply the hook-dispatch
-      calibration scale (``steady_fwd_wall_s / hooked_fwd_wall_s``,
-      clamped to ``[_HOOK_SCALE_MIN, _HOOK_SCALE_MAX]``) to the per-op
-      sum. On transformer-sized models this strips ~2.5-8x hook
-      inflation from the measurement.
-    - If the scaled total is still larger than 2x the activation-size
-      roofline (defensive secondary cap), collapse the total to the
-      roofline budget while preserving the per-block shape. Protects
-      against runaway measurements on stale traces (pre-v4) where the
-      scale is 1.0 identity.
-    - If the trace has no measured latencies, fall back to the pure
-      activation-size roofline and return ``used_measured=False``.
+    Preference order (highest first):
+
+    1. **Phase-2 chunked forward measurement** (TRACE_VERSION ≥ 11): if
+       ``steady_fwd_chunked_wall_s > 0``, return it as the forward
+       total. The per-block distribution comes from the per-op path
+       (used by ``estimate_runtime`` for CKPT recompute accounting and
+       the per-chunk roofline split). Forward is approximately
+       config-independent at the cost-model level (no recompute on
+       forward; differences in n_persist / n_buffer between bootstrap
+       and candidate change comm overlap marginally), so the
+       measurement applies as the new baseline for ANY candidate cfg
+       the search evaluates.
+    2. **Per-op-latency sum + hook-scale + roofline cap** (TRACE_VERSION
+       ≥ 2): if the trace carries ``op_latencies``, apply the
+       hook-dispatch calibration scale (``steady_fwd_wall_s /
+       hooked_fwd_wall_s``, clamped to ``[_HOOK_SCALE_MIN,
+       _HOOK_SCALE_MAX]``) to the per-op sum. On transformer-sized
+       models this strips ~2.5-8x hook inflation from the measurement.
+       The scaled total is then capped at ``steady_fwd_wall_s`` (or 2×
+       activation-byte roofline as a legacy fallback) to protect
+       against runaway measurements on stale traces.
+    3. **Activation-size roofline** (always available): pure fallback
+       for traces with no measured latencies; returns
+       ``used_measured=False``.
+
+    Mirrors the precedence pattern of
+    :func:`_bwd_compute_time_from_trace` (phase-2 chunked > steady
+    unwrapped > heuristic), with the simplification that forward needs
+    no per-cfg adjustment because it doesn't recompute.
     """
     per_block: dict[BlockId, float] = {}
     total = 0.0
@@ -260,6 +276,29 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
                 safety = cap / total
                 per_block = {bid: v * safety for bid, v in per_block.items()}
                 total = cap
+            # PHASE-2 FORWARD OVERRIDE (TRACE_VERSION ≥ 11): override
+            # the per-op-derived total with the chunked-runtime
+            # measurement when populated. Mirrors the precedence
+            # pattern in ``_bwd_compute_time_from_trace``. The
+            # per-block distribution stays at the per-op-derived shape
+            # (used for CKPT recompute accounting); only the total is
+            # replaced.
+            #
+            # Note: the actual t_fwd assembly in ``estimate_runtime``
+            # consumes ``trace.steady_fwd_chunked_wall_s`` directly as
+            # t_fwd (skipping the per-chunk roofline) because feeding
+            # the chunked wall through the per-chunk max(compute,
+            # comm) roofline still overshoots reality — the chunked
+            # measurement already accounts for chunk-prefetch /
+            # gather overlap that the per-chunk roofline assumes
+            # unconditionally non-overlapping. Returning the chunked
+            # wall as the total here keeps this helper's contract
+            # consistent with ``_bwd_compute_time_from_trace`` and
+            # makes any downstream consumer that asks "what's the
+            # forward compute total?" see the ground-truth
+            # measurement.
+            if trace.steady_fwd_chunked_wall_s > 0.0:
+                total = trace.steady_fwd_chunked_wall_s
             return total, per_block, True
 
     # Fallback: pure roofline. No measurements available (empty op_latencies).
@@ -472,24 +511,48 @@ def estimate_runtime(
             if eff_d2h > 0:
                 t_fwd_swap_transfer += act_sz / eff_d2h
 
-    # Per-chunk forward roofline: max(compute per chunk, comm per chunk).
-    # Distribute the per-block compute evenly across non-persistent
-    # chunks (persistent chunks are counted in compute but have no
-    # comm). This is the chunk-level roofline the paper describes.
-    if layout.N_chunk > 0:
-        t_fwd_compute_per_chunk = t_fwd_compute_total / layout.N_chunk
+    # PHASE-2 FORWARD OVERRIDE (TRACE_VERSION ≥ 11): when the
+    # chunked-runtime forward measurement is available, use it
+    # directly as the t_fwd compute+comm baseline rather than
+    # re-estimating via the per-chunk roofline. The measurement was
+    # captured under a real chunked runtime — gather/prefetch overhead,
+    # CPU<->GPU PCIe traffic, NCCL on multi-rank — that the analytical
+    # per-chunk max(compute, comm) roofline OVERESTIMATES because the
+    # roofline assumes zero comm/compute overlap. The phase-2
+    # measurement captures the real overlapping pipeline.
+    #
+    # SWAP transfer is added on top because phase-2's bootstrap config
+    # has n_swap=0 — any candidate using SWAP must pay that activation
+    # transfer in addition.
+    #
+    # SKU compute scale is NOT applied to the chunked wall here —
+    # mirrors :func:`_bwd_compute_time_from_trace`, which also
+    # consumes ``steady_bwd_chunked_wall_s`` without an SKU scale.
+    # The chunked wall already incorporates compute + comm + overlap
+    # on the trace SKU; cross-SKU calibration of the chunked
+    # measurement requires re-running phase-2 on the new SKU rather
+    # than scalar scaling.
+    if trace.steady_fwd_chunked_wall_s > 0.0:
+        t_fwd = trace.steady_fwd_chunked_wall_s + t_fwd_swap_transfer
     else:
-        t_fwd_compute_per_chunk = 0.0
+        # Per-chunk forward roofline: max(compute per chunk, comm per chunk).
+        # Distribute the per-block compute evenly across non-persistent
+        # chunks (persistent chunks are counted in compute but have no
+        # comm). This is the chunk-level roofline the paper describes.
+        if layout.N_chunk > 0:
+            t_fwd_compute_per_chunk = t_fwd_compute_total / layout.N_chunk
+        else:
+            t_fwd_compute_per_chunk = 0.0
 
-    t_fwd_persistent_chunks = n_persist * t_fwd_compute_per_chunk
-    t_fwd_nonpersistent_chunks = n_nonpersist * max(
-        t_fwd_compute_per_chunk, t_fwd_comm_per_chunk
-    )
-    t_fwd = (
-        t_fwd_persistent_chunks
-        + t_fwd_nonpersistent_chunks
-        + t_fwd_swap_transfer
-    )
+        t_fwd_persistent_chunks = n_persist * t_fwd_compute_per_chunk
+        t_fwd_nonpersistent_chunks = n_nonpersist * max(
+            t_fwd_compute_per_chunk, t_fwd_comm_per_chunk
+        )
+        t_fwd = (
+            t_fwd_persistent_chunks
+            + t_fwd_nonpersistent_chunks
+            + t_fwd_swap_transfer
+        )
 
     # ----- Backward compute --------------------------------------------
     # Baseline backward: either the measured aggregate <backward> latency

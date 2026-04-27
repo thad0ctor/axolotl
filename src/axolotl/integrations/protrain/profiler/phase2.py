@@ -141,10 +141,10 @@ def measure_chunked_steady(
     optimizer: "torch.optim.Optimizer",
     n_warmup: int = _PHASE2_N_WARMUP,
     n_iters: int = _PHASE2_N_ITERS,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """Run a chunked steady-state ``fwd → bwd → step`` loop and time it.
 
-    Times the backward and the post-backward optimizer step using
+    Times the forward, backward, and post-backward optimizer step using
     ``torch.cuda.Event`` pairs (same convention as
     :mod:`profiler.hw_bench` for ``measure_compute_rate`` /
     ``measure_cpu_adam`` / ``measure_gpu_adam``). The optimizer step
@@ -152,9 +152,14 @@ def measure_chunked_steady(
     that the per-param grad hooks kick off during backward — so it
     captures the bwd↔step overlap envelope, not the cumulative compute.
 
+    The forward window measures the full chunked-runtime forward
+    (compute + chunk-prefetch / gather overhead inherent to the chunk
+    manager). Closes the residual forward over-prediction left over
+    after the v10 backward calibration.
+
     Returns
     -------
-    (steady_bwd_chunked_wall_s, steady_step_overlap_s)
+    (steady_fwd_chunked_wall_s, steady_bwd_chunked_wall_s, steady_step_overlap_s)
         Median across ``n_iters`` timed iterations. ``n_warmup``
         iterations are discarded — they pay one-time costs (chunk
         manager LRU settling, CPU Adam state lazy init, autograd
@@ -179,15 +184,20 @@ def measure_chunked_steady(
         optimizer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
 
+    fwd_times_s: list[float] = []
     bwd_times_s: list[float] = []
     step_times_s: list[float] = []
     for _ in range(n_iters):
-        out = model(**batch)
-        loss = _extract_loss(out)
-
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        fwd_end = torch.cuda.Event(enable_timing=True)
         bwd_start = torch.cuda.Event(enable_timing=True)
         bwd_end = torch.cuda.Event(enable_timing=True)
         step_end = torch.cuda.Event(enable_timing=True)
+
+        fwd_start.record()
+        out = model(**batch)
+        loss = _extract_loss(out)
+        fwd_end.record()
 
         bwd_start.record()
         loss.backward()
@@ -196,24 +206,29 @@ def measure_chunked_steady(
         step_end.record()
 
         torch.cuda.synchronize()
+        fwd_times_s.append(fwd_start.elapsed_time(fwd_end) / 1000.0)
         bwd_times_s.append(bwd_start.elapsed_time(bwd_end) / 1000.0)
         step_times_s.append(bwd_end.elapsed_time(step_end) / 1000.0)
 
         optimizer.zero_grad(set_to_none=True)
 
+    fwd_median = statistics.median(fwd_times_s)
     bwd_median = statistics.median(bwd_times_s)
     step_median = statistics.median(step_times_s)
     LOG.info(
         "Phase-2 chunked-runtime measurement: "
-        "steady_bwd_chunked_wall_s=%.4f (n=%d, samples=%s) "
+        "steady_fwd_chunked_wall_s=%.4f (n=%d, samples=%s) "
+        "steady_bwd_chunked_wall_s=%.4f (samples=%s) "
         "steady_step_overlap_s=%.4f (samples=%s)",
-        bwd_median,
+        fwd_median,
         n_iters,
+        ["%.4f" % t for t in fwd_times_s],
+        bwd_median,
         ["%.4f" % t for t in bwd_times_s],
         step_median,
         ["%.4f" % t for t in step_times_s],
     )
-    return bwd_median, step_median
+    return fwd_median, bwd_median, step_median
 
 
 def estimate_per_block_recompute_s(

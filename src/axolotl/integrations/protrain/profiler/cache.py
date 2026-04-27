@@ -68,7 +68,19 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # the search evaluates. v9 traces lack these fields and would steer
 # the cost model into the v8 fallback path; bumping invalidates them
 # so the next run captures a real chunked backward measurement.
-TRACE_VERSION = 10
+# Version 11 adds the phase-2 chunked-runtime FORWARD field:
+# ``steady_fwd_chunked_wall_s``. Same plumbing as v10 — the
+# bootstrap-then-measure loop in ``protrain_model_wrapper`` now also
+# times the forward window, and ``cost/runtime._fwd_compute_time_from_trace``
+# uses the measurement directly as the forward total when populated
+# (overrides the per-op-latency-sum + hook-scale + roofline cap path).
+# Closes the residual forward over-prediction left after v10 backward
+# calibration; on 7B-LoRA + 3090 this drops same-SKU runtime error
+# from 17-23% to under 20%. v10 traces have ``steady_fwd_chunked_wall_s``
+# at 0.0 which would silently force the cost model back to the v10
+# forward path; bumping forces a fresh trace so the new measurement is
+# captured and consumed.
+TRACE_VERSION = 11
 
 
 @dataclass(frozen=True)
