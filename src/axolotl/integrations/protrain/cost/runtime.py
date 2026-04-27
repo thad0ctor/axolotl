@@ -578,30 +578,41 @@ def estimate_runtime(
                 t_bwd_swap_prefetch += act_sz / eff_h2d
 
     t_bwd_compute_total = t_bwd_compute_base + t_bwd_recompute
-    if layout.N_chunk > 0:
-        t_bwd_compute_per_chunk = t_bwd_compute_total / layout.N_chunk
+    if (
+        trace.steady_bwd_chunked_wall_s > 0.0
+        and trace.phase2_per_block_recompute_s > 0.0
+    ):
+        # PHASE-2 BACKWARD OVERRIDE (TRACE_VERSION >= 10): the chunked
+        # backward wall already includes the measured chunk runtime and its
+        # real comm/compute overlap. After translating out the bootstrap
+        # recompute and adding this candidate's recompute, consume it
+        # directly instead of re-injecting analytical per-chunk comm.
+        t_bwd = t_bwd_compute_total + t_bwd_swap_prefetch
     else:
-        t_bwd_compute_per_chunk = 0.0
+        if layout.N_chunk > 0:
+            t_bwd_compute_per_chunk = t_bwd_compute_total / layout.N_chunk
+        else:
+            t_bwd_compute_per_chunk = 0.0
 
-    # Split non-persistent chunks into buffer-cached vs. uncached.
-    # Buffer-cached chunks carry forward their GPU residency; up to
-    # n_buffer of them skip the re-gather in backward.
-    n_cached = min(n_buffer, n_nonpersist)
-    n_uncached = n_nonpersist - n_cached
+        # Split non-persistent chunks into buffer-cached vs. uncached.
+        # Buffer-cached chunks carry forward their GPU residency; up to
+        # n_buffer of them skip the re-gather in backward.
+        n_cached = min(n_buffer, n_nonpersist)
+        n_uncached = n_nonpersist - n_cached
 
-    t_bwd_persistent_chunks = n_persist * t_bwd_compute_per_chunk
-    t_bwd_cached_chunks = n_cached * max(
-        t_bwd_compute_per_chunk, t_bwd_comm_per_chunk_cached
-    )
-    t_bwd_uncached_chunks = n_uncached * max(
-        t_bwd_compute_per_chunk, t_bwd_comm_per_chunk_uncached
-    )
-    t_bwd = (
-        t_bwd_persistent_chunks
-        + t_bwd_cached_chunks
-        + t_bwd_uncached_chunks
-        + t_bwd_swap_prefetch
-    )
+        t_bwd_persistent_chunks = n_persist * t_bwd_compute_per_chunk
+        t_bwd_cached_chunks = n_cached * max(
+            t_bwd_compute_per_chunk, t_bwd_comm_per_chunk_cached
+        )
+        t_bwd_uncached_chunks = n_uncached * max(
+            t_bwd_compute_per_chunk, t_bwd_comm_per_chunk_uncached
+        )
+        t_bwd = (
+            t_bwd_persistent_chunks
+            + t_bwd_cached_chunks
+            + t_bwd_uncached_chunks
+            + t_bwd_swap_prefetch
+        )
 
     # ----- Optimizer step ----------------------------------------------
     # Model-state bytes per chunk = model_state_bytes / N_chunk.
