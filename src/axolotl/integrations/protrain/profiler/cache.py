@@ -74,12 +74,13 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # times the forward window, and ``cost/runtime._fwd_compute_time_from_trace``
 # uses the measurement directly as the forward total when populated
 # (overrides the per-op-latency-sum + hook-scale + roofline cap path).
-# Closes the residual forward over-prediction left after v10 backward
-# calibration; on 7B-LoRA + 3090 this drops same-SKU runtime error
-# from 17-23% to under 20%. v10 traces have ``steady_fwd_chunked_wall_s``
-# at 0.0 which would silently force the cost model back to the v10
-# forward path; bumping forces a fresh trace so the new measurement is
-# captured and consumed.
+# Closes the forward half of the residual over-prediction left after
+# v10 backward calibration; on 7B-LoRA + 3090 this drops same-SKU
+# runtime error into the high-20% range before the matching backward
+# chunked-wall bypass. v10 traces have ``steady_fwd_chunked_wall_s`` at
+# 0.0 which would silently force the cost model back to the v10 forward
+# path; bumping forces a fresh trace so the new measurement is captured
+# and consumed.
 TRACE_VERSION = 11
 
 

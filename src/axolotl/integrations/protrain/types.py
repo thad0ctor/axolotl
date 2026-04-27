@@ -288,10 +288,9 @@ class ProfilerTrace:
     #         the per-op-latency sum + hook-scale + roofline cap path)
     #
     # Per-block compute distribution is preserved from the per-op path
-    # (used for CKPT recompute accounting in backward + for the per-
-    # chunk roofline split) but rescaled to match the new total — this
-    # mirrors the SECONDARY safety cap path in
-    # ``_fwd_compute_time_from_trace``.
+    # without rescaling. The aggregate chunked wall replaces the forward
+    # total directly, while the per-block shape remains the recompute
+    # basis for CKPT accounting.
     #
     # ``0.0`` (default) means "no phase-2 forward measurement
     # available" and the cost model falls back to the v10 path
