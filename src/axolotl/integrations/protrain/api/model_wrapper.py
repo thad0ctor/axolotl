@@ -125,28 +125,6 @@ def _infer_vocab_size(model: nn.Module) -> int:
     return 1024
 
 
-def _exec_order_from_trace(trace) -> list[ParamId]:
-    """Derive a param-level execution order from the profiler's op order.
-
-    For each forward op in ``trace.op_order`` we emit the params owned
-    by its ``module_path`` in ``model.named_parameters()`` order. The
-    result is deduplicated at the first occurrence (the layout builder
-    will also dedup but doing it here keeps downstream sizes small).
-
-    This is a **best effort** — the profiler traces at module
-    granularity, not tensor granularity, so we approximate "first use"
-    by "first op inside the owning module". For the layouts the
-    searcher cares about (block-aware grouping + persistent-first
-    placement) this is sufficient: the block-contiguity rule in
-    ``build_layout`` ensures block params land in the right chunk even
-    if our exec order shuffles within a block.
-    """
-    # Param ids will be supplied by the caller from ``model.named_parameters``
-    # — this function is kept for forward-compatibility if M4c wants to
-    # drive exec-order directly off the trace.
-    return [cast(ParamId, rec.module_path) for rec in trace.op_order if rec.is_forward]
-
-
 def _build_block_spans(
     model: nn.Module,
 ) -> tuple[list[nn.Module], dict[BlockId, list[ParamId]]]:
@@ -189,18 +167,82 @@ def _module_path_in(root: nn.Module, target: nn.Module) -> str | None:
 def _param_exec_order(
     model: nn.Module,
     block_spans: dict[BlockId, list[ParamId]],
+    trace,
 ) -> list[ParamId]:
-    """Rough execution-order list of params.
+    """Param-level execution order derived from ``trace.op_order`` (§3.1.1).
 
-    We walk ``model.named_parameters()`` in insertion order (which is
-    the canonical definition order HuggingFace uses) and emit each
-    param exactly once. For block-member params, the ``build_layout``
-    block-contiguity rule takes over and re-groups as needed; for
-    non-block params the definition order is a sensible proxy for first-
-    use order on the forward pass.
+    For each forward op we walk the owning module's *direct* parameters
+    (``module.parameters(recurse=False)``) and emit each param the first
+    time it appears. Shared params keep their first-use slot — the
+    paper's eviction-ordering guarantee. Params that the profiler never
+    visited (unused weights, modules outside the traced forward) are
+    appended in ``named_parameters`` order at the end so ``build_layout``
+    still gets a chunk assignment for them.
+
+    Falling back to ``named_parameters`` declaration order is only
+    correct for uniform transformer stacks where declaration order
+    happens to match forward order. Architectures with non-trivial
+    block topologies or shared params get a measurably better gather
+    pattern when we drive the order off the actual op stream.
+
+    ``block_spans`` is unused here — block grouping happens later inside
+    ``build_layout``. Kept in the signature so the call site can pass
+    the same arguments it always did.
     """
-    del block_spans  # unused; here for signature stability
-    return [cast(ParamId, name) for name, _ in model.named_parameters()]
+    del block_spans  # block grouping happens in build_layout
+
+    # Map dotted module paths to the param names hanging directly off
+    # them (no recursion — children are visited via their own ops).
+    module_to_param_names: dict[str, list[str]] = {}
+    for mod_path, module in model.named_modules():
+        names = [
+            f"{mod_path}.{p_name}" if mod_path else p_name
+            for p_name, _ in module.named_parameters(recurse=False)
+        ]
+        if names:
+            module_to_param_names[mod_path] = names
+
+    # Identity-based dedup so weight-tied params (which share a tensor
+    # under different names) collapse to the first encountered name.
+    seen_names: set[str] = set()
+    seen_ids: set[int] = set()
+    name_to_param = dict(model.named_parameters())
+    order: list[ParamId] = []
+
+    for rec in trace.op_order:
+        if not rec.is_forward:
+            continue
+        names = module_to_param_names.get(rec.module_path)
+        if not names:
+            continue
+        for name in names:
+            if name in seen_names:
+                continue
+            param = name_to_param.get(name)
+            if param is None:
+                continue
+            pid = id(param)
+            if pid in seen_ids:
+                # Weight-tied alias for an earlier first-use slot; skip.
+                seen_names.add(name)
+                continue
+            seen_ids.add(pid)
+            seen_names.add(name)
+            order.append(cast(ParamId, name))
+
+    # Catch-all: any parameter the trace never touched still needs a
+    # slot. ``build_layout`` would do this itself but appending here
+    # keeps the returned order self-describing.
+    for name, param in name_to_param.items():
+        if name in seen_names:
+            continue
+        if id(param) in seen_ids:
+            continue
+        seen_ids.add(id(param))
+        seen_names.add(name)
+        order.append(cast(ParamId, name))
+
+    return order
 
 
 def _chunk_bytes(layout, chunk_manager) -> dict[int, int]:
@@ -688,7 +730,7 @@ def protrain_model_wrapper(
     _sys2.stderr.write("[protrain] building layout\n")
     _sys2.stderr.flush()
     blocks, block_spans = _build_block_spans(model)
-    exec_order = _param_exec_order(model, block_spans)
+    exec_order = _param_exec_order(model, block_spans, trace)
 
     # Derive S_chunk from a {ParamId -> bytes} map.
     param_bytes: dict[ParamId, int] = {

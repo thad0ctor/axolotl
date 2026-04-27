@@ -162,6 +162,135 @@ def test_layout_preserves_first_occurrence_for_shared_params():
     assert cast(ParamId, "a.weight") in layout.chunks[0]
 
 
+def test_param_exec_order_follows_trace_op_stream_not_declaration_order():
+    """Exec order is derived from ``trace.op_order`` (§3.1.1), not param declaration.
+
+    Build a 2-block model that *registers* its blocks in one order
+    (``b`` then ``a``) but *executes* them in the opposite order
+    (``a`` then ``b``) on the forward pass. The trace-driven helper
+    must emit ``a``'s param before ``b``'s, so the gather pattern lines
+    up with the actual op stream rather than the storage order.
+    """
+    pytest.importorskip("torch")
+
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.api.model_wrapper import (
+        _param_exec_order,
+    )
+    from axolotl.integrations.protrain.types import OpId, OpRecord
+
+    class FlippedOrder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # Registration order: b first, then a — opposite to forward order.
+            self.b = nn.Linear(4, 4, bias=False)
+            self.a = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Execution order: a first, then b.
+            return self.b(self.a(x))
+
+    model = FlippedOrder()
+
+    # Sanity: declaration order really is (b, a).
+    declared = [n for n, _ in model.named_parameters()]
+    assert declared == ["b.weight", "a.weight"], (
+        f"test setup invariant broken: declared order is {declared}; "
+        "expected ['b.weight', 'a.weight'] so a trace-driven order can "
+        "differ from declaration order"
+    )
+
+    # Synthesize a minimal trace whose op_order reflects forward order.
+    # build_layout doesn't care about non-module-path fields, but we
+    # still construct a valid OpRecord for each step.
+    def _op(op_id: int, mod_path: str) -> OpRecord:
+        return OpRecord(
+            op_id=cast(OpId, op_id),
+            module_path=mod_path,
+            qualified_name="aten::linear",
+            shape_signature=((1, 4),),
+            block_id=None,
+            is_forward=True,
+        )
+
+    class FakeTrace:
+        op_order = (_op(0, "a"), _op(1, "b"))
+
+    # _param_exec_order ignores block_spans (block grouping happens in
+    # build_layout); pass an empty mapping to avoid invoking
+    # discover_blocks on this non-transformer toy model.
+    exec_order = _param_exec_order(model, {}, FakeTrace())
+
+    assert exec_order == [
+        cast(ParamId, "a.weight"),
+        cast(ParamId, "b.weight"),
+    ], (
+        f"trace-driven exec order should be (a, b) — the forward order — "
+        f"got {exec_order}"
+    )
+
+    # And the layout chunks must reflect the same order.
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+
+    layout = build_layout(model, exec_order, S_chunk=1 << 20, block_spans={})
+    flat = [pid for chunk in layout.chunks for pid in chunk]
+    a_idx = flat.index(cast(ParamId, "a.weight"))
+    b_idx = flat.index(cast(ParamId, "b.weight"))
+    assert a_idx < b_idx, (
+        f"layout still walks declaration order: a@{a_idx} b@{b_idx}; "
+        "expected a before b to match forward op stream"
+    )
+
+
+def test_param_exec_order_dedups_weight_tied_params():
+    """A tied weight visited twice in the trace keeps only the first slot."""
+    pytest.importorskip("torch")
+
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.api.model_wrapper import (
+        _param_exec_order,
+    )
+    from axolotl.integrations.protrain.types import OpId, OpRecord
+
+    class Tied(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = nn.Linear(4, 4, bias=False)
+            self.second = nn.Linear(4, 4, bias=False)
+            self.second.weight = self.first.weight  # tie
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.second(self.first(x))
+
+    model = Tied()
+
+    def _op(op_id: int, mod_path: str) -> OpRecord:
+        return OpRecord(
+            op_id=cast(OpId, op_id),
+            module_path=mod_path,
+            qualified_name="aten::linear",
+            shape_signature=((1, 4),),
+            block_id=None,
+            is_forward=True,
+        )
+
+    class FakeTrace:
+        # second uses the SAME tensor as first; the second op should not
+        # introduce a duplicate slot.
+        op_order = (_op(0, "first"), _op(1, "second"))
+
+    exec_order = _param_exec_order(model, {}, FakeTrace())
+
+    # named_parameters dedups by tensor identity, exposing the tied
+    # weight under its first registered name (``first.weight``).
+    assert exec_order.count(cast(ParamId, "first.weight")) == 1
+    assert cast(ParamId, "second.weight") not in exec_order
+
+
 def test_sizing_picks_min_waste():
     """Grid-search chooses the minimum-waste candidate, tie-breaking to the larger S.
 
