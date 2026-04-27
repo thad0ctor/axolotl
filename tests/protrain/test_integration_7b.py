@@ -265,7 +265,7 @@ def test_protrain_7b_end_to_end() -> None:
     # Peak stays strict at 10% — that is the OOM-safety invariant
     # (paper Eqs. 8-11 with ALPHA_FRAGMENTATION = 1.10).
     assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
-    # Runtime tolerance: 35% ceiling.
+    # Runtime tolerance: 25% ceiling.
     #
     # Calibration history on this workload (TRACE_VERSION → measured error):
     #   * v2 (per-op latencies):                    ~52%
@@ -282,15 +282,27 @@ def test_protrain_7b_end_to_end() -> None:
     #     dominated by LoRA bwd/fwd-ratio fallback over-prediction;
     #     cross-SKU now calibrated at the cost-model layer rather than
     #     absorbed by the test tolerance.
+    #   * v10 (phase-2 chunked-runtime backward measurement —
+    #     ProfilerTrace.steady_bwd_chunked_wall_s populated by the
+    #     bootstrap-then-measure loop in protrain_model_wrapper, with
+    #     the cost model's _bwd_compute_time_from_trace using the
+    #     measurement minus phase2 recompute as the base, and the
+    #     candidate cfg's per-block recompute added on top): same-SKU
+    #     17-23% on 7B-LoRA — the LoRA bwd/fwd-ratio fallback that
+    #     dominated v8's noise floor is gone. Variance comes from the
+    #     phase-2 measurement (5 timed iters, bwd time ~270ms ± 1-2ms)
+    #     and the GPU thermal/clock noise on the test rig.
     #
-    # Above 35% indicates a regression in the calibration path or a new
-    # systematic bias. Tightening below 30% reliably is blocked on real
-    # measured-bwd-on-chunked-7B (the profiler's measured backward
-    # currently OOMs without chunk-offload engaged), which would replace
-    # the 2.0× bwd/fwd fallback with measured ~1.3× for LoRA — a
-    # separate engineering investment.
-    assert runtime_err < 0.35, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=8 "
-        "calibration. Above 35% indicates a regression. "
+    # Above 25% indicates a regression in the calibration path or a new
+    # systematic bias. The remaining residual is forward-time
+    # over-prediction (the cost model's per-chunk compute/comm roofline
+    # vs the actual fused-kernel forward time on Llama-7B + LoRA on
+    # 3090) — closing it requires either a measured forward calibration
+    # under the chunked runtime or a better roofline derate. Both are
+    # separate engineering investments; phase-2 only addresses backward.
+    assert runtime_err < 0.25, (
+        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=10 "
+        "calibration with phase-2 chunked backward measurement. Above 25% "
+        "indicates a regression. "
         f"iter_s_all={iter_s_all}"
     )
