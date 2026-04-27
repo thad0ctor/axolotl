@@ -855,3 +855,319 @@ def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
     mgr.uninstall()
     host.close()
     del pool
+
+
+# ---------------------------------------------------------------------------
+# Sharded restore_to_gpu (zero3_shard=True) — gloo 2-rank round-trip
+# ---------------------------------------------------------------------------
+#
+# The sharded teardown path was added so the phase-2 profiler can rebuild
+# the chunk-manager under a new config in a distributed run. Round-trip
+# correctness here means: after materialize_offload partitions every
+# chunk's bytes across ranks, restore_to_gpu reassembles them via
+# per-region all_gather and rebinds param.data so every rank's model
+# matches the pre-offload weights bit-for-bit. Mirrors the existing
+# ``test_zero3_sharded_roundtrip_2rank`` pattern in
+# ``test_chunk_manager_distributed.py`` (gloo + ``mp.spawn`` + CPU device
+# pool — the byte-level operations are identical to the CUDA path).
+
+
+def _worker_sharded_restore_round_trip(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Child process body: sharded materialize_offload -> restore_to_gpu.
+
+    Builds a small mixed-dtype model (fp16 Linear + fp32 LayerNorm) so
+    the test exercises the multi-region branch of the sharded restore —
+    a homogeneous-dtype chunk would only issue ONE all_gather and miss
+    the per-region loop. After restore every param's bytes must equal
+    the pre-offload snapshot.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import (
+        PinnedHostMemory,
+    )
+
+    _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    _os.environ.setdefault("MASTER_PORT", "29551")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-restore",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        # Same seed across ranks => identical fresh-init weights.
+        torch.manual_seed(0)
+        from torch import nn
+
+        class _MixedLayer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(16, 16, bias=True).to(torch.float16)
+                self.norm = nn.LayerNorm(16).to(torch.float32)
+
+        layer = _MixedLayer()
+        model = nn.Module()
+        model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+        block_spans: dict = {}
+        for name, _p in model.named_parameters():
+            block_spans.setdefault(BlockId(0), []).append(ParamId(name))  # type: ignore[index]
+        exec_order = [ParamId(n) for n, _ in model.named_parameters()]
+        S_chunk = 1 << 14
+        layout = build_layout(model, exec_order, S_chunk, block_spans)
+
+        host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+        pool = BufferPool(
+            n_buffer=1,
+            S_chunk=layout.S_chunk,
+            pinned_host=host,
+            device=torch.device("cpu"),
+        )
+
+        # Snapshot every param BEFORE materialize_offload — restore must
+        # reproduce these bytes exactly.
+        pre_data = {
+            str(name): p.detach().clone()
+            for name, p in model.named_parameters()
+        }
+
+        mgr = ChunkManager(
+            model=model,
+            layout=layout,
+            n_persist=0,
+            buffer_pool=pool,
+            cpu_optim=None,
+            gpu_optim=None,
+            device=torch.device("cpu"),
+            world_size=world_size,
+            rank=rank,
+            zero3_shard=True,
+        )
+
+        try:
+            mgr.materialize_offload()
+        except RuntimeError as exc:
+            if "gloo" in str(exc).lower():
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
+                ) as f:
+                    f.write(f"gloo-unsupported: {exc}\n")
+                return
+            raise
+
+        # Sharding must have actually engaged for the test to be
+        # meaningful — a silent fall-back to replicated would route
+        # restore through the non-sharded branch and leave the new
+        # all_gather code uncovered.
+        assert mgr.sharded_chunk_ids() == [ChunkId(0)], (
+            f"rank {rank}: expected chunk 0 sharded, got "
+            f"{mgr.sharded_chunk_ids()}"
+        )
+        # Multi-region invariant: mixed-dtype chunk produces 2 regions.
+        shard_state = mgr._chunk_shards[ChunkId(0)]
+        assert len(shard_state.regions) == 2, (
+            f"rank {rank}: expected 2 dtype regions (fp16 + fp32), "
+            f"got {len(shard_state.regions)}"
+        )
+
+        # Every param's data should be an empty placeholder after
+        # materialize_offload — confirms the test exercises the path
+        # where restore_to_gpu has real work to do.
+        any_empty = any(
+            p.data.numel() == 0 for _n, p in model.named_parameters()
+        )
+        assert any_empty, (
+            f"rank {rank}: post-offload param data should be empty"
+        )
+
+        # The actual round-trip: sharded restore must reassemble every
+        # chunk via all_gather and rebind param.data on every rank.
+        try:
+            moved = mgr.restore_to_gpu()
+        except RuntimeError as exc:
+            if "not implemented" in str(exc).lower() or "gloo" in str(exc).lower():
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
+                ) as f:
+                    f.write(f"gloo-collective-unsupported: {exc}\n")
+                return
+            raise
+
+        assert moved > 0, (
+            f"rank {rank}: restore_to_gpu reported 0 bytes moved — "
+            "should be > 0 with sharded chunks present"
+        )
+
+        # Bit-exact match against the pre-offload snapshot. fp16/fp32
+        # tensors are checked with torch.equal because no arithmetic
+        # ran between materialize and restore — only memcpy through
+        # all_gather. Any mismatch indicates the byte layout flipped
+        # somewhere in the per-region reassembly.
+        for name, p in model.named_parameters():
+            snap = pre_data[str(name)]
+            assert p.data.shape == snap.shape, (
+                f"rank {rank}: shape changed for {name}: "
+                f"{p.data.shape} vs {snap.shape}"
+            )
+            assert p.data.dtype == snap.dtype, (
+                f"rank {rank}: dtype changed for {name}: "
+                f"{p.data.dtype} vs {snap.dtype}"
+            )
+            assert torch.equal(p.data, snap), (
+                f"rank {rank}: param {name} bytes diverged across "
+                "sharded materialize_offload -> restore_to_gpu round-trip"
+            )
+
+        # Internal-state cleanup is the same contract as the
+        # non-sharded restore: every per-chunk dict must be empty
+        # after teardown so a fresh manager can be built on the same
+        # model.
+        assert not mgr._cpu_slots, (
+            f"rank {rank}: restore_to_gpu must clear _cpu_slots"
+        )
+        assert not mgr._chunk_shards, (
+            f"rank {rank}: restore_to_gpu must clear _chunk_shards"
+        )
+        assert not mgr._grad_hook_handles, (
+            f"rank {rank}: restore_to_gpu must remove grad hook handles"
+        )
+
+        host.close()
+        del pool
+
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+@pytest.mark.gpu  # paired with the rest of the distributed lane
+def test_sharded_restore_to_gpu_round_trip_2rank(tmp_path) -> None:
+    """2-rank gloo: sharded materialize_offload -> restore_to_gpu round-trip.
+
+    Documents the full-distributed paper-fidelity invariant: after a
+    sharded ``materialize_offload`` partitions every chunk across ranks
+    and a subsequent ``restore_to_gpu`` reassembles them via per-region
+    ``all_gather_into_tensor``, every param on every rank must hold the
+    exact same bytes as before the round-trip. This is what the phase-2
+    profiler needs to bootstrap-then-rebuild under a new config in a
+    distributed run.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_sharded_restore_round_trip,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    # Downgrade to a skip if any rank hit an unsupported gloo collective
+    # (older torch builds may not expose all_gather_into_tensor on CPU).
+    skip_files = list(tmp_path.glob("rank*.skip"))
+    if skip_files:
+        reasons = [f.read_text().strip() for f in skip_files]
+        pytest.skip(f"gloo does not support required collective(s): {reasons}")
+
+
+def test_sharded_restore_to_gpu_requires_initialized_distributed() -> None:
+    """Pre-flight: sharded restore must raise a clean error sans dist init.
+
+    The sharded path issues ``all_gather_into_tensor`` per region —
+    that requires a live process group. Calling restore on a sharded
+    manager AFTER ``destroy_process_group`` (or before init) is a
+    programmer error; the manager raises ``RuntimeError`` with a clear
+    message instead of letting torch.distributed surface an opaque
+    "default process group not initialized" later in the call stack.
+
+    Exercised single-process by manually planting a ``_chunk_shards``
+    entry on a manager that was constructed with
+    ``zero3_shard=False`` then forced into the sharded branch — same
+    code path the round-trip test takes through legitimate
+    ``materialize_offload`` but without needing a live gloo cluster.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        pytest.skip(
+            "torch.distributed already initialized — cannot exercise "
+            "the uninitialized-dist guard"
+        )
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.manager import (
+        ChunkManager,
+        _ChunkShardState,
+    )
+    from axolotl.integrations.protrain.chunk.pinned_alloc import (
+        PinnedHostMemory,
+    )
+
+    # Build a tiny single-chunk manager on CPU; we do NOT init dist.
+    # Manager constructor forces ``zero3_shard=False`` when world_size
+    # is 1, so we flip both flags by hand to drive restore_to_gpu
+    # into its sharded branch.
+    hidden = 8
+    model = _tiny_model(hidden=hidden, n_layers=2)
+    layout = _build_layout_for(model, S_chunk=hidden * hidden * 4 + 4096)
+
+    host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+    pool = BufferPool(
+        n_buffer=1,
+        S_chunk=layout.S_chunk,
+        pinned_host=host,
+        device=torch.device("cpu"),
+    )
+    mgr = ChunkManager(
+        model=model,
+        layout=layout,
+        n_persist=0,
+        buffer_pool=pool,
+        cpu_optim=None,
+        gpu_optim=None,
+        device=torch.device("cpu"),
+    )
+
+    # Force the sharded-restore branch by populating both
+    # ``zero3_shard`` and ``_chunk_shards`` / ``_cpu_slots`` directly.
+    # The chunk shard's regions list can be empty — the guard fires on
+    # the dict membership before any per-region work happens.
+    mgr.zero3_shard = True
+    cid = cast(ChunkId, 0)
+    mgr._chunk_shards[cid] = _ChunkShardState(
+        regions=[], chunk_bytes=0, shard_bytes=0
+    )
+    # An empty cpu_slots entry keeps the non-sharded copy loop a no-op
+    # while still satisfying the "_cpu_slots or _chunk_shards" trigger.
+    mgr._cpu_slots[cid] = []
+
+    with pytest.raises(RuntimeError, match="torch.distributed is not initialized"):
+        mgr.restore_to_gpu()
+
+    # Cleanup — restore_to_gpu raised so its own clear() never ran.
+    mgr._chunk_shards.clear()
+    mgr._cpu_slots.clear()
+    mgr.uninstall()
+    host.close()
+    del pool
