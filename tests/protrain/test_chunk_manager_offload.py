@@ -750,3 +750,108 @@ def test_restore_to_gpu_enables_clean_rebuild_under_new_config() -> None:
     mgr2.uninstall()
     host2.close()
     del pool2
+
+
+# ---------------------------------------------------------------------------
+# protrain_optimizer_wrapper partitioning — regression for non-contiguous
+# _persistent_ids (the non-block-chunk pin produces e.g. {0..n-1, last} on
+# Llama with an untied lm_head; a prefix ``cid < n_persist`` test would
+# misroute that high-cid persistent chunk to the CPU adam path).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
+    """When _persistent_ids is non-contiguous, partitioning must follow the SET."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA runtime")
+
+    from axolotl.integrations.protrain.api.optim_wrapper import (
+        protrain_optimizer_wrapper,
+    )
+    from axolotl.integrations.protrain.types import WrappedModel
+
+    torch.cuda.empty_cache()
+    hidden = 64
+    model = _tiny_model(hidden=hidden, n_layers=4).to("cuda")
+    S_chunk = hidden * hidden * 4 + 4096
+
+    mgr, layout, pool, host = _build_chunk_manager(
+        model, n_persist=1, S_chunk=S_chunk
+    )
+    # Force a non-contiguous persistent set: {0, last}. This is the
+    # shape the wrapper's non-block-chunk pin produces when an untied
+    # lm_head sits at the tail of N_chunk. The fix must route chunk
+    # ``last`` into the GPU optimizer's param list (its params are
+    # GPU-resident, never offloaded), and chunks 1..last-1 into the
+    # CPU FusedAdam path (their params will be offloaded by
+    # materialize_offload).
+    last = layout.N_chunk - 1
+    assert last >= 2, "test setup needs N_chunk >= 3 for a useful gap"
+    mgr._persistent_ids = {cast(ChunkId, 0), cast(ChunkId, last)}
+    mgr._non_persistent_ids = {
+        cast(ChunkId, c) for c in range(layout.N_chunk)
+        if c not in mgr._persistent_ids
+    }
+
+    # materialize_offload to set up the CPU shards for non-persistent
+    # chunks — protrain_optimizer_wrapper consults
+    # chunk_manager._chunk_shards / cpu_slots to derive the CPU adam
+    # adapter's per-chunk param lists.
+    mgr.materialize_offload()
+
+    # Build a placeholder WrappedModel (only the fields the optim
+    # wrapper reads matter).
+    wrapped = WrappedModel(
+        module=model,
+        search_result=None,  # type: ignore[arg-type]
+        chunk_manager=mgr,
+        scheduler=None,
+        _hook_handles=[],
+    )
+
+    # Patch CpuFusedAdamAdapter at the optim_wrapper module's lookup
+    # site to capture the partitioning without requiring DeepSpeed's
+    # CPU-Adam C++ extension (this rig may not have it compiled — see
+    # the CUDA-version mismatch warning the wrapper emits). The
+    # capture lets us inspect the EXACT keys the partition produced.
+    from unittest.mock import patch
+
+    captured_keys: dict = {}
+
+    class _StubCpuAdam:
+        def __init__(self, params_per_chunk, **_kwargs):
+            captured_keys["keys"] = set(
+                int(k) for k in params_per_chunk.keys()
+            )
+            captured_keys["params_per_chunk"] = params_per_chunk
+
+        def zero_grad(self, set_to_none: bool = True): pass
+
+    with patch(
+        "axolotl.integrations.protrain.api.optim_wrapper.CpuFusedAdamAdapter",
+        _StubCpuAdam,
+    ):
+        _ = protrain_optimizer_wrapper(wrapped, lr=1e-3)
+
+    assert "keys" in captured_keys, (
+        "CpuFusedAdamAdapter constructor was never invoked — "
+        "partitioning must have routed every chunk to the GPU optim "
+        "(unexpected for a {0, last} persistent set)"
+    )
+    cpu_keys = captured_keys["keys"]
+    expected_cpu_keys = set(int(c) for c in mgr._non_persistent_ids)
+    assert cpu_keys == expected_cpu_keys, (
+        f"CPU adam partitioning misroutes chunks: got cpu_keys="
+        f"{sorted(cpu_keys)}, expected exactly the non-persistent set "
+        f"{sorted(expected_cpu_keys)}. Persistent chunks at high cid "
+        "(non-block-pinned tail like an untied lm_head) leak into the "
+        "CPU adam partition under a prefix ``cid < n_persist`` test."
+    )
+
+    mgr.uninstall()
+    host.close()
+    del pool
