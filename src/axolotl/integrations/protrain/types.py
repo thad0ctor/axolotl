@@ -266,6 +266,38 @@ class ProfilerTrace:
     phase2_n_checkpoint: int = 0
     phase2_per_block_recompute_s: float = 0.0
 
+    # ----- Phase-2 chunked-runtime forward measurement (TRACE_VERSION 11) -----
+    #
+    # ``steady_fwd_chunked_wall_s`` is the median measured forward
+    # wall-clock under the bootstrap config, captured by the same
+    # phase-2 measurement loop that produces ``steady_bwd_chunked_wall_s``.
+    # Forward time under the chunk manager includes any
+    # chunk-prefetch / gather overhead that's inherent to the chunked
+    # runtime AND the actual fused-kernel forward compute — closing the
+    # forward over-prediction gap left over after phase-2 backward
+    # calibration.
+    #
+    # Unlike the backward, the forward cost is approximately
+    # config-independent at the cost-model level: forward never
+    # recomputes (recompute happens in backward for CKPT blocks), so
+    # there's no per-cfg adjustment to apply on top of the measurement.
+    # The cost model simply uses ``steady_fwd_chunked_wall_s`` directly
+    # as the forward-compute total when populated:
+    #
+    #     t_fwd_compute_total = steady_fwd_chunked_wall_s   (overrides
+    #         the per-op-latency sum + hook-scale + roofline cap path)
+    #
+    # Per-block compute distribution is preserved from the per-op path
+    # (used for CKPT recompute accounting in backward + for the per-
+    # chunk roofline split) but rescaled to match the new total — this
+    # mirrors the SECONDARY safety cap path in
+    # ``_fwd_compute_time_from_trace``.
+    #
+    # ``0.0`` (default) means "no phase-2 forward measurement
+    # available" and the cost model falls back to the v10 path
+    # (per-op-latency sum with hook scale + roofline cap).
+    steady_fwd_chunked_wall_s: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)

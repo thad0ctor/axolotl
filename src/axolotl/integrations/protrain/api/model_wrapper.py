@@ -1488,10 +1488,11 @@ def protrain_model_wrapper(
         boot_batch = _dummy_batch(model, batch_size, seq_len, device)
 
         measurement_failed = False
+        fwd_s = 0.0
         bwd_s = 0.0
         step_s = 0.0
         try:
-            bwd_s, step_s = measure_chunked_steady(
+            fwd_s, bwd_s, step_s = measure_chunked_steady(
                 model=model, batch=boot_batch, optimizer=boot_optim
             )
         except Exception as exc:  # noqa: BLE001 — measurement is best-effort
@@ -1539,6 +1540,14 @@ def protrain_model_wrapper(
                 device=device,
             )
         if not measurement_failed:
+            # ``estimate_per_block_recompute_s`` derives a per-block
+            # recompute estimate from ``_fwd_compute_time_from_trace``.
+            # For TRACE_VERSION 11 the per-op-derived per-block shape is
+            # what the bwd-translation in ``_bwd_compute_time_from_trace``
+            # consumes (both the bootstrap subtraction AND the per-cfg
+            # add) — so it stays consistent regardless of whether we
+            # call it pre- or post-splice. We call it pre-splice to
+            # mirror the v10 ordering and keep the splice block compact.
             per_block_recompute_s = estimate_per_block_recompute_s(
                 trace, n_block
             )
@@ -1546,6 +1555,7 @@ def protrain_model_wrapper(
 
             new_trace = _replace(
                 trace,
+                steady_fwd_chunked_wall_s=fwd_s,
                 steady_bwd_chunked_wall_s=bwd_s,
                 steady_step_overlap_s=step_s,
                 phase2_n_checkpoint=boot_cfg.n_checkpoint,
