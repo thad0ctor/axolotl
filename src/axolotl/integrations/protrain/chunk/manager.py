@@ -858,6 +858,139 @@ class ChunkManager:
         )
         return freed
 
+    def restore_to_gpu(self) -> int:
+        """Inverse of :meth:`materialize_offload` — move every param back to GPU.
+
+        For each non-persistent chunk in ``self._cpu_slots``: allocate a
+        fresh standalone GPU tensor of each param's recorded shape +
+        dtype, copy from the pinned CPU slot, and rebind ``param.data``
+        to the new tensor. For each persistent chunk that has a
+        materialized resident buffer: copy each param's typed view out
+        of the pool buffer into a standalone GPU tensor and rebind.
+
+        After the pass every parameter once again owns its own GPU
+        storage — exactly as it did before ``materialize_offload`` ran —
+        so a fresh :class:`ChunkManager` constructed against the same
+        model can re-run ``materialize_offload`` from scratch under a
+        new ``CostConfig`` (different ``n_persist`` / ``n_buffer`` /
+        ``S_chunk``). This is the foundation for the phase-2 profiler's
+        bootstrap-then-rebuild flow (paper §3.2 calibration loop).
+
+        Returns
+        -------
+        int
+            Bytes copied back to standalone GPU storage. 0 on a manager
+            that was never offloaded.
+
+        Raises
+        ------
+        NotImplementedError
+            When ``zero3_shard`` is True on this manager. The phase-2
+            measurement runs single-rank by construction (it's invoked
+            from ``protrain_model_wrapper`` BEFORE Trainer brings up
+            distributed), so a sharded restore is not on any code path
+            we need today. Adding it would require an ``all_gather`` to
+            reconstruct full-chunk bytes from per-rank shards before the
+            copy-and-rebind step.
+
+        Idempotent: a second call with no offload materialized is a no-op.
+        """
+        if self.zero3_shard and (self._cpu_slots or self._chunk_shards):
+            raise NotImplementedError(
+                "ChunkManager.restore_to_gpu: sharded teardown not "
+                "implemented (would need an all_gather per chunk to "
+                "reassemble bytes before rebind). Phase-2 runs "
+                "single-rank by construction so this code path is "
+                "unreachable from the wrapper today."
+            )
+        if not self._cpu_slots and not self._persistent_buffers:
+            LOG.debug(
+                "ChunkManager.restore_to_gpu: nothing offloaded "
+                "(no _cpu_slots, no _persistent_buffers), no-op"
+            )
+            return 0
+
+        import torch
+
+        moved = 0
+
+        # ---- Non-persistent chunks: copy from pinned CPU slots --------
+        for cid, slots in self._cpu_slots.items():
+            for slot in slots:
+                param = self._params_by_id.get(slot.param_id)
+                if param is None or slot.cpu_data is None:
+                    # cpu_data is None on sharded slots; the guard above
+                    # already short-circuited that case but be defensive.
+                    continue
+                gpu_tensor = torch.empty(
+                    slot.shape, dtype=slot.dtype, device=self.device
+                )
+                gpu_tensor.copy_(slot.cpu_data)
+                param.data = gpu_tensor
+                moved += slot.numel * slot.element_size
+
+        # ---- Persistent chunks: extract from the resident pool buffer
+        # back into standalone GPU storage. The pool buffer itself can
+        # then be released by clearing _persistent_buffers — params are
+        # no longer pointing into it.
+        for cid, buf in self._persistent_buffers.items():
+            # We need the per-param byte offsets used at gather time.
+            # _cpu_slots is the canonical record but persistent chunks
+            # were never offloaded so it has no entry for them. Recompute
+            # the same aligned-offset layout that materialize_offload
+            # would have used (offsets are a function of the chunk's
+            # param sequence + dtypes, not the offload itself).
+            param_ids = self.layout.chunks[int(cid)]
+            offset = 0
+            for pid in param_ids:
+                param = self._params_by_id.get(pid)
+                if param is None:
+                    continue
+                nbytes = int(param.numel()) * int(param.element_size())
+                if nbytes == 0:
+                    continue
+                esz = int(param.element_size())
+                # Same alignment rule as materialize_offload (line ~550).
+                offset = ((offset + esz - 1) // esz) * esz
+                byte_view = buf.narrow(0, offset, nbytes)
+                typed = byte_view.view(param.data.dtype).view(param.shape)
+                gpu_tensor = torch.empty(
+                    param.shape, dtype=param.data.dtype, device=self.device
+                )
+                gpu_tensor.copy_(typed)
+                param.data = gpu_tensor
+                moved += nbytes
+                offset += nbytes
+
+        # ---- Drop hook handles + per-chunk state ----------------------
+        # uninstall() removes the post-accumulate-grad hooks installed
+        # by materialize_offload. After this the per-param hook bindings
+        # are gone; a subsequent materialize_offload on a fresh manager
+        # will install a new set.
+        self.uninstall()
+
+        # Clear every dict that materialize_offload populated so the
+        # next ChunkManager doesn't see stale entries (shouldn't happen
+        # — restore_to_gpu is meant to precede this manager's GC — but
+        # be defensive).
+        self._cpu_slots.clear()
+        self._chunk_shards.clear()
+        self._persistent_buffers.clear()
+        self._grad_initial.clear()
+        self._grad_remaining.clear()
+        # Empty placeholders are still referenced by params we just
+        # rebound — the rebind dropped the param.data reference, so the
+        # placeholders are unreferenced from torch's perspective. Drop
+        # the dict so the next gather builds fresh ones if needed.
+        self._empty_by_dtype.clear()
+
+        LOG.info(
+            "ChunkManager.restore_to_gpu: moved %.3f GB back to standalone "
+            "GPU storage (non-persistent + persistent combined)",
+            moved / 1e9,
+        )
+        return moved
+
     def _empty_placeholder(self, dtype: "torch.dtype") -> "torch.Tensor":
         """Return a zero-element GPU tensor of ``dtype`` (cached per dtype)."""
         import torch

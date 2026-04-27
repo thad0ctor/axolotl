@@ -578,3 +578,175 @@ def test_grad_offload_hook_fires() -> None:
     mgr.uninstall()
     host.close()
     del pool
+
+
+# ---------------------------------------------------------------------------
+# restore_to_gpu — inverse of materialize_offload (phase-2 profiler bootstrap)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_restore_to_gpu_round_trip_preserves_param_values() -> None:
+    """materialize_offload → restore_to_gpu must leave every param byte-identical.
+
+    The phase-2 profiler builds a bootstrap chunk-manager, runs a
+    chunked fwd+bwd+step measurement loop, then needs to tear down and
+    rebuild under a (potentially different) post-research config. The
+    teardown lives in :meth:`ChunkManager.restore_to_gpu`. Round-trip
+    correctness is the hard correctness invariant — without it the
+    rebuilt manager would see corrupted weights.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA runtime")
+
+    torch.cuda.empty_cache()
+
+    hidden = 64
+    n_layers = 4
+    model = _tiny_model(hidden=hidden, n_layers=n_layers).to("cuda")
+    S_chunk = hidden * hidden * 4 + 4096
+
+    # Snapshot every parameter's value BEFORE we touch the manager. The
+    # round-trip must reproduce these byte-for-byte.
+    reference: dict[str, torch.Tensor] = {
+        name: p.detach().clone() for name, p in model.named_parameters()
+    }
+
+    mgr, layout, pool, host = _build_chunk_manager(
+        model, n_persist=1, S_chunk=S_chunk
+    )
+
+    freed = mgr.materialize_offload()
+    assert freed > 0, "test setup: expected non-persistent bytes to be freed"
+
+    any_empty = any(
+        p.data.numel() == 0 for name, p in model.named_parameters()
+    )
+    assert any_empty, (
+        "test setup invariant: at least one param should be offloaded to "
+        "an empty placeholder before restore"
+    )
+
+    # Gather persistent chunks so their pool-buffer view becomes the
+    # source-of-truth bytes that restore_to_gpu must extract.
+    for cid_int in sorted(mgr._persistent_ids):
+        mgr.gather(cast(ChunkId, cid_int))
+
+    moved = mgr.restore_to_gpu()
+    assert moved > 0, "restore_to_gpu reported 0 bytes moved — should be > 0"
+
+    for name, p in model.named_parameters():
+        assert p.data.numel() == reference[name].numel(), (
+            f"param {name}: numel changed across restore "
+            f"({reference[name].numel()} -> {p.data.numel()})"
+        )
+        assert p.data.device.type == "cuda", (
+            f"param {name} not on cuda after restore: {p.data.device}"
+        )
+        assert torch.equal(p.data, reference[name]), (
+            f"param {name} bytes diverged across "
+            "materialize_offload -> restore_to_gpu round-trip"
+        )
+
+    # Internal state cleared so a new manager can rebuild from scratch.
+    assert not mgr._cpu_slots, "restore_to_gpu must clear _cpu_slots"
+    assert not mgr._persistent_buffers, (
+        "restore_to_gpu must clear _persistent_buffers"
+    )
+    assert not mgr._grad_hook_handles, (
+        "restore_to_gpu must remove all grad hook handles"
+    )
+
+    host.close()
+    del pool
+
+
+@pytest.mark.gpu
+def test_restore_to_gpu_idempotent_on_unmaterialized_manager() -> None:
+    """A manager that never offloaded is a no-op restore — no exception, returns 0."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA runtime")
+
+    torch.cuda.empty_cache()
+
+    hidden = 64
+    model = _tiny_model(hidden=hidden, n_layers=4).to("cuda")
+    S_chunk = hidden * hidden * 4 + 4096
+
+    mgr, _layout, pool, host = _build_chunk_manager(
+        model, n_persist=1, S_chunk=S_chunk
+    )
+
+    assert mgr.restore_to_gpu() == 0
+    assert mgr.restore_to_gpu() == 0  # twice in a row
+
+    host.close()
+    del pool
+
+
+@pytest.mark.gpu
+def test_restore_to_gpu_enables_clean_rebuild_under_new_config() -> None:
+    """Restore lets a fresh ChunkManager be built on the same model with a new n_persist.
+
+    This is the actual phase-2 use case: bootstrap manager -> measure ->
+    restore -> build a second manager with a different config. The
+    second materialize_offload must run successfully (i.e. not see the
+    first manager's leftover state on the model parameters).
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA runtime")
+
+    torch.cuda.empty_cache()
+
+    hidden = 64
+    n_layers = 4
+    model = _tiny_model(hidden=hidden, n_layers=n_layers).to("cuda")
+    S_chunk = hidden * hidden * 4 + 4096
+
+    reference: dict[str, torch.Tensor] = {
+        name: p.detach().clone() for name, p in model.named_parameters()
+    }
+
+    # Bootstrap: n_persist=1.
+    mgr1, _layout1, pool1, host1 = _build_chunk_manager(
+        model, n_persist=1, S_chunk=S_chunk
+    )
+    mgr1.materialize_offload()
+    for cid_int in sorted(mgr1._persistent_ids):
+        mgr1.gather(cast(ChunkId, cid_int))
+    mgr1.restore_to_gpu()
+    host1.close()
+    del mgr1, pool1
+
+    # Post-research: a different n_persist on the same model.
+    mgr2, _layout2, pool2, host2 = _build_chunk_manager(
+        model, n_persist=2, S_chunk=S_chunk
+    )
+    freed2 = mgr2.materialize_offload()
+    assert freed2 > 0, (
+        "second materialize_offload reported 0 freed — restore left "
+        "stale state on the model that prevented re-offload"
+    )
+
+    # Gather everything so we can compare against the reference.
+    for cid_int in sorted(mgr2._persistent_ids):
+        mgr2.gather(cast(ChunkId, cid_int))
+    for cid_int in sorted(mgr2._non_persistent_ids):
+        mgr2.gather(cast(ChunkId, cid_int))
+    for name, p in model.named_parameters():
+        assert torch.equal(p.data, reference[name]), (
+            f"param {name} corrupted across two materialize/restore cycles"
+        )
+
+    mgr2.uninstall()
+    host2.close()
+    del pool2
