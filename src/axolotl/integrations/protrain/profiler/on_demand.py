@@ -167,16 +167,35 @@ class OnDemandTensorMgr:
                 self._spill_param_to_cpu(param, target_device)
 
             for sub in self.model.modules():
-                self._handles.append(sub.register_forward_pre_hook(self._pre_gather))
+                # ``prepend=True`` on pre-hooks: the trace driver registers its
+                # own pre_forward (and pre_backward) hooks BEFORE we enter this
+                # context. PyTorch fires forward_pre hooks in registration
+                # order, so without ``prepend`` the trace's snapshot of
+                # allocated_before would be taken BEFORE our gather, and
+                # ``intra_op_delta = peak - allocated_before`` would absorb
+                # the per-leaf gather bytes for every op. By prepending, our
+                # gather fires FIRST; the trace's allocated_before then
+                # already includes the gathered param, and intra_op_delta
+                # captures only workspace + output (the cost model's
+                # peak-reconstruction expects exactly that).
+                self._handles.append(
+                    sub.register_forward_pre_hook(self._pre_gather, prepend=True)
+                )
+                # Post-release stays FIFO: it must fire AFTER the trace's
+                # post_forward measures peak/end, otherwise we'd release
+                # mid-measurement.
                 self._handles.append(sub.register_forward_hook(self._post_release))
                 # Backward path: re-gather params before each module's bwd
                 # and release them after. Forward-only callers pay nothing
                 # (the hooks never fire). Backward callers pay one extra
                 # H2D copy of the param + one D2H release per module per
                 # backward pass — the same per-module cost the forward
-                # path already pays.
+                # path already pays. Same ordering rationale: prepend the
+                # pre-gather, FIFO the post-release.
                 self._handles.append(
-                    sub.register_full_backward_pre_hook(self._pre_gather_bwd)
+                    sub.register_full_backward_pre_hook(
+                        self._pre_gather_bwd, prepend=True
+                    )
                 )
                 self._handles.append(
                     sub.register_full_backward_hook(self._post_release_bwd)
