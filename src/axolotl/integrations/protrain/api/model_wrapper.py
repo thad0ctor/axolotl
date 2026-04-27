@@ -20,7 +20,6 @@ to opt into ProTrain without Axolotl orchestration.
 
 from __future__ import annotations
 
-import hashlib
 from typing import TYPE_CHECKING, cast
 
 from torch import nn
@@ -46,6 +45,7 @@ from axolotl.integrations.protrain.profiler import (
     save_cached_trace,
 )
 from axolotl.integrations.protrain.profiler.cache import ProfilerCacheKey
+from axolotl.integrations.protrain.profiler.trace import _arch_hash
 from axolotl.integrations.protrain.profiler.hw_bench import measure_compute_rate
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
 from axolotl.integrations.protrain.runtime.scheduler import Scheduler
@@ -71,19 +71,6 @@ LOG = get_logger(__name__)
 # caller does not override ``capacity_bytes``. Reserves 2 GiB for CUDA
 # context + PyTorch allocator overhead, matching the M4 task spec.
 _DEFAULT_HEADROOM_BYTES = 2 * (1 << 30)
-
-
-def _arch_hash(model: nn.Module) -> str:
-    """Deterministic hash of the model architecture for the cache key.
-
-    Mirrors the profiler's internal hash so the cache key is stable
-    across processes that only see the module (no trace) — the plugin
-    (M5) will call this before invoking the profiler.
-    """
-    parts: list[str] = [type(model).__name__]
-    for name, p in model.named_parameters():
-        parts.append(f"{name}:{tuple(p.shape)}:{p.dtype}")
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _sku(device: "torch.device | str") -> str:
