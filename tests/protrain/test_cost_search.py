@@ -529,6 +529,148 @@ def test_estimate_runtime_uses_measured_adam_when_provided(toy_trace, toy_layout
     )
 
 
+def test_bwd_compute_time_uses_phase2_chunked_measurement_when_present():
+    """Phase-2 path (TRACE_VERSION 10) takes precedence over the v8 unwrapped ratio.
+
+    A trace with both ``steady_bwd_chunked_wall_s`` and the legacy
+    ``steady_bwd_wall_s`` populated must use the chunked field. The
+    return value is the BASE backward (recompute subtracted), so the
+    caller's per-cfg recompute term still adds the right amount on top.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _bwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+    # Numbers picked so the translation is hand-verifiable:
+    # measurement = 1.20s, bootstrap had 4 CKPT'd blocks, per-block
+    # recompute = 0.05s -> phase2_recompute = 0.20s -> base = 1.00s.
+    trace = replace(
+        base_trace,
+        steady_bwd_wall_s=2.50,  # would give a 1.0× clamp via path 2
+        steady_bwd_chunked_wall_s=1.20,
+        phase2_n_checkpoint=4,
+        phase2_per_block_recompute_s=0.05,
+    )
+    base = _bwd_compute_time_from_trace(trace, t_fwd_total=2.50)
+    assert base == pytest.approx(1.00, abs=1e-9), (
+        f"phase-2 base should be measured - bootstrap_recompute = "
+        f"1.20 - 4*0.05 = 1.00, got {base}"
+    )
+
+
+def test_bwd_compute_time_phase2_clamped_to_non_negative():
+    """If the measurement is shorter than bootstrap recompute (degenerate case),
+    the base is clamped to 0 — the caller's per-cfg recompute then provides
+    the entire backward time. Real measurements should never trigger this,
+    but we guard against arithmetic surprises.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _bwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+    # Bootstrap recompute = 4 * 0.5 = 2.0s but measurement = 1.0s.
+    trace = replace(
+        base_trace,
+        steady_bwd_chunked_wall_s=1.0,
+        phase2_n_checkpoint=4,
+        phase2_per_block_recompute_s=0.5,
+    )
+    base = _bwd_compute_time_from_trace(trace, t_fwd_total=2.50)
+    assert base == 0.0, f"expected clamp to 0, got {base}"
+
+
+def test_bwd_compute_time_falls_back_when_phase2_not_populated():
+    """When phase-2 fields are 0 (pre-v10 cache or skipped phase-2), use v8 path."""
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _bwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+
+    # v8-style trace: legacy steady_bwd_wall_s populated, phase-2 fields 0.
+    trace_v8 = replace(
+        base_trace,
+        steady_bwd_wall_s=1.5,
+        steady_fwd_wall_s=1.0,  # ratio = 1.5
+        # phase-2 fields all default 0.0 / 0
+    )
+    bwd_v8 = _bwd_compute_time_from_trace(trace_v8, t_fwd_total=2.0)
+    assert bwd_v8 == pytest.approx(2.0 * 1.5, abs=1e-9), (
+        f"v8 path should return t_fwd * measured_ratio = 3.0, got {bwd_v8}"
+    )
+
+    # Pure heuristic: nothing measured at all -> 2x canonical (assuming
+    # trainable_param_fraction defaults to 0 which goes to else branch).
+    trace_h = replace(
+        base_trace,
+        steady_bwd_wall_s=0.0,
+        steady_fwd_wall_s=0.0,
+    )
+    bwd_h = _bwd_compute_time_from_trace(trace_h, t_fwd_total=2.0)
+    assert bwd_h == pytest.approx(2.0 * 2.0, abs=1e-9), (
+        f"heuristic path should return t_fwd * 2.0 = 4.0, got {bwd_h}"
+    )
+
+
+def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
+    """End-to-end: with phase-2 populated, increasing n_checkpoint adds recompute.
+
+    The translation is the whole point of D1b. A trace whose phase-2
+    measurement was taken under all-CKPT bootstrap should yield bigger
+    backward times for configs with more CKPT blocks (the addition is
+    via the caller's per_block_compute walk, NOT via the measurement
+    itself).
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import estimate_runtime
+
+    base_trace = _make_trace()
+    n_block = len(base_trace.activation_sizes)
+    # Bootstrap was n_checkpoint=N_block (all CKPT). Per-block recompute
+    # at 0.001s — small enough that the translation doesn't dominate
+    # but big enough to be visible after the n_block multiplier.
+    trace = replace(
+        base_trace,
+        steady_bwd_chunked_wall_s=0.5,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.001,
+    )
+    layout = _make_layout()
+    hw = _make_hw()
+    n_chunk = layout.N_chunk
+
+    # All-persistent so CPU-Adam doesn't mask backward changes.
+    cfg_zero = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    cfg_full_ckpt = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=n_block
+    )
+    bm_zero = assign_modes(0, 0, n_block)
+    bm_full = assign_modes(0, n_block, n_block)
+
+    t_zero = estimate_runtime(cfg_zero, trace, layout, bm_zero, hw)
+    t_full = estimate_runtime(cfg_full_ckpt, trace, layout, bm_full, hw)
+
+    # The all-CKPT config must add per-block recompute on top of the
+    # base; the all-NONE config must not. The DELTA proves the
+    # translation is wired up.
+    assert t_full > t_zero, (
+        f"phase-2 translation broken: t_full={t_full:.6f} <= t_zero={t_zero:.6f}; "
+        "all-CKPT should be more expensive than all-NONE because the "
+        "caller's per-cfg recompute term adds time on top of the base"
+    )
+
+
 def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
     """SKU compute-rate calibration scales forward compute proportionally.
 

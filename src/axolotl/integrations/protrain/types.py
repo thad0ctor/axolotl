@@ -223,6 +223,49 @@ class ProfilerTrace:
     # (pre-v8) — falls back to the canonical 2× ratio. New in TRACE_VERSION=8.
     trainable_param_fraction: float = 0.0
 
+    # ----- Phase-2 chunked-runtime measurements (TRACE_VERSION 10) -----
+    #
+    # The phase-2 profiler runs a short chunked steady-state fwd+bwd+step
+    # loop INSIDE ``protrain_model_wrapper`` (after the initial trace +
+    # initial search but before returning the wrapped model). It measures
+    # backward time with the chunk manager engaged — closing the gap that
+    # forced ``include_backward=False`` on 7B+ profiles where the
+    # unwrapped backward OOMs.
+    #
+    # ``steady_bwd_chunked_wall_s`` is the median measured backward
+    # wall-clock under the bootstrap config, in seconds. Includes
+    # gradient checkpoint recompute for ``phase2_n_checkpoint`` blocks
+    # plus any chunk-gather / reduce-offload overhead inherent to the
+    # chunked path. The cost model translates this into a config-
+    # independent base via:
+    #
+    #     base_bwd = steady_bwd_chunked_wall_s
+    #              - phase2_n_checkpoint * phase2_per_block_recompute_s
+    #     predicted_bwd(cfg) = base_bwd + k_ckpt(cfg) * per_block_compute(cfg)
+    #
+    # where ``k_ckpt(cfg)`` is the count of CKPT blocks in the candidate's
+    # block_map. The translation handles the case where the post-research
+    # search picks a different ``n_checkpoint`` than the bootstrap's
+    # measurement (the common case — phase-2 reveals real backward cost
+    # and the search may switch some blocks from CKPT to NONE).
+    #
+    # ``steady_step_overlap_s`` is the wall-clock window where backward
+    # compute and the optimizer step overlap, captured via
+    # ``torch.cuda.Event`` pairs around the bwd→step transition. The
+    # cost model does not consume this directly today (the paper's
+    # T_iter = T_FWD + max{T_BWD + T_GPU_OPT, T_CPU_OPT} accounts for
+    # overlap implicitly), but it's recorded for future cost-model
+    # tuning + telemetry validation.
+    #
+    # All three default to 0.0 / 0; the cost model treats 0.0 in
+    # ``steady_bwd_chunked_wall_s`` as "no phase-2 measurement available"
+    # and falls back to the v8 path (``steady_bwd_wall_s`` ratio →
+    # trainable-fraction heuristic → 2× canonical).
+    steady_bwd_chunked_wall_s: float = 0.0
+    steady_step_overlap_s: float = 0.0
+    phase2_n_checkpoint: int = 0
+    phase2_per_block_recompute_s: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)

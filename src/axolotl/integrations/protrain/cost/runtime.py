@@ -269,22 +269,55 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
 def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> float:
     """Return the aggregate backward compute time in seconds.
 
-    Preferred: measured ``steady_bwd_wall_s / steady_fwd_wall_s`` ratio
-    from the profiler's multi-iter hot-loop (TRACE_VERSION ≥ 7 when
-    ``cfg.include_backward`` is set and backward didn't OOM during
-    measurement). This captures the actual transformer-specific bwd/fwd
-    relationship on the measured hardware — typically 1.5-2.2× depending
-    on the attention implementation and which paths are autograd-traced.
+    Preference order:
 
-    Fallback: ``t_fwd_total * _BWD_FWD_COMPUTE_RATIO`` (2.0× — canonical
-    transformer prior). Used when backward wasn't measured (7B trace
-    where backward OOMs without chunk offload) or the trace predates v7.
+    1. **Phase-2 chunked measurement** (TRACE_VERSION ≥ 10): if
+       ``steady_bwd_chunked_wall_s > 0`` AND ``phase2_per_block_recompute_s > 0``,
+       use the chunked measurement minus the bootstrap's recompute term.
+       This returns the **base** backward time (no recompute) — the
+       caller then adds the candidate ``block_map``'s recompute on top
+       in the same way as the v8 path. The translation is:
+
+           base_bwd = steady_bwd_chunked_wall_s
+                    - phase2_n_checkpoint * phase2_per_block_recompute_s
+
+       (clamped to ≥ 0 for numerical safety; a base of 0 means the
+       measured chunked time was entirely recompute, which only happens
+       when the bootstrap had every block CKPT'd and the model was
+       essentially all-recompute already. Caller's per-cfg recompute
+       term still adds the right amount on top.)
+
+    2. **Steady (unwrapped) measurement** (TRACE_VERSION ≥ 7): measured
+       ``steady_bwd_wall_s / steady_fwd_wall_s`` ratio from the 4-iter
+       hot loop. Captures the actual transformer-specific bwd/fwd
+       relationship on the measured hardware — typically 1.5-2.2×
+       depending on the attention implementation. Used when phase-2
+       didn't run (smaller models where the unwrapped backward fits)
+       and is more accurate than the heuristic.
+
+    3. **Heuristic** (always available): trainable-fraction-aware.
+       LoRA / adapter training has ~0.1% trainable; backward only flows
+       through those params, ratio ≈ 1.0. Full finetune sees the
+       canonical 2.0×. This is the path 7B-LoRA traces hit before
+       phase-2 because the unwrapped backward OOMs and the chunked
+       measurement hadn't been wired up.
 
     The hooked aggregate ``<backward>`` latency retained in
     ``trace.op_latencies`` is NOT used — autograd holds the hook-saved
     tensors during the forward which materially distorts the hooked
     backward timing.
     """
+    # ---- Path 1: phase-2 chunked measurement ----
+    if (
+        trace.steady_bwd_chunked_wall_s > 0.0
+        and trace.phase2_per_block_recompute_s > 0.0
+    ):
+        bootstrap_recompute = (
+            trace.phase2_n_checkpoint * trace.phase2_per_block_recompute_s
+        )
+        base = max(0.0, trace.steady_bwd_chunked_wall_s - bootstrap_recompute)
+        return base
+    # ---- Path 2: steady unwrapped measurement ----
     if trace.steady_bwd_wall_s > 0.0 and trace.steady_fwd_wall_s > 0.0:
         measured_ratio = trace.steady_bwd_wall_s / trace.steady_fwd_wall_s
         # Clamp to a sane range — if the measurement is wildly off
@@ -293,11 +326,7 @@ def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> fl
         # skips frozen subgraphs) and 3× (full-finetune with attention recomp).
         measured_ratio = max(1.0, min(3.0, measured_ratio))
         return t_fwd_total * measured_ratio
-    # Fallback: trainable-fraction-aware. LoRA / adapter training has
-    # ~0.1% trainable; backward only flows through those params, so the
-    # ratio is ~1.0. Full finetune sees the canonical 2.0×. Threshold
-    # 5% — anything below is "mostly frozen" (LoRA r=8/16/32 on a 7B
-    # base lands around 0.05-0.5%).
+    # ---- Path 3: trainable-fraction-aware heuristic ----
     if 0.0 < trace.trainable_param_fraction < 0.05:
         return t_fwd_total * 1.0
     return t_fwd_total * _BWD_FWD_COMPUTE_RATIO
