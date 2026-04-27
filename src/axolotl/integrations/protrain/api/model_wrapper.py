@@ -569,6 +569,334 @@ def _select_mode(
     )
 
 
+def _construct_runtime(
+    *,
+    model: nn.Module,
+    blocks: list[nn.Module],
+    layout,
+    result: SearchResult,
+    hardware_profile: HardwareProfile,
+    capacity_bytes: int,
+    trace,
+    zero3_shard,
+    device,
+) -> tuple[object, object, list[object], SearchResult]:
+    """Build chunk_manager + scheduler + hooks under a given ``result``.
+
+    Encapsulates the post-search runtime-construction half of
+    :func:`protrain_model_wrapper` so it can be invoked twice when
+    phase-2 picks a different config than the bootstrap. The returned
+    ``result`` may differ from the input — peak-prediction calibration
+    can adjust ``predicted_peak_bytes`` and ``cfg.n_persist`` (because
+    chunks containing non-block params get force-pinned to the
+    persistent set, which can grow ``n_persist`` beyond the search's
+    pick).
+
+    Construction order (mirrors the paper §3 + DESIGN.md §Construction):
+    PinnedHostMemory → BufferPool → GpuFusedAdamAdapter → ChunkManager →
+    non-block-chunk pinning → peak calibration → materialize_offload →
+    CpuFusedAdamAdapter → Scheduler → wrap_block (per block) →
+    install_hooks. Every step is idempotent on the model OR has a
+    documented inverse, so a teardown via ``ChunkManager.restore_to_gpu``
+    + hook ``.remove()`` + block ``unwrap`` lets the caller re-invoke
+    this helper under a new ``result`` for the phase-2 rebuild.
+
+    Returns
+    -------
+    (chunk_manager, scheduler, handles, result)
+        ``chunk_manager`` and ``scheduler`` are the live runtime
+        objects; ``handles`` is the list of hook handles for later
+        removal; ``result`` is the (possibly calibrated) SearchResult.
+    """
+    import sys as _sys2
+    import torch
+
+    n_persist = result.cfg.n_persist
+    n_buffer = max(1, result.cfg.n_buffer)
+
+    pinned_host = PinnedHostMemory(n_buffer=n_buffer, S_chunk=layout.S_chunk)
+    buffer_pool = BufferPool(
+        n_buffer=n_buffer,
+        S_chunk=layout.S_chunk,
+        pinned_host=pinned_host,
+        device=device,
+    )
+
+    # Partition params: persistent chunks get the GPU optimizer, the rest
+    # get per-chunk CPU FusedAdam adapters keyed on ChunkId.
+    params_by_name: dict[str, nn.Parameter] = dict(model.named_parameters())
+    persistent_params: list[nn.Parameter] = []
+    cpu_params_per_chunk: dict = {}
+
+    for cid, chunk_param_ids in enumerate(layout.chunks):
+        chunk_params = [
+            params_by_name[str(pid)]
+            for pid in chunk_param_ids
+            if str(pid) in params_by_name
+        ]
+        if cid < n_persist:
+            persistent_params.extend(chunk_params)
+        else:
+            cpu_params_per_chunk[cid] = chunk_params
+
+    # Adam hyperparameters are owned by the optimizer wrapper; seed with
+    # harmless defaults here. ``protrain_optimizer_wrapper`` will rebuild
+    # these adapters with the user's real LR/betas, so this instance is
+    # transient — we still allocate it so the chunk manager has a live
+    # reference during the smoke-test smoke path.
+    #
+    # BUG 3 FIX: ``CpuFusedAdamAdapter`` construction is deferred to
+    # AFTER ``chunk_manager.materialize_offload()`` below. Before
+    # offload, the non-persistent chunk params are full-size GPU
+    # tensors; after offload they are zero-element GPU placeholders
+    # whose *real* weights live in ``chunk_manager._cpu_slots``. The
+    # lazy CPU-Adam state init (``torch.zeros_like(p.data, device='cpu')``)
+    # runs on the first ``step`` call — by which point
+    # ``_ensure_cpu_grads_attached`` has repointed ``p.data`` at the CPU
+    # shard — so what matters is that the adapter's ``param_groups``
+    # reference the right ``nn.Parameter`` objects, not what ``p.data``
+    # currently points at. The previous ordering (adapter built
+    # pre-offload) was benign in the p.data sense but risked a CUDA
+    # initialization hazard if DeepSpeed ever cached pointers on the
+    # GPU tensor; deferring is the safe invariant.
+    gpu_optim: GpuFusedAdamAdapter | None = None
+    if persistent_params:
+        gpu_optim = GpuFusedAdamAdapter(params=persistent_params, lr=1e-4)
+
+    # ---- Distributed context + M7 zero3_shard decision -----------------
+    # Auto-detect world_size / rank from the active process group;
+    # default to single-rank when no group is up. ``zero3_shard`` was
+    # already resolved above the search call so it could flow through
+    # ``HardwareProfile.zero3_shard`` into the cost model; re-use that
+    # decision here for the ChunkManager constructor. The ChunkManager
+    # silently degrades zero3_shard to False when world_size == 1, so
+    # the auto-detect path is safe on single-rank hosts too.
+    _ws = 1
+    _rank = 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        _ws = int(torch.distributed.get_world_size())
+        _rank = int(torch.distributed.get_rank())
+    _zero3 = bool(hardware_profile.zero3_shard) and (_ws > 1)
+    LOG.info(
+        "ProTrain: distributed context world_size=%d rank=%d zero3_shard=%s "
+        "(requested=%s)",
+        _ws,
+        _rank,
+        _zero3,
+        zero3_shard,
+    )
+
+    chunk_manager = ChunkManager(
+        model=model,
+        layout=layout,
+        n_persist=n_persist,
+        buffer_pool=buffer_pool,
+        cpu_optim=None,  # wired in after materialize_offload (BUG 3)
+        gpu_optim=gpu_optim,
+        device=device,
+        world_size=_ws,
+        rank=_rank,
+        zero3_shard=_zero3,
+    )
+
+    # Chunks containing ANY non-block param (embeddings, final norm,
+    # lm_head — any param not living inside a transformer block) are
+    # pinned to the persistent set. Reasoning:
+    #
+    #   a) The block-granularity scheduler only knows about chunks
+    #      listed in ``layout.block_to_chunks``. Pure non-block chunks
+    #      (the trivial case — all their params are non-block) are never
+    #      gathered by any hook; if offloaded they'd be zero-sized
+    #      during forward.
+    #   b) Mixed chunks (e.g. the last block's chunk that was greedy-
+    #      filled with the final model.norm.weight) ARE gathered by the
+    #      block-post hook, but the block-post hook ALSO releases them
+    #      since they're not in the next block's chunk set — which
+    #      leaves the non-block param (``model.norm.weight``) empty by
+    #      the time LlamaModel.forward calls ``self.norm(...)`` after
+    #      block 31's forward-post hook fires.
+    #
+    # The fix in both cases is the same: keep chunks with any non-block
+    # param GPU-resident. Cost is bounded by ``S_chunk`` per such chunk;
+    # for Llama it's typically 2 chunks ≈ 256 MB.
+    param_is_in_block: dict[str, bool] = {
+        str(pid): False for pid in layout.param_to_chunk
+    }
+    for bid, pids in _build_block_spans(model)[1].items():
+        for pid in pids:
+            param_is_in_block[str(pid)] = True
+    chunks_with_nonblock: set[int] = set()
+    for cid, pid_tuple in enumerate(layout.chunks):
+        for pid in pid_tuple:
+            if not param_is_in_block.get(str(pid), False):
+                chunks_with_nonblock.add(cid)
+                break
+    extra = chunks_with_nonblock - chunk_manager._persistent_ids
+    if extra:
+        # Expand the persistent set in-place; mark_persistent takes a
+        # prefix length, so we instead mutate the internal set directly
+        # for this cross-cutting pin.
+        chunk_manager._persistent_ids |= extra
+        chunk_manager._non_persistent_ids -= extra
+        LOG.info(
+            "ProTrain: pinning %d chunks %s to persistent because they "
+            "contain non-block params the scheduler cannot gather on "
+            "its own",
+            len(extra),
+            sorted(extra),
+        )
+
+    # ---- peak-prediction calibration ------------------------------------
+    # The cost/memory.py estimator approximates persistent model state as
+    # ``n_persist * S_chunk`` — a tight upper bound when chunks pack
+    # snugly to S_chunk, but a loose one when the layout leaves many
+    # chunks partially filled (common for Llama-7B: avg chunk density
+    # ~80% of S_chunk). For the integration-test peak-tolerance check
+    # to land within the paper's stated "up to 10% overestimate" window
+    # we recompute the model-state-present term using the *actual*
+    # per-chunk byte footprint, then preserve the estimator's F_bm
+    # (fragmentation + activation + inter/intra-op delta) component.
+    calibrated_peak = _calibrate_peak_with_actual_chunk_bytes(
+        original_peak=result.predicted_peak_bytes,
+        layout=layout,
+        chunk_manager=chunk_manager,
+        n_buffer=result.cfg.n_buffer,
+        trace=trace,
+        block_map=result.block_map,
+    )
+    if calibrated_peak != result.predicted_peak_bytes:
+        LOG.info(
+            "ProTrain: peak prediction calibrated %.2f -> %.2f GB "
+            "using actual per-chunk byte footprint",
+            result.predicted_peak_bytes / (1 << 30),
+            calibrated_peak / (1 << 30),
+        )
+        effective_n_persist = len(chunk_manager._persistent_ids)
+        result = SearchResult(
+            cfg=CostConfig(
+                n_persist=effective_n_persist,
+                n_buffer=result.cfg.n_buffer,
+                n_swap=result.cfg.n_swap,
+                n_checkpoint=result.cfg.n_checkpoint,
+            ),
+            block_map=result.block_map,
+            predicted_peak_bytes=calibrated_peak,
+            predicted_iter_s=result.predicted_iter_s,
+        )
+
+    # ---- 4.5: materialize the init-time chunk offload (M4.5 Gap 1) -----
+    # Physically move every non-persistent chunk's param data to pinned
+    # CPU memory and install the per-param grad hooks (Gap 2). This must
+    # happen BEFORE step 5 (block wrap) / step 6 (hook install) so the
+    # first forward sees the correct GPU residency picture and the grad
+    # hooks are live by the time autograd starts accumulating.
+    alloc_before = (
+        torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
+    )
+    freed = chunk_manager.materialize_offload()
+    alloc_after = (
+        torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
+    )
+    LOG.info(
+        "ProTrain: materialize_offload freed %.2f GB (reported), "
+        "alloc %.2f -> %.2f GB (torch measured)",
+        freed / (1 << 30),
+        alloc_before / (1 << 30),
+        alloc_after / (1 << 30),
+    )
+    _sys2.stderr.write(
+        f"[protrain] materialize_offload: freed {freed/1e9:.2f}GB "
+        f"(alloc {alloc_before/1e9:.2f}->{alloc_after/1e9:.2f}GB)\n"
+    )
+    _sys2.stderr.flush()
+
+    # ---- 4.6: build the CPU FusedAdam adapter (post-offload) ------------
+    # BUG 3 FIX: now that ``materialize_offload`` has allocated the pinned
+    # CPU shards and installed per-param grad hooks, build the CPU Adam
+    # adapter with references to the same ``nn.Parameter`` objects the
+    # hooks will repoint to CPU storage before calling step. The adapter
+    # is "transient" (``protrain_optimizer_wrapper`` rebuilds it at the
+    # user's real hyperparams) but we still need one live here so the
+    # chunk manager has something to drive during smoke tests.
+    # M7: for sharded non-persistent chunks, the CPU Adam updates each
+    # region's flat shard_param (one per :class:`_DtypeRegion`) rather
+    # than the user-facing param list. Homogeneous-dtype chunks have
+    # one region and behave exactly like the pre-followup single-param
+    # case; mixed-dtype chunks expose one shard_param per region.
+    cpu_params_per_chunk_for_optim: dict = {}
+    for cid, chunk_params in cpu_params_per_chunk.items():
+        shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
+        if shard_state is not None and shard_state.regions:
+            cpu_params_per_chunk_for_optim[cid] = [
+                r.shard_param for r in shard_state.regions
+            ]
+        else:
+            cpu_params_per_chunk_for_optim[cid] = chunk_params
+
+    cpu_optim: CpuFusedAdamAdapter | None = None
+    if any(params for params in cpu_params_per_chunk_for_optim.values()):
+        try:
+            cpu_optim = CpuFusedAdamAdapter(
+                params_per_chunk=cpu_params_per_chunk_for_optim,
+                lr=1e-4,
+            )
+        except (ImportError, Exception) as err:  # noqa: BLE001 - see below
+            # CpuFusedAdamAdapter can fail with more than ``ImportError``:
+            # DeepSpeed raises ``CUDAMismatchException`` (not an
+            # ``ImportError`` subclass) when the system nvcc and torch's
+            # cu-version disagree. We degrade gracefully in both cases —
+            # persistent chunks still run fused GPU Adam, non-persistent
+            # chunks fall through to the in-line torch.optim path inside
+            # the optimizer wrapper. The warning surfaces the root cause
+            # so users know they're not getting the async overlap.
+            LOG.warning(
+                "ProTrain: CPU FusedAdam unavailable (%s); non-persistent chunks "
+                "will not get async CPU Adam. Install DeepSpeed with a matching "
+                "CUDA toolkit (or set DS_SKIP_CUDA_CHECK=1) for full coverage.",
+                err,
+            )
+            cpu_optim = None
+    chunk_manager.cpu_optim = cpu_optim
+
+    eff_h2d, eff_d2h = effective_bw(result.cfg, hardware_profile)
+
+    scheduler = Scheduler(
+        chunk_manager=chunk_manager,
+        block_map=result.block_map,
+        layout=layout,
+        effective_h2d_bps=eff_h2d,
+        effective_d2h_bps=eff_d2h,
+    )
+
+    # ---- 5. wrap blocks -------------------------------------------------
+    # Locate the parent ModuleList so we can swap in the wrapped blocks in-place.
+    module_list = _find_parent_module_list(model, blocks)
+    for idx, block in enumerate(blocks):
+        mode = result.block_map.get(BlockId(idx))
+        if mode is None:
+            continue
+        wrapped_block = wrap_block(block, mode)
+        if wrapped_block is not block and module_list is not None:
+            module_list[idx] = wrapped_block
+            blocks[idx] = wrapped_block
+
+    # ---- 6. install hooks ----------------------------------------------
+    handles = install_hooks(
+        model=model,
+        chunk_manager=chunk_manager,
+        block_map=result.block_map,
+        scheduler=scheduler,
+    )
+
+    # ``capacity_bytes`` is unused inside the helper — kept in the
+    # signature for symmetry with the wrapper's call site so a future
+    # extension that derates by capacity (e.g. peak vs. budget headroom)
+    # can read it without refactoring callers.
+    del capacity_bytes  # silence linter
+
+    return chunk_manager, scheduler, list(handles), result
+
+
 def protrain_model_wrapper(
     model: nn.Module,
     model_config: object,  # noqa: ARG001 — accepted for API symmetry with the plan
@@ -1062,281 +1390,16 @@ def protrain_model_wrapper(
             )
 
     # ---- 4. construct runtime ------------------------------------------
-    n_persist = result.cfg.n_persist
-    n_buffer = max(1, result.cfg.n_buffer)
-
-    pinned_host = PinnedHostMemory(n_buffer=n_buffer, S_chunk=layout.S_chunk)
-    buffer_pool = BufferPool(
-        n_buffer=n_buffer,
-        S_chunk=layout.S_chunk,
-        pinned_host=pinned_host,
-        device=device,
-    )
-
-    # Partition params: persistent chunks get the GPU optimizer, the rest
-    # get per-chunk CPU FusedAdam adapters keyed on ChunkId.
-    params_by_name: dict[str, nn.Parameter] = dict(model.named_parameters())
-    persistent_params: list[nn.Parameter] = []
-    cpu_params_per_chunk: dict = {}
-
-    for cid, chunk_param_ids in enumerate(layout.chunks):
-        chunk_params = [
-            params_by_name[str(pid)]
-            for pid in chunk_param_ids
-            if str(pid) in params_by_name
-        ]
-        if cid < n_persist:
-            persistent_params.extend(chunk_params)
-        else:
-            cpu_params_per_chunk[cid] = chunk_params
-
-    # Adam hyperparameters are owned by the optimizer wrapper; seed with
-    # harmless defaults here. ``protrain_optimizer_wrapper`` will rebuild
-    # these adapters with the user's real LR/betas, so this instance is
-    # transient — we still allocate it so the chunk manager has a live
-    # reference during the smoke-test smoke path.
-    #
-    # BUG 3 FIX: ``CpuFusedAdamAdapter`` construction is deferred to
-    # AFTER ``chunk_manager.materialize_offload()`` below. Before
-    # offload, the non-persistent chunk params are full-size GPU
-    # tensors; after offload they are zero-element GPU placeholders
-    # whose *real* weights live in ``chunk_manager._cpu_slots``. The
-    # lazy CPU-Adam state init (``torch.zeros_like(p.data, device='cpu')``)
-    # runs on the first ``step`` call — by which point
-    # ``_ensure_cpu_grads_attached`` has repointed ``p.data`` at the CPU
-    # shard — so what matters is that the adapter's ``param_groups``
-    # reference the right ``nn.Parameter`` objects, not what ``p.data``
-    # currently points at. The previous ordering (adapter built
-    # pre-offload) was benign in the p.data sense but risked a CUDA
-    # initialization hazard if DeepSpeed ever cached pointers on the
-    # GPU tensor; deferring is the safe invariant.
-    gpu_optim: GpuFusedAdamAdapter | None = None
-    if persistent_params:
-        gpu_optim = GpuFusedAdamAdapter(params=persistent_params, lr=1e-4)
-
-    # ---- Distributed context + M7 zero3_shard decision -----------------
-    # Auto-detect world_size / rank from the active process group;
-    # default to single-rank when no group is up. ``zero3_shard`` was
-    # already resolved above the search call so it could flow through
-    # ``HardwareProfile.zero3_shard`` into the cost model; re-use that
-    # decision here for the ChunkManager constructor. The ChunkManager
-    # silently degrades zero3_shard to False when world_size == 1, so
-    # the auto-detect path is safe on single-rank hosts too.
-    _ws = 1
-    _rank = 0
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        _ws = int(torch.distributed.get_world_size())
-        _rank = int(torch.distributed.get_rank())
-    _zero3 = bool(hardware_profile.zero3_shard) and (_ws > 1)
-    LOG.info(
-        "ProTrain: distributed context world_size=%d rank=%d zero3_shard=%s "
-        "(requested=%s)",
-        _ws,
-        _rank,
-        _zero3,
-        zero3_shard,
-    )
-
-    chunk_manager = ChunkManager(
+    chunk_manager, scheduler, handles, result = _construct_runtime(
         model=model,
+        blocks=blocks,
         layout=layout,
-        n_persist=n_persist,
-        buffer_pool=buffer_pool,
-        cpu_optim=None,  # wired in after materialize_offload (BUG 3)
-        gpu_optim=gpu_optim,
-        device=device,
-        world_size=_ws,
-        rank=_rank,
-        zero3_shard=_zero3,
-    )
-
-    # Chunks containing ANY non-block param (embeddings, final norm,
-    # lm_head — any param not living inside a transformer block) are
-    # pinned to the persistent set. Reasoning:
-    #
-    #   a) The block-granularity scheduler only knows about chunks
-    #      listed in ``layout.block_to_chunks``. Pure non-block chunks
-    #      (the trivial case — all their params are non-block) are never
-    #      gathered by any hook; if offloaded they'd be zero-sized
-    #      during forward.
-    #   b) Mixed chunks (e.g. the last block's chunk that was greedy-
-    #      filled with the final model.norm.weight) ARE gathered by the
-    #      block-post hook, but the block-post hook ALSO releases them
-    #      since they're not in the next block's chunk set — which
-    #      leaves the non-block param (``model.norm.weight``) empty by
-    #      the time LlamaModel.forward calls ``self.norm(...)`` after
-    #      block 31's forward-post hook fires.
-    #
-    # The fix in both cases is the same: keep chunks with any non-block
-    # param GPU-resident. Cost is bounded by ``S_chunk`` per such chunk;
-    # for Llama it's typically 2 chunks ≈ 256 MB.
-    param_is_in_block: dict[str, bool] = {
-        str(pid): False for pid in layout.param_to_chunk
-    }
-    for bid, pids in _build_block_spans(model)[1].items():
-        for pid in pids:
-            param_is_in_block[str(pid)] = True
-    chunks_with_nonblock: set[int] = set()
-    for cid, pid_tuple in enumerate(layout.chunks):
-        for pid in pid_tuple:
-            if not param_is_in_block.get(str(pid), False):
-                chunks_with_nonblock.add(cid)
-                break
-    extra = chunks_with_nonblock - chunk_manager._persistent_ids
-    if extra:
-        # Expand the persistent set in-place; mark_persistent takes a
-        # prefix length, so we instead mutate the internal set directly
-        # for this cross-cutting pin.
-        chunk_manager._persistent_ids |= extra
-        chunk_manager._non_persistent_ids -= extra
-        LOG.info(
-            "ProTrain: pinning %d chunks %s to persistent because they "
-            "contain non-block params the scheduler cannot gather on "
-            "its own",
-            len(extra),
-            sorted(extra),
-        )
-
-    # ---- peak-prediction calibration ------------------------------------
-    # The cost/memory.py estimator approximates persistent model state as
-    # ``n_persist * S_chunk`` — a tight upper bound when chunks pack
-    # snugly to S_chunk, but a loose one when the layout leaves many
-    # chunks partially filled (common for Llama-7B: avg chunk density
-    # ~80% of S_chunk). For the integration-test peak-tolerance check
-    # to land within the paper's stated "up to 10% overestimate" window
-    # we recompute the model-state-present term using the *actual*
-    # per-chunk byte footprint, then preserve the estimator's F_bm
-    # (fragmentation + activation + inter/intra-op delta) component.
-    calibrated_peak = _calibrate_peak_with_actual_chunk_bytes(
-        original_peak=result.predicted_peak_bytes,
-        layout=layout,
-        chunk_manager=chunk_manager,
-        n_buffer=result.cfg.n_buffer,
+        result=result,
+        hardware_profile=hardware_profile,
+        capacity_bytes=capacity_bytes,
         trace=trace,
-        block_map=result.block_map,
-    )
-    if calibrated_peak != result.predicted_peak_bytes:
-        LOG.info(
-            "ProTrain: peak prediction calibrated %.2f -> %.2f GB "
-            "using actual per-chunk byte footprint",
-            result.predicted_peak_bytes / (1 << 30),
-            calibrated_peak / (1 << 30),
-        )
-        effective_n_persist = len(chunk_manager._persistent_ids)
-        result = SearchResult(
-            cfg=CostConfig(
-                n_persist=effective_n_persist,
-                n_buffer=result.cfg.n_buffer,
-                n_swap=result.cfg.n_swap,
-                n_checkpoint=result.cfg.n_checkpoint,
-            ),
-            block_map=result.block_map,
-            predicted_peak_bytes=calibrated_peak,
-            predicted_iter_s=result.predicted_iter_s,
-        )
-
-    # ---- 4.5: materialize the init-time chunk offload (M4.5 Gap 1) -----
-    # Physically move every non-persistent chunk's param data to pinned
-    # CPU memory and install the per-param grad hooks (Gap 2). This must
-    # happen BEFORE step 5 (block wrap) / step 6 (hook install) so the
-    # first forward sees the correct GPU residency picture and the grad
-    # hooks are live by the time autograd starts accumulating.
-    alloc_before = (
-        torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
-    )
-    freed = chunk_manager.materialize_offload()
-    alloc_after = (
-        torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
-    )
-    LOG.info(
-        "ProTrain: materialize_offload freed %.2f GB (reported), "
-        "alloc %.2f -> %.2f GB (torch measured)",
-        freed / (1 << 30),
-        alloc_before / (1 << 30),
-        alloc_after / (1 << 30),
-    )
-    _sys2.stderr.write(
-        f"[protrain] materialize_offload: freed {freed/1e9:.2f}GB "
-        f"(alloc {alloc_before/1e9:.2f}->{alloc_after/1e9:.2f}GB)\n"
-    )
-    _sys2.stderr.flush()
-
-    # ---- 4.6: build the CPU FusedAdam adapter (post-offload) ------------
-    # BUG 3 FIX: now that ``materialize_offload`` has allocated the pinned
-    # CPU shards and installed per-param grad hooks, build the CPU Adam
-    # adapter with references to the same ``nn.Parameter`` objects the
-    # hooks will repoint to CPU storage before calling step. The adapter
-    # is "transient" (``protrain_optimizer_wrapper`` rebuilds it at the
-    # user's real hyperparams) but we still need one live here so the
-    # chunk manager has something to drive during smoke tests.
-    # M7: for sharded non-persistent chunks, the CPU Adam updates each
-    # region's flat shard_param (one per :class:`_DtypeRegion`) rather
-    # than the user-facing param list. Homogeneous-dtype chunks have
-    # one region and behave exactly like the pre-followup single-param
-    # case; mixed-dtype chunks expose one shard_param per region.
-    cpu_params_per_chunk_for_optim: dict = {}
-    for cid, chunk_params in cpu_params_per_chunk.items():
-        shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
-        if shard_state is not None and shard_state.regions:
-            cpu_params_per_chunk_for_optim[cid] = [
-                r.shard_param for r in shard_state.regions
-            ]
-        else:
-            cpu_params_per_chunk_for_optim[cid] = chunk_params
-
-    cpu_optim: CpuFusedAdamAdapter | None = None
-    if any(params for params in cpu_params_per_chunk_for_optim.values()):
-        try:
-            cpu_optim = CpuFusedAdamAdapter(
-                params_per_chunk=cpu_params_per_chunk_for_optim,
-                lr=1e-4,
-            )
-        except (ImportError, Exception) as err:  # noqa: BLE001 - see below
-            # CpuFusedAdamAdapter can fail with more than ``ImportError``:
-            # DeepSpeed raises ``CUDAMismatchException`` (not an
-            # ``ImportError`` subclass) when the system nvcc and torch's
-            # cu-version disagree. We degrade gracefully in both cases —
-            # persistent chunks still run fused GPU Adam, non-persistent
-            # chunks fall through to the in-line torch.optim path inside
-            # the optimizer wrapper. The warning surfaces the root cause
-            # so users know they're not getting the async overlap.
-            LOG.warning(
-                "ProTrain: CPU FusedAdam unavailable (%s); non-persistent chunks "
-                "will not get async CPU Adam. Install DeepSpeed with a matching "
-                "CUDA toolkit (or set DS_SKIP_CUDA_CHECK=1) for full coverage.",
-                err,
-            )
-            cpu_optim = None
-    chunk_manager.cpu_optim = cpu_optim
-
-    eff_h2d, eff_d2h = effective_bw(result.cfg, hardware_profile)
-
-    scheduler = Scheduler(
-        chunk_manager=chunk_manager,
-        block_map=result.block_map,
-        layout=layout,
-        effective_h2d_bps=eff_h2d,
-        effective_d2h_bps=eff_d2h,
-    )
-
-    # ---- 5. wrap blocks -------------------------------------------------
-    # Locate the parent ModuleList so we can swap in the wrapped blocks in-place.
-    module_list = _find_parent_module_list(model, blocks)
-    for idx, block in enumerate(blocks):
-        mode = result.block_map.get(BlockId(idx))
-        if mode is None:
-            continue
-        wrapped = wrap_block(block, mode)
-        if wrapped is not block and module_list is not None:
-            module_list[idx] = wrapped
-            blocks[idx] = wrapped
-
-    # ---- 6. install hooks ----------------------------------------------
-    handles = install_hooks(
-        model=model,
-        chunk_manager=chunk_manager,
-        block_map=result.block_map,
-        scheduler=scheduler,
+        zero3_shard=zero3_shard,
+        device=device,
     )
 
     LOG.info(
