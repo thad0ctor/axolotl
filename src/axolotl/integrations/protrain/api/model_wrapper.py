@@ -639,6 +639,33 @@ def _construct_runtime(
         device=device,
     )
 
+    # Compute the effective persistent set FIRST so the param
+    # partitioning + the ChunkManager construction agree on which
+    # chunks are persistent. The non-block-chunk pin (added below to
+    # _persistent_ids) extends the set beyond the search's prefix
+    # ``[0, n_persist)`` — any non-block chunk at cid >= n_persist
+    # MUST land in the GPU optimizer's param list, not CPU FusedAdam,
+    # because materialize_offload only offloads chunks in
+    # ``_non_persistent_ids`` and the optim wrapper relies on those
+    # offloaded params for CPU adam. Without this hoist, a high-cid
+    # non-block chunk (e.g. an untied lm_head at the tail of N_chunk)
+    # would be misrouted to CPU adam against GPU-resident params.
+    param_is_in_block: dict[str, bool] = {
+        str(pid): False for pid in layout.param_to_chunk
+    }
+    for bid, pids in _build_block_spans(model)[1].items():
+        for pid in pids:
+            param_is_in_block[str(pid)] = True
+    chunks_with_nonblock: set[int] = set()
+    for cid, pid_tuple in enumerate(layout.chunks):
+        for pid in pid_tuple:
+            if not param_is_in_block.get(str(pid), False):
+                chunks_with_nonblock.add(cid)
+                break
+    effective_persistent_ids: set[int] = (
+        set(range(n_persist)) | chunks_with_nonblock
+    )
+
     # Partition params: persistent chunks get the GPU optimizer, the rest
     # get per-chunk CPU FusedAdam adapters keyed on ChunkId.
     params_by_name: dict[str, nn.Parameter] = dict(model.named_parameters())
@@ -651,7 +678,7 @@ def _construct_runtime(
             for pid in chunk_param_ids
             if str(pid) in params_by_name
         ]
-        if cid < n_persist:
+        if cid in effective_persistent_ids:
             persistent_params.extend(chunk_params)
         else:
             cpu_params_per_chunk[cid] = chunk_params
@@ -716,43 +743,34 @@ def _construct_runtime(
         zero3_shard=_zero3,
     )
 
-    # Chunks containing ANY non-block param (embeddings, final norm,
-    # lm_head — any param not living inside a transformer block) are
-    # pinned to the persistent set. Reasoning:
+    # Pin non-block-containing chunks to the persistent set. The set
+    # was already computed above (effective_persistent_ids) so the
+    # param partitioning + GPU-optim build agree with the chunk
+    # manager's residency. Reasoning for the pin:
     #
     #   a) The block-granularity scheduler only knows about chunks
     #      listed in ``layout.block_to_chunks``. Pure non-block chunks
-    #      (the trivial case — all their params are non-block) are never
-    #      gathered by any hook; if offloaded they'd be zero-sized
-    #      during forward.
+    #      (the trivial case — all their params are non-block) are
+    #      never gathered by any hook; if offloaded they'd be
+    #      zero-sized during forward.
     #   b) Mixed chunks (e.g. the last block's chunk that was greedy-
-    #      filled with the final model.norm.weight) ARE gathered by the
-    #      block-post hook, but the block-post hook ALSO releases them
-    #      since they're not in the next block's chunk set — which
-    #      leaves the non-block param (``model.norm.weight``) empty by
-    #      the time LlamaModel.forward calls ``self.norm(...)`` after
-    #      block 31's forward-post hook fires.
+    #      filled with the final model.norm.weight) ARE gathered by
+    #      the block-post hook, but the block-post hook ALSO releases
+    #      them since they're not in the next block's chunk set —
+    #      which leaves the non-block param (``model.norm.weight``)
+    #      empty by the time LlamaModel.forward calls
+    #      ``self.norm(...)`` after block 31's forward-post hook fires.
     #
     # The fix in both cases is the same: keep chunks with any non-block
-    # param GPU-resident. Cost is bounded by ``S_chunk`` per such chunk;
-    # for Llama it's typically 2 chunks ≈ 256 MB.
-    param_is_in_block: dict[str, bool] = {
-        str(pid): False for pid in layout.param_to_chunk
-    }
-    for bid, pids in _build_block_spans(model)[1].items():
-        for pid in pids:
-            param_is_in_block[str(pid)] = True
-    chunks_with_nonblock: set[int] = set()
-    for cid, pid_tuple in enumerate(layout.chunks):
-        for pid in pid_tuple:
-            if not param_is_in_block.get(str(pid), False):
-                chunks_with_nonblock.add(cid)
-                break
+    # param GPU-resident. Cost is bounded by ``S_chunk`` per such
+    # chunk; for Llama it's typically 2 chunks ≈ 256 MB.
     extra = chunks_with_nonblock - chunk_manager._persistent_ids
     if extra:
         # Expand the persistent set in-place; mark_persistent takes a
         # prefix length, so we instead mutate the internal set directly
-        # for this cross-cutting pin.
+        # for this cross-cutting pin. effective_persistent_ids already
+        # accounts for these — this just propagates them to the
+        # chunk_manager whose __init__ only knew the prefix.
         chunk_manager._persistent_ids |= extra
         chunk_manager._non_persistent_ids -= extra
         LOG.info(

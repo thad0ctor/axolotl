@@ -146,11 +146,22 @@ def protrain_optimizer_wrapper(
     """
     chunk_manager = wrapped.chunk_manager
     layout = chunk_manager.layout  # type: ignore[union-attr]
-    n_persist = len(chunk_manager._persistent_ids)  # type: ignore[union-attr]
+    persistent_ids = set(
+        chunk_manager._persistent_ids  # type: ignore[union-attr]
+    )
 
     # Partition params the same way ``protrain_model_wrapper`` did —
     # persistent chunks go to GPU FusedAdam, the rest to per-chunk
-    # CPU FusedAdam adapters.
+    # CPU FusedAdam adapters. Membership-test against the chunk
+    # manager's actual ``_persistent_ids`` set rather than a prefix
+    # ``cid < n_persist`` test: non-block-chunk pinning expands the
+    # persistent set into a non-contiguous shape (e.g. {0..110, 129}
+    # when an untied lm_head lands at chunk 129), and a prefix test
+    # would mis-route the high-cid persistent chunk's GPU params to
+    # CPU FusedAdam — which materialize_offload never offloaded, so
+    # the CPU adam would step against full-size GPU tensors and the
+    # mid-prefix non-persistent chunk's CPU shards would never get
+    # an optimizer step.
     module = wrapped.module
     params_by_name = dict(module.named_parameters())
 
@@ -163,7 +174,7 @@ def protrain_optimizer_wrapper(
             for pid in chunk_param_ids
             if str(pid) in params_by_name
         ]
-        if cid < n_persist:
+        if cid in persistent_ids:
             persistent_params.extend(chunk_params)
         else:
             cpu_params_per_chunk[ChunkId(cid)] = chunk_params
