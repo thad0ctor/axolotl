@@ -257,12 +257,21 @@ class ProfilerTrace:
     # overlap implicitly), but it's recorded for future cost-model
     # tuning + telemetry validation.
     #
-    # All three default to 0.0 / 0; the cost model treats 0.0 in
+    # ``steady_phase2_peak_bytes`` records the CUDA high-water mark
+    # during the same chunked measurement. When the final post-phase-2
+    # config matches ``phase2_n_persist`` / ``phase2_n_buffer`` /
+    # ``phase2_n_checkpoint``, the wrapper can use this as a measured
+    # peak calibration instead of the analytical CKPT op-walk bound.
+    #
+    # These fields default to 0.0 / 0; the cost model treats 0.0 in
     # ``steady_bwd_chunked_wall_s`` as "no phase-2 measurement available"
     # and falls back to the v8 path (``steady_bwd_wall_s`` ratio →
     # trainable-fraction heuristic → 2× canonical).
     steady_bwd_chunked_wall_s: float = 0.0
     steady_step_overlap_s: float = 0.0
+    steady_phase2_peak_bytes: int = 0
+    phase2_n_persist: int = 0
+    phase2_n_buffer: int = 0
     phase2_n_checkpoint: int = 0
     phase2_per_block_recompute_s: float = 0.0
 

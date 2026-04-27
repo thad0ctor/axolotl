@@ -180,6 +180,21 @@ class Scheduler:
         compute = torch.cuda.current_stream()
         compute.wait_stream(self._prefetch_stream)
 
+    def ensure_block_resident(self, block_id: BlockId) -> None:
+        """Synchronously ensure ``block_id``'s parameter chunks are resident.
+
+        Used by checkpoint recompute. ``torch.utils.checkpoint`` replays
+        the inner block forward directly during backward, bypassing the
+        wrapper module's forward-pre hook. The replay therefore needs a
+        direct, idempotent gather hook before it touches the inner
+        block's parameters.
+        """
+        chunk_ids = self._chunks_for(block_id)
+        if not chunk_ids:
+            return
+        self._gather_on_prefetch_stream(chunk_ids)
+        self._sync_prefetch_with_compute()
+
     # ---- forward -------------------------------------------------------
 
     def pre_block_forward(self, block_id: BlockId) -> None:
@@ -192,14 +207,11 @@ class Scheduler:
         handle synchronously here to keep correctness.
         """
         # First-block warm-up: make sure the current block's chunks are in.
-        current_chunks = self._chunks_for(block_id)
-        if current_chunks:
-            # ``gather`` is idempotent on persistent chunks and fast on
-            # already-resident non-persistent ones (it's just a tag
-            # lookup through the pool). So calling unconditionally costs
-            # nothing in steady state.
-            self._gather_on_prefetch_stream(current_chunks)
-            self._sync_prefetch_with_compute()
+        # ``gather`` is idempotent on persistent chunks and fast on
+        # already-resident non-persistent ones (it's just a tag lookup
+        # through the pool). So calling unconditionally costs nothing in
+        # steady state.
+        self.ensure_block_resident(block_id)
 
         # Kick off async prefetch for the *next* block.
         nxt = self._next_block_of(block_id)

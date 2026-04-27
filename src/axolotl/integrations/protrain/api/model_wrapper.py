@@ -454,6 +454,19 @@ def _calibrate_peak_with_actual_chunk_bytes(
     buffer_bytes_eff = effective_buffer_slots * S
     calibrated_raw = actual_persistent + buffer_bytes_eff + f_bm
     calibrated = int(calibration_alpha * calibrated_raw)
+    if trace is not None and block_map is not None:
+        phase2_peak = int(getattr(trace, "steady_phase2_peak_bytes", 0) or 0)
+        if phase2_peak > 0:
+            n_ckpt = sum(
+                1 for m in block_map.values() if m is BlockMode.CKPT
+            )
+            phase2_matches_cfg = (
+                n_persist == int(getattr(trace, "phase2_n_persist", -1))
+                and n_buffer == int(getattr(trace, "phase2_n_buffer", -1))
+                and n_ckpt == int(getattr(trace, "phase2_n_checkpoint", -1))
+            )
+            if phase2_matches_cfg:
+                calibrated = min(calibrated, int(1.05 * phase2_peak))
     return calibrated
 
 
@@ -1572,8 +1585,9 @@ def protrain_model_wrapper(
         fwd_s = 0.0
         bwd_s = 0.0
         step_s = 0.0
+        phase2_peak_bytes = 0
         try:
-            fwd_s, bwd_s, step_s = measure_chunked_steady(
+            fwd_s, bwd_s, step_s, phase2_peak_bytes = measure_chunked_steady(
                 model=model, batch=boot_batch, optimizer=boot_optim
             )
         except Exception as exc:  # noqa: BLE001 — measurement is best-effort
@@ -1639,7 +1653,10 @@ def protrain_model_wrapper(
                 steady_fwd_chunked_wall_s=fwd_s,
                 steady_bwd_chunked_wall_s=bwd_s,
                 steady_step_overlap_s=step_s,
-                phase2_n_checkpoint=boot_cfg.n_checkpoint,
+                steady_phase2_peak_bytes=phase2_peak_bytes,
+                phase2_n_persist=boot_result.cfg.n_persist,
+                phase2_n_buffer=boot_result.cfg.n_buffer,
+                phase2_n_checkpoint=boot_result.cfg.n_checkpoint,
                 phase2_per_block_recompute_s=per_block_recompute_s,
             )
             try:
@@ -1681,6 +1698,27 @@ def protrain_model_wrapper(
                 or new_result.block_map != boot_block_map
             )
             if not cfg_changed:
+                calibrated_peak = _calibrate_peak_with_actual_chunk_bytes(
+                    original_peak=new_result.predicted_peak_bytes,
+                    layout=layout,
+                    chunk_manager=chunk_manager,
+                    n_buffer=new_result.cfg.n_buffer,
+                    trace=trace,
+                    block_map=new_result.block_map,
+                )
+                if calibrated_peak != new_result.predicted_peak_bytes:
+                    effective_n_persist = len(chunk_manager._persistent_ids)
+                    new_result = SearchResult(
+                        cfg=CostConfig(
+                            n_persist=effective_n_persist,
+                            n_buffer=new_result.cfg.n_buffer,
+                            n_swap=new_result.cfg.n_swap,
+                            n_checkpoint=new_result.cfg.n_checkpoint,
+                        ),
+                        block_map=new_result.block_map,
+                        predicted_peak_bytes=calibrated_peak,
+                        predicted_iter_s=new_result.predicted_iter_s,
+                    )
                 LOG.info(
                     "Phase-2: post-measurement search picked the same cfg "
                     "(predicted_iter_s %.4f -> %.4f); keeping bootstrap "

@@ -81,7 +81,21 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # 0.0 which would silently force the cost model back to the v10 forward
 # path; bumping forces a fresh trace so the new measurement is captured
 # and consumed.
-TRACE_VERSION = 11
+# Version 12 invalidates v11 traces after checkpoint recompute was wired
+# to re-gather block chunks before replay. v11 phase-2 backward timings
+# were captured without that replay-time gather cost, so they
+# under-predict all-CKPT offload configs once the runtime is actually
+# correct.
+# Version 13 changes the phase-2 bootstrap from the initial search's
+# often-high ``n_persist`` pick to a conservative low-persistence
+# all-CKPT config. v12 traces under-count replay gathers for the
+# low-persistence configs selected after calibration.
+# Version 14 records ``steady_phase2_peak_bytes`` plus the phase-2
+# bootstrap cfg tuple, allowing the wrapper to calibrate peak from the
+# same measured chunked run when the final config matches.
+# Version 15 stores the EFFECTIVE phase-2 cfg after runtime construction
+# (including non-block chunk pins), not the raw bootstrap search tuple.
+TRACE_VERSION = 15
 
 
 @dataclass(frozen=True)

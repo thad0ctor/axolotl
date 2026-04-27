@@ -20,6 +20,7 @@ call signature.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -44,6 +45,15 @@ class CheckpointedBlock(nn.Module):
         self.block = block
         # Public marker consumed by dispatcher.unwrap_block and inspection code.
         self._protrain_wrapped_mode: BlockMode = BlockMode.CKPT
+        # Optional callback installed by runtime.hooks. It re-gathers
+        # this block's parameter chunks before checkpoint recompute,
+        # because the recompute calls ``self.block`` directly and does
+        # not pass through hooks attached to this wrapper module.
+        self._protrain_recompute_pre_hook: Callable[[], None] | None = None
+
+    def set_recompute_pre_hook(self, hook: Callable[[], None] | None) -> None:
+        """Install a callback run before both original and recompute forwards."""
+        self._protrain_recompute_pre_hook = hook
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         # torch.utils.checkpoint.checkpoint only threads positional args into
@@ -52,6 +62,9 @@ class CheckpointedBlock(nn.Module):
         block = self.block
 
         def _run(*inner_args: Any) -> Any:
+            hook = self._protrain_recompute_pre_hook
+            if hook is not None:
+                hook()
             return block(*inner_args, **kwargs)
 
         return torch_checkpoint.checkpoint(

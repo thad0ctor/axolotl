@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from axolotl.integrations.protrain.types import (
     BlockId,
-    BlockMode,
+    ChunkId,
     CostConfig,
     SearchResult,
 )
@@ -59,6 +59,30 @@ _PHASE2_N_WARMUP = 3
 _PHASE2_N_ITERS = 5
 
 
+def _min_n_buffer_for_layout(layout: "ChunkLayout", n_persist: int) -> int:
+    """Minimum pool size needed for adjacent-block prefetch at ``n_persist``."""
+    if n_persist >= layout.N_chunk:
+        return 0
+    persistent: set[ChunkId] = {ChunkId(i) for i in range(n_persist)}
+    block_ids = sorted(layout.block_to_chunks.keys())
+    if not block_ids:
+        return 0
+    need = 0
+    for i, bid in enumerate(block_ids):
+        cur_np = [
+            c for c in layout.block_to_chunks.get(bid, ()) if c not in persistent
+        ]
+        nxt_np: list[ChunkId] = []
+        if i + 1 < len(block_ids):
+            nxt_np = [
+                c
+                for c in layout.block_to_chunks.get(block_ids[i + 1], ())
+                if c not in persistent
+            ]
+        need = max(need, len({*cur_np, *nxt_np}))
+    return max(1, need)
+
+
 def select_bootstrap_config(
     *,
     initial_result: SearchResult,
@@ -85,25 +109,24 @@ def select_bootstrap_config(
     from axolotl.integrations.protrain.block.layout_rules import assign_modes
     from axolotl.integrations.protrain.cost.memory import estimate_peak
 
-    # Use the search's own n_persist + n_buffer pick — those were
-    # validated against capacity and sized so the scheduler's prefetch
-    # cadence doesn't exhaust the pool. Only override n_checkpoint to
-    # the all-CKPT extreme: all-CKPT uses STRICTLY LESS GPU memory than
-    # any fewer-CKPT config (CKPT drops activations; the analytical
-    # peak's per-block bump only fires for non-CKPT blocks), so the
-    # bootstrap stays capacity-feasible by transitivity from the
-    # search's pick. The spec's literal n_persist=N_chunk/2 + n_buffer=4
-    # would shrink n_buffer below what the search needed for prefetch
-    # and trip BufferPool exhaustion under the all-CKPT recompute load.
-    n_chunk = layout.N_chunk
+    # Measure a conservative low-persistence, all-CKPT runtime. The
+    # phase-2 measurement is later used as a calibration baseline for
+    # low-persistence offload configs, so using the initial search's
+    # high-persistence pick can under-count replay-time chunk gathers by
+    # several multiples. Keep the searcher's n_buffer as a lower bound,
+    # then raise it if lowering n_persist increases the adjacent-block
+    # prefetch window.
+    min_buffer = _min_n_buffer_for_layout(layout, 0)
     bootstrap_cfg = CostConfig(
-        n_persist=initial_result.cfg.n_persist,
-        n_buffer=initial_result.cfg.n_buffer,
+        n_persist=0,
+        n_buffer=min(
+            layout.N_chunk,
+            max(initial_result.cfg.n_buffer, min_buffer),
+        ),
         n_swap=0,
         n_checkpoint=n_block,
     )
     bootstrap_block_map = assign_modes(0, n_block, n_block)
-    del n_chunk  # currently unused; kept above for self-documenting layout intent
 
     candidate_peak = estimate_peak(
         bootstrap_cfg, trace, layout, bootstrap_block_map, hw
@@ -141,7 +164,7 @@ def measure_chunked_steady(
     optimizer: "torch.optim.Optimizer",
     n_warmup: int = _PHASE2_N_WARMUP,
     n_iters: int = _PHASE2_N_ITERS,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, int]:
     """Run a chunked steady-state ``fwd → bwd → step`` loop and time it.
 
     Times the forward, backward, and post-backward optimizer step using
@@ -159,11 +182,13 @@ def measure_chunked_steady(
 
     Returns
     -------
-    (steady_fwd_chunked_wall_s, steady_bwd_chunked_wall_s, steady_step_overlap_s)
+    (steady_fwd_chunked_wall_s, steady_bwd_chunked_wall_s,
+    steady_step_overlap_s, steady_phase2_peak_bytes)
         Median across ``n_iters`` timed iterations. ``n_warmup``
         iterations are discarded — they pay one-time costs (chunk
         manager LRU settling, CPU Adam state lazy init, autograd
-        graph construction) that would inflate the median.
+        graph construction) that would inflate the median. Peak bytes
+        are the CUDA high-water mark across the timed loop.
     """
     import torch
 
@@ -183,6 +208,7 @@ def measure_chunked_steady(
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
 
     fwd_times_s: list[float] = []
     bwd_times_s: list[float] = []
@@ -215,11 +241,13 @@ def measure_chunked_steady(
     fwd_median = statistics.median(fwd_times_s)
     bwd_median = statistics.median(bwd_times_s)
     step_median = statistics.median(step_times_s)
+    peak_bytes = int(torch.cuda.max_memory_allocated())
     LOG.info(
         "Phase-2 chunked-runtime measurement: "
         "steady_fwd_chunked_wall_s=%.4f (n=%d, samples=%s) "
         "steady_bwd_chunked_wall_s=%.4f (samples=%s) "
-        "steady_step_overlap_s=%.4f (samples=%s)",
+        "steady_step_overlap_s=%.4f (samples=%s) "
+        "steady_phase2_peak_bytes=%.2f GB",
         fwd_median,
         n_iters,
         ["%.4f" % t for t in fwd_times_s],
@@ -227,8 +255,9 @@ def measure_chunked_steady(
         ["%.4f" % t for t in bwd_times_s],
         step_median,
         ["%.4f" % t for t in step_times_s],
+        peak_bytes / (1 << 30),
     )
-    return fwd_median, bwd_median, step_median
+    return fwd_median, bwd_median, step_median, peak_bytes
 
 
 def estimate_per_block_recompute_s(

@@ -118,6 +118,22 @@ def test_wrap_block_ckpt_marks_wrapper() -> None:
     assert unwrap_block(wrapped) is block
 
 
+def test_checkpointed_block_recompute_pre_hook_fires_on_replay() -> None:
+    """Runtime can re-gather offloaded chunks before checkpoint recompute."""
+    block = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
+    wrapped = CheckpointedBlock(block)
+    calls: list[bool] = []
+    wrapped.set_recompute_pre_hook(lambda: calls.append(torch.is_grad_enabled()))
+
+    x = torch.randn(4, 8, requires_grad=True)
+    wrapped(x).sum().backward()
+
+    # Called once for the original checkpointed forward and at least
+    # once more for backward replay. The replay call is the correctness
+    # path ProTrain needs after forward offload nulled param.data.
+    assert len(calls) >= 2
+
+
 def test_wrap_block_idempotent_rewrap() -> None:
     """Re-wrapping an already-wrapped block unwraps then re-wraps."""
     block = nn.Linear(8, 8)
