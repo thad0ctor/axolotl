@@ -620,6 +620,109 @@ def test_bwd_compute_time_falls_back_when_phase2_not_populated():
     )
 
 
+def test_fwd_compute_time_uses_phase2_chunked_fwd_when_present():
+    """``_fwd_compute_time_from_trace`` overrides the total with the chunked
+    forward measurement when populated (TRACE_VERSION ≥ 11).
+
+    Mirrors the precedence pattern in
+    :func:`_bwd_compute_time_from_trace`: the phase-2 chunked
+    measurement takes precedence over the per-op-derived total. The
+    per-block distribution stays at the per-op-derived shape — used
+    for CKPT recompute accounting in ``estimate_runtime``.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _fwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+    per_op_sum = 8 * 5 * 0.0002
+
+    # Without chunked fwd populated — total = per-op sum.
+    trace_no = replace(base_trace, steady_fwd_chunked_wall_s=0.0)
+    total_no, per_block_no, used_no = _fwd_compute_time_from_trace(trace_no)
+    assert used_no is True
+    assert total_no == pytest.approx(per_op_sum, abs=1e-9), (
+        f"v10 fallback should return per-op sum {per_op_sum}, got {total_no}"
+    )
+
+    # With chunked fwd populated — total = chunked wall.
+    chunked_fwd = 0.30
+    trace_with = replace(base_trace, steady_fwd_chunked_wall_s=chunked_fwd)
+    total_with, per_block_with, used_with = _fwd_compute_time_from_trace(
+        trace_with
+    )
+    assert used_with is True
+    assert total_with == pytest.approx(chunked_fwd, abs=1e-9), (
+        f"phase-2 fwd path should return chunked wall {chunked_fwd}, "
+        f"got {total_with}"
+    )
+    # Per-block stays at per-op-derived shape — does NOT rescale.
+    for bid in per_block_no:
+        assert per_block_with[bid] == pytest.approx(per_block_no[bid], rel=1e-6), (
+            f"per-block must stay per-op-derived for block {bid}: "
+            f"with={per_block_with[bid]} no={per_block_no[bid]}"
+        )
+
+
+def test_estimate_runtime_uses_phase2_chunked_fwd_measurement():
+    """End-to-end: ``estimate_runtime`` substitutes ``steady_fwd_chunked_wall_s``
+    for the per-chunk-roofline t_fwd assembly.
+
+    With phase-2 fwd populated, t_fwd should equal the measured
+    chunked wall (plus SKU scale + any swap transfer) — NOT the
+    per-chunk max(compute, comm) sum. The bootstrap-then-search
+    pipeline depends on this for the cost model to predict close to
+    actual on the bootstrap config.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import estimate_runtime
+
+    base_trace = _make_trace()
+    n_block = len(base_trace.activation_sizes)
+    chunked_fwd = 0.20
+    trace = replace(
+        base_trace,
+        steady_fwd_chunked_wall_s=chunked_fwd,
+        # Set chunked bwd too so the bwd path is also on the phase-2
+        # branch (otherwise its fallback paths depend on
+        # steady_fwd_wall_s and would mask the forward signal).
+        steady_bwd_chunked_wall_s=0.30,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=8 * 5 * 0.0002 / n_block,
+    )
+    layout = _make_layout()
+    hw = _make_hw()
+    n_chunk = layout.N_chunk
+
+    cfg_high_persist = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    bm = assign_modes(0, 0, n_block)
+
+    t_with = estimate_runtime(cfg_high_persist, trace, layout, bm, hw)
+
+    # Synthesize a trace WITHOUT the chunked fwd; the per-chunk-roofline
+    # forward path fires instead. Under cfg_high_persist (all
+    # persistent, no comm), that path collapses to per-op-sum × hook
+    # scale = 8 * 5 * 0.0002 = 0.008s. With phase-2 forward, t_fwd
+    # = chunked_fwd (0.20s). So the t_iter delta should be
+    # chunked_fwd - per_op_sum ≈ 0.192s (forward is the only
+    # phase-2-affected term in this all-NONE config).
+    trace_no_fwd = replace(trace, steady_fwd_chunked_wall_s=0.0)
+    t_without = estimate_runtime(
+        cfg_high_persist, trace_no_fwd, layout, bm, hw
+    )
+    delta = t_with - t_without
+    expected_delta = 0.20 - 8 * 5 * 0.0002  # ~0.192
+    assert delta == pytest.approx(expected_delta, abs=1e-3), (
+        f"chunked-fwd override should increase t_fwd by ~{expected_delta:.4f}, "
+        f"got delta={delta:.4f} (t_with={t_with:.4f} t_without={t_without:.4f})"
+    )
+
+
 def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
     """End-to-end: with phase-2 populated, increasing n_checkpoint adds recompute.
 
@@ -669,6 +772,58 @@ def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
         "all-CKPT should be more expensive than all-NONE because the "
         "caller's per-cfg recompute term adds time on top of the base"
     )
+
+
+def test_estimate_runtime_phase2_bwd_bypasses_chunk_comm_but_keeps_recompute():
+    """Phase-2 backward consumes translated measured wall directly.
+
+    Changing n_persist/n_buffer changes the analytical backward comm assembly,
+    but must not change t_bwd when the phase-2 chunked backward measurement is
+    populated. Candidate CKPT recompute should still be added on top of the
+    translated base.
+    """
+    from dataclasses import replace
+
+    base_trace = _make_trace(world=2)
+    n_block = len(base_trace.activation_sizes)
+    per_op_sum = 8 * 5 * 0.0002
+    trace = replace(
+        base_trace,
+        model_state_bytes=0,
+        steady_fwd_chunked_wall_s=0.05,
+        steady_bwd_chunked_wall_s=0.020,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.0005,
+    )
+    layout = _make_layout()
+    hw = _make_hw(gpu_count=2)
+    n_chunk = layout.N_chunk
+    bm_none = assign_modes(0, 0, n_block)
+
+    cfg_uncached = CostConfig(
+        n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    cfg_cached = CostConfig(
+        n_persist=0, n_buffer=n_chunk, n_swap=0, n_checkpoint=0
+    )
+    cfg_persistent = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+
+    t_uncached = estimate_runtime(cfg_uncached, trace, layout, bm_none, hw)
+    t_cached = estimate_runtime(cfg_cached, trace, layout, bm_none, hw)
+    t_persistent = estimate_runtime(cfg_persistent, trace, layout, bm_none, hw)
+
+    assert t_cached == pytest.approx(t_uncached, abs=1e-9)
+    assert t_persistent == pytest.approx(t_uncached, abs=1e-9)
+
+    cfg_ckpt = CostConfig(
+        n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_block
+    )
+    bm_ckpt = assign_modes(0, n_block, n_block)
+    t_ckpt = estimate_runtime(cfg_ckpt, trace, layout, bm_ckpt, hw)
+
+    assert t_ckpt - t_uncached == pytest.approx(per_op_sum, abs=1e-9)
 
 
 def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
