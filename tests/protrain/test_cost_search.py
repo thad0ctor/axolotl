@@ -774,6 +774,58 @@ def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
     )
 
 
+def test_estimate_runtime_phase2_bwd_bypasses_chunk_comm_but_keeps_recompute():
+    """Phase-2 backward consumes translated measured wall directly.
+
+    Changing n_persist/n_buffer changes the analytical backward comm assembly,
+    but must not change t_bwd when the phase-2 chunked backward measurement is
+    populated. Candidate CKPT recompute should still be added on top of the
+    translated base.
+    """
+    from dataclasses import replace
+
+    base_trace = _make_trace(world=2)
+    n_block = len(base_trace.activation_sizes)
+    per_op_sum = 8 * 5 * 0.0002
+    trace = replace(
+        base_trace,
+        model_state_bytes=0,
+        steady_fwd_chunked_wall_s=0.05,
+        steady_bwd_chunked_wall_s=0.020,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.0005,
+    )
+    layout = _make_layout()
+    hw = _make_hw(gpu_count=2)
+    n_chunk = layout.N_chunk
+    bm_none = assign_modes(0, 0, n_block)
+
+    cfg_uncached = CostConfig(
+        n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    cfg_cached = CostConfig(
+        n_persist=0, n_buffer=n_chunk, n_swap=0, n_checkpoint=0
+    )
+    cfg_persistent = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+
+    t_uncached = estimate_runtime(cfg_uncached, trace, layout, bm_none, hw)
+    t_cached = estimate_runtime(cfg_cached, trace, layout, bm_none, hw)
+    t_persistent = estimate_runtime(cfg_persistent, trace, layout, bm_none, hw)
+
+    assert t_cached == pytest.approx(t_uncached, abs=1e-9)
+    assert t_persistent == pytest.approx(t_uncached, abs=1e-9)
+
+    cfg_ckpt = CostConfig(
+        n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_block
+    )
+    bm_ckpt = assign_modes(0, n_block, n_block)
+    t_ckpt = estimate_runtime(cfg_ckpt, trace, layout, bm_ckpt, hw)
+
+    assert t_ckpt - t_uncached == pytest.approx(per_op_sum, abs=1e-9)
+
+
 def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
     """SKU compute-rate calibration scales forward compute proportionally.
 
