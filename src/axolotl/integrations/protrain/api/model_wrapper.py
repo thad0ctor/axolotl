@@ -1353,13 +1353,25 @@ def protrain_model_wrapper(
         capacity_bytes / (1 << 30),
     )
 
-    return WrappedModel(
+    wrapped = WrappedModel(
         module=model,
         search_result=result,
         chunk_manager=chunk_manager,
         scheduler=scheduler,
         _hook_handles=list(handles),
     )
+    # Stash the searcher inputs so the plugin's post_trainer_create hook
+    # can re-run search() once the distributed process group is up and
+    # real NCCL collectives become measurable. The trace was profiled
+    # before dist.init, so its nccl_gather_s / nccl_reduce_s tables are
+    # empty whenever the wrapper runs from post_model_load with
+    # world_size > 1 — see DESIGN.md "NCCL measurement gap".
+    wrapped._trace = trace  # type: ignore[attr-defined]
+    wrapped._layout = layout  # type: ignore[attr-defined]
+    wrapped._capacity_bytes = int(capacity_bytes)  # type: ignore[attr-defined]
+    wrapped._hardware_profile = hardware_profile  # type: ignore[attr-defined]
+    wrapped._cache_key = cache_key  # type: ignore[attr-defined]
+    return wrapped
 
 
 def _find_parent_module_list(

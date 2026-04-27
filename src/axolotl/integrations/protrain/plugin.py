@@ -44,6 +44,157 @@ LOG = get_logger(__name__)
 _DEFAULT_PCIE_BPS = 13e9
 
 
+def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
+    """Late-bind real NCCL timings into the cached trace, then re-run search().
+
+    The default Axolotl plugin path runs ``protrain_model_wrapper`` from
+    ``post_model_load``, which fires before Trainer / Accelerate brings
+    up the distributed process group. The profiler's
+    :func:`measure_nccl` therefore short-circuits to empty tables and
+    the trace records ``world=1`` regardless of the eventual world size.
+    Mode C (ZeRO-3 sharded) consumes the NCCL tables in
+    ``cost/runtime.estimate_runtime``; with empty tables, sharded
+    predictions under-count the per-chunk gather + reduce-scatter cost.
+
+    This helper, invoked from ``post_trainer_create`` once dist is up,
+    measures NCCL on the live process group, splices the new tables and
+    actual world size into the cached trace, persists the updated trace
+    under a new cache key (so the next multi-rank run skips the
+    re-measurement), and re-runs ``search()`` with the same layout +
+    capacity + hardware profile. If the new search picks a different
+    ``cfg`` or ``block_map`` the WrappedModel's ``search_result`` is
+    overwritten and a WARN is logged — but the chunk manager itself is
+    NOT rebuilt. The optimizer state slots are already wired into the
+    trainer; rebuilding mid-flight would invalidate them. The updated
+    SearchResult exists so any future cost-model-based decisions
+    (telemetry, dynamic re-tuning) reflect real comm cost.
+
+    Returns ``(updated, cfg_changed)`` for telemetry / test inspection:
+
+    * ``updated`` — True iff the trace's NCCL tables were rewritten
+      (False on single-rank, on missing dist init, or when the trace
+      already had populated tables).
+    * ``cfg_changed`` — True iff the re-run search picked a different
+      ``cfg`` or ``block_map`` than the original. Implies ``updated``.
+    """
+    import dataclasses
+
+    try:
+        import torch
+        import torch.distributed as dist
+    except ImportError:
+        return (False, False)
+
+    if not dist.is_available() or not dist.is_initialized():
+        return (False, False)
+    world_size = int(dist.get_world_size())
+    if world_size <= 1:
+        return (False, False)
+
+    trace = getattr(wrapped, "_trace", None)
+    layout = getattr(wrapped, "_layout", None)
+    hw = getattr(wrapped, "_hardware_profile", None)
+    capacity = getattr(wrapped, "_capacity_bytes", None)
+    cache_key = getattr(wrapped, "_cache_key", None)
+    if trace is None or layout is None or hw is None or capacity is None:
+        LOG.warning(
+            "ProTrain: NCCL re-measurement skipped — wrapped model is "
+            "missing one of {_trace,_layout,_hardware_profile,"
+            "_capacity_bytes}. Cost-model NCCL terms will fall back to "
+            "the empty-table path."
+        )
+        return (False, False)
+
+    # Idempotency: if the cached trace already carries NCCL tables (e.g.
+    # second call on a re-entrant trainer create, or a cache hit on a
+    # prior multi-rank run), skip the measurement but DO consider the
+    # re-run search a no-op.
+    if trace.nccl_gather_s and trace.nccl_reduce_s and trace.world == world_size:
+        return (False, False)
+
+    from axolotl.integrations.protrain.profiler import measure_nccl
+    from axolotl.integrations.protrain.profiler.cache import (
+        ProfilerCacheKey,
+        save_cached_trace,
+    )
+    from axolotl.integrations.protrain.search import search
+
+    LOG.info(
+        "ProTrain: re-measuring NCCL on world_size=%d (trace was profiled "
+        "with empty tables)", world_size,
+    )
+    try:
+        gather_table, reduce_table = measure_nccl(world_size)
+    except (RuntimeError, ImportError) as exc:
+        LOG.warning(
+            "ProTrain: NCCL re-measurement failed (%s); leaving trace "
+            "with empty tables — Mode C predictions will under-count "
+            "comm cost.",
+            exc,
+        )
+        return (False, False)
+
+    new_trace = dataclasses.replace(
+        trace,
+        nccl_gather_s=gather_table,
+        nccl_reduce_s=reduce_table,
+        world=world_size,
+    )
+
+    # Save under a new cache key with the live world so future multi-
+    # rank runs skip the round-trip. Leave the original world=1 entry
+    # alone (it is the correct cache for single-rank runs).
+    new_key = ProfilerCacheKey(
+        arch_hash=cache_key.arch_hash,
+        bs=cache_key.bs,
+        seq=cache_key.seq,
+        sku=cache_key.sku,
+        world=world_size,
+    )
+    try:
+        save_cached_trace(new_key, new_trace)
+    except OSError as exc:
+        LOG.warning(
+            "ProTrain: failed to persist updated trace to cache (%s); "
+            "the in-memory trace is still updated for this run.", exc,
+        )
+
+    # Re-run search with the populated tables. ``hw`` is reused as-is —
+    # gpu_count was already correct at wrapper time (hw.gpu_count was
+    # set from torch.cuda.device_count(), which under torchrun is the
+    # per-rank device count, not the world size; the searcher reads
+    # ``trace.world`` for the comm-cost gate).
+    new_result = search(new_trace, layout, capacity, hw)
+
+    cfg_changed = (
+        new_result.cfg != wrapped.search_result.cfg
+        or new_result.block_map != wrapped.search_result.block_map
+    )
+    if cfg_changed:
+        LOG.warning(
+            "ProTrain: post-NCCL search picked a different config than "
+            "the empty-tables prediction. cfg %s -> %s; updating "
+            "WrappedModel.search_result for telemetry but NOT rebuilding "
+            "chunk_manager (optimizer slots are already wired). The "
+            "running step uses the bootstrap config; future runs will "
+            "hit the multi-rank cache and pick the new config from the "
+            "start.",
+            wrapped.search_result.cfg,
+            new_result.cfg,
+        )
+    else:
+        LOG.info(
+            "ProTrain: post-NCCL re-run picked the same config; "
+            "predicted_iter_s %.4f -> %.4f.",
+            wrapped.search_result.predicted_iter_s,
+            new_result.predicted_iter_s,
+        )
+
+    wrapped.search_result = new_result
+    wrapped._trace = new_trace  # type: ignore[attr-defined]
+    return (True, cfg_changed)
+
+
 def _is_plugin_active(cfg) -> bool:
     """Return True iff both the plugin is registered and auto_memory is on.
 
@@ -423,6 +574,10 @@ class ProTrainPlugin(BasePlugin):
                 "runs, but surface it here because it is unusual.",
                 torch.distributed.get_world_size(),
             )
+
+        # Re-measure NCCL now that dist is up. No-op on single rank or
+        # when the trace already has populated tables.
+        _remeasure_nccl_and_research(wrapped)
 
 
 __all__ = ["ProTrainPlugin"]
