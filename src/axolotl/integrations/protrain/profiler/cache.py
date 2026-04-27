@@ -59,7 +59,16 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # ``trainable_param_fraction`` / ``model_state_bytes`` and steering the
 # cost model into the wrong bwd/fwd-ratio fallback. v8 traces remain on
 # disk but never look up under v9 keys.
-TRACE_VERSION = 9
+# Version 10 adds phase-2 chunked-runtime backward fields:
+# ``steady_bwd_chunked_wall_s``, ``steady_step_overlap_s``,
+# ``phase2_n_checkpoint``, ``phase2_per_block_recompute_s``. These are
+# populated by the bootstrap-then-measure loop in
+# ``protrain_model_wrapper`` and consumed by ``cost/runtime.py`` to
+# translate a measured chunked backward to any candidate ``block_map``
+# the search evaluates. v9 traces lack these fields and would steer
+# the cost model into the v8 fallback path; bumping invalidates them
+# so the next run captures a real chunked backward measurement.
+TRACE_VERSION = 10
 
 
 @dataclass(frozen=True)
