@@ -179,6 +179,45 @@ class ProTrainArgs(BaseModel):
     )
 
     # ------------------------------------------------------------------
+    # Optimizer-state checkpoint/resume (CHECKPOINT_DESIGN.md Phase 1)
+    # ------------------------------------------------------------------
+
+    protrain_save_optimizer_state: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": (
+                "Opt-in: persist ProTrain optimizer state (Adam momentums + "
+                "step counters) alongside HF Trainer checkpoints. Default "
+                "False — resumed runs cold-start every momentum buffer, "
+                "which matches today's behavior. When True, a TrainerCallback "
+                "writes per-chunk shard files under "
+                "``{checkpoint_dir}/protrain_optim/`` after each save; "
+                "``Trainer._load_optimizer_and_scheduler`` is wrapped to load "
+                "from the same path on resume. Phase 1 supports single-rank "
+                "non-ZeRO only — multi-rank and ZeRO-3 hard-error on save. "
+                "Saves are gated by ``protrain_optim_save_max_bytes`` to "
+                "avoid silently writing 84 GB blobs for 7B full-FT."
+            )
+        },
+    )
+
+    protrain_optim_save_max_bytes: int | None = Field(
+        default=2 * 1024 * 1024 * 1024,
+        json_schema_extra={
+            "description": (
+                "Soft cap (bytes) on the estimated optimizer-state save "
+                "size. Default 2 GiB — small enough that LoRA always passes, "
+                "7B full-FT (~84 GB) never silently passes. When the "
+                "estimated bytes (sum of trainable-param numel × 4 × 2 for "
+                "the fp32 momentum buffers) exceeds this and the user did "
+                "NOT explicitly raise the threshold, the save callback "
+                "emits a WARN naming the estimate and skips writing. Set "
+                "explicitly higher to opt in to large saves."
+            )
+        },
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
 

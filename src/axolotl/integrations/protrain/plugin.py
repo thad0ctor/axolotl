@@ -300,18 +300,29 @@ class ProTrainPlugin(BasePlugin):
         return "axolotl.integrations.protrain.args.ProTrainArgs"
 
     def get_training_args(self, cfg):
-        """Force ``save_only_model=True`` so HF Trainer skips optim state save.
+        """Gate ``save_only_model`` on whether ProTrain owns the optim shard.
 
-        ``_ProTrainOptimizer.state_dict`` / ``load_state_dict`` raise
-        ``NotImplementedError`` — optimizer-state checkpointing lives
-        in the M6 scope. Without this, ``save_steps`` would trigger a
-        ``NotImplementedError`` at the first checkpoint. Setting
-        ``save_only_model`` skips the ``_save_optimizer_and_scheduler``
-        call entirely; the adapter / model weights still round-trip.
+        Default: ``save_only_model=True``, which skips HF's
+        ``_save_optimizer_and_scheduler`` AND ``_save_rng_state``. Real
+        save/load of the optimizer goes through the ProTrain checkpoint
+        callback (CHECKPOINT_DESIGN.md), not HF's optimizer.pt path —
+        ``_ProTrainOptimizer.state_dict`` / ``load_state_dict`` are
+        patched to no-ops to coexist with Accelerate's ``prepare``
+        round-trip.
+
+        When ``protrain_save_optimizer_state=True`` we flip to
+        ``save_only_model=False`` so HF writes ``scheduler.pt`` and
+        ``rng_state.pth`` (both needed for a full resume — the ProTrain
+        shard only covers the optimizer adam state). HF will also write
+        a small ``optimizer.pt`` containing the patched-empty state
+        shell; that file is unused on load (the patched
+        ``load_state_dict`` is also a no-op) but the I/O cost is
+        negligible for the resume completeness it buys.
         """
         if not _is_plugin_active(cfg):
             return None
-        return {"save_only_model": True}
+        save_optim_state = bool(getattr(cfg, "protrain_save_optimizer_state", False))
+        return {"save_only_model": not save_optim_state}
 
     def post_model_load(self, cfg, model: "nn.Module") -> None:
         """Wrap the post-adapter model with the ProTrain runtime.
@@ -528,6 +539,36 @@ class ProTrainPlugin(BasePlugin):
             float(args.adam_epsilon),
             float(args.weight_decay),
         )
+
+        # ---- Optimizer-state checkpoint/resume (CHECKPOINT_DESIGN.md) ----
+        # Opt-in via protrain_save_optimizer_state. The save side is a
+        # TrainerCallback (on_save fires after HF writes its standard
+        # checkpoint dir); the load side is a monkey-patch on
+        # _load_optimizer_and_scheduler (HF has no on_load_checkpoint
+        # callback, and on_train_begin fires after the load slot).
+        if bool(getattr(cfg, "protrain_save_optimizer_state", False)):
+            from axolotl.integrations.protrain.api.checkpoint import (
+                DEFAULT_SAVE_MAX_BYTES,
+                install_load_hook,
+                make_checkpoint_callback,
+            )
+
+            cfg_max = getattr(cfg, "protrain_optim_save_max_bytes", None)
+            save_max = (
+                int(cfg_max) if cfg_max is not None else DEFAULT_SAVE_MAX_BYTES
+            )
+            trainer.add_callback(
+                make_checkpoint_callback(save_max_bytes=save_max)
+            )
+            install_load_hook(trainer, optim)
+            LOG.info(
+                "ProTrain: optimizer-state checkpointing enabled "
+                "(save_max_bytes=%d ~= %.2f GiB). "
+                "Save side: ProTrainOptimizerCheckpointCallback. "
+                "Load side: trainer._load_optimizer_and_scheduler patched.",
+                save_max,
+                save_max / 1024**3,
+            )
 
         # ---- DDP composition detection ----------------------------------
         # If the trainer's model is wrapped in DistributedDataParallel,
