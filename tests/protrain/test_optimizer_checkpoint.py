@@ -25,8 +25,12 @@ from unittest import mock
 import pytest
 
 from axolotl.integrations.protrain.api.checkpoint import (
+    CPU_OPTIM_DIRNAME,
     DEFAULT_SAVE_MAX_BYTES,
+    GPU_OPTIM_FILENAME,
+    METADATA_FILENAME,
     PROTRAIN_OPTIM_DIRNAME,
+    SAVE_MODE_REPLICATED,
     SCHEMA_FORMAT_VERSION,
     _effective_persistent_ids,
     _estimate_optim_state_bytes,
@@ -461,32 +465,18 @@ def test_save_skipped_when_offloaded_state_exceeds_threshold(tmp_path, caplog):
     assert not (tmp_path / PROTRAIN_OPTIM_DIRNAME).exists()
 
 
-def test_save_rejects_world_size_not_one(tmp_path):
-    fake_optim = mock.MagicMock()
-    fake_optim.param_groups = [
-        {"params": [mock.MagicMock(numel=lambda: 1, requires_grad=True)]}
-    ]
-    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
-
-    with mock.patch(
-        "axolotl.integrations.protrain.api.checkpoint._current_world_size",
-        return_value=2,
-    ):
-        with pytest.raises(RuntimeError, match="world_size=2"):
-            _save_protrain_optim_dir(
-                fake_optim, str(tmp_path), step=0,
-                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
-            )
-
-
-def test_save_rejects_zero3_shard(tmp_path):
+def test_save_rejects_zero3_shard_still(tmp_path):
+    """Phase 2 Mode-B drops the world_size guard but Mode-C save is still
+    out of scope; zero3_shard=True must hard-error pointing at the
+    follow-up PR.
+    """
     fake_optim = mock.MagicMock()
     fake_optim.param_groups = [
         {"params": [mock.MagicMock(numel=lambda: 1, requires_grad=True)]}
     ]
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
 
-    with pytest.raises(RuntimeError, match="zero3_shard=True"):
+    with pytest.raises(NotImplementedError, match="Mode-C"):
         _save_protrain_optim_dir(
             fake_optim, str(tmp_path), step=0,
             save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
@@ -518,7 +508,9 @@ def test_callback_skips_when_optim_is_not_protrain(tmp_path):
     import torch
 
     cb = make_checkpoint_callback(save_max_bytes=DEFAULT_SAVE_MAX_BYTES)
-    fake_args = mock.MagicMock(output_dir=str(tmp_path))
+    fake_args = mock.MagicMock(
+        output_dir=str(tmp_path), process_index=0, world_size=1
+    )
     fake_state = mock.MagicMock(global_step=1)
     fake_control = mock.MagicMock()
 
@@ -600,6 +592,7 @@ def test_save_metadata_contains_expected_fields(saved_checkpoint):
         meta = json.load(f)
 
     assert meta["format_version"] == SCHEMA_FORMAT_VERSION
+    assert SCHEMA_FORMAT_VERSION == 2
     assert isinstance(meta["protrain_layout_signature"], str)
     assert len(meta["protrain_layout_signature"]) == 64
     assert meta["protrain_persistent_ids"] == sorted(
@@ -607,6 +600,9 @@ def test_save_metadata_contains_expected_fields(saved_checkpoint):
     )
     assert meta["protrain_world_size"] == 1
     assert meta["protrain_zero3_shard"] is False
+    # Phase 2 schema additions:
+    assert meta["protrain_save_mode"] == "replicated"
+    assert meta["saving_rank"] == 0
     assert meta["saved_at_step"] == 42
     assert isinstance(meta["estimated_optim_state_bytes"], int)
 
@@ -744,7 +740,12 @@ def test_callback_unwraps_accelerated_optimizer(tmp_path, saved_checkpoint):
     ckpt_dir.mkdir()
 
     cb = make_checkpoint_callback(save_max_bytes=DEFAULT_SAVE_MAX_BYTES)
-    fake_args = mock.MagicMock(output_dir=str(output_dir))
+    # process_index/world_size must be real ints — Phase 2 Mode-B
+    # orchestration uses HF's args.process_index / args.world_size to
+    # decide who writes.
+    fake_args = mock.MagicMock(
+        output_dir=str(output_dir), process_index=0, world_size=1
+    )
     fake_state = mock.MagicMock(global_step=step)
     fake_control = mock.MagicMock()
 
@@ -810,15 +811,31 @@ def test_load_rejects_unknown_format_version(
 
 
 @pytest.mark.gpu
-def test_load_rejects_world_size_mismatch(fresh_checkpoint_dir, saved_checkpoint):
+def test_load_accepts_world_size_change_for_replicated(
+    fresh_checkpoint_dir, saved_checkpoint
+):
+    """Phase 2 Option B: replicated checkpoints saved with world_size=N
+    can load into world_size=M (state shape is rank-independent).
+
+    Tampering metadata to claim a different saved world_size + matching
+    layout signature must load cleanly. The Phase 1 test that asserted
+    the inverse was a Phase-1 hard-guard artifact.
+    """
     _, _, optim = saved_checkpoint
     meta_path = fresh_checkpoint_dir / PROTRAIN_OPTIM_DIRNAME / "metadata.json"
     meta = json.loads(meta_path.read_text())
     meta["protrain_world_size"] = 4
+    # Layout signature embeds world_size; recompute it for the saved
+    # value so the only difference is world_size itself.
+    chunk_manager = optim._chunk_manager
+    meta["protrain_layout_signature"] = _layout_signature(
+        chunk_manager,
+        world_size=4,
+        zero3_shard=bool(getattr(chunk_manager, "zero3_shard", False)),
+    )
     meta_path.write_text(json.dumps(meta))
 
-    with pytest.raises(RuntimeError, match="world_size mismatch"):
-        _load_protrain_optim_dir(optim, str(fresh_checkpoint_dir))
+    assert _load_protrain_optim_dir(optim, str(fresh_checkpoint_dir)) is True
 
 
 @pytest.mark.gpu
@@ -1062,3 +1079,913 @@ def test_continued_training_matches_continuous_via_subprocess(tmp_path):
             f"max_abs_diff={(cur_t - ref_t).abs().max().item():.3e}, "
             f"max_rel_diff={((cur_t - ref_t).abs() / ref_t.abs().clamp(min=1e-8)).max().item():.3e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Mode-B (DDP-replicated) — schema, forward compat, dispatcher
+# ---------------------------------------------------------------------------
+
+
+def test_load_rejects_v2_metadata_missing_save_mode(tmp_path):
+    """v2 saves MUST carry protrain_save_mode; missing it is a hard error.
+
+    The forward-compat path applies only to v1 saves; v2 saves with
+    incomplete metadata indicate corruption or a pre-release schema.
+    """
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    proot.mkdir()
+    bad_meta = {
+        "format_version": 2,
+        "protrain_layout_signature": "0" * 64,
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 1,
+        "protrain_world_size": 1,
+        "protrain_zero3_shard": False,
+        "saving_rank": 0,
+        # protrain_save_mode is missing on purpose
+        "param_groups_meta": [],
+        "saved_at_step": 0,
+        "torch_version": "x",
+        "estimated_optim_state_bytes": 0,
+    }
+    (proot / "metadata.json").write_text(json.dumps(bad_meta))
+    fake_optim = mock.MagicMock(
+        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
+    )
+    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
+    with pytest.raises(RuntimeError, match="protrain_save_mode"):
+        _load_protrain_optim_dir(fake_optim, str(tmp_path))
+
+
+def test_load_rejects_save_mode_mismatch_replicated_to_sharded(tmp_path):
+    """Saved replicated, current sharded → hard error pointing at Mode-C.
+
+    Catches the user trying to resume a Phase-1 / Mode-B replicated
+    save into a ZeRO-3 sharded run. The on-disk shape doesn't match
+    what the current run needs.
+    """
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    proot.mkdir()
+    meta = {
+        "format_version": 2,
+        "protrain_layout_signature": "0" * 64,
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 1,
+        "protrain_world_size": 1,
+        "protrain_zero3_shard": False,
+        "protrain_save_mode": "replicated",
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 0,
+        "torch_version": "x",
+        "estimated_optim_state_bytes": 0,
+    }
+    (proot / "metadata.json").write_text(json.dumps(meta))
+    fake_optim = mock.MagicMock(
+        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
+    )
+    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
+    with pytest.raises(RuntimeError, match="save_mode mismatch"):
+        _load_protrain_optim_dir(fake_optim, str(tmp_path))
+
+
+def test_load_rejects_save_mode_mismatch_sharded_to_replicated(tmp_path):
+    """Saved sharded, current replicated → hard error.
+
+    Inverse of the above: rank-0 of a replicated run can't reconstruct
+    full state from sharded files without a re-shard step (out of scope).
+    """
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    proot.mkdir()
+    meta = {
+        "format_version": 2,
+        "protrain_layout_signature": "0" * 64,
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 1,
+        "protrain_world_size": 2,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": "sharded",
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 0,
+        "torch_version": "x",
+        "estimated_optim_state_bytes": 0,
+    }
+    (proot / "metadata.json").write_text(json.dumps(meta))
+    fake_optim = mock.MagicMock(
+        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
+    )
+    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
+    with pytest.raises(RuntimeError, match="save_mode mismatch"):
+        _load_protrain_optim_dir(fake_optim, str(tmp_path))
+
+
+def test_load_rejects_mode_c_resume_pointing_at_followup_pr(tmp_path):
+    """Mode-C resume not yet implemented — current=sharded, saved=sharded
+    must error with the follow-up PR pointer.
+
+    Ensures Mode-C save side hasn't accidentally landed; the current
+    branch only supports Mode-B replicated resume.
+    """
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    proot.mkdir()
+    meta = {
+        "format_version": 2,
+        "protrain_layout_signature": "0" * 64,
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 1,
+        "protrain_world_size": 2,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": "sharded",
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 0,
+        "torch_version": "x",
+        "estimated_optim_state_bytes": 0,
+    }
+    (proot / "metadata.json").write_text(json.dumps(meta))
+    fake_optim = mock.MagicMock(
+        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
+    )
+    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
+    # save_mode matches; the hard error is the Mode-C-not-implemented one.
+    with pytest.raises(NotImplementedError, match="Mode-C"):
+        _load_protrain_optim_dir(fake_optim, str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# v1 forward-compat — write a Phase-1 layout, load it under Phase-2 code
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_replicated_load_v1_checkpoint_is_forward_compat(
+    fresh_checkpoint_dir, saved_checkpoint
+):
+    """v1 saves load cleanly under v2 code as Mode-B replicated, ws=1.
+
+    Mutates the saved metadata to look like a Phase-1 (v1) save: drops
+    the v2-only fields and renames format_version to 1. Phase-2 loader
+    must infer save_mode=replicated, saving_rank=0, world_size=1 and
+    proceed without error.
+    """
+    _, _, optim = saved_checkpoint
+    meta_path = fresh_checkpoint_dir / PROTRAIN_OPTIM_DIRNAME / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    # Strip the v2-only fields so the metadata looks like a v1 save.
+    meta.pop("protrain_save_mode", None)
+    meta.pop("saving_rank", None)
+    meta["format_version"] = 1
+    meta_path.write_text(json.dumps(meta))
+
+    # Loader must accept this without raising.
+    assert _load_protrain_optim_dir(optim, str(fresh_checkpoint_dir)) is True
+
+
+# ---------------------------------------------------------------------------
+# Mode-B multi-rank (gloo + mp.spawn) — slow lane
+# ---------------------------------------------------------------------------
+# The pattern here mirrors test_chunk_manager_offload.py:875
+# (_worker_sharded_restore_round_trip): each rank initializes a gloo
+# process group via a file:// rendezvous in tmpdir, runs its body, and
+# tears down the group. Tests downgrade to skip if a required gloo
+# collective isn't available on this build (rank{N}.skip files).
+
+
+def _common_worker_setup(rank: int, world_size: int, tmpdir: str, tag: str):
+    """Init gloo process group + return ``(model, mgr, optim, host)``.
+
+    The chunk_manager is built with the same seed across ranks so every
+    rank holds the same starting weights — the Mode-B replication
+    invariant. After one fwd+bwd+step every rank's optimizer state is
+    identical.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    _os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("worker: CUDA not available")
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-{tag}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    torch.manual_seed(0)  # identical init across ranks
+    model = _tiny_model().to("cuda")
+    mgr, host = _build_chunk_manager(model, n_persist=1, S_chunk=64 * 1024)
+    mgr.materialize_offload()
+    _, _, optim = _build_optim_pair(model, mgr)
+    # Replicate one fwd+bwd+step with a DETERMINISTIC batch — torch.randn
+    # advances per-process CUDA RNG that may diverge between mp.spawn
+    # workers (deepspeed/apex import side effects can consume RNG
+    # unequally). Build the input on CPU from a fresh-seeded generator
+    # then copy to GPU so the byte values are identical across ranks.
+    import torch as _torch  # local alias to satisfy linters
+
+    cpu_gen = _torch.Generator(device="cpu")
+    cpu_gen.manual_seed(123)
+    x = _torch.randn(
+        2, model.embed.in_features, generator=cpu_gen
+    ).to("cuda")
+    for cid in list(mgr._non_persistent_ids):
+        mgr.gather(cid)
+    optim.zero_grad()
+    out = model(x)
+    out.sum().backward()
+    optim.step()
+    return model, mgr, optim, host
+
+
+def _force_identical_inner_state(optim) -> None:
+    """Zero every inner-state tensor — guarantees byte-identical state
+    across ranks regardless of step-time numerical noise.
+
+    The cross-rank verify and the load tests exercise the
+    save/load/verify *mechanisms*, not DDP-determinism (which is the
+    framework's contract, verified elsewhere). Forcing zeros eliminates
+    non-determinism from CPU-adam threading, async copies, or
+    per-process RNG drift between mp.spawn workers.
+    """
+    import torch as _torch
+
+    if optim._gpu_optim is not None:
+        for s in optim._gpu_optim._optim.state.values():
+            for k, v in s.items():
+                if isinstance(v, _torch.Tensor):
+                    v.zero_()
+                elif isinstance(v, int):
+                    s[k] = 0
+    if optim._cpu_optim is not None:
+        for inner in optim._cpu_optim._optims.values():
+            for s in inner.state.values():
+                for k, v in s.items():
+                    if isinstance(v, _torch.Tensor):
+                        v.zero_()
+                    elif isinstance(v, int):
+                        s[k] = 0
+
+
+def _worker_replicated_save_only_rank_0_writes(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Rank-0 writes; rank-1 must NOT create any extra files.
+
+    Drives the callback through a fake HF args object (output_dir +
+    process_index + world_size). Rank-1 writes a sentinel file
+    naming itself; the parent test asserts there are no rank-suffix
+    files in protrain_optim/ and that rank-1 reached the post-save
+    point (so the callback didn't deadlock).
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_worker_setup(
+            rank, world_size, tmpdir, tag="r0only"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()  # output_dir must exist before any rank's callback
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            cb = make_checkpoint_callback(
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES
+            )
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
+
+            # Both ranks reach this point — sentinel for liveness.
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_replicated_save_only_rank_0_writes(tmp_path):
+    """mp.spawn 2 gloo ranks: only rank-0's files appear on disk.
+
+    The on-disk layout in Mode-B has no per-rank suffix
+    (CHECKPOINT_DESIGN_PHASE2.md §2.1). Both ranks call the callback
+    but only rank-0 actually writes; rank-1 must reach the
+    post-callback point (sentinel rank1.done) without creating extra
+    files.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_replicated_save_only_rank_0_writes,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+
+    # Both ranks must have reached the post-save sentinel.
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file(), (
+            f"rank {r} did not reach post-callback point"
+        )
+
+    # Verify the directory layout has no rank suffix.
+    proot = tmp_path / "trainer_out" / "checkpoint-1" / PROTRAIN_OPTIM_DIRNAME
+    assert (proot / METADATA_FILENAME).is_file()
+    assert (proot / GPU_OPTIM_FILENAME).is_file()
+
+    cpu_dir = proot / CPU_OPTIM_DIRNAME
+    if cpu_dir.is_dir():
+        for entry in cpu_dir.iterdir():
+            # Must match chunk_<N>.pt — no rank suffix in Mode-B.
+            assert "_rank_" not in entry.name, (
+                f"Mode-B file has unexpected rank suffix: {entry.name}"
+            )
+
+    # The metadata records save_mode=replicated, saving_rank=0,
+    # protrain_world_size=2.
+    meta = json.loads((proot / METADATA_FILENAME).read_text())
+    assert meta["protrain_save_mode"] == SAVE_MODE_REPLICATED
+    assert meta["saving_rank"] == 0
+    assert meta["protrain_world_size"] == 2
+
+
+def _worker_replicated_load_succeeds_on_all_ranks(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Each rank loads from the same path, verifies state matches pre-save.
+
+    Step 1: every rank builds a fresh chunk_manager, takes one step
+    (state X). Rank-0 saves. All ranks barrier.
+    Step 2: every rank mutates its in-memory state, then loads from
+    the saved dir. Loaded state must match pre-mutation snapshot
+    (== state X), proving the load actually reads files (and that
+    rank-1 finds the file rank-0 wrote).
+    """
+    import copy
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_worker_setup(
+            rank, world_size, tmpdir, tag="loadall"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            # Force byte-identical state across ranks. Mode-B's
+            # contract is that DDP makes this true at runtime, but for
+            # the load test we just need a known-equal baseline so the
+            # post-load comparison is deterministic regardless of
+            # CPU-adam threading or per-process RNG drift.
+            _force_identical_inner_state(optim)
+
+            # Snapshot inner state pre-save.
+            def _snap():
+                snap = {}
+                if optim._gpu_optim is not None:
+                    snap["gpu"] = copy.deepcopy(
+                        optim._gpu_optim._optim.state_dict()
+                    )
+                if optim._cpu_optim is not None:
+                    snap["cpu"] = {
+                        cid: copy.deepcopy(inner.state_dict())
+                        for cid, inner in optim._cpu_optim._optims.items()
+                    }
+                return snap
+
+            pre_save = _snap()
+
+            if rank == 0:
+                wrote = _save_protrain_optim_dir(
+                    optim,
+                    save_dir,
+                    step=1,
+                    save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                    rank=0,
+                    world_size=world_size,
+                )
+                assert wrote is True, "rank-0 save returned False"
+            dist.barrier()
+
+            # Mutate every state tensor on every rank so a no-op load
+            # would be visible.
+            if optim._gpu_optim is not None:
+                for s in optim._gpu_optim._optim.state.values():
+                    for v in s.values():
+                        if isinstance(v, torch.Tensor):
+                            v.add_(7.0)
+            if optim._cpu_optim is not None:
+                for inner in optim._cpu_optim._optims.values():
+                    for s in inner.state.values():
+                        for v in s.values():
+                            if isinstance(v, torch.Tensor):
+                                v.add_(7.0)
+
+            # Load from the same path on every rank.
+            loaded = _load_protrain_optim_dir(optim, save_dir)
+            assert loaded is True, f"rank {rank}: load returned False"
+
+            post_load = _snap()
+
+            def _states_match(a, b) -> bool:
+                if set(a) != set(b):
+                    return False
+                for k in a:
+                    sa, sb = a[k], b[k]
+                    if isinstance(sa, dict) and isinstance(sb, dict):
+                        if not _states_match(sa, sb):
+                            return False
+                    elif isinstance(sa, torch.Tensor) and isinstance(
+                        sb, torch.Tensor
+                    ):
+                        if not torch.equal(sa, sb):
+                            return False
+                    else:
+                        if sa != sb:
+                            return False
+                return True
+
+            assert _states_match(post_load, pre_save), (
+                f"rank {rank}: load did not restore inner state"
+            )
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_replicated_load_succeeds_on_all_ranks(tmp_path):
+    """2 ranks load from rank-0's saved dir; loaded state matches pre-save.
+
+    Verifies the Mode-B load contract (CHECKPOINT_DESIGN_PHASE2.md §2.5):
+    every rank reads the same files into its own optimizer.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_replicated_load_succeeds_on_all_ranks,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file(), (
+            f"rank {r} did not reach post-load point"
+        )
+
+
+def _worker_estimate_gate_broadcast(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Rank-0's estimate trips the threshold; rank-1's wouldn't on its own.
+
+    Mocks ``_estimate_optim_state_bytes`` per-rank: rank-0 returns
+    ``threshold + 1``; rank-1 returns 0. Without the broadcast,
+    rank-0 would skip but rank-1 would write — partial save.
+    With the broadcast, all ranks must skip together.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_worker_setup(
+            rank, world_size, tmpdir, tag="gate"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            small_threshold = 64
+            # Per-rank patch: rank-0's estimate exceeds; rank-1's fits.
+            per_rank_estimate = (small_threshold + 1) if rank == 0 else 0
+
+            cb = make_checkpoint_callback(save_max_bytes=small_threshold)
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            with mock.patch(
+                "axolotl.integrations.protrain.api.checkpoint."
+                "_estimate_optim_state_bytes",
+                return_value=per_rank_estimate,
+            ):
+                cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_save_estimate_gate_broadcast_from_rank_0(tmp_path):
+    """Rank-0's gate decision is broadcast; all ranks skip together.
+
+    Without the broadcast (per-rank decide), rank-0 would skip but
+    rank-1 would write — partial save → broken checkpoint
+    (CHECKPOINT_DESIGN_PHASE2.md §4.4). Verifies no protrain_optim/
+    files end up on disk despite rank-1's "would-fit" estimate.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_estimate_gate_broadcast,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+
+    proot = tmp_path / "trainer_out" / "checkpoint-1" / PROTRAIN_OPTIM_DIRNAME
+    assert not proot.exists() or not (proot / METADATA_FILENAME).exists(), (
+        "Mode-B estimate gate failed: some rank wrote despite rank-0's "
+        "skip decision — partial save means broken checkpoint."
+    )
+
+
+def _worker_verify_replicated_clean(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Verify flag ON, identical state across ranks → save proceeds."""
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_worker_setup(
+            rank, world_size, tmpdir, tag="verifyok"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            # Force byte-identical state across ranks. The clean-run
+            # test exercises the verify *mechanism*, not DDP
+            # determinism (which is a different invariant).
+            _force_identical_inner_state(optim)
+
+            cb = make_checkpoint_callback(
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                verify_replicated=True,
+            )
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_replicated_save_with_verify_flag_passes_on_clean_run(tmp_path):
+    """Verify flag ON, identical state across ranks → save proceeds, no error."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_verify_replicated_clean,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file()
+    proot = tmp_path / "trainer_out" / "checkpoint-1" / PROTRAIN_OPTIM_DIRNAME
+    assert (proot / METADATA_FILENAME).is_file(), (
+        "verify-on clean-run did not produce a checkpoint"
+    )
+
+
+def _worker_verify_replicated_divergent(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Verify flag ON, mutate rank-1's state pre-save → expect RuntimeError."""
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_worker_setup(
+            rank, world_size, tmpdir, tag="verifybad"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            # Force identical state on both ranks first, then mutate
+            # rank-1's only — this isolates the verify path from any
+            # incidental determinism issues in the chunk_manager
+            # plumbing.
+            _force_identical_inner_state(optim)
+
+            # Tamper rank-1's state so the cross-rank hash compare fails.
+            if rank == 1 and optim._cpu_optim is not None:
+                for inner in optim._cpu_optim._optims.values():
+                    for s in inner.state.values():
+                        for v in s.values():
+                            if isinstance(v, torch.Tensor):
+                                v.add_(13.0)
+            if rank == 1 and optim._gpu_optim is not None:
+                for s in optim._gpu_optim._optim.state.values():
+                    for v in s.values():
+                        if isinstance(v, torch.Tensor):
+                            v.add_(13.0)
+
+            cb = make_checkpoint_callback(
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                verify_replicated=True,
+            )
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            try:
+                cb.on_save(
+                    fake_args, fake_state, fake_control, optimizer=optim
+                )
+            except RuntimeError as exc:
+                if "Mode-B precondition violated" in str(exc):
+                    with open(
+                        _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+                    ) as f:
+                        f.write(str(exc))
+                else:
+                    raise
+            else:
+                # No raise == bug. Mark sentinel so the parent test
+                # fails loudly.
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
+                ) as f:
+                    f.write("verify did not raise on divergent state")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and "Mode-B precondition violated" in str(exc):
+            with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
+                f.write(str(exc))
+            return
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_replicated_save_with_verify_flag_catches_divergence(tmp_path):
+    """Verify flag ON, divergent state → RuntimeError naming the divergence.
+
+    Mutates rank-1's state pre-save; the all_gather_object hash compare
+    must trip. Both ranks raise (the all_gather is collective).
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    # mp.spawn re-raises the worker exception in the parent, but the
+    # workers also write a "caught" sentinel so we can verify the
+    # message regardless of how mp.spawn surfaces it.
+    try:
+        mp.spawn(
+            _worker_verify_replicated_divergent,
+            args=(world_size, str(tmp_path)),
+            nprocs=world_size,
+            join=True,
+        )
+    except Exception:
+        # Expected: at least one rank raised RuntimeError. The
+        # sentinel files distinguish "verify caught divergence" from
+        # "actual unexpected error".
+        pass
+
+    no_raise = list(tmp_path.glob("rank*.no_raise"))
+    if no_raise:
+        bodies = "\n---\n".join(f.read_text() for f in no_raise)
+        pytest.fail(f"verify did not raise on divergent state:\n{bodies}")
+
+    caught = list(tmp_path.glob("rank*.caught"))
+    assert caught, "no rank caught the verify-flag RuntimeError"
+    # The error message names the divergent ranks.
+    msgs = [f.read_text() for f in caught]
+    assert any(
+        "divergent ranks" in m and "Mode-B precondition violated" in m
+        for m in msgs
+    ), f"verify error did not mention divergent ranks: {msgs}"
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"unexpected worker errors:\n{bodies}")
