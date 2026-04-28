@@ -31,7 +31,9 @@ from axolotl.integrations.protrain.api.checkpoint import (
     METADATA_FILENAME,
     PROTRAIN_OPTIM_DIRNAME,
     SAVE_MODE_REPLICATED,
+    SAVE_MODE_SHARDED,
     SCHEMA_FORMAT_VERSION,
+    _build_regions_per_chunk,
     _effective_persistent_ids,
     _estimate_optim_state_bytes,
     _is_protrain_optimizer,
@@ -40,6 +42,7 @@ from axolotl.integrations.protrain.api.checkpoint import (
     _load_protrain_optim_dir,
     _save_protrain_optim_dir,
     _unwrap_protrain_optim,
+    _validate_regions_match,
     install_load_hook,
     make_checkpoint_callback,
 )
@@ -463,24 +466,6 @@ def test_save_skipped_when_offloaded_state_exceeds_threshold(tmp_path, caplog):
         )
     assert wrote is False, "estimator must count offloaded inner state, not outer placeholders"
     assert not (tmp_path / PROTRAIN_OPTIM_DIRNAME).exists()
-
-
-def test_save_rejects_zero3_shard_still(tmp_path):
-    """Phase 2 Mode-B drops the world_size guard but Mode-C save is still
-    out of scope; zero3_shard=True must hard-error pointing at the
-    follow-up PR.
-    """
-    fake_optim = mock.MagicMock()
-    fake_optim.param_groups = [
-        {"params": [mock.MagicMock(numel=lambda: 1, requires_grad=True)]}
-    ]
-    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
-
-    with pytest.raises(NotImplementedError, match="Mode-C"):
-        _save_protrain_optim_dir(
-            fake_optim, str(tmp_path), step=0,
-            save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
-        )
 
 
 def test_load_returns_false_when_dir_absent(tmp_path):
@@ -1180,12 +1165,118 @@ def test_load_rejects_save_mode_mismatch_sharded_to_replicated(tmp_path):
         _load_protrain_optim_dir(fake_optim, str(tmp_path))
 
 
-def test_load_rejects_mode_c_resume_pointing_at_followup_pr(tmp_path):
-    """Mode-C resume not yet implemented — current=sharded, saved=sharded
-    must error with the follow-up PR pointer.
+# ---------------------------------------------------------------------------
+# Phase 2 Mode-C (ZeRO-3 sharded) — CPU-only unit tests for helpers
+# ---------------------------------------------------------------------------
 
-    Ensures Mode-C save side hasn't accidentally landed; the current
-    branch only supports Mode-B replicated resume.
+
+def _make_region_dict(
+    chunk_offset: int = 0,
+    region_bytes: int = 1024,
+    region_bytes_padded: int = 1024,
+    shard_bytes: int = 512,
+    dtype: str = "torch.float16",
+) -> dict:
+    return {
+        "chunk_offset": chunk_offset,
+        "region_bytes": region_bytes,
+        "region_bytes_padded": region_bytes_padded,
+        "shard_bytes": shard_bytes,
+        "dtype": dtype,
+    }
+
+
+def test_validate_regions_match_passes_on_identical_layout():
+    """Identical region descriptors round-trip cleanly."""
+    a = {"0": [_make_region_dict()], "1": [_make_region_dict(chunk_offset=2048)]}
+    b = {"0": [_make_region_dict()], "1": [_make_region_dict(chunk_offset=2048)]}
+    _validate_regions_match(a, b)  # no raise
+
+
+def test_validate_regions_match_rejects_chunk_id_mismatch():
+    a = {"0": [_make_region_dict()], "1": [_make_region_dict()]}
+    b = {"0": [_make_region_dict()], "2": [_make_region_dict()]}
+    with pytest.raises(RuntimeError, match="chunk-id mismatch"):
+        _validate_regions_match(a, b)
+
+
+def test_validate_regions_match_rejects_region_count_mismatch():
+    a = {"0": [_make_region_dict()]}
+    b = {"0": [_make_region_dict(), _make_region_dict(chunk_offset=2048)]}
+    with pytest.raises(RuntimeError, match="region count mismatch.*chunk 0"):
+        _validate_regions_match(a, b)
+
+
+def test_validate_regions_match_rejects_dtype_mismatch():
+    a = {"0": [_make_region_dict(dtype="torch.float16")]}
+    b = {"0": [_make_region_dict(dtype="torch.bfloat16")]}
+    with pytest.raises(RuntimeError, match="field 'dtype'"):
+        _validate_regions_match(a, b)
+
+
+def test_validate_regions_match_rejects_shard_bytes_mismatch():
+    """world_size change typically manifests as a shard_bytes drift."""
+    a = {"0": [_make_region_dict(shard_bytes=512)]}
+    b = {"0": [_make_region_dict(shard_bytes=256)]}
+    with pytest.raises(RuntimeError, match="field 'shard_bytes'"):
+        _validate_regions_match(a, b)
+
+
+def test_validate_regions_match_rejects_chunk_offset_mismatch():
+    a = {"0": [_make_region_dict(chunk_offset=0)]}
+    b = {"0": [_make_region_dict(chunk_offset=64)]}
+    with pytest.raises(RuntimeError, match="field 'chunk_offset'"):
+        _validate_regions_match(a, b)
+
+
+def test_build_regions_per_chunk_emits_expected_descriptors():
+    """`_build_regions_per_chunk` walks `_chunk_shards` and serializes
+    every region's load-bearing fields."""
+    import torch
+
+    fake_region_a = mock.MagicMock(
+        chunk_offset=0,
+        region_bytes=1000,
+        region_bytes_padded=1024,
+        shard_bytes=512,
+        dtype=torch.float16,
+    )
+    fake_region_b = mock.MagicMock(
+        chunk_offset=1024,
+        region_bytes=128,
+        region_bytes_padded=128,
+        shard_bytes=64,
+        dtype=torch.float32,
+    )
+    fake_shard_state = mock.MagicMock(regions=[fake_region_a, fake_region_b])
+    chunk_manager = mock.MagicMock()
+    chunk_manager._chunk_shards = {ChunkId(0): fake_shard_state}
+
+    out = _build_regions_per_chunk(chunk_manager)
+    assert "0" in out
+    assert len(out["0"]) == 2
+    assert out["0"][0]["chunk_offset"] == 0
+    assert out["0"][0]["region_bytes"] == 1000
+    assert out["0"][0]["region_bytes_padded"] == 1024
+    assert out["0"][0]["shard_bytes"] == 512
+    assert out["0"][0]["dtype"] == "torch.float16"
+    assert out["0"][1]["chunk_offset"] == 1024
+    assert out["0"][1]["dtype"] == "torch.float32"
+
+
+def test_build_regions_per_chunk_empty_when_no_chunk_shards():
+    """Replicated-mode managers have an empty `_chunk_shards`."""
+    chunk_manager = mock.MagicMock()
+    chunk_manager._chunk_shards = {}
+    assert _build_regions_per_chunk(chunk_manager) == {}
+
+
+def test_load_rejects_sharded_metadata_missing_regions_per_chunk(tmp_path):
+    """A v2 sharded save that lacks regions_per_chunk is rejected.
+
+    Catches a corrupt file or a forward-incompat producer; the loader
+    needs the descriptors to validate the rebuilt shard_param fits the
+    saved bytes.
     """
     proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
     proot.mkdir()
@@ -1202,15 +1293,60 @@ def test_load_rejects_mode_c_resume_pointing_at_followup_pr(tmp_path):
         "saved_at_step": 0,
         "torch_version": "x",
         "estimated_optim_state_bytes": 0,
+        # regions_per_chunk missing on purpose
+    }
+    (proot / "metadata.json").write_text(json.dumps(meta))
+    fake_optim = mock.MagicMock(
+        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
+    )
+    # Pretend we're in a 2-rank sharded run so we get past the
+    # save_mode/world_size guards and reach the regions check.
+    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
+    fake_optim._chunk_manager._chunk_shards = {}
+    with mock.patch(
+        "axolotl.integrations.protrain.api.checkpoint._current_world_size",
+        return_value=2,
+    ):
+        with pytest.raises(RuntimeError, match="regions_per_chunk"):
+            _load_protrain_optim_dir(fake_optim, str(tmp_path))
+
+
+def test_load_rejects_sharded_world_size_change(tmp_path):
+    """Mode-C resume requires identical world_size; mismatch hard-errors.
+
+    Sharded shard arithmetic depends on world_size — cross-world-size
+    resume is out of scope for Phase 2.
+    """
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    proot.mkdir()
+    meta = {
+        "format_version": 2,
+        "protrain_layout_signature": "0" * 64,
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 1,
+        "protrain_world_size": 2,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": "sharded",
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 0,
+        "torch_version": "x",
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {"0": [_make_region_dict()]},
     }
     (proot / "metadata.json").write_text(json.dumps(meta))
     fake_optim = mock.MagicMock(
         spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
     )
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
-    # save_mode matches; the hard error is the Mode-C-not-implemented one.
-    with pytest.raises(NotImplementedError, match="Mode-C"):
-        _load_protrain_optim_dir(fake_optim, str(tmp_path))
+    fake_optim._chunk_manager._chunk_shards = {}
+    # Saved world=2; pretend current world=4 → must error.
+    with mock.patch(
+        "axolotl.integrations.protrain.api.checkpoint._current_world_size",
+        return_value=4,
+    ):
+        with pytest.raises(RuntimeError, match="world_size"):
+            _load_protrain_optim_dir(fake_optim, str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -1989,3 +2125,758 @@ def test_replicated_save_with_verify_flag_catches_divergence(tmp_path):
     if err_files:
         bodies = "\n---\n".join(f.read_text() for f in err_files)
         pytest.fail(f"unexpected worker errors:\n{bodies}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Mode-C (ZeRO-3 sharded) — multi-rank gloo + mp.spawn
+# ---------------------------------------------------------------------------
+# Mode-C writes per-rank chunk shards (chunk_<N>_rank_<R>.pt) so we
+# need real distributed init even on a single-GPU box. Gloo's CPU
+# collectives suffice for the file-bookkeeping path. The mixed-dtype
+# model below produces multiple dtype regions per chunk — exercises
+# the multi-region branch of regions_per_chunk.
+
+
+def _build_sharded_chunk_manager_mixed_dtype(
+    rank: int, world_size: int
+):
+    """Mixed-dtype 1-block model + sharded ChunkManager for Mode-C tests.
+
+    Uses an fp16 Linear + fp32 LayerNorm (mirrors
+    test_chunk_manager_offload.py:875's ``_MixedLayer``) so the chunk
+    contains multiple dtype regions and the regions_per_chunk path
+    exercises real multi-region descriptors. Returns
+    ``(model, mgr, host)``. Caller builds the optim via
+    :func:`_build_optim_pair`.
+
+    The chunk manager is built with the supplied ``rank`` /
+    ``world_size`` and ``zero3_shard=True``; ``materialize_offload``
+    runs against gloo's CPU collective for the ``broadcast``-style
+    payload assembly. The model lives on CUDA so the optim adapters
+    that follow `_build_optim_pair` can use the existing
+    DeepSpeedCPUAdam plumbing without forking onto a CPU-only path.
+    """
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import (
+        PinnedHostMemory,
+    )
+
+    class _MixedLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(32, 32, bias=True).to(torch.float16)
+            self.norm = nn.LayerNorm(32).to(torch.float32)
+
+    class _MixedModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.h = nn.ModuleList([_MixedLayer()])
+
+    torch.manual_seed(0)  # identical init across ranks
+    model = _MixedModel().to("cuda")
+
+    block_spans: dict[BlockId, list[ParamId]] = {}
+    for name, _p in model.named_parameters():
+        if name.startswith("h."):
+            idx = int(name.split(".")[1])
+            block_spans.setdefault(cast(BlockId, idx), []).append(
+                cast(ParamId, name)
+            )
+    exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
+    S_chunk = 1 << 14  # plenty for the tiny mixed layer
+    layout = build_layout(model, exec_order, S_chunk, block_spans)
+
+    n_buffer = 2
+    host = PinnedHostMemory(n_buffer=n_buffer, S_chunk=layout.S_chunk)
+    pool = BufferPool(
+        n_buffer=n_buffer,
+        S_chunk=layout.S_chunk,
+        pinned_host=host,
+        device=torch.device("cuda"),
+    )
+    mgr = ChunkManager(
+        model=model,
+        layout=layout,
+        n_persist=0,  # everything offloaded -> sharded path
+        buffer_pool=pool,
+        cpu_optim=None,
+        gpu_optim=None,
+        device=torch.device("cuda"),
+        world_size=world_size,
+        rank=rank,
+        zero3_shard=True,
+    )
+    return model, mgr, host
+
+
+def _common_sharded_worker_setup(
+    rank: int, world_size: int, tmpdir: str, tag: str
+):
+    """Init gloo + build mixed-dtype sharded chunk_manager + optim.
+
+    Mode-C analog of :func:`_common_worker_setup`. Returns
+    ``(model, mgr, optim, host)``. Each rank takes one fwd+bwd+step
+    so the optimizer state is non-trivial.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    _os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("worker: CUDA not available")
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-{tag}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(
+        rank, world_size
+    )
+    mgr.materialize_offload()
+    _, _, optim = _build_optim_pair(model, mgr)
+    # Take one step against a deterministic batch so the inner state
+    # has real exp_avg / exp_avg_sq tensors. Identical inputs across
+    # ranks; with gloo all-reduce hooks elsewhere DDP would replicate
+    # grads, but here we just want non-empty state — the test bodies
+    # zero state where strict cross-rank equality is needed.
+    cpu_gen = torch.Generator(device="cpu")
+    cpu_gen.manual_seed(123)
+    x = torch.randn(2, 32, generator=cpu_gen).to("cuda").to(torch.float16)
+    for cid in list(mgr._non_persistent_ids):
+        mgr.gather(cid)
+    optim.zero_grad()
+    out = model.h[0].proj(x)
+    out = model.h[0].norm(out.to(torch.float32))
+    out.sum().backward()
+    optim.step()
+    return model, mgr, optim, host
+
+
+def _worker_sharded_save_writes_per_rank_files(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Each rank's callback writes its own chunk_<N>_rank_<R>.pt.
+
+    Drives the callback with a fake HF args. Verifies post-callback
+    that on rank-0 all expected files exist and metadata declares
+    ``protrain_save_mode="sharded"``. Both ranks write a sentinel
+    ``rank<R>.done`` so the parent test can confirm liveness.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="shardsave"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            cb = make_checkpoint_callback(
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES
+            )
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_save_writes_per_rank_shard_files(tmp_path):
+    """2-rank gloo: each rank writes its own chunk_<N>_rank_<R>.pt files.
+
+    Verifies the Mode-C save layout (CHECKPOINT_DESIGN_PHASE2.md §3.1):
+    rank-0 writes metadata + gpu_optim.pt (none here since n_persist=0);
+    every rank writes chunk_<N>_rank_<R>.pt. Metadata records
+    ``protrain_save_mode="sharded"`` and a non-empty
+    ``regions_per_chunk``.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_sharded_save_writes_per_rank_files,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file()
+
+    proot = tmp_path / "trainer_out" / "checkpoint-1" / PROTRAIN_OPTIM_DIRNAME
+    assert (proot / METADATA_FILENAME).is_file()
+
+    meta = json.loads((proot / METADATA_FILENAME).read_text())
+    assert meta["protrain_save_mode"] == SAVE_MODE_SHARDED
+    assert meta["protrain_zero3_shard"] is True
+    assert meta["protrain_world_size"] == 2
+    assert "regions_per_chunk" in meta
+    assert meta["regions_per_chunk"], (
+        "regions_per_chunk should be non-empty (mixed-dtype chunk has "
+        "at least one region)"
+    )
+
+    cpu_dir = proot / CPU_OPTIM_DIRNAME
+    assert cpu_dir.is_dir(), "cpu_optim/ must exist"
+
+    # Every chunk in regions_per_chunk must have a per-rank file from
+    # every rank.
+    for cid in meta["regions_per_chunk"]:
+        for r in range(world_size):
+            shard_path = cpu_dir / f"chunk_{int(cid)}_rank_{r}.pt"
+            assert shard_path.is_file(), (
+                f"missing per-rank shard {shard_path.name}"
+            )
+
+    # No unsuffixed Mode-B-style chunk_<N>.pt files in this dir.
+    for entry in cpu_dir.iterdir():
+        assert "_rank_" in entry.name, (
+            f"Mode-C cpu_optim/ contains a non-rank-suffixed file: "
+            f"{entry.name}"
+        )
+
+
+def _worker_sharded_metadata_contains_regions(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Save and verify ``regions_per_chunk`` matches runtime descriptors."""
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="shardmeta"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=1,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                rank=rank,
+                world_size=world_size,
+            )
+            assert wrote is True, f"rank {rank}: save returned False"
+            dist.barrier()
+
+            # Snapshot expected regions on every rank from the live
+            # chunk_manager — rank-0 wrote them; non-zero ranks didn't.
+            # Either way the in-memory descriptors are the source of
+            # truth.
+            current_regions = _build_regions_per_chunk(mgr)
+
+            if rank == 0:
+                meta_path = _os.path.join(
+                    save_dir, PROTRAIN_OPTIM_DIRNAME, METADATA_FILENAME
+                )
+                meta = json.loads(open(meta_path).read())
+                saved_regions = meta["regions_per_chunk"]
+                assert set(saved_regions.keys()) == set(
+                    current_regions.keys()
+                ), (
+                    f"rank 0: saved chunk-id set {set(saved_regions)} "
+                    f"!= current {set(current_regions)}"
+                )
+                for cid in saved_regions:
+                    s = saved_regions[cid]
+                    c = current_regions[cid]
+                    assert len(s) == len(c), (
+                        f"rank 0: chunk {cid} region count diff: "
+                        f"{len(s)} vs {len(c)}"
+                    )
+                    for i, (sr, cr) in enumerate(zip(s, c)):
+                        for k in (
+                            "chunk_offset",
+                            "region_bytes",
+                            "region_bytes_padded",
+                            "shard_bytes",
+                            "dtype",
+                        ):
+                            assert sr[k] == cr[k], (
+                                f"rank 0: chunk {cid} region {i} "
+                                f"field {k}: saved={sr[k]!r} "
+                                f"current={cr[k]!r}"
+                            )
+
+                # Multi-region invariant: the mixed-dtype layer
+                # produces at least 2 regions (fp16 weights + fp32
+                # layernorm). Be tolerant of different layout decisions
+                # but assert at least one chunk has > 1 region so the
+                # multi-region branch is genuinely exercised.
+                multi_region_chunks = [
+                    cid for cid, regs in saved_regions.items() if len(regs) > 1
+                ]
+                assert multi_region_chunks, (
+                    "rank 0: expected at least one multi-region chunk "
+                    f"in regions_per_chunk; got {saved_regions}"
+                )
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_metadata_contains_regions_per_chunk(tmp_path):
+    """metadata.json's regions_per_chunk matches runtime DtypeRegion records."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_sharded_metadata_contains_regions,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file()
+
+
+def _worker_sharded_load_round_trip(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Save, mutate state, load, verify state matches pre-save snapshot."""
+    import copy
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="shardload"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            # Force byte-identical state structure across ranks; the
+            # actual values may differ per rank in Mode-C (each rank
+            # owns its own slice), but zeroing keeps the test focused
+            # on the load round-trip rather than on cpu-adam threading
+            # noise.
+            _force_identical_inner_state(optim)
+
+            def _snap():
+                snap = {}
+                if optim._gpu_optim is not None:
+                    snap["gpu"] = copy.deepcopy(
+                        optim._gpu_optim._optim.state_dict()
+                    )
+                if optim._cpu_optim is not None:
+                    snap["cpu"] = {
+                        cid: copy.deepcopy(inner.state_dict())
+                        for cid, inner in optim._cpu_optim._optims.items()
+                    }
+                return snap
+
+            pre_save = _snap()
+
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=1,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                rank=rank,
+                world_size=world_size,
+            )
+            assert wrote is True
+            dist.barrier()
+
+            # Mutate state on every rank so a no-op load would be
+            # visible.
+            if optim._cpu_optim is not None:
+                for inner in optim._cpu_optim._optims.values():
+                    for s in inner.state.values():
+                        for v in s.values():
+                            if isinstance(v, torch.Tensor):
+                                v.add_(7.0)
+
+            # Load: each rank reads its own per-rank shard.
+            loaded = _load_protrain_optim_dir(optim, save_dir)
+            assert loaded is True
+
+            post_load = _snap()
+
+            def _states_match(a, b) -> bool:
+                if set(a) != set(b):
+                    return False
+                for k in a:
+                    sa, sb = a[k], b[k]
+                    if isinstance(sa, dict) and isinstance(sb, dict):
+                        if not _states_match(sa, sb):
+                            return False
+                    elif isinstance(sa, torch.Tensor) and isinstance(
+                        sb, torch.Tensor
+                    ):
+                        if not torch.equal(sa, sb):
+                            return False
+                    else:
+                        if sa != sb:
+                            return False
+                return True
+
+            assert _states_match(post_load, pre_save), (
+                f"rank {rank}: load did not restore inner state"
+            )
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_load_reads_per_rank_shard_files(tmp_path):
+    """2-rank gloo: each rank loads its own per-rank shard.
+
+    Verifies the Mode-C load contract (CHECKPOINT_DESIGN_PHASE2.md
+    §3.4): every rank reads ``chunk_<N>_rank_<R>.pt`` for its own
+    ordinal and the resulting inner CPU optim state matches what the
+    rank had pre-save.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_sharded_load_round_trip,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file()
+
+
+def _worker_sharded_load_rejects(
+    rank: int, world_size: int, tmpdir: str, mode: str
+) -> None:
+    """Save, then tamper the saved metadata/files per ``mode``, expect
+    RuntimeError on load.
+
+    ``mode``:
+      - "region_count": rank-0 appends a fake region to chunk-0 metadata
+      - "region_dtype": rank-0 flips a region's dtype string
+      - "missing_shard": rank-0 deletes rank-1's chunk-0 shard file
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag=f"shardrej-{mode}"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=1,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                rank=rank,
+                world_size=world_size,
+            )
+            assert wrote is True
+            dist.barrier()
+
+            # Rank-0 mutates the saved layout to provoke the failure
+            # the test is checking.
+            if rank == 0:
+                meta_path = _os.path.join(
+                    save_dir, PROTRAIN_OPTIM_DIRNAME, METADATA_FILENAME
+                )
+                meta = json.loads(open(meta_path).read())
+                first_cid = sorted(meta["regions_per_chunk"], key=int)[0]
+                if mode == "region_count":
+                    # Append a fake region so the count drifts.
+                    fake_region = dict(meta["regions_per_chunk"][first_cid][0])
+                    meta["regions_per_chunk"][first_cid].append(fake_region)
+                    open(meta_path, "w").write(json.dumps(meta))
+                elif mode == "region_dtype":
+                    # Flip the first region's dtype to something that
+                    # won't match the runtime.
+                    meta["regions_per_chunk"][first_cid][0]["dtype"] = (
+                        "torch.float64"
+                    )
+                    open(meta_path, "w").write(json.dumps(meta))
+                elif mode == "missing_shard":
+                    # Delete rank-1's chunk-0 shard.
+                    target_rank = 1
+                    cpu_dir = _os.path.join(
+                        save_dir, PROTRAIN_OPTIM_DIRNAME, CPU_OPTIM_DIRNAME
+                    )
+                    victim = _os.path.join(
+                        cpu_dir,
+                        f"chunk_{int(first_cid)}_rank_{target_rank}.pt",
+                    )
+                    _os.remove(victim)
+                else:
+                    raise ValueError(f"unknown mode {mode!r}")
+            dist.barrier()
+
+            # Both ranks attempt to load. The error mode determines which
+            # rank raises:
+            #   - region_count / region_dtype: every rank validates
+            #     metadata first → both raise.
+            #   - missing_shard: only rank-1's file is gone → only
+            #     rank-1 raises; rank-0 loads successfully.
+            try:
+                _load_protrain_optim_dir(optim, save_dir)
+            except RuntimeError as exc:
+                msg = str(exc)
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+                ) as f:
+                    f.write(msg)
+            else:
+                # Some ranks legitimately don't error in missing_shard
+                # mode (only rank-1 does). Mark a sentinel so we can
+                # tell "load succeeded on this rank" from "load
+                # silently skipped".
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
+                ) as f:
+                    f.write("load did not raise on this rank")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
+                f.write(str(exc))
+            return
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _spawn_sharded_load_rejects(tmp_path, mode: str) -> list[str]:
+    """Run the ``_worker_sharded_load_rejects`` body and return ``caught`` msgs."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    try:
+        mp.spawn(
+            _worker_sharded_load_rejects,
+            args=(world_size, str(tmp_path), mode),
+            nprocs=world_size,
+            join=True,
+        )
+    except Exception:
+        # mp.spawn re-raises any worker exception; the workers also
+        # write sentinel files so the parent test can inspect details.
+        pass
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"unexpected worker errors:\n{bodies}")
+
+    caught_files = sorted(tmp_path.glob("rank*.caught"))
+    return [f.read_text() for f in caught_files]
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_load_rejects_region_count_mismatch(tmp_path):
+    """Tamper saved metadata to add a fake region → load hard-errors.
+
+    A region-count drift means the saved per-rank shards won't match
+    the rebuilt shard_param. Loader must raise pointing at the
+    differing chunk + region index instead of letting torch's
+    load_state_dict crash with a shape error.
+    """
+    msgs = _spawn_sharded_load_rejects(tmp_path, mode="region_count")
+    assert msgs, "no rank caught the region-count-mismatch RuntimeError"
+    assert any("region count mismatch" in m for m in msgs), (
+        f"region count error did not name the mismatch: {msgs}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_load_rejects_region_dtype_mismatch(tmp_path):
+    """Tamper saved region dtype → load hard-errors naming the field."""
+    msgs = _spawn_sharded_load_rejects(tmp_path, mode="region_dtype")
+    assert msgs, "no rank caught the region-dtype-mismatch RuntimeError"
+    assert any("field 'dtype'" in m for m in msgs), (
+        f"region dtype error did not name the field: {msgs}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_load_rejects_missing_rank_shard(tmp_path):
+    """Delete a per-rank shard → that rank's load hard-errors naming the file.
+
+    The missing file must be flagged by name so an operator reading
+    the trace can map it to the worker that failed to write.
+    """
+    msgs = _spawn_sharded_load_rejects(tmp_path, mode="missing_shard")
+    assert msgs, "no rank caught the missing-shard RuntimeError"
+    assert any(
+        "missing rank shard" in m and "rank_1.pt" in m for m in msgs
+    ), f"missing-shard error did not name the file: {msgs}"
