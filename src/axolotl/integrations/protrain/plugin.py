@@ -557,17 +557,24 @@ class ProTrainPlugin(BasePlugin):
             save_max = (
                 int(cfg_max) if cfg_max is not None else DEFAULT_SAVE_MAX_BYTES
             )
+            verify_replicated = bool(
+                getattr(cfg, "protrain_save_optim_verify_replicated", False)
+            )
             trainer.add_callback(
-                make_checkpoint_callback(save_max_bytes=save_max)
+                make_checkpoint_callback(
+                    save_max_bytes=save_max,
+                    verify_replicated=verify_replicated,
+                )
             )
             install_load_hook(trainer, optim)
             LOG.info(
                 "ProTrain: optimizer-state checkpointing enabled "
-                "(save_max_bytes=%d ~= %.2f GiB). "
+                "(save_max_bytes=%d ~= %.2f GiB, verify_replicated=%s). "
                 "Save side: ProTrainOptimizerCheckpointCallback. "
                 "Load side: trainer._load_optimizer_and_scheduler patched.",
                 save_max,
                 save_max / 1024**3,
+                verify_replicated,
             )
 
         # ---- DDP composition detection ----------------------------------
