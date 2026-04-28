@@ -217,6 +217,23 @@ class ProTrainArgs(BaseModel):
         },
     )
 
+    protrain_save_optim_verify_replicated: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": (
+                "Mode-B (DDP-replicated) only: if True, on the FIRST save "
+                "of each run every rank hashes its inner optimizer state "
+                "and ``all_gather_object``-s the hashes; the save aborts "
+                "with ``RuntimeError`` if the hashes don't match. Default "
+                "False because DDP determinism makes a divergence very "
+                "unlikely in practice and the check costs one full state "
+                "hash + an all_gather. Subsequent saves skip the check "
+                "(per-save would be expensive). Has no effect on "
+                "single-rank or ZeRO-3 sharded runs."
+            )
+        },
+    )
+
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------

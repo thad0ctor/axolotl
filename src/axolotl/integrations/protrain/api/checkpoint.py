@@ -1,10 +1,10 @@
 """Optimizer-state checkpoint/resume for the ProTrain runtime.
 
-Implements Phase 1 of CHECKPOINT_DESIGN.md: single-rank, non-ZeRO save
-and load that bypasses HF Trainer's stock optimizer.pt path. Save runs
-through ``ProTrainOptimizerCheckpointCallback.on_save`` after HF
-writes its standard checkpoint files; load runs through a
-monkey-patched ``trainer._load_optimizer_and_scheduler`` (HF has no
+Implements Phase 1 (CHECKPOINT_DESIGN.md) and Phase 2 Mode-B
+(CHECKPOINT_DESIGN_PHASE2.md). Save runs through
+``ProTrainOptimizerCheckpointCallback.on_save`` after HF writes its
+standard checkpoint files; load runs through a monkey-patched
+``trainer._load_optimizer_and_scheduler`` (HF has no
 ``on_load_checkpoint`` callback, and ``on_train_begin`` fires after
 the load slot, so the patch is the only correct hook).
 
@@ -12,7 +12,8 @@ On disk under ``{checkpoint_dir}/protrain_optim/``:
 
 * ``metadata.json``        — schema version, layout signature,
                              effective persistent_ids set, world_size,
-                             zero3_shard, hyperparam snapshot, step.
+                             zero3_shard, save_mode, saving_rank,
+                             hyperparam snapshot, step.
 * ``gpu_optim.pt``         — ``torch.save`` of the persistent inner
                              optimizer's ``state_dict`` (absent if no
                              chunks are persistent).
@@ -21,13 +22,17 @@ On disk under ``{checkpoint_dir}/protrain_optim/``:
                              ``state_dict``. Bounds peak save-time RAM
                              to one chunk's worth of state.
 
-Hard validation on load: world_size, zero3_shard, layout signature,
-and effective persistent_ids set must all match the current run. All
-``torch.load`` calls pin ``map_location='cpu'`` to defeat HF Trainer's
-hostile ``map_location=device`` default for CPU-offloaded adam state.
+Mode-B (DDP-replicated) writes only on rank-0 — every rank has the
+same state by DDP's grad-allreduce contract. Mode-C (ZeRO-3 sharded)
+is not yet implemented; the dispatcher raises ``NotImplementedError``
+for that path.
 
-Phase 2 (multi-rank + ZeRO-3) needs per-rank file naming, region
-metadata, and barrier coordination, all out of scope here.
+Hard validation on load: zero3_shard, layout signature, save_mode,
+and effective persistent_ids set must all match the current run. World
+size is allowed to differ between save and load in Mode-B (replicated
+state is shape-independent of world_size). All ``torch.load`` calls
+pin ``map_location='cpu'`` to defeat HF Trainer's hostile
+``map_location=device`` default for CPU-offloaded adam state.
 """
 
 from __future__ import annotations
@@ -57,8 +62,40 @@ METADATA_FILENAME = "metadata.json"
 GPU_OPTIM_FILENAME = "gpu_optim.pt"
 CPU_OPTIM_DIRNAME = "cpu_optim"
 CHUNK_FILE_RE = re.compile(r"^chunk_(\d+)\.pt$")
-SCHEMA_FORMAT_VERSION = 1
+SCHEMA_FORMAT_VERSION = 2
+SAVE_MODE_REPLICATED = "replicated"
+SAVE_MODE_SHARDED = "sharded"
 DEFAULT_SAVE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB; mirrors args.py default
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers — no-op on single-rank
+# ---------------------------------------------------------------------------
+
+
+def _dist_is_active() -> bool:
+    return bool(
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    )
+
+
+def _broadcast_object_list_or_noop(obj_list: list, src: int = 0) -> None:
+    """Broadcast a list of picklable objects from ``src`` to every rank.
+
+    No-op when ``torch.distributed`` is not initialized — preserves
+    Phase 1 single-rank behavior. ``obj_list`` is mutated in place to
+    match ``src``'s contents.
+    """
+    if not _dist_is_active():
+        return
+    torch.distributed.broadcast_object_list(obj_list, src=src)
+
+
+def _barrier_or_noop() -> None:
+    """``dist.barrier()`` if dist is active; else no-op."""
+    if not _dist_is_active():
+        return
+    torch.distributed.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -199,14 +236,116 @@ def _is_protrain_optimizer(optim: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _hash_state_dict(sd: dict) -> bytes:
+    """Recursively hash a state_dict-like nested structure deterministically.
+
+    pickle.dumps is NOT cross-process-deterministic for torch tensors:
+    the pickle stream embeds Python-level metadata (storage offsets,
+    type-class object IDs in some torch builds) that can drift between
+    the two mp.spawn workers' independent CUDA contexts even when the
+    tensor *values* are identical. We instead walk the nested dict and
+    feed only the load-bearing bytes (tensor element bytes, scalar
+    values, sorted dict keys) into the hash.
+    """
+    h = hashlib.sha256()
+
+    def _emit(obj: Any) -> None:
+        if isinstance(obj, dict):
+            h.update(b"dict:")
+            for k in sorted(obj, key=repr):
+                h.update(repr(k).encode("utf-8"))
+                h.update(b"=")
+                _emit(obj[k])
+                h.update(b";")
+        elif isinstance(obj, (list, tuple)):
+            h.update(b"seq:")
+            for item in obj:
+                _emit(item)
+                h.update(b",")
+        elif isinstance(obj, torch.Tensor):
+            t = obj.detach().contiguous().cpu()
+            h.update(b"t:")
+            h.update(str(t.dtype).encode("utf-8"))
+            h.update(b":")
+            h.update(repr(tuple(t.shape)).encode("utf-8"))
+            h.update(b":")
+            # numpy() avoids pickle stream non-determinism; the raw
+            # tensor bytes are what we actually care about.
+            h.update(t.numpy().tobytes())
+        else:
+            # Scalar: int, float, bool, str, None, etc. repr() is
+            # stable across processes.
+            h.update(repr(obj).encode("utf-8"))
+
+    _emit(sd)
+    return h.digest()
+
+
+def _hash_inner_state_dicts(optim: Any) -> str:
+    """SHA-256 over the rank's inner optimizer state dicts.
+
+    Used by the optional Mode-B cross-rank verify path (§2.4 of the
+    Phase 2 design). Walks the same inner adapters the save path
+    serializes (``_gpu_optim._optim`` and every entry in
+    ``_cpu_optim._optims``) and folds each state_dict's structural
+    bytes into the hash via :func:`_hash_state_dict`.
+    """
+    h = hashlib.sha256()
+    if optim._gpu_optim is not None:
+        h.update(b"gpu:")
+        h.update(_hash_state_dict(optim._gpu_optim._optim.state_dict()))
+    if optim._cpu_optim is not None:
+        for cid in sorted(optim._cpu_optim._optims):
+            h.update(f"cpu:{int(cid)}:".encode("utf-8"))
+            h.update(
+                _hash_state_dict(optim._cpu_optim._optims[cid].state_dict())
+            )
+    return h.hexdigest()
+
+
+def _verify_replicated_state_across_ranks(optim: Any, *, world_size: int) -> None:
+    """Cross-rank state-equality check for Mode-B (opt-in, single shot).
+
+    Each rank computes a SHA-256 over its inner state, all_gather_object
+    the hashes, and raises if any rank disagrees with rank-0. Cheap
+    insurance against the corner case where DDP determinism fails
+    (numerical drift, manual override, etc.) and rank-0's saved state
+    would not represent the cluster.
+    """
+    if world_size <= 1 or not _dist_is_active():
+        return
+    local_hash = _hash_inner_state_dicts(optim)
+    gathered: list[str] = [""] * world_size
+    torch.distributed.all_gather_object(gathered, local_hash)
+    rank0 = gathered[0]
+    diverged = [
+        (r, h) for r, h in enumerate(gathered) if h != rank0
+    ]
+    if diverged:
+        raise RuntimeError(
+            "ProTrain optimizer save: Mode-B precondition violated — "
+            "optimizer state diverges across ranks. Refusing to save "
+            "(rank-0's state would not represent the cluster). "
+            f"rank-0 hash={rank0!r}, divergent ranks: {diverged!r}"
+        )
+
+
 def _save_protrain_optim_dir(
     optim: Any,
     output_dir: str,
     *,
     step: int,
     save_max_bytes: int,
+    rank: int = 0,
+    world_size: int | None = None,
 ) -> bool:
     """Write the protrain_optim/ subdirectory. Returns True iff written.
+
+    Mode-B (DDP-replicated) is the supported multi-rank flow. When
+    ``world_size > 1`` and ``zero3_shard == False``, only rank-0
+    actually writes; other ranks return True (the save was performed
+    cluster-wide via rank-0). Mode-C (sharded) raises
+    ``NotImplementedError`` — that lands in a follow-up.
 
     Returns False (with a WARN) when the size estimate exceeds
     ``save_max_bytes``. The user opts in to large saves by raising
@@ -214,24 +353,24 @@ def _save_protrain_optim_dir(
     optimizer.pt is independent — the plugin's ``save_only_model``
     knob controls that.
 
-    Raises RuntimeError on world_size != 1 or zero3_shard=True; those
-    configs are Phase-2 scope and must not silently produce a Phase-1
-    checkpoint.
+    Raises RuntimeError on zero3_shard=True (Mode-C save is not yet
+    implemented).
+
+    ``rank`` and ``world_size`` are the HF Trainer's view (typically
+    ``args.process_index`` / ``args.world_size``). ``world_size=None``
+    falls back to ``_current_world_size`` for backward compatibility
+    with Phase-1 callers.
     """
     chunk_manager = optim._chunk_manager
-    world_size = _current_world_size()
+    if world_size is None:
+        world_size = _current_world_size()
     zero3_shard = bool(getattr(chunk_manager, "zero3_shard", False))
 
-    if world_size != 1:
-        raise RuntimeError(
-            "ProTrain optimizer save: world_size=%d but Phase 1 supports "
-            "single-rank only. Multi-rank save/load is Phase 2 scope. "
-            "Disable via protrain_save_optimizer_state=False." % world_size
-        )
     if zero3_shard:
-        raise RuntimeError(
-            "ProTrain optimizer save: zero3_shard=True is Phase 2 scope. "
-            "Disable via protrain_save_optimizer_state=False."
+        raise NotImplementedError(
+            "ProTrain optimizer save: Mode-C sharded save/load is "
+            "Phase 2-second; lands in protrain-optim-checkpoint-phase2-"
+            "mode-c. Disable via protrain_save_optimizer_state=False."
         )
 
     estimate = _estimate_optim_state_bytes(optim)
@@ -248,8 +387,14 @@ def _save_protrain_optim_dir(
         return False
 
     # Drain any in-flight async CPU Adam futures so we snapshot a
-    # consistent post-step state, not a half-applied one.
+    # consistent post-step state, not a half-applied one. Every rank
+    # drains its own queue; the rank-0-only-write contract is below.
     chunk_manager.wait_cpu_optim_all()
+
+    if rank != 0:
+        # Mode-B: only rank-0 writes. Other ranks just return True so
+        # the caller knows the save was performed cluster-wide.
+        return True
 
     target = os.path.join(output_dir, PROTRAIN_OPTIM_DIRNAME)
     os.makedirs(target, exist_ok=True)
@@ -261,8 +406,10 @@ def _save_protrain_optim_dir(
         ),
         "protrain_persistent_ids": _effective_persistent_ids(chunk_manager),
         "protrain_n_buffer": int(getattr(chunk_manager, "n_buffer", 0)),
-        "protrain_world_size": world_size,
+        "protrain_world_size": int(world_size),
         "protrain_zero3_shard": zero3_shard,
+        "protrain_save_mode": SAVE_MODE_REPLICATED,
+        "saving_rank": int(rank),
         "param_groups_meta": _hyperparam_snapshot(optim),
         "saved_at_step": int(step),
         "torch_version": str(torch.__version__),
@@ -288,12 +435,15 @@ def _save_protrain_optim_dir(
 
     LOG.info(
         "ProTrain optimizer save: wrote %s (estimate=%d bytes, "
-        "persistent=%d chunks, cpu_chunks=%d, step=%d)",
+        "persistent=%d chunks, cpu_chunks=%d, step=%d, "
+        "world_size=%d, save_mode=%s)",
         target,
         estimate,
         len(metadata["protrain_persistent_ids"]),
         len(optim._cpu_optim._optims) if optim._cpu_optim is not None else 0,
         step,
+        world_size,
+        SAVE_MODE_REPLICATED,
     )
     return True
 
@@ -311,8 +461,18 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
     normal "first run / opt-out" case).
 
     Raises RuntimeError on any mismatch the saved metadata flags
-    against the current run (world_size, zero3_shard, layout
-    signature, persistent_ids set, missing per-chunk file).
+    against the current run (zero3_shard, save_mode, layout signature,
+    persistent_ids set, missing per-chunk file).
+
+    World-size mismatch policy (CHECKPOINT_DESIGN_PHASE2.md §4.1
+    Option B): Mode-B replicated saves are tolerated across world_size
+    changes — the on-disk state is rank-independent. Mode-C sharded
+    saves require identical world_size (and Mode-C resume itself is
+    not yet implemented).
+
+    Forward compatibility: ``format_version=1`` saves are read as
+    Mode-B replicated with ``saving_rank=0`` and ``world_size=1``
+    (CHECKPOINT_DESIGN_PHASE2.md §5).
 
     All torch.load calls use map_location='cpu'. Inner load_state_dict
     handles device placement per-tensor (GPU adam → GPU, CPU adam →
@@ -333,7 +493,25 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
         metadata = json.load(f)
 
     fmt = int(metadata.get("format_version", 0))
-    if fmt != SCHEMA_FORMAT_VERSION:
+    if fmt == 1:
+        # Forward compat: v1 saves predate the save_mode / saving_rank
+        # fields. They're known to be single-rank non-ZeRO replicated
+        # by Phase 1's hard guard.
+        metadata.setdefault("protrain_save_mode", SAVE_MODE_REPLICATED)
+        metadata.setdefault("saving_rank", 0)
+        metadata.setdefault("protrain_world_size", 1)
+    elif fmt == SCHEMA_FORMAT_VERSION:
+        if "protrain_save_mode" not in metadata:
+            raise RuntimeError(
+                "ProTrain optimizer load: v2 metadata missing required "
+                "field 'protrain_save_mode'. Refusing to load."
+            )
+        if "saving_rank" not in metadata:
+            raise RuntimeError(
+                "ProTrain optimizer load: v2 metadata missing required "
+                "field 'saving_rank'. Refusing to load."
+            )
+    else:
         raise RuntimeError(
             f"ProTrain optimizer load: unknown format_version={fmt} "
             f"(this build expects {SCHEMA_FORMAT_VERSION}). Refusing to load."
@@ -344,31 +522,69 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
     current_zero3 = bool(getattr(chunk_manager, "zero3_shard", False))
     saved_world = int(metadata["protrain_world_size"])
     saved_zero3 = bool(metadata["protrain_zero3_shard"])
+    saved_mode = str(metadata["protrain_save_mode"])
+    current_mode = (
+        SAVE_MODE_SHARDED if current_zero3 else SAVE_MODE_REPLICATED
+    )
 
-    if saved_world != current_world:
+    if saved_mode not in (SAVE_MODE_REPLICATED, SAVE_MODE_SHARDED):
         raise RuntimeError(
-            f"ProTrain optimizer load: world_size mismatch — saved={saved_world} "
-            f"current={current_world}. Multi-rank resume is Phase 2 scope; "
-            f"resume single-rank or disable protrain_save_optimizer_state."
+            f"ProTrain optimizer load: unknown protrain_save_mode="
+            f"{saved_mode!r}. Refusing to load."
         )
+
+    # Save-mode mismatch (§4.2). Hard error in either direction.
+    if saved_mode != current_mode:
+        raise RuntimeError(
+            f"ProTrain optimizer load: save_mode mismatch — "
+            f"saved={saved_mode!r} current={current_mode!r}. "
+            "Replicated state cannot be loaded into a sharded run, and "
+            "sharded state cannot be loaded into a replicated run; the "
+            "on-disk shape doesn't match what the current run needs."
+        )
+
     if saved_zero3 != current_zero3:
         raise RuntimeError(
             f"ProTrain optimizer load: zero3_shard mismatch — saved={saved_zero3} "
-            f"current={current_zero3}. ZeRO-3 resume is Phase 2 scope."
-        )
-    if current_world != 1 or current_zero3:
-        raise RuntimeError(
-            "ProTrain optimizer load: Phase 1 supports single-rank non-ZeRO "
-            "only. Disable protrain_save_optimizer_state for this config."
+            f"current={current_zero3}."
         )
 
+    if current_zero3:
+        # We never reach here with a replicated save (the save_mode
+        # mismatch above would have fired). A sharded save into the
+        # current sharded run hits this guard until Mode-C lands.
+        raise NotImplementedError(
+            "ProTrain optimizer load: Mode-C sharded resume is not yet "
+            "implemented; lands in protrain-optim-checkpoint-phase2-"
+            "mode-c. Disable via protrain_save_optimizer_state=False."
+        )
+
+    # Mode-B replicated load (current scope). World-size differences
+    # are tolerated per Option B — replicated state is shape-
+    # independent of world_size.
+    if saved_world != current_world:
+        LOG.info(
+            "ProTrain optimizer load: replicated checkpoint saved with "
+            "world_size=%d loading into world_size=%d. Replicated state "
+            "is rank-independent, so this is supported.",
+            saved_world,
+            current_world,
+        )
+
+    # Layout signature embeds world_size, so a world_size delta would
+    # naively trip the signature check. Recompute the saved signature's
+    # would-be value at the CURRENT world_size for the comparison —
+    # the only legitimately load-bearing layout fields here are chunk
+    # geometry + persistent_ids + zero3_shard.
     saved_sig = metadata["protrain_layout_signature"]
-    current_sig = _layout_signature(chunk_manager, current_world, current_zero3)
-    if saved_sig != current_sig:
+    expected_sig = _layout_signature(
+        chunk_manager, saved_world, saved_zero3
+    )
+    if saved_sig != expected_sig:
         raise RuntimeError(
             "ProTrain optimizer load: layout signature mismatch.\n"
             f"  saved   = {saved_sig}\n"
-            f"  current = {current_sig}\n"
+            f"  current = {expected_sig}\n"
             "The model architecture, S_chunk, persistent_ids, world_size, or "
             "zero3_shard differs between save and load. Resume is unsafe."
         )
@@ -497,13 +713,39 @@ def _make_callback_class():
 
         Reads the optimizer off ``kwargs['optimizer']`` (HF passes it in
         on every callback). Routes the save through
-        ``_save_protrain_optim_dir``, which enforces the gating + Phase 1
-        scope checks. Failures are loud (raise) — silently producing an
+        ``_save_protrain_optim_dir``, which enforces the gating + scope
+        checks. Failures are loud (raise) — silently producing an
         unloadable checkpoint is worse than crashing on save.
+
+        HF's ``on_save`` fires on every rank
+        (``_maybe_log_save_evaluate`` calls ``callback_handler.on_save``
+        unconditionally). For Mode-B the callback orchestrates a rank-0-
+        only write with cross-rank coordination:
+
+        * Every rank drains ``wait_cpu_optim_all`` (CPU adam must be
+          quiescent before any rank snapshots).
+        * Rank-0 computes the size-gate decision; the decision is
+          broadcast so all ranks act consistently (no partial saves).
+        * Optional opt-in: on the FIRST save of each run, every rank
+          hashes its inner state and ``all_gather_object``-s the hashes
+          to verify Mode-B's replication invariant. Skipped on
+          subsequent saves to keep per-save overhead low.
+        * Rank-0 writes; other ranks no-op.
+        * ``dist.barrier()`` at exit so callers see a complete dir.
         """
 
-        def __init__(self, *, save_max_bytes: int) -> None:
+        def __init__(
+            self,
+            *,
+            save_max_bytes: int,
+            verify_replicated: bool = False,
+        ) -> None:
             self._save_max_bytes = save_max_bytes
+            self._verify_replicated = bool(verify_replicated)
+            # Track whether the cross-rank verify already fired for
+            # this run; we only do it on the first save (cheap insurance
+            # at run start, but per-save would be expensive).
+            self._verify_replicated_done = False
 
         def on_save(
             self,
@@ -518,30 +760,112 @@ def _make_callback_class():
             raw = _unwrap_protrain_optim(kwargs.get("optimizer"))
             if raw is None:
                 return control
+
+            rank = int(getattr(args, "process_index", 0))
+            world_size = int(getattr(args, "world_size", 1))
+            chunk_manager = raw._chunk_manager
+            zero3_shard = bool(getattr(chunk_manager, "zero3_shard", False))
+
             checkpoint_dir = os.path.join(
                 args.output_dir, f"checkpoint-{state.global_step}"
             )
-            if not os.path.isdir(checkpoint_dir):
+            # Only rank-0 sees the HF-created checkpoint dir on multi-
+            # rank runs (`should_save` gates HF's mkdir). The other
+            # ranks must still drain their CPU adam and participate in
+            # the broadcast / barrier so the cross-rank protocol stays
+            # in sync — but if rank-0 itself doesn't see the dir, that's
+            # the legitimate "skip" case.
+            if rank == 0 and not os.path.isdir(checkpoint_dir):
                 LOG.warning(
                     "ProTrainOptimizerCheckpointCallback.on_save: expected "
-                    "checkpoint dir %s does not exist; skipping ProTrain shard.",
+                    "checkpoint dir %s does not exist on rank-0; skipping "
+                    "ProTrain shard.",
                     checkpoint_dir,
                 )
+                # Still broadcast the skip so non-rank-0 ranks bail in
+                # lockstep.
+                skip_decision = [True]
+                _broadcast_object_list_or_noop(skip_decision, src=0)
+                _barrier_or_noop()
                 return control
+
+            # ---------- 1. Drain CPU adam on every rank ----------
+            chunk_manager.wait_cpu_optim_all()
+
+            # Mode-C save is not yet implemented; raise loudly here so
+            # the failure points at the right follow-up PR. Every rank
+            # raises in lockstep — no risk of a partial Mode-C save.
+            if zero3_shard:
+                raise NotImplementedError(
+                    "Mode-C sharded save/load is Phase 2-second; lands "
+                    "in protrain-optim-checkpoint-phase2-mode-c. Disable "
+                    "via protrain_save_optimizer_state=False."
+                )
+
+            # ---------- 2. Estimate-gate broadcast ----------
+            # Rank-0 decides; all ranks act on rank-0's decision. The
+            # broadcast is a no-op on single-rank runs.
+            if rank == 0:
+                estimate = _estimate_optim_state_bytes(raw)
+                skip = estimate > self._save_max_bytes
+                if skip:
+                    LOG.warning(
+                        "ProTrain optimizer save: estimated %d bytes "
+                        "(~%.2f GiB) exceeds protrain_optim_save_max_bytes="
+                        "%d (~%.2f GiB) — skipping save (decision "
+                        "broadcast to %d ranks).",
+                        estimate,
+                        estimate / 1024**3,
+                        self._save_max_bytes,
+                        self._save_max_bytes / 1024**3,
+                        world_size,
+                    )
+            else:
+                skip = False  # placeholder, will be overwritten by broadcast
+            skip_decision = [skip]
+            _broadcast_object_list_or_noop(skip_decision, src=0)
+            if skip_decision[0]:
+                _barrier_or_noop()
+                return control
+
+            # ---------- 3. Cross-rank verify (opt-in, once per run) ----------
+            if (
+                self._verify_replicated
+                and not self._verify_replicated_done
+                and world_size > 1
+            ):
+                _verify_replicated_state_across_ranks(
+                    raw, world_size=world_size
+                )
+                self._verify_replicated_done = True
+
+            # ---------- 4. Mode-B rank-0-only write ----------
             _save_protrain_optim_dir(
                 raw,
                 checkpoint_dir,
                 step=int(state.global_step),
                 save_max_bytes=self._save_max_bytes,
+                rank=rank,
+                world_size=world_size,
             )
+
+            # ---------- 5. Barrier so downstream code sees the dir ----------
+            _barrier_or_noop()
             return control
 
     return ProTrainOptimizerCheckpointCallback
 
 
-def make_checkpoint_callback(*, save_max_bytes: int) -> "TrainerCallback":
+def make_checkpoint_callback(
+    *,
+    save_max_bytes: int,
+    verify_replicated: bool = False,
+) -> "TrainerCallback":
     cls = _make_callback_class()
-    return cls(save_max_bytes=save_max_bytes)
+    return cls(
+        save_max_bytes=save_max_bytes,
+        verify_replicated=verify_replicated,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +913,11 @@ def install_load_hook(trainer: Any, optim: Any) -> None:
                 checkpoint,
             )
             raise
+        # Defensive barrier: every rank loaded its own copy of the
+        # files; the barrier just ensures the cluster moves past the
+        # load slot in lockstep before training resumes. Cheap on
+        # single-rank (no-op).
+        _barrier_or_noop()
 
     trainer._load_optimizer_and_scheduler = _patched  # type: ignore[method-assign]
 
@@ -596,6 +925,8 @@ def install_load_hook(trainer: Any, optim: Any) -> None:
 __all__ = [
     "PROTRAIN_OPTIM_DIRNAME",
     "SCHEMA_FORMAT_VERSION",
+    "SAVE_MODE_REPLICATED",
+    "SAVE_MODE_SHARDED",
     "DEFAULT_SAVE_MAX_BYTES",
     "make_checkpoint_callback",
     "install_load_hook",
@@ -608,4 +939,8 @@ __all__ = [
     "_is_protrain_optimizer",
     "_is_raw_protrain_optimizer",
     "_unwrap_protrain_optim",
+    "_hash_inner_state_dicts",
+    "_verify_replicated_state_across_ranks",
+    "_broadcast_object_list_or_noop",
+    "_barrier_or_noop",
 ]
