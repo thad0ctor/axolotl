@@ -855,35 +855,210 @@ def test_load_rejects_missing_metadata(fresh_checkpoint_dir, saved_checkpoint):
 
 
 # ---------------------------------------------------------------------------
-# Functional-equivalence-under-resume note
+# Functional-equivalence-under-resume — separate-process verification
 # ---------------------------------------------------------------------------
-# A test that compares "N steps → save → load → M steps" against a
-# reference of "N+M continuous steps" would prove the saved state is
-# functionally meaningful, not just syntactically equal. We attempted
-# such a test but it requires two distinct ChunkManager instantiations
-# in one process; the pinned-host allocator can't recover between them
-# even with explicit restore_to_gpu / shutdown / gc, and the test
-# segfaults reliably on the test rig. Single-process functional
-# equivalence is therefore deferred to an integration-suite test that
-# runs the two arms in separate process invocations (out of scope for
-# Phase 1).
+# The single-process version of this test segfaults on the rig because
+# two ChunkManager instantiations exhaust the pinned-host allocator
+# even with explicit restore_to_gpu / shutdown / gc. Workaround: run
+# each arm of the experiment in a fresh subprocess via
+# ``multiprocessing.Process`` with the ``spawn`` start method. Process
+# teardown reclaims pinned host memory cleanly.
 #
-# What this test file DOES prove for Phase 1 ship:
-#   - Inner state_dicts round-trip bit-identical via the save/load path
-#     (proved by test_save_metadata_contains_expected_fields +
-#     test_load_succeeds_from_pristine_checkpoint).
-#   - All loaded tensors stay on CPU per map_location='cpu'
-#     (test_load_uses_map_location_cpu) — defeats HF Trainer's hostile
-#     map_location=device default.
-#   - Pre-snapshot drain semantics work
-#     (test_save_drains_cpu_optim_before_snapshot).
-#   - Validation gates fire correctly on every documented mismatch
-#     (test_load_rejects_*).
-#   - Phase 1 scope guards trip on world_size != 1 / zero3_shard=True
-#     (test_save_rejects_*).
+# Three arms:
+#   * Reference: 4 continuous steps from scratch → final params
+#   * Save:      2 steps from scratch → save state to disk
+#   * Resume:    load state from save → 2 more steps → final params
 #
-# The remaining functional claim — "load(state_dict(opt)) reproduces
-# opt's behavior on subsequent step() calls" — is the standard torch
-# Optimizer contract that DeepSpeedCPUAdam inherits unmodified
-# (verified in CHECKPOINT_DESIGN.md §1.1), not a ProTrain claim we
-# need to re-prove.
+# Each arm is its own subprocess. Driver compares the reference's
+# final params to the resume's final params with torch.allclose.
+
+
+def _arm_continuous_training(
+    start_step: int,
+    end_step: int,
+    load_dir: str | None,
+    save_dir: str | None,
+    output_path: str | None,
+    error_path: str,
+) -> None:
+    """One arm of the continued-training experiment, run inside a
+    fresh subprocess.
+
+    Half-open step range ``[start_step, end_step)``. If ``load_dir``
+    is set, load BOTH model weights (model_state.pt) AND optimizer
+    state (protrain_optim/) before the loop — mirrors HF Trainer's
+    real resume flow where model weights and optimizer state both
+    live in the checkpoint dir. If ``save_dir`` is set, save both.
+    If ``output_path`` is set, write a snapshot of model params there.
+
+    Errors are captured to ``error_path`` so the parent process can
+    surface them after seeing a non-zero exitcode.
+    """
+    import os
+    import traceback
+
+    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    try:
+        import torch
+
+        torch.manual_seed(0)
+        model = _tiny_model().to("cuda")
+        mgr, _host = _build_chunk_manager(
+            model, n_persist=1, S_chunk=64 * 1024
+        )
+        mgr.materialize_offload()
+        _, _, optim = _build_optim_pair(model, mgr)
+
+        if load_dir is not None:
+            from axolotl.integrations.protrain.api.checkpoint import (
+                _load_protrain_optim_dir,
+            )
+
+            # Load model weights into the gathered (on-GPU) chunks.
+            # Gather every non-persistent chunk first so param.data is
+            # real GPU storage (otherwise load_state_dict's tensor
+            # copy would write into the empty placeholder).
+            for cid in list(mgr._non_persistent_ids):
+                mgr.gather(cid)
+            saved_model_state = torch.load(
+                os.path.join(load_dir, "model_state.pt"),
+                map_location="cuda",
+                weights_only=False,
+            )
+            model.load_state_dict(saved_model_state)
+
+            ok = _load_protrain_optim_dir(optim, load_dir)
+            assert ok, "load_protrain_optim_dir returned False unexpectedly"
+
+        for step_idx in range(start_step, end_step):
+            # Deterministic batch RNG keyed on absolute step idx so
+            # reference and resume see identical batches at the same
+            # step idx regardless of how they got there.
+            torch.manual_seed(100 + step_idx)
+            for cid in list(mgr._non_persistent_ids):
+                mgr.gather(cid)
+            optim.zero_grad()
+            x = torch.randn(2, model.embed.in_features, device="cuda")
+            out = model(x)
+            out.sum().backward()
+            optim.step()
+
+        if save_dir is not None:
+            from axolotl.integrations.protrain.api.checkpoint import (
+                _save_protrain_optim_dir,
+                DEFAULT_SAVE_MAX_BYTES,
+            )
+
+            # Save model weights AND optimizer state. Mirrors HF
+            # Trainer's behavior: checkpoint dir contains both.
+            # Gather every chunk before snapshotting weights so all
+            # param.data tensors hold real values.
+            for cid in list(mgr._non_persistent_ids):
+                mgr.gather(cid)
+            torch.save(
+                model.state_dict(),
+                os.path.join(save_dir, "model_state.pt"),
+            )
+
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=end_step,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+            )
+            assert wrote is True, "save returned False unexpectedly"
+
+        if output_path is not None:
+            # Gather every chunk so each param.data is real GPU
+            # storage (post-step, offloaded params have empty
+            # placeholders again).
+            for cid in list(mgr._non_persistent_ids):
+                mgr.gather(cid)
+            snap = {
+                n: p.detach().cpu().clone()
+                for n, p in model.named_parameters()
+            }
+            torch.save(snap, output_path)
+
+    except BaseException:
+        with open(error_path, "w") as f:
+            traceback.print_exc(file=f)
+        raise
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_continued_training_matches_continuous_via_subprocess(tmp_path):
+    """Functional equivalence: N save+load+M matches N+M continuous.
+
+    Three subprocess arms (reference, save-half, resume-half), spawn
+    start method, fresh CUDA state per arm. Final params from the
+    resume arm must match the reference within tight tol — proves the
+    saved optimizer state is functionally meaningful, not just
+    syntactically equal to its source.
+    """
+    import multiprocessing as mp
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    ctx = mp.get_context("spawn")
+
+    ref_out = tmp_path / "ref_params.pt"
+    save_dir = tmp_path / "save"
+    save_dir.mkdir()
+    resume_out = tmp_path / "resume_params.pt"
+
+    def _spawn_arm(
+        start: int,
+        end: int,
+        load_d: str | None,
+        save_d: str | None,
+        out: str | None,
+        tag: str,
+    ) -> None:
+        err = tmp_path / f"err_{tag}.txt"
+        p = ctx.Process(
+            target=_arm_continuous_training,
+            args=(start, end, load_d, save_d, out, str(err)),
+        )
+        p.start()
+        p.join(timeout=180)
+        if p.is_alive():
+            p.terminate()
+            pytest.fail(f"arm {tag!r} timed out after 180s")
+        if p.exitcode != 0:
+            err_text = err.read_text() if err.exists() else "(no traceback captured)"
+            pytest.fail(
+                f"arm {tag!r} exited with code {p.exitcode}:\n{err_text}"
+            )
+
+    # Reference: 4 continuous steps from scratch
+    _spawn_arm(0, 4, None, None, str(ref_out), tag="reference")
+
+    # Save arm: 2 steps from scratch, save state
+    _spawn_arm(0, 2, None, str(save_dir), None, tag="save")
+
+    # Resume arm: load state, run steps 2 and 3
+    _spawn_arm(2, 4, str(save_dir), None, str(resume_out), tag="resume")
+
+    ref = torch.load(ref_out, map_location="cpu", weights_only=False)
+    resume = torch.load(resume_out, map_location="cpu", weights_only=False)
+
+    assert set(ref) == set(resume), (
+        f"param name sets differ: "
+        f"only_ref={set(ref) - set(resume)}, only_resume={set(resume) - set(ref)}"
+    )
+    for name, ref_t in ref.items():
+        cur_t = resume[name]
+        assert ref_t.shape == cur_t.shape, (
+            f"shape mismatch on {name!r}: ref={ref_t.shape} resume={cur_t.shape}"
+        )
+        assert torch.allclose(cur_t, ref_t, atol=1e-5, rtol=1e-4), (
+            f"param {name!r} diverged after subprocess resume: "
+            f"max_abs_diff={(cur_t - ref_t).abs().max().item():.3e}, "
+            f"max_rel_diff={((cur_t - ref_t).abs() / ref_t.abs().clamp(min=1e-8)).max().item():.3e}"
+        )

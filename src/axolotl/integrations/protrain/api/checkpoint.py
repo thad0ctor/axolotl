@@ -436,12 +436,33 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
                 saved_chunks[int(cid)], map_location="cpu", weights_only=False
             )
             inner.load_state_dict(loaded)
+            # ``torch.optim.Optimizer.load_state_dict`` auto-casts every
+            # state tensor to the device of the matching param. After
+            # ``ChunkManager.materialize_offload`` runs, the user-facing
+            # params held by the inner CPU adam have empty GPU
+            # placeholders for ``.data`` — so torch silently moves the
+            # loaded ``exp_avg`` / ``exp_avg_sq`` tensors to CUDA. The
+            # DeepSpeedCPUAdam C++ kernel then segfaults on the next
+            # step trying to write through a GPU pointer. Force the
+            # inner CPU adam state back to CPU after the cast.
+            for state in inner.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                        state[k] = v.cpu()
 
-    # Hyperparam drift: warn but accept.
+    # Hyperparam drift: warn but accept. JSON serialization turns
+    # ``betas`` tuples into lists; normalize before comparing so
+    # round-tripped data doesn't trigger a spurious warning.
+    def _normalize_hp(hp: dict[str, Any]) -> dict[str, Any]:
+        return {
+            k: (tuple(v) if isinstance(v, list) else v)
+            for k, v in hp.items()
+        }
+
     saved_hp = metadata.get("param_groups_meta", [])
     current_hp = _hyperparam_snapshot(optim)
     for i, (s, c) in enumerate(zip(saved_hp, current_hp)):
-        if s != c:
+        if _normalize_hp(s) != _normalize_hp(c):
             LOG.warning(
                 "ProTrain optimizer load: param_groups[%d] hyperparams drifted "
                 "between save and load — saved=%s current=%s. Continuing.",
