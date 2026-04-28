@@ -31,9 +31,11 @@ from axolotl.integrations.protrain.api.checkpoint import (
     _effective_persistent_ids,
     _estimate_optim_state_bytes,
     _is_protrain_optimizer,
+    _is_raw_protrain_optimizer,
     _layout_signature,
     _load_protrain_optim_dir,
     _save_protrain_optim_dir,
+    _unwrap_protrain_optim,
     install_load_hook,
     make_checkpoint_callback,
 )
@@ -220,28 +222,63 @@ def _teardown_mgr(mgr, optim) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_estimate_optim_state_bytes_counts_correctly():
-    """Estimator returns 8 bytes per element (fp32 × exp_avg + exp_avg_sq)."""
+def test_estimate_optim_state_bytes_walks_inner_state():
+    """Estimator sums tensor bytes from inner adapter state dicts.
+
+    Walking outer optim.param_groups would miss offloaded state (the
+    user-facing param.data is replaced with an empty placeholder by
+    materialize_offload — manager.py:706 / :1494). The fix walks the
+    inner adapters' state directly, where tensors are real.
+    """
     import torch
 
-    p1 = torch.nn.Parameter(torch.zeros(8, 4))
-    p2 = torch.nn.Parameter(torch.zeros(10))
-    frozen = torch.nn.Parameter(torch.zeros(99), requires_grad=False)
+    fake_inner_gpu = mock.MagicMock()
+    fake_inner_gpu.state = {
+        0: {
+            "exp_avg": torch.zeros(10, dtype=torch.float32),     # 10 * 4 = 40 bytes
+            "exp_avg_sq": torch.zeros(10, dtype=torch.float32),  # 40 bytes
+            "step": 1,                                           # int — not counted
+        },
+    }
+    fake_inner_cpu_chunk_0 = mock.MagicMock()
+    fake_inner_cpu_chunk_0.state = {
+        0: {
+            "exp_avg": torch.zeros(20, dtype=torch.float32),     # 80 bytes
+            "exp_avg_sq": torch.zeros(20, dtype=torch.float32),  # 80 bytes
+        },
+    }
 
     fake_optim = mock.MagicMock()
-    fake_optim.param_groups = [{"params": [p1, p2, frozen]}]
+    fake_optim._gpu_optim = mock.MagicMock(_optim=fake_inner_gpu)
+    fake_optim._cpu_optim = mock.MagicMock(_optims={0: fake_inner_cpu_chunk_0})
 
-    estimate = _estimate_optim_state_bytes(fake_optim)
-    assert estimate == (32 + 10) * 4 * 2
+    # 40 + 40 + 80 + 80 = 240 bytes
+    assert _estimate_optim_state_bytes(fake_optim) == 240
 
 
-def test_estimate_optim_state_bytes_dedupes_shared_params():
-    import torch
+def test_estimate_optim_state_bytes_pre_step_returns_zero():
+    """Pre-first-step the inner state is empty → estimate is 0.
 
-    p = torch.nn.Parameter(torch.zeros(100))
-    fake = mock.MagicMock()
-    fake.param_groups = [{"params": [p]}, {"params": [p]}]
-    assert _estimate_optim_state_bytes(fake) == 100 * 4 * 2
+    This is correct: there is no Adam state to save yet. Any save
+    attempt would produce small placeholder files that legitimately
+    pass the gate.
+    """
+    fake_inner_gpu = mock.MagicMock()
+    fake_inner_gpu.state = {}
+    fake_optim = mock.MagicMock()
+    fake_optim._gpu_optim = mock.MagicMock(_optim=fake_inner_gpu)
+    fake_optim._cpu_optim = None
+
+    assert _estimate_optim_state_bytes(fake_optim) == 0
+
+
+def test_estimate_optim_state_bytes_handles_none_adapters():
+    """Both adapters absent → 0. Either present alone → counted."""
+    fake_optim = mock.MagicMock()
+    fake_optim._gpu_optim = None
+    fake_optim._cpu_optim = None
+
+    assert _estimate_optim_state_bytes(fake_optim) == 0
 
 
 def test_layout_signature_stable_across_calls():
@@ -290,15 +327,80 @@ def test_is_protrain_optimizer_duck_types():
         spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
     )
     assert _is_protrain_optimizer(has_all) is True
+    assert _is_raw_protrain_optimizer(has_all) is True
+
+
+def test_unwrap_protrain_optim_handles_raw_and_wrapped():
+    """Without the unwrap, AcceleratedOptimizer wrapping silently
+    no-ops the callback in real Trainer saves (HF replaces
+    trainer.optimizer with AcceleratedOptimizer post-prepare; the raw
+    ProTrain attrs are only reachable via .optimizer)."""
+    raw = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
+    # Direct case
+    assert _unwrap_protrain_optim(raw) is raw
+
+    # Wrapped case — anything with .optimizer pointing at raw
+    class _WrapperLike:
+        def __init__(self, inner):
+            self.optimizer = inner
+
+    wrapper = _WrapperLike(raw)
+    assert _unwrap_protrain_optim(wrapper) is raw
+    assert _is_protrain_optimizer(wrapper) is True
+    # Raw-only check rejects the wrapper
+    assert _is_raw_protrain_optimizer(wrapper) is False
+
+    # Non-ProTrain optimizer wrapped or otherwise: returns None
+    not_protrain = mock.MagicMock(spec=[])
+    assert _unwrap_protrain_optim(not_protrain) is None
+    assert _unwrap_protrain_optim(_WrapperLike(not_protrain)) is None
+    assert _unwrap_protrain_optim(None) is None
+
+
+def test_unwrap_real_accelerated_optimizer():
+    """AcceleratedOptimizer (the actual class HF Trainer wraps with) is
+    correctly unwrapped. Catches the silent-no-op bug where the
+    callback receives the wrapped form post-prepare and the duck-type
+    check fails on the wrapper.
+    """
+    pytest.importorskip("accelerate")
+    from accelerate import Accelerator
+    from accelerate.optimizer import AcceleratedOptimizer
+
+    # AcceleratedOptimizer.__init__ touches the accelerator state
+    # singleton. Initialize one (idempotent across tests).
+    Accelerator()
+
+    raw_protrain = mock.MagicMock(
+        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager",
+              "state_dict", "load_state_dict", "param_groups", "state",
+              "defaults"]
+    )
+    raw_protrain.state_dict.return_value = {"state": {}, "param_groups": []}
+    raw_protrain.load_state_dict.return_value = None
+
+    wrapped = AcceleratedOptimizer(raw_protrain, device_placement=False)
+
+    assert wrapped.optimizer is raw_protrain
+    assert _unwrap_protrain_optim(wrapped) is raw_protrain
 
 
 def test_save_skipped_when_estimate_exceeds_threshold(tmp_path, caplog):
+    """Gate trips on the inner-state size, not outer param_groups."""
     import logging
 
+    import torch
+
+    fake_inner_gpu = mock.MagicMock()
+    fake_inner_gpu.state = {
+        0: {
+            "exp_avg": torch.zeros(10**5, dtype=torch.float32),  # 400 KB
+            "exp_avg_sq": torch.zeros(10**5, dtype=torch.float32),
+        }
+    }
     fake_optim = mock.MagicMock()
-    fake_optim.param_groups = [
-        {"params": [mock.MagicMock(numel=lambda: 10**6, requires_grad=True)]}
-    ]
+    fake_optim._gpu_optim = mock.MagicMock(_optim=fake_inner_gpu)
+    fake_optim._cpu_optim = None
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
     fake_optim._chunk_manager.layout = mock.MagicMock(
         S_chunk=1024, N_chunk=1, chunks=(("a",),)
@@ -314,6 +416,48 @@ def test_save_skipped_when_estimate_exceeds_threshold(tmp_path, caplog):
         "skipping save" in rec.message and "exceeds" in rec.message
         for rec in caplog.records
     )
+    assert not (tmp_path / PROTRAIN_OPTIM_DIRNAME).exists()
+
+
+def test_save_skipped_when_offloaded_state_exceeds_threshold(tmp_path, caplog):
+    """Regression for the param_groups-walking bug: offloaded state's
+    user-facing params have empty .data after materialize_offload, so
+    walking outer param_groups returned 0 bytes for offloaded state and
+    let arbitrarily large saves through. Verify the fix counts the
+    actual inner-state bytes regardless of outer placeholder shapes.
+    """
+    import logging
+
+    import torch
+
+    # Simulate the post-materialize_offload state: outer param_groups
+    # have empty placeholders (would have summed to 0 under the old
+    # estimator), but the inner CPU adam owns real state tensors.
+    empty_placeholder = torch.nn.Parameter(torch.empty(0))
+    fake_inner_cpu_chunk_0 = mock.MagicMock()
+    fake_inner_cpu_chunk_0.state = {
+        0: {
+            "exp_avg": torch.zeros(10**5, dtype=torch.float32),  # 400 KB real
+            "exp_avg_sq": torch.zeros(10**5, dtype=torch.float32),
+        }
+    }
+    fake_optim = mock.MagicMock()
+    fake_optim.param_groups = [{"params": [empty_placeholder]}]  # red herring
+    fake_optim._gpu_optim = None
+    fake_optim._cpu_optim = mock.MagicMock(
+        _optims={0: fake_inner_cpu_chunk_0}
+    )
+    fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
+    fake_optim._chunk_manager.layout = mock.MagicMock(
+        S_chunk=1024, N_chunk=1, chunks=(("a",),)
+    )
+    fake_optim._chunk_manager._persistent_ids = set()
+
+    with caplog.at_level(logging.WARNING):
+        wrote = _save_protrain_optim_dir(
+            fake_optim, str(tmp_path), step=1, save_max_bytes=1024
+        )
+    assert wrote is False, "estimator must count offloaded inner state, not outer placeholders"
     assert not (tmp_path / PROTRAIN_OPTIM_DIRNAME).exists()
 
 
@@ -489,6 +633,130 @@ def test_load_succeeds_from_pristine_checkpoint(fresh_checkpoint_dir, saved_chec
     """Sanity: a clean copy of the saved dir loads without error."""
     _, _, optim = saved_checkpoint
     assert _load_protrain_optim_dir(optim, str(fresh_checkpoint_dir)) is True
+
+
+@pytest.mark.gpu
+def test_load_actually_restores_inner_state(fresh_checkpoint_dir, saved_checkpoint):
+    """Load overwrites in-memory state with disk state.
+
+    Stronger than test_load_succeeds_from_pristine_checkpoint: snapshot
+    the inner adapters' state, mutate the in-memory tensors, load from
+    disk, and verify state matches the snapshot bit-identical. The
+    earlier "load returned True" assertion proved the function ran but
+    not that it restored anything.
+    """
+    import copy
+
+    import torch
+
+    _, _, optim = saved_checkpoint
+
+    def _snapshot_inner_states():
+        snap = {}
+        if optim._gpu_optim is not None:
+            snap["gpu"] = copy.deepcopy(optim._gpu_optim._optim.state_dict())
+        if optim._cpu_optim is not None:
+            snap["cpu"] = {
+                cid: copy.deepcopy(inner.state_dict())
+                for cid, inner in optim._cpu_optim._optims.items()
+            }
+        return snap
+
+    pre_load = _snapshot_inner_states()
+
+    # Mutate every state tensor in-memory so a no-op load would be visible.
+    def _mutate_inner_states(by: float):
+        if optim._gpu_optim is not None:
+            for s in optim._gpu_optim._optim.state.values():
+                for v in s.values():
+                    if isinstance(v, torch.Tensor):
+                        v.add_(by)
+        if optim._cpu_optim is not None:
+            for inner in optim._cpu_optim._optims.values():
+                for s in inner.state.values():
+                    for v in s.values():
+                        if isinstance(v, torch.Tensor):
+                            v.add_(by)
+
+    _mutate_inner_states(by=1.0)
+    # Sanity: the mutation actually changed state vs the snapshot.
+    mutated = _snapshot_inner_states()
+    assert mutated != pre_load, (
+        "test setup failure: mutation didn't change state — "
+        "the load assertion below would be vacuous"
+    )
+
+    # Load from the on-disk copy.
+    assert _load_protrain_optim_dir(optim, str(fresh_checkpoint_dir)) is True
+
+    post_load = _snapshot_inner_states()
+
+    # Compare every tensor value
+    def _states_match(a, b) -> bool:
+        if set(a) != set(b):
+            return False
+        for k in a:
+            sa, sb = a[k], b[k]
+            if isinstance(sa, dict) and isinstance(sb, dict):
+                if not _states_match(sa, sb):
+                    return False
+            elif isinstance(sa, torch.Tensor) and isinstance(sb, torch.Tensor):
+                if not torch.equal(sa, sb):
+                    return False
+            else:
+                if sa != sb:
+                    return False
+        return True
+
+    assert _states_match(post_load, pre_load), (
+        "load did not restore inner state to pre-mutation snapshot"
+    )
+
+
+@pytest.mark.gpu
+def test_callback_unwraps_accelerated_optimizer(tmp_path, saved_checkpoint):
+    """Callback fires through Accelerate's AcceleratedOptimizer wrapper.
+
+    Regression for the bug where Trainer.optimizer is replaced by
+    AcceleratedOptimizer post-prepare; without unwrap, the callback's
+    duck-type check fails on the wrapper and protrain_optim/ is never
+    written in real Trainer runs.
+    """
+    pytest.importorskip("accelerate")
+    from accelerate.optimizer import AcceleratedOptimizer
+
+    _, _, raw_optim = saved_checkpoint
+
+    # Construct the wrapper. We disable device_placement to avoid the
+    # prepare round-trip's extra state_dict/load_state_dict pass —
+    # those work via the no-op patches in real Trainer runs but we
+    # don't need them for this regression test.
+    try:
+        wrapped = AcceleratedOptimizer(raw_optim, device_placement=False)
+    except Exception as e:
+        pytest.skip(f"AcceleratedOptimizer needs accelerate state init: {e}")
+
+    # Build a checkpoint dir per HF's convention.
+    output_dir = tmp_path / "trainer_out"
+    output_dir.mkdir()
+    step = 7
+    ckpt_dir = output_dir / f"checkpoint-{step}"
+    ckpt_dir.mkdir()
+
+    cb = make_checkpoint_callback(save_max_bytes=DEFAULT_SAVE_MAX_BYTES)
+    fake_args = mock.MagicMock(output_dir=str(output_dir))
+    fake_state = mock.MagicMock(global_step=step)
+    fake_control = mock.MagicMock()
+
+    # The callback receives the wrapped optimizer (mimics HF's
+    # callback_handler.on_save signature).
+    cb.on_save(fake_args, fake_state, fake_control, optimizer=wrapped)
+
+    # Verify the ProTrain shard was actually written.
+    assert (ckpt_dir / PROTRAIN_OPTIM_DIRNAME / "metadata.json").is_file(), (
+        "callback failed to write protrain_optim/ when handed an "
+        "AcceleratedOptimizer wrapper — the unwrap path is broken"
+    )
 
 
 @pytest.mark.gpu

@@ -104,22 +104,45 @@ def _layout_signature(
 def _estimate_optim_state_bytes(optim: Any) -> int:
     """Estimated bytes for the optimizer's persisted Adam state.
 
-    Walks every parameter in ``optim.param_groups`` and counts
-    ``numel * 4 * 2`` per trainable param (fp32 exp_avg + exp_avg_sq).
-    The step counter is a Python int — negligible. We do NOT estimate
-    the on-disk pickle overhead; this is meant as a sanity gate, not
-    an exact disk budget.
+    Walks each INNER adapter's ``state`` dict (``_gpu_optim._optim`` and
+    every entry in ``_cpu_optim._optims``) and sums tensor bytes —
+    counting exactly what gets pickled to disk modulo Python object
+    overhead.
+
+    Walking the user-facing ``optim.param_groups`` is wrong here:
+    after :meth:`ChunkManager.materialize_offload` runs, every
+    offloaded param's ``.data`` is replaced with an empty placeholder
+    (manager.py:706 / :1494), so ``p.numel()`` returns 0 between
+    training steps and the estimate misses every offloaded chunk's
+    optimizer state. For 7B full-FT that's the difference between a
+    silent 84 GB write and a correct gate trip.
+
+    Pre-first-step the inner state dicts are empty and this returns 0
+    — that's correct: there is no state to save yet, so any save would
+    produce small placeholder files that can pass the gate.
     """
+    import torch
+
     total = 0
-    seen: set[int] = set()
-    for group in optim.param_groups:
-        for p in group["params"]:
-            if not getattr(p, "requires_grad", True):
-                continue
-            if id(p) in seen:
-                continue
-            seen.add(id(p))
-            total += int(p.numel()) * 4 * 2
+
+    def _add_inner(inner_optim: Any) -> None:
+        nonlocal total
+        for state in getattr(inner_optim, "state", {}).values():
+            for v in state.values():
+                if isinstance(v, torch.Tensor):
+                    total += int(v.numel()) * int(v.element_size())
+
+    gpu_optim = getattr(optim, "_gpu_optim", None)
+    if gpu_optim is not None:
+        inner = getattr(gpu_optim, "_optim", None)
+        if inner is not None:
+            _add_inner(inner)
+
+    cpu_optim = getattr(optim, "_cpu_optim", None)
+    if cpu_optim is not None:
+        for inner in getattr(cpu_optim, "_optims", {}).values():
+            _add_inner(inner)
+
     return total
 
 
@@ -136,10 +159,39 @@ def _hyperparam_snapshot(optim: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _is_protrain_optimizer(optim: Any) -> bool:
-    """Duck-type rather than import the class (avoids a circular import)."""
-    return hasattr(optim, "_gpu_optim") and hasattr(optim, "_cpu_optim") \
+def _is_raw_protrain_optimizer(optim: Any) -> bool:
+    """Duck-type for the raw _ProTrainOptimizer (avoids a circular import)."""
+    return (
+        hasattr(optim, "_gpu_optim")
+        and hasattr(optim, "_cpu_optim")
         and hasattr(optim, "_chunk_manager")
+    )
+
+
+def _unwrap_protrain_optim(optim: Any) -> Any:
+    """Return the raw _ProTrainOptimizer or None.
+
+    HF Trainer + Accelerate wrap ``trainer.optimizer`` with
+    ``AcceleratedOptimizer`` after Accelerate's ``prepare`` runs, and
+    every callback fired post-prepare receives the wrapped form (see
+    accelerate/optimizer.py: AcceleratedOptimizer stores the raw
+    optimizer at ``.optimizer``). Without this unwrap, the callback's
+    duck-type check fails on the wrapper and the save silently no-ops
+    in real Trainer runs.
+    """
+    if optim is None:
+        return None
+    if _is_raw_protrain_optimizer(optim):
+        return optim
+    inner = getattr(optim, "optimizer", None)
+    if inner is not None and _is_raw_protrain_optimizer(inner):
+        return inner
+    return None
+
+
+def _is_protrain_optimizer(optim: Any) -> bool:
+    """Truthy iff ``optim`` is (or wraps) a _ProTrainOptimizer."""
+    return _unwrap_protrain_optim(optim) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +491,11 @@ def _make_callback_class():
             control: "TrainerControl",
             **kwargs: Any,
         ) -> "TrainerControl":
-            optim = kwargs.get("optimizer")
-            if optim is None or not _is_protrain_optimizer(optim):
+            # Trainer.optimizer is wrapped by AcceleratedOptimizer after
+            # prepare runs; the callback receives the wrapped form. Unwrap
+            # before the duck-type guard.
+            raw = _unwrap_protrain_optim(kwargs.get("optimizer"))
+            if raw is None:
                 return control
             checkpoint_dir = os.path.join(
                 args.output_dir, f"checkpoint-{state.global_step}"
@@ -453,7 +508,7 @@ def _make_callback_class():
                 )
                 return control
             _save_protrain_optim_dir(
-                optim,
+                raw,
                 checkpoint_dir,
                 step=int(state.global_step),
                 save_max_bytes=self._save_max_bytes,
@@ -483,17 +538,27 @@ def install_load_hook(trainer: Any, optim: Any) -> None:
     plugin.py: the no-op patches stay (they coexist with Accelerate's
     prepare round-trip), and this load hook handles real resume via a
     completely separate path.
+
+    The closed-over ``optim`` is captured at install time (in
+    ``post_trainer_create``, BEFORE Accelerate.prepare wraps the
+    optimizer), so it's already raw. We unwrap defensively in case
+    the caller hands in a wrapper.
     """
+    raw = _unwrap_protrain_optim(optim)
+    if raw is None:
+        # Caller passed something that isn't a ProTrain optimizer —
+        # silently no-op rather than installing a hook that would
+        # never fire.
+        return
+
     original = trainer._load_optimizer_and_scheduler
 
     def _patched(checkpoint: str | None) -> None:
         original(checkpoint)
         if checkpoint is None:
             return
-        if not _is_protrain_optimizer(optim):
-            return
         try:
-            _load_protrain_optim_dir(optim, checkpoint)
+            _load_protrain_optim_dir(raw, checkpoint)
         except Exception:
             LOG.exception(
                 "ProTrain optimizer load failed from %s — re-raising. "
@@ -520,4 +585,6 @@ __all__ = [
     "_effective_persistent_ids",
     "_estimate_optim_state_bytes",
     "_is_protrain_optimizer",
+    "_is_raw_protrain_optimizer",
+    "_unwrap_protrain_optim",
 ]
