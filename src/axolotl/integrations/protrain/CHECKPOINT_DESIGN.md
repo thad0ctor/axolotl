@@ -470,45 +470,19 @@ The integration test guards on world_size==1 to keep it Phase 1.
 
 ## 3. Phase 2: multi-rank (replicated AND ZeRO-3 sharded)
 
+**Phase 2 has its own design note: `CHECKPOINT_DESIGN_PHASE2.md`.**
+Read that doc for the detailed schema, save/load flows, validation
+matrix, and test plan covering DDP-replicated and ZeRO-3 sharded
+modes.
+
 Phase 2 is **not** "Phase 1 with sharded tensors." Both multi-rank
-replicated AND ZeRO-3 require:
-- Per-rank coordination of the save callback (which rank writes which
-  files; how to stage `dist.barrier()` properly inside the callback).
-- A per-rank file naming convention
-  (e.g., `cpu_optim/chunk_5_rank_2.pt`).
-- Region-layout metadata persisted per-chunk (for ZeRO-3 sharded
-  reload to validate that current run's regions match saved).
-- Pre-flight checks: `dist.is_initialized()` mirroring the
-  `restore_to_gpu` checks.
-- A real cross-rank consistency test (mp.spawn with gloo, similar to
-  `test_sharded_restore_to_gpu_round_trip_2rank`).
-
-### 3.1 What carries over from Phase 1
-
-- Schema design (with new `rank`, `regions[]` per chunk).
-- Layout-signature validation.
-- `persistent_ids` pinning (Option A).
-- Map_location='cpu' discipline.
-- Per-chunk file-per-chunk write strategy.
-- `protrain_save_optimizer_state` flag and the size-gate.
-
-### 3.2 What is genuinely new in Phase 2
-
-- Callback semantics across ranks: every rank writes its own shard
-  files; rank-0 writes the metadata; barriers around the writes.
-- Load coordination: every rank reads its own shards; pre-load
-  consistency check via collective.
-- Region-layout match: each chunk's `regions[]` (chunk_offset,
-  region_bytes, shard_bytes, dtype) must match between save and load.
-- DDP-replicated case: every rank holds the same persistent state but
-  potentially different non-persistent state if the routing is
-  rank-aware (it isn't today, but verify before assuming).
-
-### 3.3 Phase 2 ships its own design note
-
-Phase 2's specifics warrant their own design pass once Phase 1 is in
-production. The current note lays out the shape but doesn't try to
-specify the multi-rank protocol in detail.
+replicated AND ZeRO-3 sharded require multi-rank save/load
+coordination (per-rank shard files for sharded mode, rank-0-only
+writes for replicated mode, dist.barrier framing, broadcast-of-gate-
+decision for cross-rank consistency, region-layout metadata for the
+sharded reload contract). The Phase 2 doc lays out the file-naming
+convention, schema bump (v1 → v2 with forward compat), and the
+~12-test ship gate.
 
 ---
 
