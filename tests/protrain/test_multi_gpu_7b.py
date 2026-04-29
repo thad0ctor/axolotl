@@ -36,12 +36,28 @@ check is done via ``nvidia-smi`` at test time.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
+
+
+def _pick_free_port() -> int:
+    """Bind a transient socket to port 0 to let the OS pick a free port.
+
+    Avoids the EADDRINUSE failure mode when the hardcoded MASTER_PORT
+    (29500 or 29531) collides with another ``torch.distributed`` /
+    ``pt_elastic`` / ``torchrun`` process already bound to the same
+    port on this box. The socket is closed before returning so the
+    rendezvous ``TCPStore`` can bind it; the sub-millisecond TOCTOU
+    window is acceptable for test infra.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 def _nvidia_smi_gpu_count() -> int:
@@ -89,7 +105,11 @@ _WORKER_SCRIPT = textwrap.dedent(
     def _worker(rank: int, world_size: int, out_file: str,
                 bs: int, seq: int, n_iters: int, n_warmup: int) -> None:
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "29500"
+        # PROTRAIN_MASTER_PORT is picked free in the parent test
+        # (avoids EADDRINUSE collisions with stray torch.distributed
+        # processes). Fall back to 29500 so the worker still works
+        # under direct invocation outside the pytest harness.
+        os.environ["MASTER_PORT"] = os.environ.get("PROTRAIN_MASTER_PORT", "29500")
         # Bind this rank to its own GPU BEFORE any CUDA alloc.
         # ``CUDA_VISIBLE_DEVICES`` is a comma list at the subprocess
         # level (e.g. "1,2,4,5"); ``rank`` is the logical index into
@@ -359,6 +379,9 @@ def _launch(
     env["PROTRAIN_N_ITERS"] = str(n_iters)
     env["PROTRAIN_N_WARMUP"] = str(n_warmup)
     env["PROTRAIN_OUT_FILE"] = str(out_path)
+    # Pick a free port per launch so we don't collide with other
+    # torch.distributed / pt_elastic processes already on this box.
+    env["PROTRAIN_MASTER_PORT"] = str(_pick_free_port())
     # Avoid NCCL IB probes on a pure-PCIe box — faster startup and no
     # spurious warnings about ibv_open_device failures.
     env.setdefault("NCCL_IB_DISABLE", "1")
@@ -489,7 +512,10 @@ _ZERO3_WORKER_SCRIPT = textwrap.dedent(
                 bs: int, seq: int, n_iters: int,
                 force_replicate: bool) -> None:
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "29531"
+        # PROTRAIN_MASTER_PORT is picked free in the parent test
+        # (see _pick_free_port). 29531 is the legacy fallback for
+        # direct script invocation.
+        os.environ["MASTER_PORT"] = os.environ.get("PROTRAIN_MASTER_PORT", "29531")
         torch.cuda.set_device(rank)
         dist.init_process_group(
             backend="nccl",
@@ -753,6 +779,8 @@ def _launch_zero3(
     env["PROTRAIN_N_ITERS"] = str(n_iters)
     env["PROTRAIN_OUT_DIR"] = str(out_dir)
     env["PROTRAIN_FORCE_REPLICATE"] = "1" if force_replicate else "0"
+    # Pick a free port per launch (see _pick_free_port).
+    env["PROTRAIN_MASTER_PORT"] = str(_pick_free_port())
     env.setdefault("NCCL_IB_DISABLE", "1")
     env.setdefault("NCCL_P2P_DISABLE", "0")
 
