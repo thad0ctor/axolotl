@@ -95,41 +95,39 @@ def _dummy_batch(
     seq_len: int,
     device: "torch.device | str",
 ) -> dict:
-    """Build a minimal ``(input_ids, labels)`` batch suitable for causal LM.
+    """Build a sample batch appropriate for ``model``'s task type.
+
+    Delegates to
+    :func:`axolotl.integrations.protrain.profiler.batch_factory.build_batch`,
+    which inspects ``model.config.architectures`` /
+    ``config.is_encoder_decoder`` / module class name to pick the right
+    factory (causal-LM, sequence classification, token classification,
+    encoder-decoder). Causal-LM remains the default fallback so existing
+    cached traces and behaviour are preserved bit-for-bit.
 
     Used when the profiler cache misses and we need to drive one
-    forward + backward. Works on any HuggingFace causal LM (and many
-    encoder-decoder models whose forward accepts ``input_ids`` +
-    ``labels``); callers with exotic input signatures should supply
-    their own batch via a future optional parameter (not M4b scope).
+    forward + backward. Callers with exotic input signatures should
+    register a custom factory via
+    :func:`axolotl.integrations.protrain.profiler.batch_factory.register_factory`
+    rather than monkey-patching this helper.
     """
-    import torch
+    from axolotl.integrations.protrain.profiler.batch_factory import build_batch
 
-    vocab_size = _infer_vocab_size(model)
-    input_ids = torch.randint(
-        low=0,
-        high=vocab_size,
-        size=(batch_size, seq_len),
-        device=device,
-        dtype=torch.long,
-    )
-    labels = input_ids.clone()
-    return {"input_ids": input_ids, "labels": labels}
+    return build_batch(model, batch_size, seq_len, device)
 
 
 def _infer_vocab_size(model: nn.Module) -> int:
-    """Best-effort vocab size from common HF config shapes."""
-    cfg = getattr(model, "config", None)
-    for attr in ("vocab_size", "n_vocab", "vocabulary_size"):
-        if cfg is not None and hasattr(cfg, attr):
-            val = getattr(cfg, attr)
-            if isinstance(val, int) and val > 0:
-                return val
-    # Fallback: peek at the first Embedding layer.
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            return int(m.num_embeddings)
-    return 1024
+    """Best-effort vocab size from common HF config shapes.
+
+    Kept as a thin wrapper over the canonical implementation in
+    :mod:`axolotl.integrations.protrain.profiler.batch_factory` so prior
+    callers that imported the symbol from this module continue to work.
+    """
+    from axolotl.integrations.protrain.profiler.batch_factory import (
+        _infer_vocab_size as _impl,
+    )
+
+    return _impl(model)
 
 
 def _build_block_spans(

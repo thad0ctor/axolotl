@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from axolotl.integrations.protrain.types import ProfilerTrace
 
+from axolotl.integrations.protrain.profiler.batch_factory import (
+    build_batch,
+    detect_task_type,
+    register_factory,
+)
 from axolotl.integrations.protrain.profiler.cache import (
     ProfilerCacheKey,
     load_cached_trace,
@@ -57,4 +62,7 @@ __all__ = [
     "load_cached_trace",
     "save_cached_trace",
     "ProfilerCacheKey",
+    "build_batch",
+    "detect_task_type",
+    "register_factory",
 ]
