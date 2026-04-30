@@ -179,7 +179,8 @@ class ProTrainArgs(BaseModel):
     )
 
     # ------------------------------------------------------------------
-    # Optimizer-state checkpoint/resume (CHECKPOINT_DESIGN.md Phase 1)
+    # Optimizer-state checkpoint/resume (CHECKPOINT_DESIGN.md Phase 1,
+    # CHECKPOINT_DESIGN_PHASE2.md Modes B + C)
     # ------------------------------------------------------------------
 
     protrain_save_optimizer_state: bool | None = Field(
@@ -193,10 +194,15 @@ class ProTrainArgs(BaseModel):
                 "writes per-chunk shard files under "
                 "``{checkpoint_dir}/protrain_optim/`` after each save; "
                 "``Trainer._load_optimizer_and_scheduler`` is wrapped to load "
-                "from the same path on resume. Phase 1 supports single-rank "
-                "non-ZeRO only — multi-rank and ZeRO-3 hard-error on save. "
-                "Saves are gated by ``protrain_optim_save_max_bytes`` to "
-                "avoid silently writing 84 GB blobs for 7B full-FT."
+                "from the same path on resume. Supported configurations: "
+                "single-rank non-ZeRO (Phase 1), multi-rank DDP-replicated "
+                "(Phase 2 Mode-B, rank-0-only writes to ``chunk_<N>.pt``), "
+                "and multi-rank ZeRO-3 sharded (Phase 2 Mode-C, every rank "
+                "writes its own ``chunk_<N>_rank_<R>.pt``). Saves are gated "
+                "by ``protrain_optim_save_max_bytes`` to avoid silently "
+                "writing 84 GB blobs for 7B full-FT; in multi-rank runs "
+                "rank-0's gate decision is broadcast so all ranks save or "
+                "none do."
             )
         },
     )
@@ -207,12 +213,17 @@ class ProTrainArgs(BaseModel):
             "description": (
                 "Soft cap (bytes) on the estimated optimizer-state save "
                 "size. Default 2 GiB — small enough that LoRA always passes, "
-                "7B full-FT (~84 GB) never silently passes. When the "
-                "estimated bytes (sum of trainable-param numel × 4 × 2 for "
-                "the fp32 momentum buffers) exceeds this and the user did "
-                "NOT explicitly raise the threshold, the save callback "
-                "emits a WARN naming the estimate and skips writing. Set "
-                "explicitly higher to opt in to large saves."
+                "7B full-FT (~84 GB) never silently passes. The estimate "
+                "walks the inner adapters' state dicts (``_gpu_optim._optim`` "
+                "and every ``_cpu_optim._optims[*]``) and sums each Adam "
+                "state tensor's bytes — matching what gets pickled to disk. "
+                "Walking the user-facing param_groups would undercount: "
+                "ChunkManager.materialize_offload replaces offloaded "
+                "params' ``.data`` with empty placeholders, so "
+                "``p.numel()`` returns 0 for offloaded chunks between "
+                "training steps. When the estimate exceeds this cap, the "
+                "save callback emits a WARN naming the estimate and skips "
+                "writing. Set explicitly higher to opt in to large saves."
             )
         },
     )

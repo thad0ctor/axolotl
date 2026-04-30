@@ -216,6 +216,13 @@ default False) because it's expensive (full state hash, all_gather).
 On a clean DDP run it always passes; we offer it for paranoid
 operators but don't pay the cost by default.
 
+The flag is **Mode-B only**. The callback gate skips the check on
+Mode-C and on single-rank runs: under Mode-C every rank holds a
+genuinely different shard, so cross-rank hashing would always
+report divergence and falsely abort the save. Implementation: the
+gate requires `verify_replicated and not done and world_size > 1
+and not zero3_shard`.
+
 ### 2.5 Load flow — Mode-B
 
 ```text
@@ -384,26 +391,39 @@ to resume.
 
 ### 4.4 Estimate gate
 
-In Mode-B: rank-0's local estimate gates the rank-0 save.
-In Mode-C: each rank's local estimate gates its own per-rank shards.
-The metadata records `estimated_optim_state_bytes` per save (rank-0's
-view); the per-rank gate decisions are independent.
+A naive design would let each rank gate its own save against its
+local estimate. That breaks Mode-C: if rank-0's estimate fits but
+rank-1's estimate trips the cap, rank-1 silently skips writing its
+`chunk_<N>_rank_1.pt` shards while rank-0 writes the metadata declaring
+"saved" — a partial checkpoint that cannot be loaded. Even Mode-B is
+fragile under hypothetical state divergence. The gate decision must
+be cross-rank consistent.
 
-If a rank skips its save while others wrote theirs, that's a
-**broken** checkpoint. To prevent partial saves we need the gate
-decision to be cross-rank consistent. Two options:
-* **Gate on rank-0's estimate only**, broadcast the decision via
-  `dist.broadcast_object_list`. All ranks save or none do.
-* **Gate locally per-rank**, but cross-rank assert that all ranks
-  reached the same decision via `dist.all_gather_object`. If decisions
-  diverge, refuse to write anything.
+**Implemented behavior:** rank-0 computes its local estimate and
+**broadcasts** the skip-or-save decision via
+`torch.distributed.broadcast_object_list`. All ranks act on rank-0's
+decision — all save or none do. The metadata records
+`estimated_optim_state_bytes` from rank-0's view.
 
-**Recommendation:** the first. Rank-0's estimate is representative for
-Mode-B (every rank has the same state) and conservative for Mode-C
-(rank-0 holds at most as much as any single rank's shard slice — and
-in practice they hold the same shard size when regions are evenly
-split). Simpler, cheaper. Mode-C edge case where rank shards are
+The per-rank `_save_protrain_optim_dir` function still has its own
+size-gate for legacy direct callers (Phase-1-style single-rank
+tests). The callback path passes `_skip_size_gate=True` so the inner
+gate is suppressed and rank-0's broadcast is the single source of
+truth.
+
+**Why this works:** rank-0's estimate is representative for Mode-B
+(every rank has the same state by DDP determinism) and conservative
+for Mode-C (rank-0 holds at most as much as any single rank's shard
+slice — and in practice they hold the same shard size when regions
+are evenly split). Simpler and cheaper than `all_gather_object`-ing
+local decisions. Mode-C edge case where rank shards are wildly
 unequal is exotic and can be handled in a follow-up.
+
+**Rejected alternative:** gate locally per-rank, then
+`all_gather_object` the decisions and refuse to write anything if
+they diverge. Equivalent correctness but adds a round-trip and makes
+the failure surface more confusing (every rank participates in a
+collective just to discover none of them want to save).
 
 ---
 

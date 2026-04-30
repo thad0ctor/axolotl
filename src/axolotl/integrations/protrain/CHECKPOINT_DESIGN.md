@@ -366,9 +366,17 @@ full-FT optimizer state is ~84 GB (fp32 × 2 buffers × ~14B numel).
 We don't want to default-write 84 GB blobs.
 
 **Gating logic before save:**
-1. Compute `estimated_optim_state_bytes` from the param-group layout
-   (sum over all trainable params: `numel × 4 × 2` for the two fp32
-   momentum buffers, plus the model-weight master copy if applicable).
+1. Compute `estimated_optim_state_bytes` by walking the inner adapter
+   state dicts (`_gpu_optim._optim.state` and every
+   `_cpu_optim._optims[*].state`), summing each tensor's bytes
+   (`numel × element_size`). This matches exactly what gets pickled
+   to disk modulo Python object overhead. Walking the user-facing
+   `optim.param_groups` instead would undercount: after
+   `ChunkManager.materialize_offload` runs, every offloaded param's
+   `.data` is replaced with an empty placeholder, so `p.numel()`
+   returns 0 between training steps and the estimate would miss every
+   offloaded chunk's optimizer state — producing silent 84 GB writes
+   for 7B full-FT.
 2. Compare against `protrain_optim_save_max_bytes` (default
    `2 * 1024**3`, i.e., 2 GiB — small enough that LoRA always passes,
    full-FT never silently passes).
