@@ -36,6 +36,7 @@ from axolotl.integrations.protrain.api.checkpoint import (
     _build_regions_per_chunk,
     _effective_persistent_ids,
     _estimate_optim_state_bytes,
+    _hash_state_dict,
     _is_protrain_optimizer,
     _is_raw_protrain_optimizer,
     _layout_signature,
@@ -326,6 +327,38 @@ def test_layout_signature_changes_with_world_size_or_zero3():
 def test_effective_persistent_ids_returns_sorted_list():
     fake_mgr = mock.MagicMock(_persistent_ids={5, 1, 3, 0})
     assert _effective_persistent_ids(fake_mgr) == [0, 1, 3, 5]
+
+
+def test_hash_state_dict_handles_bf16_tensor():
+    """Direct ``t.numpy()`` rejects bf16 (and other torch-only dtypes);
+    the hash path goes through a uint8 view so storage bytes always
+    work. Regression: prior implementation crashed with
+    ``TypeError: Got unsupported ScalarType BFloat16`` for any
+    optimizer state holding bf16 momentum (custom optimizers, future
+    mixed-precision configs)."""
+    import torch
+
+    sd = {"x": torch.zeros(2, dtype=torch.bfloat16)}
+    digest = _hash_state_dict(sd)
+    assert isinstance(digest, bytes)
+    assert len(digest) == 32  # SHA-256
+
+    # Different bf16 contents → different hash. Confirms the byte view
+    # actually round-trips storage, not just shape/dtype.
+    sd_other = {"x": torch.ones(2, dtype=torch.bfloat16)}
+    assert _hash_state_dict(sd_other) != digest
+
+
+def test_hash_state_dict_handles_empty_tensor():
+    """Empty tensors must not break the hash path. The numpy() byte
+    view path skips the body for numel()==0 to avoid edge-case behavior
+    of ``view(torch.uint8)`` on zero-element storage."""
+    import torch
+
+    sd = {"x": torch.empty(0, dtype=torch.bfloat16)}
+    digest = _hash_state_dict(sd)
+    assert isinstance(digest, bytes)
+    assert len(digest) == 32
 
 
 def test_is_protrain_optimizer_duck_types():
@@ -2880,3 +2913,280 @@ def test_sharded_load_rejects_missing_rank_shard(tmp_path):
     assert any(
         "missing rank shard" in m and "rank_1.pt" in m for m in msgs
     ), f"missing-shard error did not name the file: {msgs}"
+
+
+# ---------------------------------------------------------------------------
+# Mode-C regression tests for the verify-gate and inner-size-gate fixes
+# ---------------------------------------------------------------------------
+
+
+def _worker_sharded_verify_replicated_is_noop(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Mode-C with ``verify_replicated=True`` must NOT call the cross-rank
+    state-equality check. In Mode-C each rank's inner state is sharded
+    per-rank, so the check would falsely raise. The schema documents
+    "Has no effect on single-rank or ZeRO-3 sharded runs".
+
+    We patch ``_verify_replicated_state_across_ranks`` to write a
+    sentinel file on entry; the parent test asserts the file was
+    never created.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="verifynoop"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            # Sentinel: any call raises so the fixture sees the
+            # symptom even if mp.spawn swallows the patch context.
+            sentinel_path = _os.path.join(tmpdir, f"verify_called_rank{rank}")
+
+            def _tripwire(*args, **kwargs):
+                with open(sentinel_path, "w") as f:
+                    f.write("called")
+                raise RuntimeError(
+                    "verify_replicated should be a no-op in Mode-C"
+                )
+
+            cb = make_checkpoint_callback(
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                verify_replicated=True,
+            )
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            with mock.patch(
+                "axolotl.integrations.protrain.api.checkpoint."
+                "_verify_replicated_state_across_ranks",
+                side_effect=_tripwire,
+            ):
+                cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_save_with_verify_flag_skips_cross_rank_check(tmp_path):
+    """Mode-C + ``verify_replicated=True`` → save proceeds; the cross-rank
+    hash check is NOT invoked.
+
+    Regression: prior gate checked only ``world_size > 1``, so a Mode-C
+    user who left the Mode-B verify flag enabled would see a spurious
+    RuntimeError on save (per-rank shards intentionally diverge).
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_sharded_verify_replicated_is_noop,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file(), (
+            f"rank {r} did not reach post-save sentinel"
+        )
+        assert not (tmp_path / f"verify_called_rank{r}").exists(), (
+            f"_verify_replicated_state_across_ranks fired on rank {r} "
+            f"in Mode-C — gate must exclude zero3_shard"
+        )
+
+    proot = tmp_path / "trainer_out" / "checkpoint-1" / PROTRAIN_OPTIM_DIRNAME
+    assert (proot / METADATA_FILENAME).is_file(), (
+        "save did not produce a Mode-C checkpoint"
+    )
+
+
+def _worker_sharded_inverted_gate_writes_all_shards(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Mode-C: rank-0 estimate fits; rank-1 estimate would trip the cap
+    if recomputed locally inside ``_save_protrain_optim_dir``. After
+    rank-0's broadcast says proceed, every rank must still write its
+    shards — the inner per-rank gate must be suppressed via
+    ``_skip_size_gate=True``.
+
+    Regression: prior code re-ran the gate per-rank, so rank-1 would
+    silently return False without writing ``chunk_<N>_rank_1.pt`` and
+    leave a partial Mode-C checkpoint.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="invgate"
+        )
+        try:
+            output_dir = _os.path.join(tmpdir, "trainer_out")
+            if rank == 0:
+                _os.makedirs(output_dir, exist_ok=True)
+            dist.barrier()
+            ckpt_dir = _os.path.join(output_dir, "checkpoint-1")
+            if rank == 0:
+                _os.makedirs(ckpt_dir, exist_ok=True)
+            dist.barrier()
+
+            small_threshold = 64
+            # Per-rank patch: rank-0's local estimate fits (skip=False
+            # broadcast), but rank-1's would trip the cap if the inner
+            # gate fired. With the fix the inner gate is suppressed by
+            # the callback so rank-1 still writes.
+            per_rank_estimate = 0 if rank == 0 else (small_threshold + 1)
+
+            cb = make_checkpoint_callback(save_max_bytes=small_threshold)
+            fake_args = mock.MagicMock(
+                output_dir=output_dir,
+                process_index=rank,
+                world_size=world_size,
+            )
+            fake_state = mock.MagicMock(global_step=1)
+            fake_control = mock.MagicMock()
+
+            with mock.patch(
+                "axolotl.integrations.protrain.api.checkpoint."
+                "_estimate_optim_state_bytes",
+                return_value=per_rank_estimate,
+            ):
+                cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_save_inner_gate_does_not_drop_rank_n_shards(tmp_path):
+    """Mode-C: rank-N's local estimate must NOT independently trip the
+    inner save-size gate after rank-0's broadcast said proceed.
+
+    Without the ``_skip_size_gate=True`` plumbing in the callback,
+    rank-1 would silently bail inside ``_save_protrain_optim_dir`` and
+    the on-disk Mode-C checkpoint would be missing every
+    ``chunk_<N>_rank_1.pt`` shard.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_sharded_inverted_gate_writes_all_shards,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"worker errors:\n{bodies}")
+
+    for r in range(world_size):
+        assert (tmp_path / f"rank{r}.done").is_file(), (
+            f"rank {r} did not reach post-save sentinel"
+        )
+
+    proot = tmp_path / "trainer_out" / "checkpoint-1" / PROTRAIN_OPTIM_DIRNAME
+    assert (proot / METADATA_FILENAME).is_file(), "metadata missing"
+    meta = json.loads((proot / METADATA_FILENAME).read_text())
+    assert meta["protrain_save_mode"] == SAVE_MODE_SHARDED
+
+    cpu_dir = proot / CPU_OPTIM_DIRNAME
+    assert cpu_dir.is_dir(), "cpu_optim/ missing"
+
+    # Every chunk in regions_per_chunk must have a per-rank file from
+    # *every* rank. The bug this guards against: rank-1 tripping the
+    # inner gate and silently skipping its writes.
+    for cid in meta["regions_per_chunk"]:
+        for r in range(world_size):
+            shard_path = cpu_dir / f"chunk_{int(cid)}_rank_{r}.pt"
+            assert shard_path.is_file(), (
+                f"missing per-rank shard {shard_path.name} — inner "
+                f"size-gate likely fired on rank {r} after rank-0's "
+                f"broadcast said proceed"
+            )

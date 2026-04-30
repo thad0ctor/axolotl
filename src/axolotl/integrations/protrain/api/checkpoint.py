@@ -408,9 +408,15 @@ def _hash_state_dict(sd: dict) -> bytes:
             h.update(b":")
             h.update(repr(tuple(t.shape)).encode("utf-8"))
             h.update(b":")
-            # numpy() avoids pickle stream non-determinism; the raw
-            # tensor bytes are what we actually care about.
-            h.update(t.numpy().tobytes())
+            # Hash raw storage bytes via a uint8 view. Direct .numpy()
+            # rejects bf16 ("Got unsupported ScalarType BFloat16") and
+            # other torch-only dtypes — view-as-uint8 reinterprets the
+            # storage as bytes and works for every fixed-width dtype.
+            # ``flatten()`` first because ``view(torch.uint8)`` rejects
+            # 0-dim tensors when the target element size differs (Adam's
+            # ``step`` field is a scalar 0-dim tensor).
+            if t.numel() > 0:
+                h.update(t.flatten().view(torch.uint8).numpy().tobytes())
         else:
             # Scalar: int, float, bool, str, None, etc. repr() is
             # stable across processes.
@@ -477,6 +483,7 @@ def _save_protrain_optim_dir(
     save_max_bytes: int,
     rank: int = 0,
     world_size: int | None = None,
+    _skip_size_gate: bool = False,
 ) -> bool:
     """Write the protrain_optim/ subdirectory. Returns True iff written.
 
@@ -508,7 +515,15 @@ def _save_protrain_optim_dir(
     zero3_shard = bool(getattr(chunk_manager, "zero3_shard", False))
 
     estimate = _estimate_optim_state_bytes(optim)
-    if estimate > save_max_bytes:
+    # The callback already runs a rank-0-broadcast size-gate before
+    # calling here (see ProTrainOptimizerCheckpointCallback.on_save),
+    # so re-running it here per-rank would let a non-rank-0 local trip
+    # diverge from rank-0's cluster-wide decision — in Mode-C that would
+    # leave a partial checkpoint where rank-0's metadata says "saved"
+    # but rank-N's per-rank shards are missing. Skip the redundant gate
+    # in that path; the legacy direct caller (Phase-1 single-rank) keeps
+    # the gate by leaving _skip_size_gate at its default False.
+    if not _skip_size_gate and estimate > save_max_bytes:
         LOG.warning(
             "ProTrain optimizer save: estimated %d bytes (~%.2f GiB) exceeds "
             "protrain_optim_save_max_bytes=%d (~%.2f GiB) — skipping save. "
@@ -1212,10 +1227,16 @@ def _make_callback_class():
                 return control
 
             # ---------- 3. Cross-rank verify (opt-in, once per run) ----------
+            # Mode-B only: in Mode-C every rank's inner state intentionally
+            # differs (per-rank shard), so cross-rank hashing would falsely
+            # raise. The schema documents "Has no effect on single-rank or
+            # ZeRO-3 sharded runs" — `world_size > 1` covers single-rank;
+            # `not zero3_shard` covers Mode-C.
             if (
                 self._verify_replicated
                 and not self._verify_replicated_done
                 and world_size > 1
+                and not zero3_shard
             ):
                 _verify_replicated_state_across_ranks(
                     raw, world_size=world_size
@@ -1235,6 +1256,9 @@ def _make_callback_class():
                 save_max_bytes=self._save_max_bytes,
                 rank=rank,
                 world_size=world_size,
+                # Callback already broadcast rank-0's gate decision; the
+                # inner per-rank gate must NOT re-trip independently.
+                _skip_size_gate=True,
             )
 
             # ---------- 5. Barrier so downstream code sees the dir ----------
@@ -1328,6 +1352,7 @@ __all__ = [
     "_is_protrain_optimizer",
     "_is_raw_protrain_optimizer",
     "_unwrap_protrain_optim",
+    "_hash_state_dict",
     "_hash_inner_state_dicts",
     "_verify_replicated_state_across_ranks",
     "_broadcast_object_list_or_noop",
