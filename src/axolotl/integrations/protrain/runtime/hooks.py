@@ -25,7 +25,10 @@ from typing import TYPE_CHECKING, cast
 
 from torch import nn
 
-from axolotl.integrations.protrain.block.layout_rules import discover_blocks
+from axolotl.integrations.protrain.block.layout_rules import (
+    discover_blocks,
+    flatten_block_trees,
+)
 from axolotl.integrations.protrain.types import (
     BlockId,
     BlockStrategyMap,
@@ -120,7 +123,7 @@ def install_hooks(
         :func:`uninstall_hooks` to restore the model to its pre-install
         state.
     """
-    blocks = discover_blocks(model)
+    blocks = flatten_block_trees(discover_blocks(model))
 
     handles: list["RemovableHandle"] = []
     for idx, block in enumerate(blocks):

@@ -230,7 +230,10 @@ def test_trace_records_per_block_peaks(gpu_device):
     if not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
 
-    from axolotl.integrations.protrain.block.layout_rules import discover_blocks
+    from axolotl.integrations.protrain.block.layout_rules import (
+        discover_blocks,
+        flatten_block_trees,
+    )
     from axolotl.integrations.protrain.profiler import run_trace
     from axolotl.integrations.protrain.types import ProfilerConfig
 
@@ -238,7 +241,7 @@ def test_trace_records_per_block_peaks(gpu_device):
     _name, tok, model = _load_tiny_gpt2()
     model = model.to(device)
 
-    n_block_expected = len(discover_blocks(model))
+    n_block_expected = len(flatten_block_trees(discover_blocks(model)))
     assert n_block_expected >= 2, "tiny GPT-2 should have >=2 transformer blocks"
 
     bs, seq = 2, 64
