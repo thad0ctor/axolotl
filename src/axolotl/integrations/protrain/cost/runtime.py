@@ -587,7 +587,53 @@ def estimate_runtime(
         # real comm/compute overlap. After translating out the bootstrap
         # recompute and adding this candidate's recompute, consume it
         # directly instead of re-injecting analytical per-chunk comm.
-        t_bwd = t_bwd_compute_total + t_bwd_swap_prefetch
+        #
+        # n_buffer translation (paper §3.3.1 / §4.2):
+        # ``t_bwd_compute_total`` already encodes the bootstrap config's
+        # cache-hit savings via the measured ``steady_bwd_chunked_wall_s``.
+        # When the candidate ``n_buffer`` differs from the bootstrap's
+        # ``phase2_n_buffer``, the candidate gets ``delta_cached`` more (or
+        # fewer) chunks resident in the buffer pool from forward into
+        # backward. Each delta cache hit skips one all-gather collective
+        # in backward — the paper's "buffers surviving forward are reused
+        # in backward if not evicted, skipping reload" invariant. Without
+        # this translation the chunked-wall override is FLAT in
+        # ``n_buffer`` and the searcher's "argmin over n_buffer" would
+        # collapse to the minimum-feasible value (``_min_n_buffer_for``);
+        # the searcher then picks ``n_buffer=2`` for a Mode-C workload
+        # where ``n_buffer >= 6`` would let most non-persistent chunks
+        # survive forward and skip the re-gather in backward.
+        #
+        # The savings-per-delta-hit is the backward NCCL gather time at
+        # the chunk payload size, taken from the same trace tables the
+        # analytical path uses. Mirrors
+        # ``t_bwd_comm_per_chunk_uncached - t_bwd_comm_per_chunk_cached =
+        # nccl_gather`` in the analytical branch below, keeping the two
+        # paths' n_buffer-coefficients consistent.
+        n_nonpersist_bootstrap = max(
+            0, layout.N_chunk - trace.phase2_n_persist
+        )
+        bootstrap_cached = min(
+            trace.phase2_n_buffer, n_nonpersist_bootstrap
+        )
+        candidate_cached = min(n_buffer, n_nonpersist)
+        delta_cached = candidate_cached - bootstrap_cached
+        # Savings per cache hit = backward gather collective skipped.
+        # Single-rank / no-collective case has nccl_gather=0, so the
+        # translation is a no-op there (correctly: no NCCL gather to
+        # skip). Same nccl_gather value the analytical path uses for
+        # ``t_bwd_comm_per_chunk_*`` at this S_chunk.
+        gather_save_per_hit = nccl_gather
+        # Net override: subtract delta-hit savings from the measured
+        # backward. Clamp at 0 to prevent negative t_bwd if a wildly
+        # noisy trace has more savings than measured backward (would
+        # only happen on a degenerate bootstrap that already cached
+        # everything).
+        t_bwd_buffer_correction = -delta_cached * gather_save_per_hit
+        t_bwd = max(
+            0.0,
+            t_bwd_compute_total + t_bwd_swap_prefetch + t_bwd_buffer_correction,
+        )
     else:
         if layout.N_chunk > 0:
             t_bwd_compute_per_chunk = t_bwd_compute_total / layout.N_chunk
