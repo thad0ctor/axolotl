@@ -100,15 +100,22 @@ def _tree_index_for_path(module_path: str) -> int:
     return 0
 
 
-def _block_tree_index_map(
+def block_tree_index_map(
     trace: ProfilerTrace,
 ) -> dict[BlockId, int]:
     """Map each ``BlockId`` to its forward-order tree index.
 
-    Inferred from the first forward op tagged to each block_id, by
-    parsing its ``module_path`` prefix. Returns ``{}`` if no forward
-    ops carry block_ids (degenerate trace input).
+    Reads ``trace.block_tree_index`` when populated (TRACE_VERSION ≥ 12,
+    where the trace constructor walks ``discover_blocks(model)`` and
+    records ``block_id -> forward_order`` directly). Falls back to
+    parsing the first forward op's ``module_path`` prefix (``encoder.``
+    -> 0, ``decoder.`` -> 1, else 0) for degenerate test inputs that
+    don't carry the field. Returns ``{}`` if no forward ops carry
+    block_ids and the persisted map is empty.
     """
+    persisted = getattr(trace, "block_tree_index", None)
+    if persisted:
+        return dict(persisted)
     seen: dict[BlockId, int] = {}
     for op in trace.op_order:
         if not op.is_forward or op.block_id is None:
@@ -127,7 +134,7 @@ def _has_multiple_trees(tree_index_map: dict[BlockId, int]) -> bool:
     return len(indices) >= 2
 
 
-def _cross_attn_persist_bytes(
+def cross_attn_persist_bytes(
     trace: ProfilerTrace,
     block_map: BlockStrategyMap,
     tree_index_map: dict[BlockId, int],
@@ -178,7 +185,7 @@ def _cross_attn_persist_bytes(
     return int(trace.activation_sizes.get(last_enc_bid, 0))
 
 
-def _op_cross_attn_surcharge(
+def op_cross_attn_surcharge(
     op: OpRecord,
     cross_attn_bytes: int,
     tree_index_map: dict[BlockId, int],
@@ -405,7 +412,7 @@ def estimate_peak(
        window. When the encoder's last block is in CKPT/SWAP mode its
        full activation bytes are not in ``live_none``, but the output
        hidden tensor still IS retained for cross-attn — so we add
-       ``_cross_attn_persist_bytes`` as a per-decoder-op surcharge.
+       ``cross_attn_persist_bytes`` as a per-decoder-op surcharge.
        When the encoder's last block is NONE the bytes are already in
        ``live_none``; the helper returns 0 to avoid double-counting.
     3. **Backward sequencing:** decoder backward runs to completion
@@ -439,8 +446,8 @@ def estimate_peak(
     #   SWAP: 0 bytes retained in steady state (see module docstring).
     n_block = len(trace.activation_sizes)
     forward_ops_by_block = _group_ops_by_block(trace)
-    tree_index_map = _block_tree_index_map(trace)
-    cross_attn_bytes = _cross_attn_persist_bytes(
+    tree_index_map = block_tree_index_map(trace)
+    cross_attn_bytes = cross_attn_persist_bytes(
         trace, block_map, tree_index_map
     )
 
@@ -535,7 +542,7 @@ def estimate_peak(
                 BlockId(ckpt_bump_op[i]), 0
             )
 
-        op_cross_attn = _op_cross_attn_surcharge(
+        op_cross_attn = op_cross_attn_surcharge(
             op, cross_attn_bytes, tree_index_map
         )
 
@@ -599,4 +606,12 @@ def estimate_peak(
     return scaled
 
 
-__all__ = ["estimate_peak", "estimate_cpu_footprint", "ALPHA_FRAGMENTATION"]
+__all__ = [
+    "estimate_peak",
+    "estimate_cpu_footprint",
+    "ALPHA_FRAGMENTATION",
+    "block_tree_index_map",
+    "cross_attn_persist_bytes",
+    "op_cross_attn_surcharge",
+    "hot_iter_peak_cap",
+]
