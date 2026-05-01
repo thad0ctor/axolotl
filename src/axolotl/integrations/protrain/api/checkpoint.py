@@ -136,6 +136,79 @@ def _barrier_or_noop() -> None:
     torch.distributed.barrier()
 
 
+def _broadcast_status_or_raise(
+    status: int, *, src: int, op: str
+) -> None:
+    """Broadcast a 0/1 status flag from ``src`` and raise on every rank if non-zero.
+
+    Used to guard barriers around single-rank-writes-only sections (Mode-C
+    save: rank-0 writes ``metadata.json`` + ``gpu_optim.pt``). If ``src``
+    raised mid-write, it must still call this with ``status=1`` from a
+    ``finally`` block so the broadcast happens before the source rank
+    re-raises its original exception. Non-source ranks receive the flag
+    and synthesize a ``RuntimeError`` so the cluster fails in lockstep
+    instead of deadlocking on the trailing barrier.
+
+    No-op (with the source rank's ``status`` short-circuit-raised) when
+    dist is not initialised.
+    """
+    if not _dist_is_active():
+        if status != 0:
+            raise RuntimeError(
+                f"ProTrain optimizer {op}: rank {src} reported non-zero status "
+                "(see preceding traceback for the underlying error)."
+            )
+        return
+    flag = torch.tensor([int(status)], dtype=torch.int64)
+    torch.distributed.broadcast(flag, src=src)
+    if int(flag.item()) != 0:
+        my_rank = int(torch.distributed.get_rank())
+        if my_rank == src:
+            # Source rank raises its own original exception in the caller's
+            # ``finally``-bracketed try/except; do not stomp on it here.
+            return
+        raise RuntimeError(
+            f"ProTrain optimizer {op}: rank {src} failed during the "
+            "single-rank-writes phase (see rank "
+            f"{src}'s traceback for the underlying error). Aborting on "
+            f"rank {my_rank} so the cluster fails in lockstep instead of "
+            "deadlocking on the trailing barrier."
+        )
+
+
+def _allreduce_status_or_raise(status: int, *, op: str) -> None:
+    """All-reduce SUM a status flag across the cluster; raise everywhere if any rank failed.
+
+    Used to guard barriers around per-rank-writes/reads (Mode-C save's
+    per-rank shard writes; Mode-C/B load's per-rank shard reads). Each
+    rank contributes its local 0/1 status; if the sum is non-zero, every
+    rank raises so the cluster fails in lockstep instead of deadlocking
+    on the trailing barrier.
+    """
+    if not _dist_is_active():
+        if status != 0:
+            raise RuntimeError(
+                f"ProTrain optimizer {op}: local rank reported non-zero "
+                "status (see preceding traceback for the underlying error)."
+            )
+        return
+    flag = torch.tensor([int(status)], dtype=torch.int64)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM)
+    total = int(flag.item())
+    if total != 0:
+        my_rank = int(torch.distributed.get_rank())
+        if status != 0:
+            # Local rank raises its own original exception in the caller's
+            # try/except; do not stomp on it here.
+            return
+        raise RuntimeError(
+            f"ProTrain optimizer {op}: {total} rank(s) failed during the "
+            f"per-rank phase (see those ranks' tracebacks for the "
+            f"underlying error). Aborting on rank {my_rank} so the cluster "
+            "fails in lockstep instead of deadlocking on the trailing barrier."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -550,42 +623,64 @@ def _save_protrain_optim_dir(
         # don't race ahead of the directory creation. A trailing barrier
         # in the caller (the callback) ensures the cluster sees a fully
         # complete dir before downstream code touches it.
-        if rank == 0:
-            os.makedirs(target, exist_ok=True)
+        #
+        # Failure protocol (Finding 1): rank-0's writes can raise mid-
+        # call (ENOSPC, perm denied, json serialization, ...). Without
+        # the broadcast below, non-rank-0 ranks would block forever on
+        # the next ``_barrier_or_noop()``. Wrap rank-0's writes in
+        # try/except, broadcast a 0/1 status flag from rank-0 to every
+        # rank in a ``finally`` so it executes even on the rank-0
+        # exception path, then ranks raise in lockstep.
+        rank0_status = 0
+        try:
+            if rank == 0:
+                os.makedirs(target, exist_ok=True)
 
-            metadata = {
-                "format_version": SCHEMA_FORMAT_VERSION,
-                "protrain_layout_signature": _layout_signature(
-                    chunk_manager, world_size, zero3_shard
-                ),
-                "protrain_persistent_ids": _effective_persistent_ids(
-                    chunk_manager
-                ),
-                "protrain_n_buffer": int(
-                    getattr(chunk_manager, "n_buffer", 0)
-                ),
-                "protrain_world_size": int(world_size),
-                "protrain_zero3_shard": zero3_shard,
-                "protrain_save_mode": SAVE_MODE_SHARDED,
-                "saving_rank": int(rank),
-                "param_groups_meta": _hyperparam_snapshot(optim),
-                "saved_at_step": int(step),
-                "torch_version": str(torch.__version__),
-                "estimated_optim_state_bytes": int(estimate),
-                "regions_per_chunk": _build_regions_per_chunk(chunk_manager),
-            }
-            with open(os.path.join(target, METADATA_FILENAME), "w") as f:
-                json.dump(metadata, f, indent=2, sort_keys=True)
+                metadata = {
+                    "format_version": SCHEMA_FORMAT_VERSION,
+                    "protrain_layout_signature": _layout_signature(
+                        chunk_manager, world_size, zero3_shard
+                    ),
+                    "protrain_persistent_ids": _effective_persistent_ids(
+                        chunk_manager
+                    ),
+                    "protrain_n_buffer": int(
+                        getattr(chunk_manager, "n_buffer", 0)
+                    ),
+                    "protrain_world_size": int(world_size),
+                    "protrain_zero3_shard": zero3_shard,
+                    "protrain_save_mode": SAVE_MODE_SHARDED,
+                    "saving_rank": int(rank),
+                    "param_groups_meta": _hyperparam_snapshot(optim),
+                    "saved_at_step": int(step),
+                    "torch_version": str(torch.__version__),
+                    "estimated_optim_state_bytes": int(estimate),
+                    "regions_per_chunk": _build_regions_per_chunk(chunk_manager),
+                }
+                with open(os.path.join(target, METADATA_FILENAME), "w") as f:
+                    json.dump(metadata, f, indent=2, sort_keys=True)
 
-            if optim._gpu_optim is not None:
-                torch.save(
-                    optim._gpu_optim._optim.state_dict(),
-                    os.path.join(target, GPU_OPTIM_FILENAME),
-                )
+                if optim._gpu_optim is not None:
+                    torch.save(
+                        optim._gpu_optim._optim.state_dict(),
+                        os.path.join(target, GPU_OPTIM_FILENAME),
+                    )
 
-            cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
-            if optim._cpu_optim is not None and optim._cpu_optim._optims:
-                os.makedirs(cpu_dir, exist_ok=True)
+                cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
+                if optim._cpu_optim is not None and optim._cpu_optim._optims:
+                    os.makedirs(cpu_dir, exist_ok=True)
+        except Exception:
+            rank0_status = 1
+            raise
+        finally:
+            # Broadcast rank-0's status to every rank BEFORE the barrier
+            # so a mid-write rank-0 failure does not deadlock the cluster.
+            # Non-rank-0 ranks raise a synthetic RuntimeError; rank-0
+            # re-raises its original exception via the bare ``raise``
+            # above.
+            _broadcast_status_or_raise(
+                rank0_status, src=0, op="save (rank-0 metadata/gpu_optim)"
+            )
 
         # Barrier so non-rank-0 ranks see metadata + cpu_optim/ before
         # writing into the dir.
@@ -593,18 +688,34 @@ def _save_protrain_optim_dir(
 
         # Every rank writes its own per-rank shard files. Rank-0 also
         # writes its shards here (no separate path).
-        if optim._cpu_optim is not None and optim._cpu_optim._optims:
-            cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
-            # Defensive mkdir on every rank in case dist isn't actually
-            # initialized (single-rank zero3_shard "test mode" run that
-            # falls back to replicated behaviour but still wants the
-            # Mode-C disk shape).
-            os.makedirs(cpu_dir, exist_ok=True)
-            for cid, inner in optim._cpu_optim._optims.items():
-                path = os.path.join(
-                    cpu_dir, f"chunk_{int(cid)}_rank_{int(rank)}.pt"
-                )
-                torch.save(inner.state_dict(), path)
+        #
+        # Failure protocol (Finding 1, per-rank phase): if any rank's
+        # ``torch.save`` raises (ENOSPC on a NFS rank, perm denied on a
+        # rank-local tmp, ...), surviving ranks would block on the
+        # callback's trailing barrier. All-reduce a SUM of per-rank
+        # statuses; if any rank failed, every rank raises so the cluster
+        # fails in lockstep.
+        per_rank_status = 0
+        try:
+            if optim._cpu_optim is not None and optim._cpu_optim._optims:
+                cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
+                # Defensive mkdir on every rank in case dist isn't actually
+                # initialized (single-rank zero3_shard "test mode" run that
+                # falls back to replicated behaviour but still wants the
+                # Mode-C disk shape).
+                os.makedirs(cpu_dir, exist_ok=True)
+                for cid, inner in optim._cpu_optim._optims.items():
+                    path = os.path.join(
+                        cpu_dir, f"chunk_{int(cid)}_rank_{int(rank)}.pt"
+                    )
+                    torch.save(inner.state_dict(), path)
+        except Exception:
+            per_rank_status = 1
+            raise
+        finally:
+            _allreduce_status_or_raise(
+                per_rank_status, op="save (per-rank shard write)"
+            )
 
         if rank == 0:
             LOG.info(
@@ -893,41 +1004,90 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
 
         # Per-rank chunk shard load. Walk the current set of non-
         # persistent chunks and require every rank-suffixed file to
-        # exist. Missing file = hard error naming the rank/chunk so the
-        # operator can map back to which worker failed to write.
+        # exist. Missing file / unexpected file / corrupt file = hard
+        # error.
+        #
+        # Failure protocol (Finding 2): each rank reads its own shard. A
+        # missing or corrupt file on any rank would raise locally; the
+        # surviving ranks would then block on the load hook's trailing
+        # barrier. Wrap the whole per-rank load in try/except and
+        # all-reduce a SUM of statuses; if any rank failed, every rank
+        # raises so the cluster fails in lockstep.
+        #
+        # Stray-file rejection (Finding 3): Mode-B explicitly rejects
+        # unknown files in cpu_optim/ via CHUNK_FILE_RE. Mode-C's old
+        # behaviour silently tolerated extras (e.g. ``chunk_X_rank_8.pt``
+        # left over from a higher-world_size save). Mirror Mode-B's
+        # pattern: enumerate cpu_optim/ and reject anything that
+        # (a) doesn't match CHUNK_SHARD_FILE_RE, or
+        # (b) carries a rank ordinal outside ``[0, current_world)`` —
+        #     these match the filename grammar but are leftovers from a
+        #     larger-world_size save and would silently slip past a
+        #     pure regex check.
+        # Done up-front (inside the try/except so the cross-rank failure
+        # protocol applies) before any torch.load runs.
         cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
-        if optim._cpu_optim is not None and optim._cpu_optim._optims:
-            for cid, inner in optim._cpu_optim._optims.items():
-                shard_path = os.path.join(
-                    cpu_dir, f"chunk_{int(cid)}_rank_{current_rank}.pt"
-                )
-                if not os.path.isfile(shard_path):
-                    raise RuntimeError(
-                        "ProTrain optimizer load: missing rank shard "
-                        f"{shard_path!r}. Expected per-rank file for "
-                        f"rank {current_rank} chunk {int(cid)} — the "
-                        "saved checkpoint is incomplete or was produced "
-                        "by a different world_size."
+        load_status = 0
+        try:
+            if os.path.isdir(cpu_dir):
+                for name in os.listdir(cpu_dir):
+                    m = CHUNK_SHARD_FILE_RE.match(name)
+                    if m is None:
+                        raise RuntimeError(
+                            "ProTrain optimizer load: unexpected file "
+                            f"{name!r} in {cpu_dir!r} — Mode-C cpu_optim/ "
+                            "must contain only chunk_<N>_rank_<R>.pt "
+                            "shards. Refusing to load."
+                        )
+                    file_rank = int(m.group(2))
+                    if file_rank < 0 or file_rank >= current_world:
+                        raise RuntimeError(
+                            "ProTrain optimizer load: unexpected file "
+                            f"{name!r} in {cpu_dir!r} — rank ordinal "
+                            f"{file_rank} is outside the current "
+                            f"world_size range [0, {current_world}). "
+                            "Likely a leftover shard from a higher-"
+                            "world_size save. Refusing to load."
+                        )
+            if optim._cpu_optim is not None and optim._cpu_optim._optims:
+                for cid, inner in optim._cpu_optim._optims.items():
+                    shard_path = os.path.join(
+                        cpu_dir, f"chunk_{int(cid)}_rank_{current_rank}.pt"
                     )
-                loaded = torch.load(
-                    shard_path, map_location="cpu", weights_only=False
-                )
-                inner.load_state_dict(loaded)
-                # Defensive: torch.optim.Optimizer.load_state_dict
-                # auto-casts state tensors to the device of the matching
-                # param. Post-materialize_offload, the user-facing
-                # shard_param holds an empty placeholder on the manager's
-                # device — torch silently moves the loaded exp_avg /
-                # exp_avg_sq there. The DeepSpeedCPUAdam C++ kernel then
-                # segfaults on the next step trying to write through
-                # that pointer. Force CPU after load_state_dict.
-                for state in inner.state.values():
-                    for k, v in state.items():
-                        if (
-                            isinstance(v, torch.Tensor)
-                            and v.device.type != "cpu"
-                        ):
-                            state[k] = v.cpu()
+                    if not os.path.isfile(shard_path):
+                        raise RuntimeError(
+                            "ProTrain optimizer load: missing rank shard "
+                            f"{shard_path!r}. Expected per-rank file for "
+                            f"rank {current_rank} chunk {int(cid)} — the "
+                            "saved checkpoint is incomplete or was produced "
+                            "by a different world_size."
+                        )
+                    loaded = torch.load(
+                        shard_path, map_location="cpu", weights_only=False
+                    )
+                    inner.load_state_dict(loaded)
+                    # Defensive: torch.optim.Optimizer.load_state_dict
+                    # auto-casts state tensors to the device of the matching
+                    # param. Post-materialize_offload, the user-facing
+                    # shard_param holds an empty placeholder on the manager's
+                    # device — torch silently moves the loaded exp_avg /
+                    # exp_avg_sq there. The DeepSpeedCPUAdam C++ kernel then
+                    # segfaults on the next step trying to write through
+                    # that pointer. Force CPU after load_state_dict.
+                    for state in inner.state.values():
+                        for k, v in state.items():
+                            if (
+                                isinstance(v, torch.Tensor)
+                                and v.device.type != "cpu"
+                            ):
+                                state[k] = v.cpu()
+        except Exception:
+            load_status = 1
+            raise
+        finally:
+            _allreduce_status_or_raise(
+                load_status, op="load (per-rank shard read)"
+            )
 
         # Hyperparam drift: warn but accept.
         def _normalize_hp(hp: dict[str, Any]) -> dict[str, Any]:

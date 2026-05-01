@@ -3190,3 +3190,485 @@ def test_sharded_save_inner_gate_does_not_drop_rank_n_shards(tmp_path):
                 f"size-gate likely fired on rank {r} after rank-0's "
                 f"broadcast said proceed"
             )
+
+
+# ---------------------------------------------------------------------------
+# Mode-C lockstep-failure regressions (Findings 1, 2, 3)
+# ---------------------------------------------------------------------------
+# Pre-fix, three deadlock/silent-accept paths existed in the Mode-C save/load
+# barriers:
+#   F1: rank-0 raises mid-write on save -> non-zero ranks block forever on
+#       the trailing barrier (NCCL/gloo barriers have no timeout).
+#   F2: a single rank's shard load raises on resume -> surviving ranks
+#       block on the load hook's trailing barrier.
+#   F3: extra files left behind from a higher-world_size save in cpu_optim/
+#       were silently accepted; only the per-rank expected file existence
+#       was checked.
+# Fix: status broadcast / all_reduce around the barriers + Mode-B-style
+# stray-file rejection mirroring CHUNK_FILE_RE on the Mode-C path.
+
+
+def _worker_sharded_save_rank0_failure_lockstep(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Rank-0 fails mid-write during ``_save_protrain_optim_dir``; every
+    rank must raise (no deadlock on the post-rank-0-write barrier).
+
+    The forced failure: monkey-patch ``json.dump`` on rank-0 only so the
+    metadata write raises a synthetic ``RuntimeError``. Without the
+    Finding-1 fix, rank-1 would block forever on the barrier inside
+    ``_save_protrain_optim_dir``; with the fix, rank-0's status flag is
+    broadcast in a ``finally`` block and rank-1 raises a synthetic
+    "rank 0 failed" error.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="f1save"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            import json as _json
+
+            class _BoomError(RuntimeError):
+                pass
+
+            real_dump = _json.dump
+
+            def _maybe_boom(obj, fp, *args, **kwargs):
+                if rank == 0:
+                    raise _BoomError("synthetic ENOSPC during metadata write")
+                return real_dump(obj, fp, *args, **kwargs)
+
+            try:
+                with mock.patch("json.dump", side_effect=_maybe_boom):
+                    _save_protrain_optim_dir(
+                        optim,
+                        save_dir,
+                        step=1,
+                        save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+            except RuntimeError as exc:
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+                ) as f:
+                    f.write(f"{type(exc).__name__}: {exc}")
+            else:
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
+                ) as f:
+                    f.write("save did not raise on this rank")
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            with open(
+                _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+            ) as f:
+                f.write(f"{type(exc).__name__}: {exc}")
+            return
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_save_rank0_failure_propagates_lockstep(tmp_path):
+    """Mode-C: rank-0 raises mid-write -> every rank raises (no deadlock).
+
+    Regression for Finding 1. Pre-fix, rank-1 would block forever on the
+    barrier between the rank-0 metadata write and the per-rank shard
+    write. With the fix, rank-0's failure is broadcast as a status flag
+    before the barrier so every rank raises in lockstep.
+
+    Liveness witness: ``mp.spawn`` joins. If either rank deadlocked, the
+    spawn would hang and pytest's per-test timeout would fail the test.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    try:
+        mp.spawn(
+            _worker_sharded_save_rank0_failure_lockstep,
+            args=(world_size, str(tmp_path)),
+            nprocs=world_size,
+            join=True,
+        )
+    except Exception:
+        # mp.spawn re-raises worker exceptions; the workers also write
+        # caught/err sentinels we inspect below.
+        pass
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"unexpected worker errors:\n{bodies}")
+
+    # Every rank must have caught a RuntimeError (either rank-0's
+    # synthetic _BoomError or the synthetic "rank 0 failed" raised on
+    # rank-1 after the status broadcast).
+    caught = sorted(tmp_path.glob("rank*.caught"))
+    assert len(caught) == world_size, (
+        f"expected every rank to raise; got {[c.name for c in caught]}. "
+        f"no_raise sentinels: {[p.name for p in tmp_path.glob('rank*.no_raise')]}"
+    )
+
+    bodies = [c.read_text() for c in caught]
+    # rank-0's exception is the original synthetic ENOSPC; non-rank-0
+    # ranks see the synthetic "rank 0 failed" error.
+    assert any("ENOSPC" in b for b in bodies), (
+        f"rank-0's original exception was lost: {bodies}"
+    )
+    assert any("rank 0 failed" in b for b in bodies), (
+        f"non-rank-0 ranks did not synthesize the lockstep error: {bodies}"
+    )
+
+
+def _worker_sharded_load_rank_failure_lockstep(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Save normally, then corrupt rank-1's shard so its torch.load raises;
+    every rank must raise (no deadlock on the trailing load barrier).
+
+    The corruption: rank-0 truncates rank-1's chunk-0 shard to a few
+    junk bytes after the normal save. On load, rank-1's torch.load
+    raises an UnpicklingError; rank-0's load would otherwise succeed
+    and block on the trailing barrier — with the fix, the all-reduce
+    SUM of statuses raises on rank-0 too.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="f2load"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=1,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                rank=rank,
+                world_size=world_size,
+            )
+            assert wrote is True
+            dist.barrier()
+
+            # Rank-0 corrupts rank-1's shard so rank-1's torch.load
+            # raises while rank-0's would succeed.
+            if rank == 0:
+                cpu_dir = _os.path.join(
+                    save_dir, PROTRAIN_OPTIM_DIRNAME, CPU_OPTIM_DIRNAME
+                )
+                # Find any chunk-id; corrupt rank 1's file.
+                victim_name = None
+                for name in _os.listdir(cpu_dir):
+                    if name.endswith("_rank_1.pt"):
+                        victim_name = name
+                        break
+                assert victim_name is not None, (
+                    "no rank-1 shard found to corrupt"
+                )
+                with open(_os.path.join(cpu_dir, victim_name), "wb") as f:
+                    f.write(b"\x00garbage_not_a_pickle\x00")
+            dist.barrier()
+
+            try:
+                _load_protrain_optim_dir(optim, save_dir)
+            except Exception as exc:
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+                ) as f:
+                    f.write(f"{type(exc).__name__}: {exc}")
+            else:
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
+                ) as f:
+                    f.write("load did not raise on this rank")
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        if isinstance(exc, (RuntimeError, Exception)):
+            with open(
+                _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+            ) as f:
+                f.write(f"{type(exc).__name__}: {exc}")
+            return
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_load_single_rank_failure_propagates_lockstep(tmp_path):
+    """Mode-C: rank-1's shard is corrupt -> every rank raises (no deadlock).
+
+    Regression for Finding 2. Pre-fix, rank-0 would silently load and
+    block forever on the trailing load barrier. With the fix, the
+    all-reduce SUM of per-rank load statuses raises on every rank.
+
+    Liveness witness: ``mp.spawn`` joins. If either rank deadlocked, the
+    spawn would hang and the per-test timeout would fail the test.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    try:
+        mp.spawn(
+            _worker_sharded_load_rank_failure_lockstep,
+            args=(world_size, str(tmp_path)),
+            nprocs=world_size,
+            join=True,
+        )
+    except Exception:
+        pass
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"unexpected worker errors:\n{bodies}")
+
+    caught = sorted(tmp_path.glob("rank*.caught"))
+    assert len(caught) == world_size, (
+        f"expected every rank to raise; got {[c.name for c in caught]}. "
+        f"no_raise sentinels: {[p.name for p in tmp_path.glob('rank*.no_raise')]}"
+    )
+    bodies = [c.read_text() for c in caught]
+    # At least one rank surfaces the synthetic "rank(s) failed during the
+    # per-rank phase" error from the all_reduce path; the originating
+    # rank surfaces the real torch.load error.
+    assert any(
+        "per-rank phase" in b or "rank(s) failed" in b for b in bodies
+    ), (
+        f"no rank reported the lockstep all_reduce error: {bodies}"
+    )
+
+
+def _worker_sharded_load_rejects_stray_file(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """Save normally, drop a stray ``chunk_X_rank_99.pt`` into cpu_optim/,
+    then assert load rejects on every rank.
+
+    Mirror of Mode-B's ``CHUNK_FILE_RE`` enforcement. Pre-fix, Mode-C
+    silently accepted extras (e.g. left-over shards from a higher-
+    world_size save). Post-fix, the loader enumerates cpu_optim/ and
+    rejects anything that doesn't match ``CHUNK_SHARD_FILE_RE``.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    try:
+        model, mgr, optim, host = _common_sharded_worker_setup(
+            rank, world_size, tmpdir, tag="f3stray"
+        )
+        try:
+            save_dir = _os.path.join(tmpdir, "save_root")
+            if rank == 0:
+                _os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=1,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                rank=rank,
+                world_size=world_size,
+            )
+            assert wrote is True
+            dist.barrier()
+
+            # Rank-0 plants a stray shard from a phantom higher-
+            # world_size save. The filename matches the shape of a
+            # legitimate Mode-C shard but the rank ordinal is impossible
+            # for this 2-rank load.
+            if rank == 0:
+                cpu_dir = _os.path.join(
+                    save_dir, PROTRAIN_OPTIM_DIRNAME, CPU_OPTIM_DIRNAME
+                )
+                # Pick any chunk id from the on-disk shards.
+                some_cid = None
+                for name in _os.listdir(cpu_dir):
+                    if name.endswith("_rank_0.pt"):
+                        some_cid = name.split("_")[1]
+                        break
+                assert some_cid is not None, (
+                    "no rank-0 shard found to clone"
+                )
+                stray = _os.path.join(
+                    cpu_dir, f"chunk_{int(some_cid)}_rank_99.pt"
+                )
+                # Make it a valid pickle so the loader can't reject on
+                # corruption — we want the regex check to be the gate,
+                # not torch.load.
+                torch.save({"state": {}, "param_groups": []}, stray)
+            dist.barrier()
+
+            # Every rank attempts the load. With the fix, every rank's
+            # listdir scan trips on the stray file and raises BEFORE
+            # any torch.load runs. The all_reduce then propagates so the
+            # cluster fails in lockstep.
+            try:
+                _load_protrain_optim_dir(optim, save_dir)
+            except Exception as exc:
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+                ) as f:
+                    f.write(f"{type(exc).__name__}: {exc}")
+            else:
+                with open(
+                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
+                ) as f:
+                    f.write("load did not raise")
+
+            with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
+                f.write("ok")
+        finally:
+            _teardown_mgr(mgr, optim)
+            host.close()
+            del model, optim, mgr
+    except Exception as exc:
+        if isinstance(exc, (RuntimeError, Exception)):
+            with open(
+                _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
+            ) as f:
+                f.write(f"{type(exc).__name__}: {exc}")
+            return
+        import traceback as _tb
+
+        with open(_os.path.join(tmpdir, f"rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_load_rejects_stray_file_in_cpu_optim(tmp_path):
+    """Mode-C: a stray ``chunk_X_rank_99.pt`` file makes load hard-error.
+
+    Regression for Finding 3. Mode-B already rejects unknown files via
+    ``CHUNK_FILE_RE``; Mode-C must mirror with ``CHUNK_SHARD_FILE_RE``.
+    Pre-fix, the stray file was silently tolerated because Mode-C only
+    checked "my rank's expected files exist".
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    try:
+        mp.spawn(
+            _worker_sharded_load_rejects_stray_file,
+            args=(world_size, str(tmp_path)),
+            nprocs=world_size,
+            join=True,
+        )
+    except Exception:
+        pass
+
+    err_files = list(tmp_path.glob("rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"unexpected worker errors:\n{bodies}")
+
+    caught = sorted(tmp_path.glob("rank*.caught"))
+    assert len(caught) == world_size, (
+        f"expected every rank to raise; got {[c.name for c in caught]}. "
+        f"no_raise sentinels: {[p.name for p in tmp_path.glob('rank*.no_raise')]}"
+    )
+    bodies = [c.read_text() for c in caught]
+    assert any(
+        "unexpected file" in b and "rank_99.pt" in b for b in bodies
+    ), (
+        "stray-file rejection error did not name the offending file: "
+        f"{bodies}"
+    )
