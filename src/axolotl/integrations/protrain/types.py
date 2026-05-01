@@ -308,6 +308,27 @@ class ProfilerTrace:
     # (per-op-latency sum with hook scale + roofline cap).
     steady_fwd_chunked_wall_s: float = 0.0
 
+    # ----- Block -> tree-index registry (TRACE_VERSION 16) -----
+    #
+    # Maps each global ``BlockId`` to its forward-order tree index
+    # (encoder=0, decoder=1; single-tree causal-LM models use 0
+    # exclusively). Captured at trace-construction time by walking the
+    # ``BlockTree`` list returned by
+    # :func:`axolotl.integrations.protrain.block.layout_rules.discover_blocks`
+    # and emitting ``block_id -> tree.forward_order`` for every block
+    # in flatten order. Persisting this map removes the cost model's
+    # need to parse ``OpRecord.module_path`` prefixes (``encoder.``,
+    # ``decoder.``) — that string-prefix path is brittle for any future
+    # enc-dec family with non-``encoder``/``decoder`` naming.
+    #
+    # Empty dict (default) means "unavailable" — the cost model falls
+    # back to the legacy module_path prefix parse for traces predating
+    # this field (degenerate test inputs that construct a
+    # ``ProfilerTrace`` directly without populating it). Cached traces
+    # written by an older code path are invalidated by the
+    # TRACE_VERSION bump.
+    block_tree_index: dict[BlockId, int] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Chunk layout (§3.1.1, App B.1)

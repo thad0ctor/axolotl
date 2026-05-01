@@ -95,7 +95,13 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # same measured chunked run when the final config matches.
 # Version 15 stores the EFFECTIVE phase-2 cfg after runtime construction
 # (including non-block chunk pins), not the raw bootstrap search tuple.
-TRACE_VERSION = 15
+# Version 16 adds the persisted ``block_tree_index`` field — captured at
+# trace-construction from ``discover_blocks(model)`` so the cost model
+# no longer has to parse ``OpRecord.module_path`` prefixes (``encoder.``
+# / ``decoder.``) to recover tree membership. The string-prefix path
+# stays as a fallback for degenerate test traces but cached profiles
+# carry the authoritative map.
+TRACE_VERSION = 16
 
 
 @dataclass(frozen=True)
