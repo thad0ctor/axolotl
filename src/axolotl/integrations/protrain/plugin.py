@@ -44,27 +44,210 @@ LOG = get_logger(__name__)
 _DEFAULT_PCIE_BPS = 13e9
 
 
+def _resolve_world_size_from_env() -> int:
+    """Return ``WORLD_SIZE`` from the env, defaulting to 1.
+
+    Both torchrun and Accelerate's launchers populate ``WORLD_SIZE`` /
+    ``RANK`` / ``LOCAL_RANK`` / ``MASTER_ADDR`` / ``MASTER_PORT`` before
+    the user script starts. We treat the env as the source of truth here
+    because the plugin's ``post_model_load`` runs before the trainer (and
+    thus before Accelerate) has had a chance to call
+    :func:`torch.distributed.init_process_group`.
+    """
+    import os
+
+    raw = os.environ.get("WORLD_SIZE")
+    if raw is None:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _early_init_dist_for_nccl(cfg) -> int:
+    """Initialise ``torch.distributed`` from env-derived rendezvous if needed.
+
+    Item 6 — Preflight NCCL measurement. The paper's cost model takes
+    real per-payload NCCL gather/reduce times as load-bearing inputs to
+    the search; running the searcher with empty tables drives a wrong
+    Mode-C config on multi-rank workloads. The fix: bring the process
+    group up *before* :func:`protrain_model_wrapper` so the trace's call
+    to :func:`profiler.hw_bench.measure_nccl` records real timings on
+    the live PG.
+
+    Skip rules:
+
+    * ``WORLD_SIZE <= 1`` — single-rank, no NCCL traffic. Returns 1.
+    * ``LOCAL_RANK`` / ``RANK`` unset — we are not under torchrun /
+      Accelerate's launcher, so the rendezvous env we'd need (``MASTER_ADDR``,
+      ``MASTER_PORT``) is missing. Returns 1.
+    * ``cfg.ddp_backend`` set to a non-default backend — the user has
+      asked for a specific backend; an early ``"nccl"`` init would lock
+      them out. Defer to Accelerate / HF Trainer. Returns 1.
+    * CUDA unavailable — NCCL needs GPU tensors. Returns 1.
+    * ``torch.distributed.is_initialized()`` already True — somebody
+      else (Accelerate's prior call from a previous test, a custom
+      launcher, …) brought the PG up. Returns the live world size.
+
+    Otherwise calls ``dist.init_process_group(backend="nccl")`` against
+    the env-derived rendezvous and returns the world size. Accelerate's
+    later ``Accelerator()`` constructor checks ``is_initialized()`` and
+    skips its own init when we've already brought the PG up — see
+    ``accelerate/state.py`` ``PartialState.__init__`` lines 219–244.
+
+    Returns
+    -------
+    int
+        The effective world size (1 means "treat as single-rank, do not
+        run NCCL premeasure").
+    """
+    import os
+
+    world_size = _resolve_world_size_from_env()
+    if world_size <= 1:
+        return 1
+
+    # Sanity-check the launcher provided enough env to rendezvous. A
+    # bare ``WORLD_SIZE > 1`` without ``LOCAL_RANK`` typically indicates
+    # a misconfigured manual export rather than a real torchrun-managed
+    # process; bail rather than crash inside ``init_process_group``.
+    if os.environ.get("LOCAL_RANK") is None or os.environ.get("RANK") is None:
+        LOG.warning(
+            "ProTrain: WORLD_SIZE=%d but LOCAL_RANK/RANK not set — assuming "
+            "non-launcher environment, skipping early dist init. NCCL "
+            "tables will be empty and Mode-C selection may be suboptimal.",
+            world_size,
+        )
+        return 1
+
+    # Custom backend opt-out. ``cfg.ddp_backend`` mirrors HF
+    # ``TrainingArguments.ddp_backend`` (passed through Axolotl's
+    # ``training_args.py``); when the user has specified a non-default
+    # backend, they explicitly want Accelerate / HF to own the init
+    # call, and our early ``"nccl"`` init would clobber it.
+    ddp_backend = getattr(cfg, "ddp_backend", None)
+    if ddp_backend not in (None, "", "nccl"):
+        LOG.info(
+            "ProTrain: cfg.ddp_backend=%r is non-default; skipping early "
+            "dist init. The deferred late-bind path "
+            "(_remeasure_nccl_and_research) will splice NCCL tables once "
+            "the trainer brings the PG up.",
+            ddp_backend,
+        )
+        return 1
+
+    try:
+        import torch
+        import torch.distributed as dist
+    except ImportError:
+        return 1
+
+    if not dist.is_available():
+        LOG.warning(
+            "ProTrain: torch.distributed unavailable but WORLD_SIZE=%d. "
+            "Skipping early dist init.", world_size,
+        )
+        return 1
+
+    if dist.is_initialized():
+        # Some other path (Accelerate from a prior cfg, a custom
+        # launcher) already brought the PG up. Skip our init but do
+        # surface the live world for downstream callers.
+        try:
+            return int(dist.get_world_size())
+        except (RuntimeError, ValueError):
+            return world_size
+
+    if not torch.cuda.is_available():
+        # NCCL backend requires CUDA; if we lack it, skip the init and
+        # let the late-bind path (or a Gloo-based test harness) handle
+        # it.
+        LOG.info(
+            "ProTrain: CUDA unavailable; skipping early NCCL dist init "
+            "(WORLD_SIZE=%d).", world_size,
+        )
+        return 1
+
+    # Bind this rank to its local GPU before initialising NCCL so the
+    # default device used for collectives matches the per-rank shard. HF
+    # Trainer / Accelerate normally do this themselves later, but our
+    # early ``measure_nccl`` (called by ``run_trace``) issues GPU-side
+    # collectives and must see the correct device on entry. ``LOCAL_RANK``
+    # is the per-host ordinal under torchrun; under
+    # ``CUDA_VISIBLE_DEVICES`` it indexes into the masked subset.
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+    except (ValueError, RuntimeError) as exc:
+        LOG.warning(
+            "ProTrain: torch.cuda.set_device(LOCAL_RANK=%s) failed (%s); "
+            "early dist init may pick the wrong device.",
+            os.environ.get("LOCAL_RANK"),
+            exc,
+        )
+
+    LOG.info(
+        "ProTrain: bringing up torch.distributed (backend=nccl, "
+        "world_size=%d, rank=%s, local_rank=%s) ahead of the wrapper so "
+        "the profiler trace captures real NCCL gather/reduce times "
+        "(paper §3.3 / Appendix A). Accelerate's later Accelerator() "
+        "will detect is_initialized()=True and skip re-initialising.",
+        world_size,
+        os.environ.get("RANK"),
+        os.environ.get("LOCAL_RANK"),
+    )
+    try:
+        dist.init_process_group(backend="nccl")
+    except (RuntimeError, ValueError) as exc:
+        LOG.warning(
+            "ProTrain: early dist.init_process_group(backend=nccl) failed "
+            "(%s); falling back to the late-bind NCCL re-measurement path.",
+            exc,
+        )
+        return 1
+
+    try:
+        live_world = int(dist.get_world_size())
+    except (RuntimeError, ValueError):
+        live_world = world_size
+    return live_world
+
+
 def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
     """Late-bind real NCCL timings into the cached trace, then re-run search().
 
-    The default Axolotl plugin path runs ``protrain_model_wrapper`` from
-    ``post_model_load``, which fires before Trainer / Accelerate brings
-    up the distributed process group. The profiler's
-    :func:`measure_nccl` therefore short-circuits to empty tables and
-    the trace records ``world=1`` regardless of the eventual world size.
-    Mode C (ZeRO-3 sharded) consumes the NCCL tables in
-    ``cost/runtime.estimate_runtime``; with empty tables, sharded
-    predictions under-count the per-chunk gather + reduce-scatter cost.
+    **Role under Item 6 (post-2026-04 preflight flow):** defensive
+    fallback. The primary path now lives in
+    :func:`_early_init_dist_for_nccl` + :func:`post_model_load`: the
+    plugin brings the process group up *before* invoking the wrapper,
+    so the trace's call to :func:`profiler.hw_bench.measure_nccl`
+    captures real NCCL times on the live PG and the search picks the
+    correct config from the start. This helper still runs from
+    ``post_trainer_create`` to handle the cases where early init was
+    skipped — non-default ``cfg.ddp_backend``, user-supplied process
+    group, CPU-only test runs that bring up Gloo later, etc. — so the
+    cost model is never left consuming empty tables on a real
+    multi-rank workload. With the early-init path active, this branch
+    is normally a no-op (the trace's NCCL tables are populated and the
+    idempotency check below short-circuits).
 
-    This helper, invoked from ``post_trainer_create`` once dist is up,
-    measures NCCL on the live process group, splices the new tables and
-    actual world size into the cached trace, persists the updated trace
-    under a new cache key (so the next multi-rank run skips the
-    re-measurement), and re-runs ``search()`` with the same layout +
-    capacity + hardware profile. If the new search picks a different
-    ``cfg`` or ``block_map`` the WrappedModel's ``search_result`` is
-    overwritten and a WARN is logged — but the chunk manager itself is
-    NOT rebuilt. The optimizer state slots are already wired into the
+    The legacy commentary, retained for context: previously the default
+    Axolotl plugin path ran ``protrain_model_wrapper`` from
+    ``post_model_load`` *before* dist init, so the profiler short-circuited
+    to empty tables and the trace recorded ``world=1`` regardless of the
+    eventual world size. Mode C (ZeRO-3 sharded) consumes the NCCL tables
+    in ``cost/runtime.estimate_runtime``; with empty tables, sharded
+    predictions under-counted the per-chunk gather + reduce-scatter cost.
+
+    On invocation, the helper measures NCCL on the live process group,
+    splices the new tables and actual world size into the cached trace,
+    persists the updated trace under a new cache key, and re-runs
+    ``search()`` with the same layout + capacity + hardware profile. If
+    the new search picks a different ``cfg`` or ``block_map`` the
+    WrappedModel's ``search_result`` is overwritten and a DEBUG (was
+    WARNING pre-Item 6) is logged — but the chunk manager itself is NOT
+    rebuilt. The optimizer state slots are already wired into the
     trainer; rebuilding mid-flight would invalidate them. The updated
     SearchResult exists so any future cost-model-based decisions
     (telemetry, dynamic re-tuning) reflect real comm cost.
@@ -177,14 +360,24 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
         or new_result.block_map != wrapped.search_result.block_map
     )
     if cfg_changed:
-        LOG.warning(
+        # With Item 6's preflight NCCL measurement (early
+        # ``dist.init_process_group`` in ``post_model_load``), the late
+        # re-search should normally be a no-op: the trace already
+        # carries real NCCL tables and the search runs on accurate cost
+        # inputs. Hitting this branch implies either the early init was
+        # skipped (custom backend, single-rank → multi-rank weirdness)
+        # or the late path is plumbed against a different PG. Logged at
+        # DEBUG since it's expected-rare under the new flow; bump to
+        # INFO/WARN locally if you're debugging the late-bind path.
+        LOG.debug(
             "ProTrain: post-NCCL search picked a different config than "
-            "the empty-tables prediction. cfg %s -> %s; updating "
+            "the bootstrap prediction. cfg %s -> %s; updating "
             "WrappedModel.search_result for telemetry but NOT rebuilding "
             "chunk_manager (optimizer slots are already wired). The "
             "running step uses the bootstrap config; future runs will "
             "hit the multi-rank cache and pick the new config from the "
-            "start.",
+            "start. Reaching this branch suggests early dist init was "
+            "skipped — check cfg.ddp_backend / launcher env.",
             wrapped.search_result.cfg,
             new_result.cfg,
         )
@@ -251,7 +444,24 @@ def _build_hardware_profile(cfg):
     pcie_h2d_bps = _DEFAULT_PCIE_BPS
     pcie_d2h_bps = _DEFAULT_PCIE_BPS
 
-    world_size = max(1, int(torch.cuda.device_count()))
+    # Prefer the live process group when one is up (set by our early
+    # init in ``post_model_load`` for multi-rank torchrun runs). Fall
+    # back to ``WORLD_SIZE`` env (also accurate under torchrun) and
+    # finally to ``device_count()`` for raw single-host inference cases.
+    # ``device_count()`` is per-rank under torchrun (= 1 with
+    # CUDA_VISIBLE_DEVICES masking) so it under-reports the total world,
+    # which is the bug the early-init path repairs.
+    try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            world_size = max(1, int(_dist.get_world_size()))
+        else:
+            world_size = max(
+                _resolve_world_size_from_env(),
+                int(torch.cuda.device_count()),
+            )
+    except ImportError:
+        world_size = max(1, int(torch.cuda.device_count()))
 
     # Mirror protrain_model_wrapper's zero3_shard auto-detect so the
     # searcher's CPU-footprint accounting lines up with the runtime's
@@ -330,11 +540,37 @@ class ProTrainPlugin(BasePlugin):
         Silently no-ops when the plugin is inactive (see
         ``_is_plugin_active``). Called after LoRA adapters are attached
         so persistent-chunk sizing reflects the trainable surface.
+
+        Item 6 — Preflight NCCL measurement. Before invoking
+        :func:`protrain_model_wrapper` we attempt to bring the
+        ``torch.distributed`` process group up via
+        :func:`_early_init_dist_for_nccl` so the profiler trace captures
+        real NCCL gather/reduce timings on the live PG (paper §3.3).
+        Skipped on single-rank, on non-default ``cfg.ddp_backend``, on
+        non-CUDA hosts, and when the PG is already initialised.
         """
         if not _is_plugin_active(cfg):
             return
 
+        # Idempotency: ``post_model_load`` may fire more than once in
+        # some test harness configurations (re-runnable trainer
+        # bootstrap). The wrapper itself is cheap-but-not-free to repeat
+        # (re-measurement, allocator churn) and re-running it would
+        # invalidate the chunk-manager handles already stashed on cfg.
+        if getattr(cfg, "_protrain_wrapped", None) is not None:
+            LOG.debug(
+                "ProTrain: post_model_load called with _protrain_wrapped "
+                "already populated; skipping re-wrap (idempotent path)."
+            )
+            return
+
         from axolotl.integrations.protrain.api import protrain_model_wrapper
+
+        # Bring up dist.init *before* building the hardware profile so
+        # ``_build_hardware_profile`` can report the true world size and
+        # ``protrain_model_wrapper.run_trace`` (which calls
+        # ``measure_nccl`` internally) sees the live PG.
+        _early_init_dist_for_nccl(cfg)
 
         hw = _build_hardware_profile(cfg)
 
