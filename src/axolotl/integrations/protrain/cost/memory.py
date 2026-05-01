@@ -110,13 +110,16 @@ def hot_iter_peak_cap(
     return None
 
 
-#: Pool sizing knob mirrored from ``block.swap_pool.ActivationSwapPool``.
-#: The pool holds ``n_swap * SWAP_PREFETCH_DEPTH`` activation slots.
-#: Kept in sync with the wrapper's default (option 2A minimum-viable
-#: single-block lookahead = 2). When tuning this, update both this
-#: constant AND the model_wrapper's ``ActivationSwapPool(prefetch_depth=...)``
-#: argument so the cost model reflects the runtime pool sizing.
+#: Pool sizing knobs mirrored from ``block.swap_pool.ActivationSwapPool``.
+#: The pool holds ``n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH``
+#: activation slots, each sized to the worst-case single-saved-tensor
+#: bytes across the swap-band. Kept in sync with the wrapper's defaults
+#: (single-block lookahead = 2; K=8 saved tensors per block forward).
+#: When tuning these, update both these constants AND the
+#: model_wrapper's ``ActivationSwapPool(prefetch_depth=..., slots_per_block=...)``
+#: arguments so the cost model reflects the runtime pool sizing.
 SWAP_PREFETCH_DEPTH: int = 2
+SWAP_SLOTS_PER_BLOCK: int = 8
 
 
 def estimate_cpu_footprint(
@@ -139,10 +142,18 @@ def estimate_cpu_footprint(
     * max_swap_band_activation_bytes`` of pinned CPU. This term is
     **per-rank** and **NOT divided by gpu_count** — the swap pool is
     a rank-local allocation; sharding does not split activations
-    across ranks. When ``trace`` is None we conservatively use the
-    average across all blocks as a proxy (used by callers that want a
-    pre-search ballpark; the searcher itself always passes ``trace``
-    so the gate matches the real wrap-time pool size).
+    across ranks. The aggregate per-block activation bytes is split
+    across ``SWAP_SLOTS_PER_BLOCK`` slots in the actual pool (M5+
+    ``saved_tensors_hooks`` integration), but the **total** pinned
+    bytes per block is unchanged from option-2A: K slots each sized
+    to ``aggregate / K`` ≡ one slot sized to ``aggregate``. The
+    factoring matters for slot-fit correctness (a too-small slot
+    rejects a single tensor that exceeds it), not for the CPU-bytes
+    gate the searcher consults. When ``trace`` is None we
+    conservatively use the average across all blocks as a proxy (used
+    by callers that want a pre-search ballpark; the searcher itself
+    always passes ``trace`` so the gate matches the real wrap-time
+    pool size).
 
     This accounting is **orthogonal to** :func:`estimate_peak`, which
     models GPU memory: the gather materializes the full chunk on GPU

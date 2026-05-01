@@ -24,12 +24,16 @@ or ``WrappedModel`` GC, releasing the pinned region.
 
 Sizing
 ------
-``slot_bytes`` is the worst-case activation bytes per SWAP block (the
-maximum across the searcher's chosen swap-band of blocks). ``n_slot``
-is ``n_swap * prefetch_depth``: each SWAP block needs ``prefetch_depth``
-slots in flight (one for the activation in CPU residency, plus one for
-each pre-fetched H2D buffer the scheduler stages). For ``option 2A``
-(minimum-viable single-block lookahead) ``prefetch_depth = 2``.
+``slot_bytes`` is the worst-case activation bytes for a *single* saved
+tensor inside any SWAP block (the maximum across the searcher's chosen
+swap-band of blocks). ``n_slot`` is ``n_swap * slots_per_block *
+prefetch_depth`` where ``slots_per_block`` (K) is the number of saved
+tensors a single block forward can produce — typically the residual
+stream + Q/K/V/scores + FFN intermediates ≈ 6–8 tensors. K=8 is the
+default; the model wrapper may bump it for unusual block shapes. For
+the M5+ ``saved_tensors_hooks`` integration each saved tensor inside
+a block forward needs its own slot, so K cannot be 1 anymore.
+``prefetch_depth = 2`` keeps single-block lookahead during backward.
 """
 
 from __future__ import annotations
@@ -45,6 +49,13 @@ if TYPE_CHECKING:
 LOG = get_logger(__name__)
 
 
+#: Default number of saved tensors per block. Transformer blocks
+#: typically save residual + Q/K/V/scores + 2-3 FFN intermediates ≈ 6-8.
+#: Bumped to 8 to cover unusual shapes (gated FFN, MoE) without
+#: exhausting the pool. Tunable via ``ActivationSwapPool(slots_per_block=...)``.
+DEFAULT_SLOTS_PER_BLOCK: int = 8
+
+
 class ActivationSwapPool:
     """Fixed-size pinned-host slot pool for SWAP-block activations.
 
@@ -54,15 +65,28 @@ class ActivationSwapPool:
         Number of SWAP blocks the searcher selected. Must be ``>= 1``;
         callers should not construct a pool when ``n_swap == 0``.
     slot_bytes:
-        Worst-case activation bytes per SWAP block, in bytes. The pool
-        sizes every slot to exactly this value so any SWAP block's
-        activation fits any slot.
+        Worst-case bytes for a single saved tensor inside any SWAP
+        block. The pool sizes every slot to exactly this value so any
+        saved tensor fits any slot.
     prefetch_depth:
-        How many slots per SWAP block to keep in flight. ``2`` is the
-        minimum-viable single-block lookahead (one slot holds the
-        currently-resident CPU copy, one slot is being H2D-fetched for
-        the next block in backward). ``1`` collapses to fully-serial
-        SWAP — only useful for unit tests.
+        How many copies-per-block to keep in flight during backward.
+        ``2`` is single-block lookahead (one block's saved tensors
+        currently resident on CPU, one being H2D-fetched for the next
+        backward step). ``1`` collapses to fully-serial SWAP — only
+        useful for unit tests.
+    slots_per_block:
+        How many saved tensors per block-forward call to budget for.
+        Default is :data:`DEFAULT_SLOTS_PER_BLOCK` (8). Total slots =
+        ``n_swap * slots_per_block * prefetch_depth``.
+
+    Bounds
+    ------
+    Max in-flight slots = ``n_swap * slots_per_block * prefetch_depth``.
+    Total pinned host bytes = ``n_slot * slot_bytes``. Both terms scale
+    linearly with K (slots_per_block); setting K too high wastes
+    pinned RAM, setting it too low triggers ``RuntimeError("exhausted")``
+    inside the swap pack hook (which the wrapper degrades to "keep on
+    GPU" — correct but defeats the memory savings).
 
     Notes
     -----
@@ -76,7 +100,11 @@ class ActivationSwapPool:
     """
 
     def __init__(
-        self, n_swap: int, slot_bytes: int, prefetch_depth: int = 2
+        self,
+        n_swap: int,
+        slot_bytes: int,
+        prefetch_depth: int = 2,
+        slots_per_block: int = DEFAULT_SLOTS_PER_BLOCK,
     ) -> None:
         if n_swap < 1:
             raise ValueError(f"n_swap must be >= 1, got {n_swap}")
@@ -86,11 +114,16 @@ class ActivationSwapPool:
             raise ValueError(
                 f"prefetch_depth must be >= 1, got {prefetch_depth}"
             )
+        if slots_per_block < 1:
+            raise ValueError(
+                f"slots_per_block must be >= 1, got {slots_per_block}"
+            )
 
         self.n_swap = int(n_swap)
         self.slot_bytes = int(slot_bytes)
         self.prefetch_depth = int(prefetch_depth)
-        self.n_slot = self.n_swap * self.prefetch_depth
+        self.slots_per_block = int(slots_per_block)
+        self.n_slot = self.n_swap * self.slots_per_block * self.prefetch_depth
 
         # Backing pinned-host region (split into ``n_slot`` equal slots).
         self._pinned = PinnedHostMemory(
@@ -107,10 +140,11 @@ class ActivationSwapPool:
 
         LOG.debug(
             "ActivationSwapPool: n_swap=%d slot_bytes=%d prefetch_depth=%d "
-            "n_slot=%d total_bytes=%d precise=%s",
+            "slots_per_block=%d n_slot=%d total_bytes=%d precise=%s",
             self.n_swap,
             self.slot_bytes,
             self.prefetch_depth,
+            self.slots_per_block,
             self.n_slot,
             self.n_slot * self.slot_bytes,
             self._pinned.is_precise_size,
@@ -193,4 +227,4 @@ class ActivationSwapPool:
             pass
 
 
-__all__ = ["ActivationSwapPool"]
+__all__ = ["ActivationSwapPool", "DEFAULT_SLOTS_PER_BLOCK"]
