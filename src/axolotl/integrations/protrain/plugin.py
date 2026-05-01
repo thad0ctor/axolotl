@@ -796,21 +796,28 @@ class ProTrainPlugin(BasePlugin):
             verify_replicated = bool(
                 getattr(cfg, "protrain_save_optim_verify_replicated", False)
             )
+            allow_online_reshard = bool(
+                getattr(cfg, "protrain_allow_online_reshard", False)
+            )
             trainer.add_callback(
                 make_checkpoint_callback(
                     save_max_bytes=save_max,
                     verify_replicated=verify_replicated,
                 )
             )
-            install_load_hook(trainer, optim)
+            install_load_hook(
+                trainer, optim, allow_online_reshard=allow_online_reshard
+            )
             LOG.info(
                 "ProTrain: optimizer-state checkpointing enabled "
-                "(save_max_bytes=%d ~= %.2f GiB, verify_replicated=%s). "
+                "(save_max_bytes=%d ~= %.2f GiB, verify_replicated=%s, "
+                "allow_online_reshard=%s). "
                 "Save side: ProTrainOptimizerCheckpointCallback. "
                 "Load side: trainer._load_optimizer_and_scheduler patched.",
                 save_max,
                 save_max / 1024**3,
                 verify_replicated,
+                allow_online_reshard,
             )
 
         # ---- DDP composition detection ----------------------------------

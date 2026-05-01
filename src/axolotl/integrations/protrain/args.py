@@ -245,6 +245,35 @@ class ProTrainArgs(BaseModel):
         },
     )
 
+    protrain_allow_online_reshard: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": (
+                "Mode-C (ZeRO-3 sharded) only: if True, allow the load "
+                "path to automatically reshard a saved Mode-C checkpoint "
+                "from its saved world_size to the current run's "
+                "world_size. Default False — a world_size mismatch hard-"
+                "errors and points the user at the offline reshard tool "
+                "(``python -m scripts.protrain.reshard_optim``). The opt-"
+                "in is off by default because (a) resharding mutates "
+                "files in (or under) the checkpoint dir before loading, "
+                "(b) silent automatic resharding could mask "
+                "configuration drift the user actually wanted to know "
+                "about. When True, on world_size mismatch rank-0 invokes "
+                "the same reshard logic as the offline tool against a "
+                "temp dir (``<saved-protrain_optim>/.reshard_to_N<W>/``), "
+                "all ranks barrier, then load from the temp dir using "
+                "the existing same-world-size load path. Cleanup runs "
+                "on successful load; failures leave the temp dir for "
+                "post-mortem. Mode-B replicated saves do not need this "
+                "knob — they already tolerate world_size drift natively "
+                "(CHECKPOINT_DESIGN_PHASE2.md §4.1 Option B). The reshard "
+                "logic is the offline tool's: see "
+                "``src/axolotl/integrations/protrain/api/reshard.py``."
+            )
+        },
+    )
+
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------

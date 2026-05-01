@@ -357,19 +357,50 @@ shape mismatch deep in `load_state_dict`.
 
 ### 4.1 World-size mismatch policy
 
-Three options, picking one in §8:
+Three options:
 
 | Option | Behavior | Tradeoff |
 |---|---|---|
 | **A** | Hard error if saved world_size ≠ current | Safest. User must resume with the same job shape. Awkward if hardware changes. |
-| **B** | Allow Mode-B replicated load into different world_size | Replicated state is shape-independent of world_size, so this is mathematically fine. Different world_size only affects gradient distribution, not optimizer state. Reasonable for Mode-B. Hard error stays for Mode-C. |
-| **C** | Migration path for both: re-shard saved state on load if Mode-C and world_size changed | Lots of code (re-shard logic on disk → memory → re-distribute). Not warranted for Phase 2's first ship. |
+| **B** | Allow Mode-B replicated load into different world_size | Replicated state is shape-independent of world_size, so this is mathematically fine. Different world_size only affects gradient distribution, not optimizer state. Reasonable for Mode-B. |
+| **C** | Migration path for Mode-C: re-shard saved state on load when world_size changed | Originally rejected as "lots of code, not warranted for Phase 2's first ship." |
 
-**Recommendation:** Option B. Mode-B replicated + world_size change
-is harmless; Mode-C requires identical world_size for the shard
-arithmetic to work without re-sharding. The Phase 1 hard error stays
-for cases where saved.zero3_shard ≠ current.zero3_shard or current
-world_size != 1 with sharded data not present.
+**Implemented (post-Phase-2-first-ship):** **Option B + opt-in
+Option C.** Mode-B replicated + world_size change is harmless and
+implemented as in the original recommendation. Mode-C now has two
+recovery routes for cross-world-size resume; the user picks one
+explicitly:
+
+* **Default — offline:** the load path hard-errors on
+  `saved_world != current_world` and points the user at
+  `scripts/protrain/reshard_optim.py`. The CLI runs offline (no GPUs,
+  no `torch.distributed`) and produces a fresh directory at the new
+  world_size. The user then resumes against that directory.
+* **Opt-in — online:** when the user sets
+  `protrain_allow_online_reshard: True` in the ProTrain config, the
+  same reshard logic runs in-process at load time. Rank-0 reshards
+  into a temp dir under `<saved-protrain_optim>/.reshard_to_N<W>/`,
+  every rank `dist.barrier()`s (the failure protocol mirrors the
+  Mode-C save's lockstep `_broadcast_status_or_raise` so a rank-0
+  reshard failure surfaces on every rank, not just rank-0), and the
+  load proceeds against the temp dir as if it were a natively-saved-
+  at-N=W checkpoint. Cleanup runs after a successful load; failures
+  leave the temp dir for post-mortem inspection. **Off by default**
+  because (i) silent automatic resharding can mask configuration
+  drift the user might want to be told about, and (ii) writing files
+  in (or under) the checkpoint dir as a side-effect of "load" is
+  surprising — explicit opt-in keeps the surface conservative.
+
+The reshard logic is a single source of truth shared by both routes:
+`src/axolotl/integrations/protrain/api/reshard.py` exposes
+`reshard_mode_c_shards(src_dir, dst_dir, target_world_size)`, which
+the CLI loads via file-path-based `importlib` (preserving the "no
+heavy axolotl imports" property that makes the CLI runnable on a
+vanilla CPU host) and the load path imports normally.
+
+The Phase 1 hard error stays for cases where
+`saved.zero3_shard ≠ current.zero3_shard` or for save-mode
+mismatches (replicated ↔ sharded — see §4.2).
 
 ### 4.2 Save-mode mismatch policy
 

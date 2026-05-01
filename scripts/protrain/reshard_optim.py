@@ -1,44 +1,25 @@
 """Offline cross-world-size reshard tool for Mode-C optimizer state.
 
+Thin CLI wrapper around the core reshard logic at
+``src/axolotl/integrations/protrain/api/reshard.py``. The same logic
+also runs in-process from the load path when the user opts in via
+``protrain_allow_online_reshard=True`` (see ``api/checkpoint.py`` Mode-C
+branch). Keeping a single source of truth means the offline and online
+paths cannot drift on shard arithmetic.
+
 ProTrain Phase 2 Mode-C (ZeRO-3 sharded) saves a per-rank slice of every
 non-persistent chunk's CPU Adam state to ``chunk_<N>_rank_<R>.pt``. The
 load path hard-errors when ``saved_world_size != current_world_size``
-(api/checkpoint.py:_load_protrain_optim_dir, the Mode-C branch) because
-the shard arithmetic depends on world_size. Online resharding is
-intentionally out of scope (CHECKPOINT_DESIGN_PHASE2.md §4.1) — too
-brittle: re-running the shard partition mid-load would touch every
-DeepSpeedCPUAdam instance, and any error during the redistribution
-would leave the cluster's optimizer in an inconsistent state.
+unless the user opts in to online reshard. This tool is the offline
+alternative — runs without GPUs, without ``torch.distributed``, and
+without the heavyweight axolotl import chain (transformers, etc.) so
+the conversion can happen on a CPU-only host.
 
-This tool runs offline (no GPUs, no torch.distributed) and produces a
-new ``protrain_optim/`` directory at a different world_size. The
-resulting directory looks identical to a natively-saved-at-N2
-checkpoint from the loader's POV: the load path's region descriptors
-and per-rank shard files are regenerated for the new world_size, the
-``protrain_world_size`` metadata field is updated, and the
-``protrain_layout_signature`` is recomputed from the persisted
-``layout_fingerprint`` dict.
-
-Per-region resharding maths (paper's ZeRO-3 sharding rule):
-
-* Each region holds ``region_bytes`` of valid state plus padding to
-  ``region_bytes_padded = ceil(region_bytes / lcm(elem_size, W)) *
-  lcm(elem_size, W)`` so ``shard_bytes = region_bytes_padded / W`` is
-  a clean element-aligned slice. The valid prefix length
-  ``region_bytes / element_size`` is independent of W.
-* For each region, concatenate the N1 saved per-rank ``exp_avg`` (and
-  ``exp_avg_sq``) tensors → flat tensor of length
-  ``region_bytes_padded_old / elem_size``.
-* The first ``region_bytes / elem_size`` elements are valid. Trailing
-  bytes are padding; on a clean save they are zero (the materialize
-  pad-zero plus zero gradient on padding bytes means Adam never
-  updates those positions).
-* Build a fresh tensor of length ``region_bytes_padded_new /
-  elem_size``, copy the valid prefix, zero-pad the rest, and split
-  into N2 contiguous slices of length ``shard_bytes_new / elem_size``
-  each. Slice ``r2`` becomes the new rank ``r2``'s state for that
-  region.
-* The Adam ``step`` scalar is rank-replicated; we copy it as-is.
+To preserve the "no-axolotl-imports" property, the script loads
+``api/reshard.py`` via ``importlib.util.spec_from_file_location`` rather
+than the regular ``from axolotl... import`` path — that avoids firing
+the package's ``__init__.py`` chain (``protrain/__init__.py`` pulls in
+plugin.py, which transitively imports transformers).
 
 Usage::
 
@@ -56,430 +37,50 @@ natively, see CHECKPOINT_DESIGN_PHASE2.md §4.1 Option B).
 from __future__ import annotations
 
 import argparse
-import json
-import math
+import importlib.util
 import os
-import re
-import shutil
 import sys
-from typing import Any
-
-import torch
+import types
 
 
-# ---- Constants mirrored from api/checkpoint.py ----------------------------
-# We deliberately avoid importing the api module so this script can run on
-# a host that lacks the heavy axolotl import chain (transformers, etc.).
+def _load_reshard_module() -> types.ModuleType:
+    """Load the core reshard module by file path.
 
-METADATA_FILENAME = "metadata.json"
-GPU_OPTIM_FILENAME = "gpu_optim.pt"
-CPU_OPTIM_DIRNAME = "cpu_optim"
-SCHEMA_FORMAT_VERSION = 2
-SAVE_MODE_SHARDED = "sharded"
-CHUNK_SHARD_FILE_RE = re.compile(r"^chunk_(\d+)_rank_(\d+)\.pt$")
+    Why not ``from axolotl.integrations.protrain.api.reshard import
+    reshard_mode_c_shards``? Because that path fires
+    ``axolotl/integrations/protrain/__init__.py``, which pulls in
+    plugin.py, which transitively imports transformers — defeating the
+    "this script runs on a vanilla CPU box" property documented above.
 
-_DTYPE_NAME_TO_TORCH: dict[str, torch.dtype] = {
-    "torch.float16": torch.float16,
-    "torch.bfloat16": torch.bfloat16,
-    "torch.float32": torch.float32,
-    "torch.float64": torch.float64,
-    "torch.float": torch.float32,
-    "torch.half": torch.float16,
-    "torch.double": torch.float64,
-}
-
-
-# ---- Layout signature ------------------------------------------------------
-
-
-def _layout_signature_from_fingerprint(fingerprint: dict[str, Any]) -> str:
-    """SHA-256 over a layout fingerprint dict.
-
-    Mirrors :func:`api.checkpoint._layout_signature_from_fingerprint`.
-    Re-implemented here so this script does not pull in the heavyweight
-    api module's transitive imports. The two implementations must stay
-    byte-compatible — the loader recomputes the expected signature using
-    the api version, so any drift would trip the layout-signature check.
+    ``importlib.util.spec_from_file_location`` loads the file as an
+    isolated module without traversing the package hierarchy.
     """
-    import hashlib
-
-    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-# ---- Per-region reshard ----------------------------------------------------
-
-
-def _padded_region_bytes(region_bytes: int, elem_size: int, world_size: int) -> int:
-    """``ceil(region_bytes / lcm(elem_size, world_size)) * lcm(...)``.
-
-    Mirrors the formula in ``ChunkManager.materialize_offload`` (chunk/
-    manager.py around the ``region_plans`` block). Must stay
-    byte-compatible — the loader's region-layout match step compares
-    against the runtime's ``region_bytes_padded`` and any drift would
-    trip the regions_per_chunk validation.
-    """
-    pad_unit = (elem_size * world_size) // math.gcd(elem_size, world_size)
-    return ((region_bytes + pad_unit - 1) // pad_unit) * pad_unit
-
-
-def _reshard_region_state(
-    per_rank_tensors: list[torch.Tensor],
-    *,
-    region_bytes: int,
-    elem_size: int,
-    src_world: int,
-    dst_world: int,
-    region_bytes_padded_old: int | None = None,
-    region_bytes_padded_new: int | None = None,
-) -> list[torch.Tensor]:
-    """Reshard one region's per-rank state tensor (e.g. ``exp_avg``) from
-    ``src_world`` ranks to ``dst_world`` ranks.
-
-    Inputs
-    ------
-    per_rank_tensors:
-        List of length ``src_world`` of 1-D tensors, all with the same
-        dtype and length ``shard_bytes_old / elem_size``.
-    region_bytes:
-        Un-padded valid bytes of the region (constant across world
-        sizes).
-    elem_size:
-        ``dtype.itemsize`` for the region.
-    region_bytes_padded_old / region_bytes_padded_new:
-        If supplied (typically from the saved metadata), use these
-        directly instead of recomputing — guards against any drift
-        between the script's pad formula and the runtime's.
-
-    Output
-    ------
-    List of length ``dst_world`` of 1-D tensors, all with the same dtype
-    as the inputs and length ``shard_bytes_new / elem_size``.
-    """
-    if len(per_rank_tensors) != src_world:
-        raise RuntimeError(
-            f"reshard: expected {src_world} per-rank tensors, got "
-            f"{len(per_rank_tensors)}"
-        )
-    dtype = per_rank_tensors[0].dtype
-    for t in per_rank_tensors:
-        if t.dtype != dtype:
-            raise RuntimeError(
-                f"reshard: per-rank tensors have inconsistent dtypes "
-                f"({dtype} vs {t.dtype}) — refusing to mix"
-            )
-
-    if region_bytes_padded_old is None:
-        region_bytes_padded_old = _padded_region_bytes(
-            region_bytes, elem_size, src_world
-        )
-    if region_bytes_padded_new is None:
-        region_bytes_padded_new = _padded_region_bytes(
-            region_bytes, elem_size, dst_world
-        )
-
-    expected_old_shard_numel = (region_bytes_padded_old // src_world) // elem_size
-    for r, t in enumerate(per_rank_tensors):
-        if t.numel() != expected_old_shard_numel:
-            raise RuntimeError(
-                f"reshard: per-rank tensor {r} has numel={t.numel()}, "
-                f"expected {expected_old_shard_numel} "
-                f"(region_bytes_padded={region_bytes_padded_old}, "
-                f"elem_size={elem_size}, src_world={src_world})"
-            )
-
-    # Concatenate to the full padded region tensor (length
-    # region_bytes_padded_old / elem_size).
-    full_old = torch.cat(per_rank_tensors, dim=0).contiguous()
-
-    # Valid prefix length is independent of world_size.
-    valid_numel = region_bytes // elem_size
-
-    # Build the new padded region (length region_bytes_padded_new /
-    # elem_size). Copy the valid prefix from full_old; zero-pad the
-    # rest. Pre-step the per-rank tensors are zero-init and the full
-    # tensor is also zero in [valid_numel, padded_old / elem_size); we
-    # don't preserve those padding bytes since they're not load-bearing
-    # (Adam never reads/writes the padding positions for a clean run —
-    # see chunk/manager.py:802 zero-init of cpu_region_grad and the
-    # zero-pad of region_scratch at materialize_offload).
-    new_padded_numel = region_bytes_padded_new // elem_size
-    full_new = torch.zeros(new_padded_numel, dtype=dtype)
-    full_new[:valid_numel] = full_old[:valid_numel]
-
-    new_shard_numel = (region_bytes_padded_new // dst_world) // elem_size
-    out: list[torch.Tensor] = []
-    for r in range(dst_world):
-        start = r * new_shard_numel
-        end = start + new_shard_numel
-        # Clone so each output slice owns its own storage (defensive —
-        # the slices end up serialized via torch.save which deep-copies,
-        # but consumer code may inspect intermediates in tests).
-        out.append(full_new[start:end].clone())
-    return out
-
-
-# ---- Driver ---------------------------------------------------------------
-
-
-def _read_metadata(src_dir: str) -> dict[str, Any]:
-    meta_path = os.path.join(src_dir, METADATA_FILENAME)
-    if not os.path.isfile(meta_path):
-        raise RuntimeError(f"reshard: missing metadata at {meta_path!r}")
-    with open(meta_path) as f:
-        return json.load(f)
-
-
-def _validate_src_metadata(meta: dict[str, Any]) -> None:
-    fmt = int(meta.get("format_version", 0))
-    if fmt != SCHEMA_FORMAT_VERSION:
-        raise RuntimeError(
-            f"reshard: source format_version={fmt}, expected "
-            f"{SCHEMA_FORMAT_VERSION}. Only Phase-2 v2 saves are supported."
-        )
-    save_mode = meta.get("protrain_save_mode")
-    if save_mode != SAVE_MODE_SHARDED:
-        raise RuntimeError(
-            f"reshard: source save_mode={save_mode!r}, expected "
-            f"{SAVE_MODE_SHARDED!r}. Mode-B replicated saves do not need "
-            "resharding (the load path tolerates world_size drift "
-            "natively — see CHECKPOINT_DESIGN_PHASE2.md §4.1 Option B)."
-        )
-    if "regions_per_chunk" not in meta:
-        raise RuntimeError(
-            "reshard: source metadata missing 'regions_per_chunk'. The "
-            "save predates Mode-C support or the file is corrupt."
-        )
-    if "layout_fingerprint" not in meta:
-        raise RuntimeError(
-            "reshard: source metadata missing 'layout_fingerprint'. The "
-            "save predates the offline reshard support — re-save under a "
-            "newer ProTrain build to capture the raw layout fields."
-        )
-
-
-def _scan_src_chunks(src_dir: str, src_world: int) -> dict[int, list[str]]:
-    """Return ``{chunk_id: [path_for_rank0, path_for_rank1, ...]}``."""
-    cpu_dir = os.path.join(src_dir, CPU_OPTIM_DIRNAME)
-    if not os.path.isdir(cpu_dir):
-        return {}
-    by_chunk: dict[int, dict[int, str]] = {}
-    for name in sorted(os.listdir(cpu_dir)):
-        m = CHUNK_SHARD_FILE_RE.match(name)
-        if m is None:
-            raise RuntimeError(
-                f"reshard: unexpected file {name!r} in {cpu_dir!r} — "
-                "Mode-C cpu_optim/ must contain only chunk_<N>_rank_<R>.pt"
-            )
-        cid = int(m.group(1))
-        rank = int(m.group(2))
-        if rank < 0 or rank >= src_world:
-            raise RuntimeError(
-                f"reshard: file {name!r} rank ordinal {rank} outside "
-                f"[0, {src_world}) — corrupt source dir."
-            )
-        by_chunk.setdefault(cid, {})[rank] = os.path.join(cpu_dir, name)
-
-    out: dict[int, list[str]] = {}
-    for cid, by_rank in by_chunk.items():
-        if set(by_rank.keys()) != set(range(src_world)):
-            missing = set(range(src_world)) - set(by_rank.keys())
-            raise RuntimeError(
-                f"reshard: chunk {cid} missing per-rank shards for "
-                f"ranks {sorted(missing)}"
-            )
-        out[cid] = [by_rank[r] for r in range(src_world)]
-    return out
-
-
-def reshard(src_dir: str, dst_dir: str, target_world: int) -> None:
-    """Top-level driver. Reads ``src_dir``, writes ``dst_dir`` at
-    ``target_world`` ranks.
-
-    Idempotent at the dst_dir level — overwrites whatever is at
-    ``dst_dir/cpu_optim/chunk_*`` and ``dst_dir/metadata.json``, but
-    refuses to overwrite a non-empty dst_dir without confirmation. The
-    caller is responsible for ensuring ``dst_dir`` is fresh.
-    """
-    if target_world < 1:
-        raise ValueError(f"target_world must be >= 1 (got {target_world})")
-
-    meta = _read_metadata(src_dir)
-    _validate_src_metadata(meta)
-
-    src_world = int(meta["protrain_world_size"])
-    if src_world == target_world:
-        # Nothing to do; just copy. We still emit a fresh dst_dir for
-        # consistency with the "always produce a complete dir" contract.
-        print(
-            f"reshard: src_world == target_world == {src_world}; "
-            "copying source directory verbatim",
-            file=sys.stderr,
-        )
-
-    print(
-        f"reshard: src={src_dir!r} dst={dst_dir!r} "
-        f"src_world={src_world} target_world={target_world}",
-        file=sys.stderr,
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))  # scripts/protrain → repo
+    target = os.path.join(
+        repo_root,
+        "src",
+        "axolotl",
+        "integrations",
+        "protrain",
+        "api",
+        "reshard.py",
     )
-
-    os.makedirs(dst_dir, exist_ok=True)
-    cpu_src_dir = os.path.join(src_dir, CPU_OPTIM_DIRNAME)
-    cpu_dst_dir = os.path.join(dst_dir, CPU_OPTIM_DIRNAME)
-
-    # Replicated artifacts: gpu_optim.pt is rank-independent (same on
-    # every rank in Mode-C), so just copy it.
-    src_gpu = os.path.join(src_dir, GPU_OPTIM_FILENAME)
-    if os.path.isfile(src_gpu):
-        shutil.copyfile(src_gpu, os.path.join(dst_dir, GPU_OPTIM_FILENAME))
-
-    saved_regions: dict[str, list[dict[str, Any]]] = meta["regions_per_chunk"]
-
-    # Build fresh regions_per_chunk for the target world_size — only
-    # region_bytes_padded and shard_bytes change with world_size.
-    new_regions: dict[str, list[dict[str, Any]]] = {}
-    for cid_str, regs in saved_regions.items():
-        new_list: list[dict[str, Any]] = []
-        for r in regs:
-            elem_size_int = _DTYPE_NAME_TO_TORCH[r["dtype"]].itemsize
-            region_bytes = int(r["region_bytes"])
-            new_padded = _padded_region_bytes(
-                region_bytes, elem_size_int, target_world
-            )
-            new_shard_bytes = new_padded // target_world
-            new_list.append(
-                {
-                    "chunk_offset": int(r["chunk_offset"]),
-                    "region_bytes": region_bytes,
-                    "region_bytes_padded": int(new_padded),
-                    "shard_bytes": int(new_shard_bytes),
-                    "dtype": r["dtype"],
-                }
-            )
-        new_regions[cid_str] = new_list
-
-    # Reshard each chunk's per-rank state files.
-    chunk_paths = _scan_src_chunks(src_dir, src_world)
-    if chunk_paths:
-        os.makedirs(cpu_dst_dir, exist_ok=True)
-
-    # Cross-check chunk ids in metadata and on disk.
-    saved_cids = set(int(c) for c in saved_regions.keys())
-    disk_cids = set(chunk_paths.keys())
-    if saved_cids != disk_cids:
+    if not os.path.isfile(target):
         raise RuntimeError(
-            "reshard: regions_per_chunk chunk-ids "
-            f"{sorted(saved_cids)} disagree with on-disk shard chunk-ids "
-            f"{sorted(disk_cids)}"
+            f"reshard CLI: cannot locate core reshard module at {target!r}. "
+            "The repository layout has changed; update _load_reshard_module."
         )
-
-    for cid in sorted(chunk_paths.keys()):
-        per_rank_paths = chunk_paths[cid]
-        per_rank_state_dicts = [
-            torch.load(p, map_location="cpu", weights_only=False)
-            for p in per_rank_paths
-        ]
-        regs = saved_regions[str(cid)]
-
-        # Validate state shape consistency: every per-rank state_dict
-        # must have one ``state[i]`` entry per region, in order.
-        for r_idx, sd in enumerate(per_rank_state_dicts):
-            if "state" not in sd or "param_groups" not in sd:
-                raise RuntimeError(
-                    f"reshard: chunk {cid} rank {r_idx} state_dict missing "
-                    "'state' or 'param_groups' key"
-                )
-            if set(sd["state"].keys()) != set(range(len(regs))):
-                raise RuntimeError(
-                    f"reshard: chunk {cid} rank {r_idx} state has keys "
-                    f"{sorted(sd['state'].keys())}, expected "
-                    f"{list(range(len(regs)))} (one per region)"
-                )
-
-        # Build new per-rank state_dicts. Reuse rank-0's param_groups
-        # (it's rank-independent — defaults + the [0..N-1] params list).
-        # ``step`` is also rank-replicated; copy from rank-0.
-        new_per_rank_states: list[dict[int, dict[str, Any]]] = [
-            {} for _ in range(target_world)
-        ]
-        for region_idx, region_meta in enumerate(regs):
-            region_bytes = int(region_meta["region_bytes"])
-            elem_size_int = _DTYPE_NAME_TO_TORCH[region_meta["dtype"]].itemsize
-            saved_padded_old = int(region_meta["region_bytes_padded"])
-            new_padded = new_regions[str(cid)][region_idx]["region_bytes_padded"]
-
-            for state_key in ("exp_avg", "exp_avg_sq"):
-                per_rank_inputs = [
-                    sd["state"][region_idx][state_key]
-                    for sd in per_rank_state_dicts
-                ]
-                # Defensive: ensure all are 1-D (they should be — the
-                # shard_param's flat storage view).
-                per_rank_inputs = [t.flatten() for t in per_rank_inputs]
-                new_slices = _reshard_region_state(
-                    per_rank_inputs,
-                    region_bytes=region_bytes,
-                    elem_size=elem_size_int,
-                    src_world=src_world,
-                    dst_world=target_world,
-                    region_bytes_padded_old=saved_padded_old,
-                    region_bytes_padded_new=int(new_padded),
-                )
-                for r2, slice_ in enumerate(new_slices):
-                    new_per_rank_states[r2].setdefault(region_idx, {})[
-                        state_key
-                    ] = slice_
-
-            # Replicate ``step`` and any other per-region scalars from
-            # rank-0 (they're guaranteed identical across saving ranks
-            # since DeepSpeedCPUAdam steps in lockstep within a chunk).
-            for k, v in per_rank_state_dicts[0]["state"][region_idx].items():
-                if k in ("exp_avg", "exp_avg_sq"):
-                    continue
-                # ``step`` is a scalar tensor; clone for safety.
-                if isinstance(v, torch.Tensor):
-                    v = v.clone()
-                for r2 in range(target_world):
-                    new_per_rank_states[r2].setdefault(region_idx, {})[k] = v
-
-        param_groups = per_rank_state_dicts[0]["param_groups"]
-
-        # Write new per-rank shard files.
-        for r2 in range(target_world):
-            new_sd = {
-                "state": new_per_rank_states[r2],
-                "param_groups": param_groups,
-            }
-            out_path = os.path.join(cpu_dst_dir, f"chunk_{cid}_rank_{r2}.pt")
-            torch.save(new_sd, out_path)
-
-    # Recompute layout_fingerprint with the new world_size and the
-    # corresponding signature.
-    fp = dict(meta["layout_fingerprint"])
-    fp["world_size"] = int(target_world)
-    new_signature = _layout_signature_from_fingerprint(fp)
-
-    new_meta = dict(meta)
-    new_meta["protrain_world_size"] = int(target_world)
-    new_meta["layout_fingerprint"] = fp
-    new_meta["protrain_layout_signature"] = new_signature
-    new_meta["regions_per_chunk"] = new_regions
-    # Mark the source world for forensic-friendliness; the loader
-    # ignores unknown keys.
-    new_meta["resharded_from_world_size"] = int(src_world)
-    # ``saving_rank`` is only meaningful for the original save; preserve it.
-
-    with open(os.path.join(dst_dir, METADATA_FILENAME), "w") as f:
-        json.dump(new_meta, f, indent=2, sort_keys=True)
-
-    print(
-        f"reshard: wrote {dst_dir!r} "
-        f"(chunks={len(chunk_paths)}, target_world={target_world})",
-        file=sys.stderr,
+    spec = importlib.util.spec_from_file_location(
+        "_protrain_reshard_core", target
     )
-
-
-# ---- CLI ------------------------------------------------------------------
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"reshard CLI: importlib failed to build spec for {target!r}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -517,7 +118,8 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_argparser().parse_args(argv)
-    reshard(args.src, args.dst, args.target_world)
+    reshard_mod = _load_reshard_module()
+    reshard_mod.reshard_mode_c_shards(args.src, args.dst, args.target_world)
     return 0
 
 
