@@ -970,6 +970,56 @@ def _construct_runtime(
             module_list[idx] = wrapped_block
             blocks[idx] = wrapped_block
 
+    # ---- 5.5. wire up the activation SWAP pool --------------------------
+    # When the searcher (or an explicit override) selects ``n_swap > 0``,
+    # build a single :class:`ActivationSwapPool` sized to hold
+    # ``n_swap * prefetch_depth`` activation slots in pinned host memory,
+    # then attach the pool + scheduler's ``_swap_stream`` to every
+    # :class:`SwappedBlock`. The wrapper degrades to identity-pass
+    # autograd if the pool is None — useful for CPU-only test paths,
+    # but a configuration error in production.
+    if result.cfg.n_swap > 0:
+        from axolotl.integrations.protrain.types import BlockMode as _BM_swap
+
+        # Worst-case activation bytes across the swap-band. Reading from
+        # ``trace.activation_sizes`` (per-block) keeps this aligned with
+        # the cost model's ``estimate_cpu_footprint`` accounting.
+        max_act_bytes = 0
+        for bid, mode in result.block_map.items():
+            if mode is _BM_swap.SWAP:
+                act = trace.activation_sizes.get(bid, 0)
+                if act > max_act_bytes:
+                    max_act_bytes = int(act)
+        if max_act_bytes <= 0:
+            LOG.warning(
+                "ProTrain: result.cfg.n_swap=%d but no SWAP block has "
+                "non-zero activation_sizes; skipping swap-pool construction",
+                result.cfg.n_swap,
+            )
+        else:
+            from axolotl.integrations.protrain.block.swap_pool import (
+                ActivationSwapPool,
+            )
+
+            swap_pool = ActivationSwapPool(
+                n_swap=result.cfg.n_swap,
+                slot_bytes=max_act_bytes,
+                prefetch_depth=2,
+            )
+            scheduler.swap_pool = swap_pool
+            for block in blocks:
+                if (
+                    getattr(block, "_protrain_wrapped_mode", None)
+                    is _BM_swap.SWAP
+                ):
+                    block.attach_runtime(swap_pool, scheduler.swap_stream)
+            LOG.info(
+                "ProTrain: SWAP pool wired — %d slots × %d bytes = %.2f MB pinned",
+                swap_pool.n_slot,
+                swap_pool.slot_bytes,
+                swap_pool.total_bytes / (1 << 20),
+            )
+
     # ---- 6. install hooks ----------------------------------------------
     handles = install_hooks(
         model=model,

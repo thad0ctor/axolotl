@@ -53,8 +53,9 @@ def wrap_block(block: nn.Module, mode: BlockMode) -> nn.Module:
 
     - ``BlockMode.NONE`` — returns ``block`` unchanged (identity).
     - ``BlockMode.CKPT`` — wraps with ``CheckpointedBlock``.
-    - ``BlockMode.SWAP`` — wraps with ``SwappedBlock`` (env-gated; see
-      ``swap.py``).
+    - ``BlockMode.SWAP`` — wraps with ``SwappedBlock``. The wrapper
+      pool + swap stream are injected post-construction by the model
+      wrapper via ``SwappedBlock.attach_runtime``; see ``swap.py``.
 
     Idempotent: if ``block`` is already wrapped, it is unwrapped first
     and then re-wrapped under ``mode``. This lets the searcher re-apply

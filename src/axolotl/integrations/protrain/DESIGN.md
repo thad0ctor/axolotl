@@ -39,7 +39,8 @@ src/axolotl/integrations/protrain/
 │   ├── strategy.py              # BlockMode enum {NONE, CKPT, SWAP}
 │   ├── dispatcher.py            # per-block forward wrapper honoring selected mode
 │   ├── checkpoint.py            # CKPT path (torch.utils.checkpoint adapter)
-│   ├── swap.py                  # SWAP no-op stub gated by PROTRAIN_ENABLE_SWAP env flag
+│   ├── swap.py                  # SWAP wrapper: D2H in fwd / H2D in bwd on _swap_stream
+│   ├── swap_pool.py             # pinned-RAM activation slot pool
 │   └── layout_rules.py          # placement rules: swap-early / unopt-late / interleave
 ├── cost/
 │   ├── __init__.py
@@ -100,7 +101,8 @@ Every entry: Inputs · Outputs · Paper ref · Milestone.
 - `strategy.py` — `class BlockMode(Enum){NONE, CKPT, SWAP}`; `BlockStrategyMap = dict[int, BlockMode]`. §3.1.2.
 - `dispatcher.py` — `wrap_block(block: nn.Module, mode: BlockMode) -> nn.Module`. §3.1.2.
 - `checkpoint.py` — thin wrapper over `torch.utils.checkpoint.checkpoint` (use_reentrant=False). §3.1.2.
-- `swap.py` — no-op stub; raises if `PROTRAIN_ENABLE_SWAP` unset and `BlockMode.SWAP` requested. §3.1.2.
+- `swap.py` — `SwappedBlock`: D2H of output activation to a pinned-host slot on `_swap_stream` in forward; H2D back on `_swap_stream` in backward, with cross-stream event handshake. Pool + stream injected post-construction via `attach_runtime`. §3.1.2.
+- `swap_pool.py` — `ActivationSwapPool`: pinned-host slot pool sized to `n_swap × prefetch_depth × max_act_bytes`. Backed by one `PinnedHostMemory` allocation; slot acquire/release tracked Python-side. §3.1.2.
 - `layout_rules.py` — `assign_modes(n_swap, n_checkpoint, N_block) -> BlockStrategyMap`. Swap-early / unopt-late / interleave. §3.1.2.
 
 ### cost/ (M4)
@@ -267,4 +269,4 @@ Mirrors `plan.md`:
 2. **Pinned-memory allocator:** `ctypes` → `cudaHostAlloc` directly. ~50 LOC, zero new deps, matches App B.2 precisely (avoids `CUDAHostAllocator` pow-2 rounding). DeepSpeed's `PinnedMemoryAllocator` rejected: may inherit same wart, adds import-graph weight.
 3. **CPU FusedAdam source:** `deepspeed.ops.adam.DeepSpeedCPUAdam`. Paper builds directly on ZeRO-Offload's CPU Adam. Pure-Python reimpl is >10× slower and would collapse the T_bwd / T_cpu_optim overlap window the cost model assumes. DeepSpeed is already in Axolotl's env.
 4. **S_chunk grid:** `{32, 64, 128, 256} MB`. 7B Llama blocks are ~200 MB fp16 → chunks want to be block-scale. 16 MB is too fine-grained; per-chunk sync overhead dominates. M2 agent extends the grid if optimum lands at an endpoint.
-5. **SWAP path:** no-op stub gated by `PROTRAIN_ENABLE_SWAP` env flag. Searcher test asserts `n_swap=0` is selected on 3090. ~30 LOC; exercises M4 bound logic end-to-end. Deletable if M6 confirms we never need it.
+5. **SWAP path:** paper-real D2H/H2D wrapper on `_swap_stream`, backed by `ActivationSwapPool` (pinned host slots sized `n_swap × prefetch_depth × max_act_bytes`). Searcher's CPU-feasibility gate refuses `n_swap > 0` candidates whose pool would not fit `cpu_capacity_bytes`. On RTX 3090 / 3090 Ti (12 GB/s PCIe ceiling, no NVLink) the searcher rarely selects `n_swap > 0` — paper §3.1.2 — so the path is tested-but-unused infrastructure on this hardware class. Validated end-to-end via the wrapper-injection path with `n_swap_override`.
