@@ -645,3 +645,378 @@ def test_loss_parity_n_persist_extremes():
             f"loss divergence at step {i}: n_persist=N_chunk->{a:.6f} "
             f"vs n_persist=0->{b:.6f} (|Δ|={abs(a-b):.6f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Item 5 follow-up: throughput-fix coverage
+#
+# These two tests exercise the fast paths added by Fix B and Fix C
+# without requiring an actual distributed process group: they call the
+# manager's helpers directly with a monkeypatched ``torch.distributed``
+# entry point. Distributed-correctness coverage (real 2-rank gloo) lives
+# in ``tests/protrain/test_chunk_manager_distributed.py``.
+# ---------------------------------------------------------------------------
+
+
+def _build_one_chunk_persistent_manager_fp32(
+    *,
+    bias: bool = True,
+):
+    """Return a single-chunk persistent ChunkManager whose chunk has 2 fp32 params.
+
+    Used by the Fix C unit test. CPU-only, no distributed init.
+    Mirrors the helper in :mod:`tests.protrain.test_chunk_manager_distributed`
+    but kept local to this test module so the fast suite has zero
+    cross-file imports.
+    """
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
+
+    torch.manual_seed(0)
+    layer = nn.Linear(4, 4, bias=bias)
+    model = nn.Module()
+    model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+    block_spans: dict[BlockId, list[ParamId]] = {}
+    for name, _ in model.named_parameters():
+        block_spans.setdefault(cast(BlockId, 0), []).append(cast(ParamId, name))
+    exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
+    S_chunk = 1 << 14
+    layout = build_layout(model, exec_order, S_chunk, block_spans)
+    assert layout.N_chunk == 1, (
+        f"setup expects single-chunk layout, got {layout.N_chunk}"
+    )
+
+    host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+    pool = BufferPool(
+        n_buffer=1,
+        S_chunk=layout.S_chunk,
+        pinned_host=host,
+        device=torch.device("cpu"),
+    )
+    mgr = ChunkManager(
+        model=model,
+        layout=layout,
+        n_persist=1,  # one persistent chunk == every chunk persistent
+        buffer_pool=pool,
+        cpu_optim=None,
+        gpu_optim=None,
+        device=torch.device("cpu"),
+    )
+    return model, mgr, host, pool
+
+
+def test_persistent_grad_reduce_coalesces_same_dtype_grads(monkeypatch):
+    """Fix C: persistent-chunk grad reduction issues ONE all_reduce per dtype.
+
+    The legacy implementation looped through every param in the chunk
+    and called ``dist.all_reduce(param.grad, op=AVG)`` once per param.
+    Fix C replaces that with a coalesced flatten → single all_reduce →
+    unflatten (same primitive PyTorch DDP uses). For a chunk holding
+    two fp32 params, the coalesced path issues exactly one collective.
+
+    The test monkeypatches ``torch.distributed.all_reduce`` so it
+    counts calls without requiring an initialized process group, then
+    invokes the manager's coalesce helper directly. This covers the
+    no-DDP code path that runs in real 4-GPU Mode-C / Mode-A-no-DDP
+    benches.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    model, mgr, host, _pool = _build_one_chunk_persistent_manager_fp32()
+
+    try:
+        # Plant uniform grads on every param. We don't care about the
+        # values — the count of dist.all_reduce calls is what's under
+        # test. Use distinct values per param so the unflatten step's
+        # writeback can be verified end-to-end.
+        for i, (_n, p) in enumerate(model.named_parameters()):
+            p.grad = torch.full_like(p.data, float(i + 1))
+
+        original_grads = {
+            n: p.grad.detach().clone() for n, p in model.named_parameters()
+        }
+
+        calls: list[dict] = []
+
+        def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+            calls.append(
+                {
+                    "numel": int(tensor.numel()),
+                    "dtype": tensor.dtype,
+                    "op": op,
+                }
+            )
+            # Identity reduction: leave tensor as-is so the post-reduce
+            # value matches the input. AVG semantics across world_size=1
+            # are identity anyway, so this is faithful.
+            return None
+
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", fake_all_reduce
+        )
+
+        mgr._coalesced_all_reduce_persistent_grads(cast("ChunkId", 0))
+
+        # Critical assertion: the chunk's two same-dtype grads were
+        # coalesced into one collective, not two.
+        assert len(calls) == 1, (
+            f"expected exactly 1 coalesced all_reduce, got {len(calls)} "
+            f"(per-param path resurfaced — Fix C regression)"
+        )
+        # The coalesced buffer should match the dtype of the param
+        # grads and span all of them.
+        total_grad_numel = sum(
+            int(p.grad.numel()) for _, p in model.named_parameters()
+        )
+        # _flatten_dense_tensors may pack with no padding; numel covers
+        # every element.
+        assert calls[0]["numel"] == total_grad_numel, (
+            f"coalesced all_reduce numel ({calls[0]['numel']}) does not "
+            f"cover the chunk's grad numel ({total_grad_numel}) — flatten "
+            f"missed a tensor"
+        )
+        assert calls[0]["dtype"] == torch.float32
+
+        # Each param's grad must come back with the original values
+        # (identity reduction); confirms the unflatten + copy_back step
+        # writes the right slices into the right grads.
+        for n, p in model.named_parameters():
+            assert torch.equal(p.grad, original_grads[n]), (
+                f"unflatten/copy_back perturbed grad for '{n}' under "
+                f"identity reduction"
+            )
+    finally:
+        mgr.uninstall()
+        host.close()
+
+
+def test_persistent_grad_reduce_one_collective_per_dtype_group(monkeypatch):
+    """Fix C: mixed-dtype chunks issue ONE all_reduce per dtype group.
+
+    Constructs a 2-param chunk with one fp32 grad and one fp16 grad.
+    The coalesce helper groups by dtype and issues one all_reduce per
+    group — so we expect exactly 2 collectives (one fp32, one fp16),
+    not 2 = one per param coincidentally. The single-grad-per-dtype
+    path is also covered: it skips the flatten/unflatten round-trip
+    and reduces in-place. Both flavours are routed through the same
+    helper; counting is sufficient to lock the structure in.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
+
+    torch.manual_seed(0)
+
+    class _Mixed(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # fp32 weight — 16 elems
+            self.proj = nn.Linear(4, 4, bias=False)
+            # fp16 layernorm weight — 4 elems
+            self.norm = nn.LayerNorm(4).to(torch.float16)
+
+    layer = _Mixed()
+    model = nn.Module()
+    model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+    block_spans: dict[BlockId, list[ParamId]] = {}
+    for name, _ in model.named_parameters():
+        block_spans.setdefault(cast(BlockId, 0), []).append(cast(ParamId, name))
+    exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
+    S_chunk = 1 << 14
+    layout = build_layout(model, exec_order, S_chunk, block_spans)
+    assert layout.N_chunk == 1
+
+    host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+    try:
+        pool = BufferPool(
+            n_buffer=1,
+            S_chunk=layout.S_chunk,
+            pinned_host=host,
+            device=torch.device("cpu"),
+        )
+        mgr = ChunkManager(
+            model=model,
+            layout=layout,
+            n_persist=1,
+            buffer_pool=pool,
+            cpu_optim=None,
+            gpu_optim=None,
+            device=torch.device("cpu"),
+        )
+
+        try:
+            for _n, p in model.named_parameters():
+                p.grad = torch.full_like(p.data, 1.0)
+
+            calls: list[torch.dtype] = []
+
+            def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+                calls.append(tensor.dtype)
+                return None
+
+            monkeypatch.setattr(
+                torch.distributed, "all_reduce", fake_all_reduce
+            )
+
+            mgr._coalesced_all_reduce_persistent_grads(cast("ChunkId", 0))
+
+            # Two dtype groups → exactly two collectives. Order is
+            # dtype-dictionary-iteration order, which Python 3.7+
+            # guarantees as insertion order — so fp32 grads (proj.weight)
+            # come first, fp16 grads (norm.weight + norm.bias) second.
+            dtypes_seen = set(calls)
+            assert dtypes_seen == {torch.float32, torch.float16}, (
+                f"expected one collective per dtype group "
+                f"({{fp32, fp16}}), saw {dtypes_seen}"
+            )
+            # Per-dtype call count: exactly one per group, regardless of
+            # how many params belong to the group.
+            from collections import Counter
+
+            per_dtype = Counter(calls)
+            assert per_dtype[torch.float32] == 1, (
+                f"fp32 group should issue 1 collective, issued "
+                f"{per_dtype[torch.float32]}"
+            )
+            assert per_dtype[torch.float16] == 1, (
+                f"fp16 group should issue 1 collective, issued "
+                f"{per_dtype[torch.float16]}"
+            )
+        finally:
+            mgr.uninstall()
+    finally:
+        host.close()
+
+
+def test_gather_skips_collective_on_pool_resident_hit(monkeypatch):
+    """Fix B: gather() short-circuits when ``lookup_resident`` hits.
+
+    The buffer pool's tag survives ``release`` between forward and
+    backward, so a chunk that wasn't evicted in the meantime can be
+    re-claimed without re-issuing the per-region
+    ``all_gather_into_tensor`` collective. This test plants a sharded
+    chunk state by hand, simulates the "resident in pool" condition by
+    pre-acquiring the buffer with the chunk's id, then calls
+    ``gather()`` and asserts ``_gather_sharded`` is NOT invoked.
+
+    No real ``torch.distributed`` group is needed — the cache-hit path
+    must short-circuit BEFORE touching any collective.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import (
+        ChunkManager,
+        _ChunkShardState,
+        _DtypeRegion,
+    )
+    from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
+    from axolotl.integrations.protrain.types import ChunkId
+
+    torch.manual_seed(0)
+    layer = nn.Linear(4, 4, bias=True)
+    model = nn.Module()
+    model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+    block_spans: dict[BlockId, list[ParamId]] = {}
+    for name, _ in model.named_parameters():
+        block_spans.setdefault(cast(BlockId, 0), []).append(cast(ParamId, name))
+    exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
+    S_chunk = 1 << 14
+    layout = build_layout(model, exec_order, S_chunk, block_spans)
+    assert layout.N_chunk == 1
+
+    host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+    try:
+        pool = BufferPool(
+            n_buffer=1,
+            S_chunk=layout.S_chunk,
+            pinned_host=host,
+            device=torch.device("cpu"),
+        )
+        # n_persist=0: the chunk is non-persistent so gather() runs the
+        # full path. We do NOT enable zero3_shard at construction
+        # (which requires world_size > 1) — instead we will plant a
+        # shard state by hand so the sharded fast-path branch is
+        # exercised below.
+        mgr = ChunkManager(
+            model=model,
+            layout=layout,
+            n_persist=0,
+            buffer_pool=pool,
+            cpu_optim=None,
+            gpu_optim=None,
+            device=torch.device("cpu"),
+        )
+
+        try:
+            mgr.materialize_offload()
+
+            # Plant a synthetic shard state so gather() takes the
+            # sharded branch when it goes through cache-miss. We never
+            # actually exercise the cache-miss path here; the planted
+            # state's only role is to demonstrate the fast path bails
+            # before touching the sharded collective.
+            chunk_id = cast(ChunkId, 0)
+            mgr._chunk_shards[chunk_id] = _ChunkShardState(
+                regions=[],  # empty regions list — _gather_sharded would
+                # iterate it and do nothing; that's fine, the test
+                # below sentinels _gather_sharded BEFORE any iteration.
+                chunk_bytes=int(layout.S_chunk),
+                shard_bytes=int(layout.S_chunk),
+            )
+
+            # Pre-acquire the buffer with chunk_id 0 so the pool tags
+            # the slot as resident. Then release it so the pool's free
+            # list contains it — but the tag survives, exactly as it
+            # does at the post_block_forward / pre_block_backward
+            # boundary in real training.
+            pool.acquire(chunk_id)
+            pool.release(chunk_id)
+            assert pool.lookup_resident(chunk_id) is not None, (
+                "test setup: pool.release dropped the resident tag — "
+                "fix B's invariant cannot hold"
+            )
+
+            # Sentinel _gather_sharded: if the cache-hit path fires it
+            # MUST NOT be called. We replace it with a recorder that
+            # raises on invocation so we get a clean traceback if the
+            # short-circuit regresses.
+            sharded_calls = {"n": 0}
+            orig_gather_sharded = mgr._gather_sharded
+
+            def _recording_gather_sharded(*args, **kwargs):
+                sharded_calls["n"] += 1
+                return orig_gather_sharded(*args, **kwargs)
+
+            monkeypatch.setattr(
+                mgr, "_gather_sharded", _recording_gather_sharded
+            )
+
+            mgr.gather(chunk_id)
+
+            assert sharded_calls["n"] == 0, (
+                f"Fix B regression: pool-resident chunk still ran "
+                f"_gather_sharded (and therefore all_gather_into_tensor) "
+                f"{sharded_calls['n']} time(s) on the cache-hit path"
+            )
+        finally:
+            mgr.uninstall()
+    finally:
+        host.close()

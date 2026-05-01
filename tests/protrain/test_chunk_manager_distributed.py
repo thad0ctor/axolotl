@@ -727,3 +727,350 @@ def test_zero3_sharded_roundtrip_mixed_dtype_2rank(tmp_path) -> None:
     if skip_files:
         reasons = [f.read_text().strip() for f in skip_files]
         pytest.skip(f"gloo does not support required collective(s): {reasons}")
+
+
+# ---------------------------------------------------------------------------
+# Item 5 follow-up Fix B: gather() skips the all_gather collective when the
+# chunk's bytes are still pool-resident from forward (forward→backward
+# reuse window, paper §3.1.1 + §5)
+# ---------------------------------------------------------------------------
+
+
+def _worker_gather_skip_when_resident(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """2-rank gloo test: a pool-resident chunk skips the backward all_gather.
+
+    Builds a single-chunk sharded ChunkManager, gathers the chunk once
+    (forward), then gathers it again (backward). The buffer pool's
+    resident tag survives a ``release`` between the two gathers — see
+    :class:`BufferPool.release`. Therefore the second ``gather()`` must
+    short-circuit and NOT issue a fresh ``all_gather_into_tensor``.
+
+    The test counts ``dist.all_gather_into_tensor`` calls via a
+    monkeypatch and asserts the second gather adds zero collectives.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import (
+        PinnedHostMemory,
+    )
+    from axolotl.integrations.protrain.types import BlockId, ChunkId, ParamId
+
+    _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    _os.environ.setdefault("MASTER_PORT", "29551")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-gather-skip",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        # Wrap dist.all_gather_into_tensor to count calls. We use a
+        # mutable shared counter so the monkeypatch's closure can read
+        # and write to it from inside the patched function.
+        counter = {"n": 0}
+        orig_ag = dist.all_gather_into_tensor
+
+        def _counting_ag(*args, **kwargs):
+            counter["n"] += 1
+            return orig_ag(*args, **kwargs)
+
+        dist.all_gather_into_tensor = _counting_ag
+
+        torch.manual_seed(0)
+        from torch import nn
+
+        layer = nn.Linear(8, 8, bias=True).half()
+        model = nn.Module()
+        model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
+
+        block_spans: dict = {}
+        for name, _p in model.named_parameters():
+            block_spans.setdefault(BlockId(0), []).append(ParamId(name))  # type: ignore[index]
+        exec_order = [ParamId(n) for n, _ in model.named_parameters()]
+        S_chunk = 1 << 14
+        layout = build_layout(model, exec_order, S_chunk, block_spans)
+
+        host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+        pool = BufferPool(
+            n_buffer=1,
+            S_chunk=layout.S_chunk,
+            pinned_host=host,
+            device=torch.device("cpu"),
+        )
+
+        mgr = ChunkManager(
+            model=model,
+            layout=layout,
+            n_persist=0,
+            buffer_pool=pool,
+            cpu_optim=None,
+            gpu_optim=None,
+            device=torch.device("cpu"),
+            world_size=world_size,
+            rank=rank,
+            zero3_shard=True,
+        )
+
+        try:
+            mgr.materialize_offload()
+        except RuntimeError as exc:
+            if "gloo" in str(exc).lower():
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
+                    f.write(f"gloo-unsupported: {exc}\n")
+                return
+            raise
+
+        # ---- Forward gather: should issue the all_gather collective.
+        # Snapshot count before, expect strictly more after.
+        n_before_fwd = counter["n"]
+        try:
+            mgr.gather(ChunkId(0))
+        except RuntimeError as exc:
+            if "not implemented" in str(exc).lower() or "nccl" in str(exc).lower():
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
+                    f.write(f"gloo-collective-unsupported: {exc}\n")
+                return
+            raise
+        n_after_fwd = counter["n"]
+        assert n_after_fwd > n_before_fwd, (
+            f"rank {rank}: forward gather did not issue any all_gather "
+            f"(count went {n_before_fwd} -> {n_after_fwd})"
+        )
+
+        # Mid-iter: scheduler releases the buffer between forward and
+        # backward. release() preserves the chunk's tag — that's the
+        # invariant Fix B relies on.
+        pool.release(ChunkId(0))
+        assert pool.lookup_resident(ChunkId(0)) is not None, (
+            f"rank {rank}: pool dropped chunk 0's resident tag after "
+            f"release; cache-hit fast path cannot fire"
+        )
+
+        # ---- Backward gather: pool reports the chunk as resident, so
+        # the all_gather collective MUST be skipped. The counter is
+        # exact — every all_gather_into_tensor call goes through the
+        # monkeypatch.
+        n_before_bwd = counter["n"]
+        mgr.gather(ChunkId(0))
+        n_after_bwd = counter["n"]
+        assert n_after_bwd == n_before_bwd, (
+            f"rank {rank}: pool-resident chunk still issued "
+            f"{n_after_bwd - n_before_bwd} all_gather collective(s) on "
+            f"backward — Fix B regression. Expected zero (cache hit)."
+        )
+
+        # Sanity: param.data should still alias the pool buffer's
+        # gathered bytes after the cache-hit path.
+        for _n, p in model.named_parameters():
+            assert p.data.numel() > 0, (
+                f"rank {rank}: param '{_n}' is empty after cache-hit "
+                f"gather — rebind path failed"
+            )
+
+        mgr.uninstall()
+        host.close()
+
+        # Restore the original symbol so a hung dist.destroy_process_group
+        # call doesn't trip the count.
+        dist.all_gather_into_tensor = orig_ag
+
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_gather_skips_all_gather_when_pool_resident(tmp_path) -> None:
+    """Fix B: a pool-resident chunk's backward gather skips the all_gather.
+
+    The buffer pool's forward→backward reuse window means a chunk that
+    survived forward (no eviction) carries the same gathered bytes
+    into backward. ``ChunkManager.gather`` must consult the pool's
+    resident tag and short-circuit BEFORE issuing the
+    ``all_gather_into_tensor`` collective; otherwise we re-pay the
+    PCIe bandwidth cost on every visit.
+
+    This is the ~22% throughput win on Mode-C 4-GPU bs=1 seq=256
+    according to the Item 5 profiling pass — provided ``n_buffer`` is
+    large enough that some chunks actually survive forward (the bench
+    harness's ``n_buffer_override=2`` minimizes the cache, but
+    real-world configurations from the searcher hit cache often).
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_gather_skip_when_resident,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    skip_files = list(tmp_path.glob("rank*.skip"))
+    if skip_files:
+        reasons = [f.read_text().strip() for f in skip_files]
+        pytest.skip(f"gloo does not support required collective(s): {reasons}")
+
+
+# ---------------------------------------------------------------------------
+# Item 5 follow-up Fix C: persistent-chunk grad reduction is COALESCED
+# (one all_reduce per dtype group, not one per param)
+# ---------------------------------------------------------------------------
+
+
+def _worker_persistent_grad_reduce_coalesced(
+    rank: int, world_size: int, tmpdir: str
+) -> None:
+    """2-rank gloo test: persistent-chunk grad reduction issues one
+    ``all_reduce`` per dtype group, not one per param.
+
+    Builds a persistent (n_persist == N_chunk) ChunkManager with two
+    params in one chunk, both fp32 (single dtype group). After
+    planting rank-specific grads and calling
+    ``reduce_grads_and_offload``, the wrapped ``dist.all_reduce``
+    counter must read exactly 1 — proving the coalesce path engaged.
+    The legacy per-param path would have issued 2 (one per param).
+
+    Also asserts correctness: every grad equals the cross-rank MEAN
+    after the bucketed reduce, matching the legacy path's semantics.
+    """
+    import os as _os
+
+    import torch
+    import torch.distributed as dist
+
+    _os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    _os.environ.setdefault("MASTER_PORT", "29553")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmpdir}/rendezvous-coalesce",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    try:
+        counter = {"n": 0}
+        orig_ar = dist.all_reduce
+
+        def _counting_ar(*args, **kwargs):
+            counter["n"] += 1
+            return orig_ar(*args, **kwargs)
+
+        dist.all_reduce = _counting_ar
+
+        # Single-chunk persistent layout: two fp32 params in the same
+        # chunk → one dtype group → exactly one all_reduce.
+        torch.manual_seed(0)
+        model = _tiny_cpu_model()
+        mgr, layout, pool, host = _build_chunk_manager_cpu(
+            model, n_persist=1
+        )
+        # Sanity: tiny model packs into one chunk.
+        assert layout.N_chunk == 1, (
+            f"test setup expects single-chunk layout, got "
+            f"N_chunk={layout.N_chunk}"
+        )
+
+        # Plant rank-specific grads — rank r writes float(r) into every
+        # element of every param's grad.
+        for _n, p in model.named_parameters():
+            p.grad = torch.full_like(p.data, float(rank))
+
+        # Drive the persistent-chunk grad-reduce path.
+        n_before = counter["n"]
+        mgr.reduce_grads_and_offload(cast(ChunkId, 0))
+        n_calls = counter["n"] - n_before
+
+        # Two params, same dtype → one all_reduce. The legacy per-param
+        # path would have issued two.
+        assert n_calls == 1, (
+            f"rank {rank}: expected one coalesced all_reduce for the "
+            f"single-dtype persistent chunk, got {n_calls} (Fix C "
+            f"regression — per-param path resurfaced)"
+        )
+
+        # Correctness: every grad equals the AVG across ranks.
+        expected_mean = sum(range(world_size)) / float(world_size)
+        for _n, p in model.named_parameters():
+            assert p.grad is not None, (
+                f"rank {rank}: persistent param '{_n}' grad cleared "
+                f"unexpectedly"
+            )
+            obs = p.grad.detach().cpu().float()
+            assert torch.allclose(
+                obs,
+                torch.full_like(obs, float(expected_mean)),
+                atol=1e-5,
+                rtol=1e-5,
+            ), (
+                f"rank {rank}: coalesced grad reduce produced wrong "
+                f"value for '{_n}': expected uniform {expected_mean}, "
+                f"got min={obs.min().item()} max={obs.max().item()}"
+            )
+
+        mgr.uninstall()
+        host.close()
+        del pool
+
+        dist.all_reduce = orig_ar
+
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        dist.destroy_process_group()
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_persistent_grad_reduce_is_coalesced(tmp_path) -> None:
+    """Fix C: persistent-chunk grad reduce issues one ``all_reduce`` per dtype group.
+
+    Replaces the per-param ``dist.all_reduce`` loop that ran in
+    :meth:`ChunkManager.reduce_grads_and_offload`'s persistent branch.
+    The new path uses :func:`torch._utils._flatten_dense_tensors` to
+    coalesce same-dtype grads into one buffer before issuing a single
+    NCCL collective — same primitive PyTorch DDP uses internally for
+    its bucketed allreduce.
+
+    On a 4-GPU 3090 PCIe-bound run this saves ~30 ms of NCCL launch
+    latency per iteration (Item 5 profiling: 19 ops × 17MB unbucketed
+    → 4 persistent-chunk-sized ops). Smaller win than Fix B but pure
+    upside — the reduction math is unchanged (AVG semantics
+    preserved).
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    mp.spawn(
+        _worker_persistent_grad_reduce_coalesced,
+        args=(world_size, str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
