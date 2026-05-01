@@ -216,16 +216,38 @@ def protrain_optimizer_wrapper(
                 weight_decay=weight_decay,
             )
         except (ImportError, Exception) as err:  # noqa: BLE001 - see below
-            # See ``protrain_model_wrapper``: DeepSpeed's CUDA-version
-            # mismatch is a ``CUDAMismatchException`` that bypasses
-            # ``ImportError``. Fall back to the inline GPU optimizer
-            # path for non-persistent chunks.
-            LOG.warning(
-                "protrain_optimizer_wrapper: CPU FusedAdam unavailable (%s); "
-                "non-persistent chunks will be stepped inline on the GPU optimizer. "
-                "Install DeepSpeed for the async-overlap path.",
-                err,
+            # DeepSpeed's CUDA-version mismatch raises a
+            # ``CUDAMismatchException`` (subclass of ``Exception``, not
+            # ``ImportError``). Compare by class name to avoid a hard
+            # import on a broken deepspeed install.
+            is_cuda_mismatch = type(err).__name__ == "CUDAMismatchException"
+            base_msg = (
+                "protrain_optimizer_wrapper: CPU FusedAdam unavailable "
+                "(%s: %s). Non-persistent chunks will NOT receive "
+                "optimizer steps — only persistent chunks (the GPU "
+                "optimizer) update. Training is incorrect in this "
+                "state for any model whose non-persistent params "
+                "matter for convergence."
             )
+            if is_cuda_mismatch:
+                LOG.error(
+                    base_msg
+                    + " Detected DeepSpeed CUDAMismatchException — "
+                    "system CUDA does not match torch's CUDA wheel. "
+                    "Workaround: set env DS_SKIP_CUDA_CHECK=1 (CPU Adam "
+                    "JIT-compiles correctly despite the mismatch on "
+                    "most rigs).",
+                    type(err).__name__,
+                    err,
+                )
+            else:
+                LOG.error(
+                    base_msg
+                    + " Install DeepSpeed (or fix its dependencies) to "
+                    "enable async CPU Adam.",
+                    type(err).__name__,
+                    err,
+                )
             cpu_optim = None
 
     # Swap the freshly-built adapters into the chunk manager so the
