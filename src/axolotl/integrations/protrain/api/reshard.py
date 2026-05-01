@@ -190,23 +190,19 @@ def _reshard_region_state(
             )
 
     # Concatenate to the full padded region tensor (length
-    # region_bytes_padded_old / elem_size).
+    # region_bytes_padded_old / elem_size), then carry only the valid
+    # prefix forward — Adam never reads/writes padding bytes for a clean
+    # run (chunk/manager.py:802 zero-inits cpu_region_grad; materialize
+    # zero-pads region_scratch). Freeing full_old before allocating
+    # full_new halves peak working RAM per region.
     full_old = torch.cat(per_rank_tensors, dim=0).contiguous()
-
-    # Valid prefix length is independent of world_size.
     valid_numel = region_bytes // elem_size
-
-    # Build the new padded region (length region_bytes_padded_new /
-    # elem_size). Copy the valid prefix from full_old; zero-pad the
-    # rest. Pre-step the per-rank tensors are zero-init and the full
-    # tensor is also zero in [valid_numel, padded_old / elem_size); we
-    # don't preserve those padding bytes since they're not load-bearing
-    # (Adam never reads/writes the padding positions for a clean run —
-    # see chunk/manager.py:802 zero-init of cpu_region_grad and the
-    # zero-pad of region_scratch at materialize_offload).
+    valid_prefix = full_old[:valid_numel].clone()
+    del full_old
     new_padded_numel = region_bytes_padded_new // elem_size
     full_new = torch.zeros(new_padded_numel, dtype=dtype)
-    full_new[:valid_numel] = full_old[:valid_numel]
+    full_new[:valid_numel] = valid_prefix
+    del valid_prefix
 
     new_shard_numel = (region_bytes_padded_new // dst_world) // elem_size
     out: list[torch.Tensor] = []
@@ -501,14 +497,6 @@ def reshard_mode_c_shards(
     )
 
 
-# Backwards-compatible alias for any code that already imports
-# :func:`reshard` from the old offline-tool location. The CLI script in
-# ``scripts/protrain/reshard_optim.py`` re-exports this name.
-def reshard(src_dir: str, dst_dir: str, target_world: int) -> None:
-    """Backwards-compat wrapper around :func:`reshard_mode_c_shards`."""
-    reshard_mode_c_shards(src_dir, dst_dir, target_world)
-
-
 __all__ = [
     "METADATA_FILENAME",
     "GPU_OPTIM_FILENAME",
@@ -517,7 +505,6 @@ __all__ = [
     "SAVE_MODE_SHARDED",
     "CHUNK_SHARD_FILE_RE",
     "reshard_mode_c_shards",
-    "reshard",
     "_padded_region_bytes",
     "_reshard_region_state",
     "_layout_signature_from_fingerprint",
