@@ -152,13 +152,23 @@ def _block_map_peak_contribution(
     the terms that do not depend on ``(n_persist, n_buffer)``:
 
         F(block_map) = max over forward ops i of
-            (live_none_at(i) + ckpt_extra_at(i) + intra[i] + inter[i])
+            (live_none_at(i) + ckpt_extra_at(i)
+             + cross_attn_at(i) + intra[i] + inter[i])
 
     The returned value is the pre-alpha raw contribution; the caller
     multiplies the full ``model_state_present + F`` sum by
     ``ALPHA_FRAGMENTATION`` and ``int()``-casts to match
     ``estimate_peak`` exactly.
+
+    Cross-attention term mirrors ``estimate_peak``'s Fix-3 enc-dec
+    accounting — see the docstring of that function. For single-tree
+    causal-LM traces the term is 0 and this matches the legacy F_bm.
     """
+    from axolotl.integrations.protrain.cost.memory import (
+        _block_tree_index_map,
+        _cross_attn_persist_bytes,
+    )
+
     # Group forward ops by block.
     forward_ops_by_block: dict[BlockId, list[int]] = defaultdict(list)
     for i, op in enumerate(trace.op_order):
@@ -195,6 +205,12 @@ def _block_map_peak_contribution(
                 break
         return live
 
+    # Enc-dec cross-attn surcharge: 0 on single-tree traces.
+    tree_index_map = _block_tree_index_map(trace)
+    cross_attn_bytes = _cross_attn_persist_bytes(
+        trace, block_map, tree_index_map
+    )
+
     best = 0
     have_any_forward = False
     for i, op in enumerate(trace.op_order):
@@ -209,7 +225,11 @@ def _block_map_peak_contribution(
             ckpt_extra = trace.activation_sizes.get(
                 BlockId(ckpt_bump_op[i]), 0
             )
-        candidate = live_none + ckpt_extra + intra + inter
+        op_cross_attn = 0
+        if cross_attn_bytes > 0 and op.block_id is not None:
+            if tree_index_map.get(op.block_id, 0) > 0:
+                op_cross_attn = cross_attn_bytes
+        candidate = live_none + ckpt_extra + op_cross_attn + intra + inter
         if candidate > best:
             best = candidate
 
