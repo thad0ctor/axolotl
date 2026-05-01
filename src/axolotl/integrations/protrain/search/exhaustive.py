@@ -174,9 +174,9 @@ def _block_map_peak_contribution(
     causal-LM traces the term is 0 and this matches the legacy F_bm.
     """
     from axolotl.integrations.protrain.cost.memory import (
-        _block_tree_index_map,
-        _cross_attn_persist_bytes,
-        _op_cross_attn_surcharge,
+        block_tree_index_map,
+        cross_attn_persist_bytes,
+        op_cross_attn_surcharge,
     )
 
     if forward_ops_by_block is None:
@@ -216,8 +216,8 @@ def _block_map_peak_contribution(
         return live
 
     if tree_index_map is None:
-        tree_index_map = _block_tree_index_map(trace)
-    cross_attn_bytes = _cross_attn_persist_bytes(
+        tree_index_map = block_tree_index_map(trace)
+    cross_attn_bytes = cross_attn_persist_bytes(
         trace, block_map, tree_index_map
     )
 
@@ -235,7 +235,7 @@ def _block_map_peak_contribution(
             ckpt_extra = trace.activation_sizes.get(
                 BlockId(ckpt_bump_op[i]), 0
             )
-        op_cross_attn = _op_cross_attn_surcharge(
+        op_cross_attn = op_cross_attn_surcharge(
             op, cross_attn_bytes, tree_index_map
         )
         candidate = live_none + ckpt_extra + op_cross_attn + intra + inter
@@ -362,7 +362,7 @@ def search(
     # ``(n_persist + n_buffer) * S_chunk`` term, pre-alpha.
     from axolotl.integrations.protrain.cost.memory import (
         ALPHA_FRAGMENTATION,
-        _block_tree_index_map,
+        block_tree_index_map,
         hot_iter_peak_cap,
     )
 
@@ -375,7 +375,7 @@ def search(
     for i, op in enumerate(trace.op_order):
         if op.is_forward and op.block_id is not None:
             forward_ops_by_block[op.block_id].append(i)
-    tree_index_map = _block_tree_index_map(trace)
+    tree_index_map = block_tree_index_map(trace)
 
     for n_ckpt in range(0, bounds.N_block + 1):
         max_swap = min(bounds.N_block - n_ckpt, bounds.N_interval)
