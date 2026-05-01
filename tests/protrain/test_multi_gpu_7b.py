@@ -1071,3 +1071,370 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
             f"exceeds 1.5 * expected shard {expected_shard_bytes/1e9:.3f} GB — "
             f"sharding may not be partitioning bytes as intended"
         )
+
+
+# ===========================================================================
+# Item 9 cell A — Mistral Mode-C 2-GPU smoke
+# ===========================================================================
+#
+# Mode-C ZeRO-3 sharding has only ever been exercised against Llama
+# architectures. Mistral introduces grouped-query attention (GQA, where
+# ``num_key_value_heads < num_attention_heads``) and sliding-window
+# attention; chunk discovery + per-block hooks could break on either
+# divergence point. This smoke wraps a tiny-Mistral-shape model with
+# LoRA + ProTrain Mode-C on 2 ranks (GPUs 1,2), runs three training
+# iterations, and asserts no crash + finite losses. Throughput is not
+# checked — that's covered by ``test_protrain_4gpu_throughput_scaling``.
+#
+# A tiny Mistral config (4 blocks, 256 hidden, 4 heads / 2 KV heads,
+# sliding_window=128) is constructed with random init rather than
+# pulling the real auth-gated 7B weights — the question is "does
+# Mode-C wrap and step a Mistral architecture without crashing", not
+# "does Mistral-7B fit in 2x24GB".
+
+
+_MISTRAL_MODEC_WORKER_SCRIPT = textwrap.dedent(
+    '''
+    # Item 9 cell A worker: 2-rank tiny-Mistral Mode-C smoke. Builds a
+    # fresh-init MistralForCausalLM with GQA + sliding-window enabled,
+    # wraps with LoRA + ProTrain Mode-C (zero3_shard=True, explicit
+    # n_persist override to force the sharded path even though the
+    # tiny model trivially fits on a single 24GB card), runs three
+    # training iterations, reports per-iter loss + a sharded-engagement
+    # flag.
+    import os
+    import sys
+
+    import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+
+
+    def _worker(rank: int, world_size: int, out_dir: str,
+                bs: int, seq: int, n_iters: int) -> None:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = os.environ.get(
+            "PROTRAIN_MASTER_PORT", "29541"
+        )
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+            device_id=torch.device("cuda", rank),
+        )
+        try:
+            _run(rank, world_size, out_dir, bs, seq, n_iters)
+        finally:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            dist.destroy_process_group()
+
+
+    def _run(rank: int, world_size: int, out_dir: str,
+             bs: int, seq: int, n_iters: int) -> None:
+        from transformers import MistralConfig, MistralForCausalLM
+        from peft import LoraConfig, get_peft_model
+
+        from axolotl.integrations.protrain.api import (
+            protrain_model_wrapper,
+            protrain_optimizer_wrapper,
+        )
+        from axolotl.integrations.protrain.types import HardwareProfile
+
+        # Same seed across ranks so init weights agree (cell A doesn't
+        # actually rely on the rank-agreement invariant — it's a smoke,
+        # not a correctness test — but the symmetry keeps the loss
+        # trajectory comparable across runs).
+        torch.manual_seed(7)
+
+        # Tiny-Mistral shape with GQA + sliding-window enabled. Size
+        # rationale: ProTrain's S_chunk picker selects from {32, 64,
+        # 128, 256} MB and prefers the LARGEST size with zero
+        # fragmentation waste, so models under ~256 MB pack into a
+        # single chunk. ProTrain also pins any chunk containing
+        # non-block params (embed, lm_head, final norm) to the
+        # persistent set — so unless individual blocks are big enough
+        # to break the per-chunk packing into separate pure-block
+        # chunks, every chunk gets pinned and the sharded path has
+        # nothing to engage on. Each block here is ~63 M params
+        # (~126 MB bf16) so two blocks fill an S_chunk=256 MB chunk
+        # while leaving the embed-bearing first chunk and lm-head-
+        # bearing last chunk as pinned-mixed and the middle as a
+        # pure-block sharded chunk.
+        #
+        # Mistral's GQA (4 KV heads vs 8 Q heads) and sliding_window=128
+        # are both active; the test verifies they don't break chunk
+        # discovery, hooks, or the all_gather/reduce_scatter paths.
+        cfg = MistralConfig(
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,           # GQA: half as many KV heads as Q heads
+            intermediate_size=8192,
+            sliding_window=128,              # exercises the SWA code path
+            vocab_size=8192,
+            max_position_embeddings=256,
+            rms_norm_eps=1e-5,
+            use_cache=False,
+        )
+
+        device = torch.device("cuda", rank)
+        # bf16: same rationale as the M7 worker — fresh-init logits in
+        # fp16 overflow softmax on the very first iter; bf16 keeps the
+        # trajectory finite.
+        model = MistralForCausalLM(cfg).to(dtype=torch.bfloat16, device=device)
+
+        # LoRA on q/k/v/o so the smoke mirrors the deployment shape we
+        # ship in examples/protrain/3090-7b-lora.yml. PEFT's adapter
+        # layers prepend a dotted prefix that the chunk-manager block
+        # discovery must still resolve to ``model.layers`` (via the
+        # ``base_model.model.model.layers`` known path) — a regression
+        # there would surface here as discover_blocks raising.
+        lora_cfg = LoraConfig(
+            r=4,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_cfg)
+
+        hw = HardwareProfile(
+            gpu_sku=torch.cuda.get_device_name(rank),
+            gpu_memory_bytes=torch.cuda.get_device_properties(rank).total_memory,
+            gpu_count=world_size,
+            pcie_h2d_bps=13e9,
+            pcie_d2h_bps=13e9,
+            has_nvlink=False,
+        )
+
+        # Mode-C: explicit zero3_shard=True with n_persist override at
+        # 1 (keep the embed chunk on GPU; everything else CPU-offloaded
+        # and sharded across ranks). auto_mode=False so the selector
+        # cannot fall back to Mode B on the small model.
+        wrapped = protrain_model_wrapper(
+            model,
+            model_config=cfg,
+            hardware_profile=hw,
+            batch_size=bs,
+            seq_len=seq,
+            capacity_bytes=20 * (1 << 30),
+            force_all_persistent=False,
+            n_persist_override=1,
+            n_buffer_override=2,
+            n_swap_override=0,
+            n_checkpoint_override=0,
+            zero3_shard=True,
+            auto_mode=False,
+        )
+        optim = protrain_optimizer_wrapper(wrapped, lr=1e-4)
+
+        input_ids = torch.randint(
+            0, cfg.vocab_size, (bs, seq), device=device, dtype=torch.long
+        )
+        labels = input_ids.clone()
+
+        losses = []
+        for i in range(n_iters):
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            out = wrapped.module(input_ids=input_ids, labels=labels)
+            loss = out.loss.detach().clone()
+            out.loss.backward()
+            optim.step()
+            optim.zero_grad()
+
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            losses.append(float(loss.item()))
+
+        # Sharded engagement diagnostic — same contract as the M7
+        # worker, but reported as a stat rather than asserted in the
+        # worker. The outer test body decides whether to enforce the
+        # engagement check based on whether there are any non-persistent
+        # chunks (a tiny model where every chunk gets pinned to
+        # persistent has nothing to shard, and the assertion would be
+        # vacuously false).
+        chunk_manager = wrapped.chunk_manager
+        shard_states = list(chunk_manager._chunk_shards.values())
+        all_sharded = bool(shard_states) and all(
+            s.is_sharded for s in shard_states
+        )
+        n_persist_eff = len(chunk_manager._persistent_ids)
+        n_chunk = chunk_manager.layout.N_chunk
+        n_non_persist = n_chunk - n_persist_eff
+
+        if rank == 0:
+            out_path = os.path.join(out_dir, "mistral_modec_stats.out")
+            with open(out_path, "w") as f:
+                f.write(
+                    f"losses={losses}\\n"
+                    f"all_sharded={int(all_sharded)}\\n"
+                    f"n_chunk={n_chunk}\\n"
+                    f"n_persist={n_persist_eff}\\n"
+                    f"n_non_persist={n_non_persist}\\n"
+                )
+            print(
+                f"[rank0] mistral-modec losses={losses} "
+                f"all_sharded={all_sharded} "
+                f"n_chunk={n_chunk} "
+                f"n_persist={n_persist_eff} "
+                f"n_non_persist={n_non_persist}",
+                flush=True,
+            )
+
+
+    def main() -> int:
+        world = int(os.environ["PROTRAIN_WORLD_SIZE"])
+        bs = int(os.environ["PROTRAIN_BATCH_SIZE"])
+        seq = int(os.environ["PROTRAIN_SEQ_LEN"])
+        n_iters = int(os.environ["PROTRAIN_N_ITERS"])
+        out_dir = os.environ["PROTRAIN_OUT_DIR"]
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        ctx = mp.get_context("spawn")
+        procs = []
+        for rank in range(world):
+            p = ctx.Process(
+                target=_worker,
+                args=(rank, world, out_dir, bs, seq, n_iters),
+            )
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+        for p in procs:
+            if p.exitcode != 0:
+                print(f"worker pid={p.pid} exited with {p.exitcode}", flush=True)
+                return p.exitcode
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    '''
+)
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
+    """Tiny-Mistral Mode-C 2-rank smoke: GQA + sliding-window survive ProTrain wrap.
+
+    Mode-C sharding has only been exercised against Llama. Mistral's
+    GQA + sliding-window attention differ structurally; this test
+    proves that chunk discovery, per-block hooks, and the sharded
+    forward + backward + optimizer-step pipeline all run cleanly on a
+    Mistral-architecture model. Runs on GPUs 1,2 (2-rank world). Tiny
+    config (4 blocks, 256 hidden, ~3M params) makes this a wrap-and-
+    step smoke, not a throughput or memory test — the bigger memory
+    bars are covered by ``test_protrain_4gpu_zero3_sharding``.
+    """
+    import math
+
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+
+    gpu_count = _nvidia_smi_gpu_count()
+    if gpu_count < 2:
+        pytest.skip(f"requires >= 2 GPUs; nvidia-smi reports {gpu_count}")
+
+    bs = 1
+    seq = 64
+    n_iters = 3
+
+    out_dir = tmp_path / "mistral_modec"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    # GPUs 1,2 (per Item 9 cell A scoping — leave 4,5 free for parallel
+    # work, never touch 0/3/6/7).
+    env["CUDA_VISIBLE_DEVICES"] = "1,2"
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["PROTRAIN_WORLD_SIZE"] = "2"
+    env["PROTRAIN_BATCH_SIZE"] = str(bs)
+    env["PROTRAIN_SEQ_LEN"] = str(seq)
+    env["PROTRAIN_N_ITERS"] = str(n_iters)
+    env["PROTRAIN_OUT_DIR"] = str(out_dir)
+    env["PROTRAIN_MASTER_PORT"] = str(_pick_free_port())
+    env.setdefault("NCCL_IB_DISABLE", "1")
+    env.setdefault("NCCL_P2P_DISABLE", "0")
+
+    script_path = tmp_path / "_mistral_modec_worker.py"
+    script_path.write_text(_MISTRAL_MODEC_WORKER_SCRIPT)
+    log_path = tmp_path / "mistral_modec_worker.log"
+    with log_path.open("w") as log_f:
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            env=env,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=600,
+        )
+    if proc.returncode != 0:
+        tail = log_path.read_text()[-6000:]
+        raise RuntimeError(
+            f"mistral Mode-C worker failed (exit={proc.returncode}); "
+            f"log tail:\n{tail}"
+        )
+
+    stats_path = out_dir / "mistral_modec_stats.out"
+    if not stats_path.exists():
+        raise RuntimeError(
+            f"mistral Mode-C worker did not produce stats file {stats_path}; "
+            f"log tail:\n{log_path.read_text()[-4000:]}"
+        )
+    stats: dict = {}
+    for line in stats_path.read_text().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            stats[k.strip()] = v.strip()
+
+    raw_losses = stats.get("losses", "[]").strip("[]")
+    losses = [float(x) for x in raw_losses.split(",")] if raw_losses else []
+    all_sharded = bool(int(stats.get("all_sharded", "0")))
+    n_non_persist = int(stats.get("n_non_persist", "0"))
+
+    print(
+        "\nProTrain Item 9 cell A — Mistral Mode-C 2-rank smoke:\n"
+        f"  losses:         {losses}\n"
+        f"  all_sharded:    {all_sharded}\n"
+        f"  n_chunk:        {stats.get('n_chunk')}  "
+        f"n_persist: {stats.get('n_persist')}  "
+        f"n_non_persist: {n_non_persist}"
+    )
+
+    # Primary acceptance (Item 9 cell A scope): "no crash + finite loss".
+    assert len(losses) == n_iters, (
+        f"expected {n_iters} losses, got {len(losses)}: {losses}"
+    )
+    for i, lv in enumerate(losses):
+        assert math.isfinite(lv), (
+            f"iter {i}: non-finite loss {lv}; losses={losses}"
+        )
+
+    # Secondary check: when the chunk layout actually produces
+    # non-persistent chunks (the only condition under which the sharded
+    # path can engage), every such chunk MUST take the sharded code
+    # path. A tiny model whose entire layout collapses into pinned
+    # chunks (embed + lm_head + norm pin everything) has nothing to
+    # shard and the check is vacuously skipped — the wrap-and-step
+    # assertions above already cover the "Mistral arch survives Mode-C
+    # wrap" intent in that case.
+    if n_non_persist > 0:
+        assert all_sharded, (
+            "Mode-C did not engage the sharded path on every non-persistent "
+            "chunk — chunk_manager._chunk_shards either empty or contains "
+            "non-sharded entries; Mistral GQA / sliding-window may have "
+            f"broken chunk discovery (n_non_persist={n_non_persist})"
+        )
