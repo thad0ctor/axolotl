@@ -775,24 +775,47 @@ def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
     )
 
 
-def test_estimate_runtime_phase2_bwd_bypasses_chunk_comm_but_keeps_recompute():
-    """Phase-2 backward consumes translated measured wall directly.
+def test_estimate_runtime_phase2_bwd_credits_n_buffer_cache_hits():
+    """Phase-2 backward override translates the bootstrap measurement to
+    the candidate's ``n_buffer`` (paper §3.3.1 / §4.2 cache-hit invariant).
 
-    Changing n_persist/n_buffer changes the analytical backward comm assembly,
-    but must not change t_bwd when the phase-2 chunked backward measurement is
-    populated. Candidate CKPT recompute should still be added on top of the
-    translated base.
+    Previously the override was flat in ``n_buffer`` — every candidate's
+    backward time equalled the bootstrap measurement regardless of how
+    many non-persistent chunks would survive forward into backward. That
+    flatness made the searcher pick the smallest feasible ``n_buffer``
+    (the ``_min_n_buffer_for`` boundary) for any phase-2-calibrated
+    workload, undercounting the cache-hit savings the paper's reused-
+    buffer scheme is supposed to model. See
+    ``cost/runtime.py:estimate_runtime`` PHASE-2 BACKWARD OVERRIDE
+    branch — the fix subtracts ``delta_cached * nccl_gather`` from the
+    measured backward wall, where ``delta_cached`` is the cache-hit
+    delta between bootstrap and candidate.
+
+    Invariants:
+
+    1. ``t_cached < t_uncached`` — every extra cache hit relative to the
+       bootstrap saves one backward all-gather collective.
+    2. CKPT recompute is still additive on top — the recompute correction
+       and the buffer-cache correction compose linearly.
     """
     from dataclasses import replace
 
     base_trace = _make_trace(world=2)
     n_block = len(base_trace.activation_sizes)
     per_op_sum = 8 * 5 * 0.0002
+    # Phase-2 fields populated as if measured under
+    # ``n_persist=0, n_buffer=0`` (no cached chunks in the bootstrap),
+    # so any candidate ``n_buffer > 0`` strictly increases cache hits.
     trace = replace(
         base_trace,
         model_state_bytes=0,
         steady_fwd_chunked_wall_s=0.05,
-        steady_bwd_chunked_wall_s=0.020,
+        # Large enough that ``delta_cached * nccl_gather`` (12 * 0.012 =
+        # 0.144s) does not saturate the ``max(0, ...)`` clamp on the
+        # corrected backward total — keeps the assertion exact.
+        steady_bwd_chunked_wall_s=0.500,
+        phase2_n_persist=0,
+        phase2_n_buffer=0,
         phase2_n_checkpoint=n_block,
         phase2_per_block_recompute_s=0.0005,
     )
@@ -807,23 +830,30 @@ def test_estimate_runtime_phase2_bwd_bypasses_chunk_comm_but_keeps_recompute():
     cfg_cached = CostConfig(
         n_persist=0, n_buffer=n_chunk, n_swap=0, n_checkpoint=0
     )
-    cfg_persistent = CostConfig(
-        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
 
     t_uncached = estimate_runtime(cfg_uncached, trace, layout, bm_none, hw)
     t_cached = estimate_runtime(cfg_cached, trace, layout, bm_none, hw)
-    t_persistent = estimate_runtime(cfg_persistent, trace, layout, bm_none, hw)
 
-    assert t_cached == pytest.approx(t_uncached, abs=1e-9)
-    assert t_persistent == pytest.approx(t_uncached, abs=1e-9)
+    # Cache hits must strictly reduce predicted iter — that's the entire
+    # point of the buffer pool in the paper's runtime model.
+    assert t_cached < t_uncached, (
+        f"phase-2 override flat in n_buffer: cached={t_cached:.6f} "
+        f"uncached={t_uncached:.6f}; cache hits should save the "
+        "backward all-gather collective per chunk"
+    )
+    # Each delta cache hit saves the backward NCCL gather time at the
+    # chunk-payload size (``nccl_gather_s[64MB] = 0.01`` in
+    # ``_make_trace`` for world=2). Reduce-offload still happens on
+    # cached chunks so the savings are exactly the gather collective.
+    expected_delta = n_chunk * 0.01
+    assert t_uncached - t_cached == pytest.approx(expected_delta, abs=1e-9)
 
+    # CKPT recompute composes additively with the buffer-cache correction.
     cfg_ckpt = CostConfig(
         n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_block
     )
     bm_ckpt = assign_modes(0, n_block, n_block)
     t_ckpt = estimate_runtime(cfg_ckpt, trace, layout, bm_ckpt, hw)
-
     assert t_ckpt - t_uncached == pytest.approx(per_op_sum, abs=1e-9)
 
 
@@ -1200,6 +1230,167 @@ def test_search_picks_zero_swap_on_3090_like_hw(toy_trace, toy_layout):
         f"expected n_swap=0 on 3090-like HW, got cfg={result.cfg} "
         f"predicted_peak={result.predicted_peak_bytes} "
         f"predicted_iter_s={result.predicted_iter_s:.4f}"
+    )
+
+
+def test_search_picks_high_n_buffer_when_phase2_makes_savings_substantial():
+    """When phase-2 is calibrated and cache-hit savings dominate, the
+    searcher must pick a large ``n_buffer`` — not the
+    ``_min_n_buffer_for`` floor.
+
+    Synthetic invariant: if every additional cache hit subtracts
+    ``nccl_gather`` from the predicted backward, and the GPU capacity
+    admits ``n_buffer = N_chunk - n_persist``, then the searcher's
+    runtime-monotone-in-n_buffer optimization must land on the
+    maximum-feasible ``n_buffer``. This is the proximate fix for the
+    Item 5 B+C profiling finding: the original chunked-wall override
+    was flat in ``n_buffer`` and the searcher collapsed to
+    ``_min_n_buffer_for`` (= 2 on the bench).
+
+    This test is the synthetic version of the Mode-C regression
+    further down — same fix, smaller fixture.
+    """
+    from dataclasses import replace
+
+    base_trace = _make_trace(world=4)
+    n_block = len(base_trace.activation_sizes)
+    # Phase-2 fields populated. Bootstrap: n_persist=0, n_buffer=1
+    # (minimum feasible for adjacent-block prefetch). Candidate space:
+    # any (n_persist, n_buffer) with the GPU gate cleared.
+    trace = replace(
+        base_trace,
+        steady_fwd_chunked_wall_s=0.05,
+        steady_bwd_chunked_wall_s=0.40,
+        phase2_n_persist=0,
+        phase2_n_buffer=1,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.001,
+    )
+    layout = _make_layout()
+    hw = _make_hw(gpu_count=4, zero3_shard=True)
+
+    # Capacity wide enough to admit n_buffer up to N_chunk - 1.
+    capacity = 4 * GB
+    result = search(trace, layout, capacity, hw)
+    assert result.cfg.n_buffer >= 6, (
+        f"searcher under-credited cache-hit savings: cfg={result.cfg} "
+        f"predicted_peak={result.predicted_peak_bytes} "
+        f"predicted_iter_s={result.predicted_iter_s:.4f}; "
+        "expected cfg.n_buffer >= 6 once the override path translates "
+        "the bootstrap measurement across n_buffer"
+    )
+
+
+def test_search_picks_high_n_buffer_for_llama_3b_mode_c_4gpu_inputs():
+    """Regression: the Item 5 B+C bench config must auto-pick n_buffer >= 6.
+
+    Inputs mirror ``/tmp/protrain_item5/mode_c_bench.py`` —
+    Llama-3B-shape (26 transformer blocks, ~22 chunks of ~64 MB),
+    4-GPU world, bs=1 seq=256, ZeRO-3 sharded, post-phase-2 chunked
+    wall populated (``steady_bwd_chunked_wall_s`` ≈ 0.87s as the bench
+    measured). Without the cache-hit translation in
+    ``cost/runtime.py:estimate_runtime`` PHASE-2 BACKWARD OVERRIDE,
+    the searcher picks ``_min_n_buffer_for(layout, n_persist) = 2`` for
+    this layout. The fix translates each delta cache hit to a backward
+    NCCL gather skip and the searcher lands on the maximum feasible
+    ``n_buffer`` — which is far above 6 for this workload.
+
+    This is the proxy for the multi-rank bench result (multi-rank
+    GPUs are in use on the dev box; the unit-test assertion is the
+    proxy that ``n_buffer >= 6`` falls out of the searcher).
+    """
+    n_block = 26
+    n_chunk = 22
+    s_chunk = 64 * MB
+    ops_per_block = 8
+
+    op_order = []
+    op_id = 0
+    for b in range(n_block):
+        for _ in range(ops_per_block):
+            op_order.append(
+                OpRecord(
+                    op_id=OpId(op_id),
+                    module_path=f"block.{b}.op",
+                    qualified_name="aten::toy",
+                    shape_signature=((1,),),
+                    block_id=BlockId(b),
+                    is_forward=True,
+                )
+            )
+            op_id += 1
+    op_order = tuple(op_order)
+
+    op_lat = 0.0007  # 700 us/op -> ~150 ms total fwd compute
+    op_latencies = {op.op_id: op_lat for op in op_order}
+    activation_sizes = {BlockId(b): 30 * MB for b in range(n_block)}
+    intra_op_delta = {op.op_id: 4 * MB for op in op_order}
+    inter_op_delta = {op.op_id: 1 * MB for op in op_order}
+    chunks = tuple((ParamId(f"param.{i}"),) for i in range(n_chunk))
+    param_to_chunk = {ParamId(f"param.{i}"): i for i in range(n_chunk)}
+    block_to_chunks = {
+        BlockId(b): (min(b, n_chunk - 1),) for b in range(n_block)
+    }
+    layout = ChunkLayout(
+        S_chunk=s_chunk,
+        N_chunk=n_chunk,
+        chunks=chunks,
+        param_to_chunk=param_to_chunk,
+        block_to_chunks=block_to_chunks,
+    )
+
+    trace = ProfilerTrace(
+        op_order=op_order,
+        intra_op_delta=intra_op_delta,
+        inter_op_delta=inter_op_delta,
+        activation_sizes=activation_sizes,
+        model_state_bytes=n_chunk * s_chunk,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        nccl_gather_s={s_chunk: 0.012},
+        nccl_reduce_s={s_chunk: 0.014},
+        arch_hash="regression-llama-3b-mode-c",
+        bs=1,
+        seq=256,
+        sku="NVIDIA GeForce RTX 3090",
+        world=4,
+        op_latencies=op_latencies,
+        hooked_fwd_wall_s=sum(op_latencies.values()),
+        steady_fwd_wall_s=sum(op_latencies.values()) * 0.5,
+        # Phase-2 fields mirroring real bench measurement:
+        steady_fwd_chunked_wall_s=0.41,
+        steady_bwd_chunked_wall_s=0.87,
+        steady_step_overlap_s=0.015,
+        steady_phase2_peak_bytes=int(8 * GB),
+        phase2_n_persist=0,
+        phase2_n_buffer=8,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.005,
+        compute_rate_tflops=60.0,
+        trainable_param_fraction=1.0,
+    )
+    hw = HardwareProfile(
+        gpu_sku="NVIDIA GeForce RTX 3090",
+        gpu_memory_bytes=24 * GB,
+        gpu_count=4,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        has_nvlink=False,
+        zero3_shard=True,
+        cpu_adam_bytes_per_sec=2e9,
+        gpu_adam_bytes_per_sec=4e11,
+        gpu_compute_tflops=60.0,
+    )
+
+    capacity = 20 * GB
+    result = search(trace, layout, capacity, hw)
+    assert result.cfg.n_buffer >= 6, (
+        f"Mode-C 4-GPU regression: n_buffer auto-pick collapsed to "
+        f"{result.cfg.n_buffer}. Expected >=6 so most non-persistent "
+        f"chunks fit in the buffer pool simultaneously and gather count "
+        f"approaches N_non_persist rather than 2 * N_non_persist. "
+        f"Full cfg={result.cfg}, predicted_iter_s={result.predicted_iter_s:.4f}, "
+        f"predicted_peak={result.predicted_peak_bytes / GB:.2f}GB"
     )
 
 
