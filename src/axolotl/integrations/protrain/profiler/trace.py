@@ -262,6 +262,12 @@ def run_trace(
     # when discovery fails (non-standard model shape).
     path_to_global_bid: dict[str, BlockId] = {}
     block_path_prefixes: tuple[str, ...] = ()
+    # ``block_tree_index`` maps each global BlockId to its forward-order
+    # tree (encoder=0, decoder=1; single-tree models use 0). Populated
+    # from ``discover_blocks`` here at trace-construction time and
+    # serialized into ``ProfilerTrace.block_tree_index`` so the cost
+    # model doesn't have to parse ``module_path`` prefixes downstream.
+    block_tree_index: dict[BlockId, int] = {}
     try:
         from axolotl.integrations.protrain.block.layout_rules import (
             block_id_path_map,
@@ -276,6 +282,15 @@ def run_trace(
         block_path_prefixes = tuple(
             sorted(path_to_global_bid.keys(), key=len, reverse=True)
         )
+        # Walk the trees in the same flatten order ``block_id_path_map``
+        # uses (sorted by ``forward_order`` ascending; encoder ids
+        # ``[0, n_enc)`` precede decoder ids ``[n_enc, n_enc + n_dec)``)
+        # and stamp every block with its tree's ``forward_order``.
+        _flat_idx = 0
+        for _tree in sorted(_trees_for_trace, key=lambda t: t.forward_order):
+            for _ in _tree.blocks:
+                block_tree_index[BlockId(_flat_idx)] = int(_tree.forward_order)
+                _flat_idx += 1
     except Exception as exc:  # pragma: no cover - defensive
         LOG.debug(
             "trace: block_id_path_map unavailable (%s); falling back "
@@ -798,6 +813,7 @@ def run_trace(
         steady_fwd_block_peak_bytes=steady_fwd_block_peak_bytes,
         compute_rate_tflops=compute_rate_tflops,
         trainable_param_fraction=trainable_param_fraction,
+        block_tree_index=block_tree_index,
     )
 
 
