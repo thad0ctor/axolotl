@@ -35,6 +35,7 @@ from axolotl.integrations.protrain.types import (
     ChunkLayout,
     CostConfig,
     HardwareProfile,
+    OpRecord,
     ProfilerTrace,
 )
 from axolotl.utils.logging import get_logger
@@ -175,6 +176,26 @@ def _cross_attn_persist_bytes(
         # Already counted in retained_none_bytes; avoid double-counting.
         return 0
     return int(trace.activation_sizes.get(last_enc_bid, 0))
+
+
+def _op_cross_attn_surcharge(
+    op: OpRecord,
+    cross_attn_bytes: int,
+    tree_index_map: dict[BlockId, int],
+) -> int:
+    """Per-op cross-attention surcharge during decoder forward.
+
+    Returns ``cross_attn_bytes`` if this op belongs to a non-encoder
+    tree (decoder forward); ``0`` otherwise. Shared by
+    :func:`estimate_peak` and the searcher fast-path
+    :func:`axolotl.integrations.protrain.search.exhaustive._block_map_peak_contribution`
+    so both walks gate identically on the tree index.
+    """
+    if cross_attn_bytes <= 0 or op.block_id is None:
+        return 0
+    if tree_index_map.get(op.block_id, 0) > 0:
+        return cross_attn_bytes
+    return 0
 
 
 def hot_iter_peak_cap(
@@ -514,17 +535,9 @@ def estimate_peak(
                 BlockId(ckpt_bump_op[i]), 0
             )
 
-        # Cross-attention saved-state surcharge: applies only during
-        # decoder forward ops on enc-dec models, and only when the
-        # encoder's last block isn't already covered by live_none. See
-        # the function docstring's "encoder-decoder peak accounting"
-        # section for the full reasoning. ``cross_attn_bytes`` is 0 on
-        # single-tree traces, making this a no-op for causal-LM.
-        op_cross_attn = 0
-        if cross_attn_bytes > 0 and op.block_id is not None:
-            op_tree_idx = tree_index_map.get(op.block_id, 0)
-            if op_tree_idx > 0:
-                op_cross_attn = cross_attn_bytes
+        op_cross_attn = _op_cross_attn_surcharge(
+            op, cross_attn_bytes, tree_index_map
+        )
 
         candidate = (
             model_state_present

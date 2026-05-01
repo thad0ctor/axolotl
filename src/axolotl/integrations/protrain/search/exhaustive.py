@@ -144,7 +144,11 @@ def _iter_candidates(bounds: Bounds) -> Iterator[CostConfig]:
 
 
 def _block_map_peak_contribution(
-    block_map: BlockStrategyMap, trace: ProfilerTrace
+    block_map: BlockStrategyMap,
+    trace: ProfilerTrace,
+    *,
+    forward_ops_by_block: dict[BlockId, list[int]] | None = None,
+    tree_index_map: dict[BlockId, int] | None = None,
 ) -> int:
     """Compute the block-map-dependent part of the raw peak.
 
@@ -160,6 +164,11 @@ def _block_map_peak_contribution(
     ``ALPHA_FRAGMENTATION`` and ``int()``-casts to match
     ``estimate_peak`` exactly.
 
+    ``forward_ops_by_block`` and ``tree_index_map`` depend only on
+    ``trace`` (not ``block_map``); when called inside the searcher's
+    hot loop callers should compute them once and pass them in to
+    skip the per-iteration rebuild.
+
     Cross-attention term mirrors ``estimate_peak``'s Fix-3 enc-dec
     accounting — see the docstring of that function. For single-tree
     causal-LM traces the term is 0 and this matches the legacy F_bm.
@@ -167,13 +176,14 @@ def _block_map_peak_contribution(
     from axolotl.integrations.protrain.cost.memory import (
         _block_tree_index_map,
         _cross_attn_persist_bytes,
+        _op_cross_attn_surcharge,
     )
 
-    # Group forward ops by block.
-    forward_ops_by_block: dict[BlockId, list[int]] = defaultdict(list)
-    for i, op in enumerate(trace.op_order):
-        if op.is_forward and op.block_id is not None:
-            forward_ops_by_block[op.block_id].append(i)
+    if forward_ops_by_block is None:
+        forward_ops_by_block = defaultdict(list)
+        for i, op in enumerate(trace.op_order):
+            if op.is_forward and op.block_id is not None:
+                forward_ops_by_block[op.block_id].append(i)
 
     # Identify CKPT bump ops.
     ckpt_bump_op: dict[int, int] = {}
@@ -205,8 +215,8 @@ def _block_map_peak_contribution(
                 break
         return live
 
-    # Enc-dec cross-attn surcharge: 0 on single-tree traces.
-    tree_index_map = _block_tree_index_map(trace)
+    if tree_index_map is None:
+        tree_index_map = _block_tree_index_map(trace)
     cross_attn_bytes = _cross_attn_persist_bytes(
         trace, block_map, tree_index_map
     )
@@ -225,10 +235,9 @@ def _block_map_peak_contribution(
             ckpt_extra = trace.activation_sizes.get(
                 BlockId(ckpt_bump_op[i]), 0
             )
-        op_cross_attn = 0
-        if cross_attn_bytes > 0 and op.block_id is not None:
-            if tree_index_map.get(op.block_id, 0) > 0:
-                op_cross_attn = cross_attn_bytes
+        op_cross_attn = _op_cross_attn_surcharge(
+            op, cross_attn_bytes, tree_index_map
+        )
         candidate = live_none + ckpt_extra + op_cross_attn + intra + inter
         if candidate > best:
             best = candidate
@@ -353,11 +362,20 @@ def search(
     # ``(n_persist + n_buffer) * S_chunk`` term, pre-alpha.
     from axolotl.integrations.protrain.cost.memory import (
         ALPHA_FRAGMENTATION,
+        _block_tree_index_map,
         hot_iter_peak_cap,
     )
 
     alpha = ALPHA_FRAGMENTATION
     s_chunk = layout.S_chunk
+
+    # Hoist trace-only maps out of the (n_swap, n_ckpt) hot loop —
+    # both depend on ``trace`` only, not ``block_map``.
+    forward_ops_by_block: dict[BlockId, list[int]] = defaultdict(list)
+    for i, op in enumerate(trace.op_order):
+        if op.is_forward and op.block_id is not None:
+            forward_ops_by_block[op.block_id].append(i)
+    tree_index_map = _block_tree_index_map(trace)
 
     for n_ckpt in range(0, bounds.N_block + 1):
         max_swap = min(bounds.N_block - n_ckpt, bounds.N_interval)
@@ -365,7 +383,12 @@ def search(
             block_map = assign_modes(n_swap, n_ckpt, bounds.N_block)
             # F_bm: max over forward ops of
             #   live_none + ckpt_extra + intra + inter
-            f_bm = _block_map_peak_contribution(block_map, trace)
+            f_bm = _block_map_peak_contribution(
+                block_map,
+                trace,
+                forward_ops_by_block=forward_ops_by_block,
+                tree_index_map=tree_index_map,
+            )
 
             # For a fixed (n_ckpt, n_swap) sweep n_persist. The optimal
             # n_buffer at each n_persist is the maximum feasible value

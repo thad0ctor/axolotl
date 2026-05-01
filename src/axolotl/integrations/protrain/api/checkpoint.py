@@ -62,6 +62,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -1037,10 +1038,7 @@ def _load_protrain_optim_dir(
                     )
                     # Pre-clean stale temp dir from a previous
                     # interrupted run so we never read mixed bytes.
-                    if os.path.isdir(online_reshard_temp_dir):
-                        import shutil as _shutil  # noqa: PLC0415
-
-                        _shutil.rmtree(online_reshard_temp_dir)
+                    shutil.rmtree(online_reshard_temp_dir, ignore_errors=True)
                     reshard_mode_c_shards(
                         original_target,
                         online_reshard_temp_dir,
@@ -1287,10 +1285,8 @@ def _load_protrain_optim_dir(
         if online_reshard_temp_dir is not None:
             _barrier_or_noop()
             if current_rank == 0 and os.path.isdir(online_reshard_temp_dir):
-                import shutil as _shutil  # noqa: PLC0415
-
                 try:
-                    _shutil.rmtree(online_reshard_temp_dir)
+                    shutil.rmtree(online_reshard_temp_dir)
                 except OSError as cleanup_exc:
                     # Cleanup failure is non-fatal — the load already
                     # succeeded. Log and continue; user can manually

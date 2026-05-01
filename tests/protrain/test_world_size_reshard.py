@@ -1273,14 +1273,10 @@ def test_sharded_world_size_reshard_4_to_2_default_hard_errors(tmp_path):
         "expected per-rank .err sentinels from the failing load workers; "
         "either the workers didn't raise or the spawn didn't propagate"
     )
-    # Both ranks must have raised — the load is collective. Check the
-    # error body mentions both recovery routes (offline CLI + opt-in).
-    for ef in err_files:
-        body = ef.read_text()
-        # The lockstep allreduce / broadcast may surface a synthesised
-        # message on non-source ranks; the source rank carries the full
-        # human message. Either path must be visible somewhere across
-        # the ranks. Check the union.
+    # The lockstep broadcast surfaces a synthesised message on non-source
+    # ranks; the source rank carries the full human message. The recovery
+    # routes (offline CLI + opt-in flag) must be visible somewhere across
+    # ranks — check the union.
     union = "\n".join(ef.read_text() for ef in err_files)
     assert "scripts.protrain.reshard_optim" in union, (
         "default-error must point at the offline CLI tool"
