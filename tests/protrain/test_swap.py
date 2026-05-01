@@ -42,7 +42,12 @@ from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
 
 def test_pool_acquire_release_cycles() -> None:
     """Slots return to the free list and can be re-acquired."""
-    pool = ActivationSwapPool(n_swap=2, slot_bytes=64, prefetch_depth=2)
+    # M5+: pool capacity is n_swap * slots_per_block * prefetch_depth.
+    # Pin slots_per_block=1 here to keep the legacy 1-slot-per-block
+    # arithmetic for this allocator-semantics test.
+    pool = ActivationSwapPool(
+        n_swap=2, slot_bytes=64, prefetch_depth=2, slots_per_block=1
+    )
     assert pool.n_slot == 4
     assert pool.free_count == 4
 
@@ -67,7 +72,9 @@ def test_pool_acquire_release_cycles() -> None:
 
 def test_pool_exhaustion_raises() -> None:
     """Acquiring beyond ``n_slot`` raises a clear RuntimeError."""
-    pool = ActivationSwapPool(n_swap=1, slot_bytes=8, prefetch_depth=2)
+    pool = ActivationSwapPool(
+        n_swap=1, slot_bytes=8, prefetch_depth=2, slots_per_block=1
+    )
     held = []
     held.append(pool.acquire())
     held.append(pool.acquire())
@@ -80,7 +87,9 @@ def test_pool_exhaustion_raises() -> None:
 
 def test_pool_double_release_warns_no_corruption() -> None:
     """Double-release is logged but does not corrupt the free list."""
-    pool = ActivationSwapPool(n_swap=1, slot_bytes=8, prefetch_depth=2)
+    pool = ActivationSwapPool(
+        n_swap=1, slot_bytes=8, prefetch_depth=2, slots_per_block=1
+    )
     sid, _ = pool.acquire()
     pool.release(sid)
     pre = pool.free_count
@@ -92,8 +101,23 @@ def test_pool_double_release_warns_no_corruption() -> None:
 
 def test_pool_total_bytes_matches_sizing() -> None:
     """``total_bytes`` is the product of n_slot × slot_bytes."""
-    pool = ActivationSwapPool(n_swap=3, slot_bytes=128, prefetch_depth=2)
-    assert pool.total_bytes == 3 * 2 * 128
+    pool = ActivationSwapPool(
+        n_swap=3, slot_bytes=128, prefetch_depth=2, slots_per_block=4
+    )
+    # n_slot = n_swap * slots_per_block * prefetch_depth = 3 * 4 * 2 = 24
+    assert pool.n_slot == 24
+    assert pool.total_bytes == 24 * 128
+    pool.close()
+
+
+def test_pool_default_slots_per_block_yields_k_capacity() -> None:
+    """M5+: default ``slots_per_block`` multiplies the pool capacity."""
+    from axolotl.integrations.protrain.block.swap_pool import (
+        DEFAULT_SLOTS_PER_BLOCK,
+    )
+
+    pool = ActivationSwapPool(n_swap=1, slot_bytes=64, prefetch_depth=2)
+    assert pool.n_slot == 1 * DEFAULT_SLOTS_PER_BLOCK * 2
     pool.close()
 
 
@@ -178,6 +202,146 @@ def test_swap_correctness_matches_reference_three_steps() -> None:
 # ---------------------------------------------------------------------------
 # Memory test: SWAP path must not exceed the NONE-path peak
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.gpu
+def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
+    """M5+: SWAP=on must free GPU activations between fwd and bwd.
+
+    Build a stack of blocks (mimicking a transformer's block list),
+    then measure two quantities under SWAP=off vs SWAP=on:
+
+    1. **post-forward residency** (current GPU bytes after the full
+       forward chain finishes) — this is where SWAP's value lives:
+       earlier blocks' saved tensors should be on CPU, not GPU.
+       Acceptance: ≥30% reduction.
+    2. **forward+backward peak** — looser target since backward
+       brings tensors back to GPU. Acceptance: ≥10% reduction.
+
+    Also asserts gradient correctness within fp32 tolerance: the
+    saved-tensor round trip through pinned host memory is bit-
+    preserving for floating-point dtypes, so swap=on / swap=off
+    produce numerically equivalent gradients.
+
+    Acceptance criterion is **memory reduction**, not throughput —
+    paper §3.1.2 says SWAP costs throughput on PCIe 3090s. The
+    point of this test is solely "do GPU activations actually leave
+    GPU memory under saved_tensors_hooks?"
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from axolotl.integrations.protrain.block import swap as swap_mod
+
+    device = torch.device("cuda")
+
+    class _BigBlock(nn.Module):
+        """A block whose forward saves several large tensors.
+
+        Each ``nn.Linear`` saves its input; ``relu`` and ``softmax``
+        save their outputs. Total ≈ 4–6 saved tensors per forward,
+        mimicking the attention+MLP saved-tensor blizzard.
+        """
+
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            self.lin1 = nn.Linear(d, d, bias=False)
+            self.lin2 = nn.Linear(d, d, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            h = self.lin1(x)
+            h = torch.relu(h)
+            h = torch.softmax(h, dim=-1)
+            h = self.lin2(h)
+            return h + x
+
+    # Each saved tensor is shape (B=16, S=256, D=512) fp32 = 8 MiB —
+    # well above SIZE_THRESHOLD_BYTES (1 MiB). 4 stacked blocks make
+    # the cumulative-residency win measurable; a single block hides
+    # the win because backward immediately brings tensors back.
+    B, S, D = 16, 256, 512
+    n_blocks = 4
+
+    def _measure(use_swap: bool) -> dict[str, int | torch.Tensor]:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        torch.manual_seed(0)
+        blocks = nn.ModuleList(_BigBlock(D) for _ in range(n_blocks)).to(device)
+
+        if use_swap:
+            wrapped_blocks = nn.ModuleList(
+                swap_mod.SwappedBlock(b) for b in blocks
+            )
+            # Pool: enough capacity for all blocks × all saved tensors.
+            # slot_bytes = exactly one (B, S, D) fp32 tensor.
+            pool = ActivationSwapPool(
+                n_swap=n_blocks,
+                slot_bytes=B * S * D * 4,
+                prefetch_depth=2,
+                slots_per_block=16,
+            )
+            stream = torch.cuda.Stream()
+            for wb in wrapped_blocks:
+                wb.attach_runtime(pool, stream)
+            chain = wrapped_blocks
+        else:
+            pool = None
+            chain = blocks
+
+        x = torch.randn(B, S, D, device=device, requires_grad=True)
+        h = x
+        for b in chain:
+            h = b(h)
+        torch.cuda.synchronize()
+        post_fwd_resident = int(torch.cuda.memory_allocated(device))
+
+        h.sum().backward()
+        torch.cuda.synchronize()
+        full_peak = int(torch.cuda.max_memory_allocated(device))
+
+        gx = x.grad.detach().clone() if x.grad is not None else torch.empty(0)
+        if pool is not None:
+            pool.close()
+        del chain, blocks, x, h
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return {
+            "post_fwd_resident": post_fwd_resident,
+            "full_peak": full_peak,
+            "gx": gx,
+        }
+
+    off = _measure(use_swap=False)
+    on = _measure(use_swap=True)
+
+    # 1) Post-forward residency must drop ≥30% — this is the headline
+    # M5+ guarantee: saved activations leave GPU between fwd and bwd.
+    resident_red = (
+        off["post_fwd_resident"] - on["post_fwd_resident"]
+    ) / off["post_fwd_resident"]
+    assert resident_red >= 0.30, (
+        f"SWAP=on did not free GPU activations after forward: "
+        f"baseline={off['post_fwd_resident']:,} "
+        f"swap={on['post_fwd_resident']:,} "
+        f"reduction={resident_red:.1%} (require >= 30%)"
+    )
+
+    # 2) Full fwd+bwd peak should also drop, though by less because
+    # backward unpacks bring tensors back. ≥10% is conservative.
+    peak_red = (off["full_peak"] - on["full_peak"]) / off["full_peak"]
+    assert peak_red >= 0.10, (
+        f"SWAP=on did not reduce fwd+bwd peak enough: "
+        f"baseline={off['full_peak']:,} swap={on['full_peak']:,} "
+        f"reduction={peak_red:.1%} (require >= 10%)"
+    )
+
+    # 3) Gradients must be numerically identical — the host round trip
+    # is bit-preserving for fp32.
+    assert torch.allclose(off["gx"], on["gx"], atol=1e-5, rtol=1e-5), (
+        "Gradients diverge between SWAP=on and SWAP=off"
+    )
 
 
 @pytest.mark.gpu
