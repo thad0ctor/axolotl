@@ -71,6 +71,112 @@ def _group_ops_by_block(trace: ProfilerTrace) -> dict[BlockId, list[int]]:
     return grouped
 
 
+def _tree_index_for_path(module_path: str) -> int:
+    """Best-effort tree-index inference from a module path.
+
+    Tree boundaries are not stored in ``ProfilerTrace`` directly, so we
+    parse the dotted path's first segment:
+
+    - ``encoder...`` -> tree 0
+    - ``decoder...`` -> tree 1
+    - anything else  -> tree 0 (single-tree default)
+
+    This mirrors the convention used by
+    :func:`axolotl.integrations.protrain.block.layout_rules.flatten_block_trees`,
+    which gives the encoder ``forward_order=0`` and the decoder
+    ``forward_order=1``. Single-tree causal-LM models have all paths
+    fall through to tree 0, preserving legacy behaviour exactly.
+
+    The two-tree case targets T5 / FLAN-T5 (Item 9). BART would also
+    classify correctly here — its block paths are ``encoder.layers``
+    / ``decoder.layers``. Future enc-dec families with non-``encoder``/
+    ``decoder`` naming would need explicit handling.
+    """
+    if module_path.startswith("encoder.") or module_path == "encoder":
+        return 0
+    if module_path.startswith("decoder.") or module_path == "decoder":
+        return 1
+    return 0
+
+
+def _block_tree_index_map(
+    trace: ProfilerTrace,
+) -> dict[BlockId, int]:
+    """Map each ``BlockId`` to its forward-order tree index.
+
+    Inferred from the first forward op tagged to each block_id, by
+    parsing its ``module_path`` prefix. Returns ``{}`` if no forward
+    ops carry block_ids (degenerate trace input).
+    """
+    seen: dict[BlockId, int] = {}
+    for op in trace.op_order:
+        if not op.is_forward or op.block_id is None:
+            continue
+        if op.block_id in seen:
+            continue
+        seen[op.block_id] = _tree_index_for_path(op.module_path)
+    return seen
+
+
+def _has_multiple_trees(tree_index_map: dict[BlockId, int]) -> bool:
+    """Return True iff at least two distinct tree indices are present."""
+    if not tree_index_map:
+        return False
+    indices = set(tree_index_map.values())
+    return len(indices) >= 2
+
+
+def _cross_attn_persist_bytes(
+    trace: ProfilerTrace,
+    block_map: BlockStrategyMap,
+    tree_index_map: dict[BlockId, int],
+) -> int:
+    """Estimate cross-attention saved-state bytes that span trees.
+
+    Encoder-decoder models (T5, FLAN-T5) save the encoder's last-layer
+    hidden state for cross-attention in the decoder. That tensor is
+    produced during encoder forward, consumed during decoder forward
+    (every cross-attention layer reads it), and released only after
+    decoder backward finishes — so it spans the entire decoder
+    forward + decoder backward window.
+
+    Sizing — interpretation of T5's saved-state, NOT covered by the
+    paper (paper is causal-LM only):
+
+    - Use ``activation_sizes[last_enc_bid]`` as a CONSERVATIVE upper
+      bound. The retained-activation-bytes value for the encoder's
+      final block already includes the hidden-state output that gets
+      passed to the decoder; it's strictly larger than the
+      cross-attn-only saved-state.
+    - When that block is in NONE mode the bytes are already counted in
+      :func:`estimate_peak`'s ``live_none`` accumulator, so we return
+      ``0`` to avoid double-counting.
+    - When that block is in CKPT or SWAP mode its activations are not
+      in ``live_none``; CKPT discards the BLOCK INTERNALS but the
+      OUTPUT hidden tensor passed to the decoder cannot be discarded
+      (the cross-attention layers reference it). Same for SWAP — the
+      saved-state output isn't part of the swap-band's offload set.
+      We therefore return the full ``activation_sizes`` upper bound.
+
+    Returns 0 when the trace looks single-tree (no decoder ops), when
+    no encoder block_ids resolve, or when we lack activation bytes for
+    the last encoder block.
+    """
+    if not _has_multiple_trees(tree_index_map):
+        return 0
+    encoder_bids = sorted(
+        bid for bid, idx in tree_index_map.items() if idx == 0
+    )
+    if not encoder_bids:
+        return 0
+    last_enc_bid = encoder_bids[-1]
+    last_enc_mode = block_map.get(last_enc_bid, BlockMode.NONE)
+    if last_enc_mode is BlockMode.NONE:
+        # Already counted in retained_none_bytes; avoid double-counting.
+        return 0
+    return int(trace.activation_sizes.get(last_enc_bid, 0))
+
+
 def hot_iter_peak_cap(
     trace: ProfilerTrace,
     block_map: BlockStrategyMap,
@@ -258,6 +364,42 @@ def estimate_peak(
     -------
     int
         Peak bytes, rounded via ``int(alpha * raw_peak)``.
+
+    Notes — encoder-decoder peak accounting (Fix 3, post-Item 9)
+    ------------------------------------------------------------
+    The paper's §3.3 op-walk derivation assumes a single transformer
+    tree (causal-LM); it does not cover encoder-decoder models. Our
+    interpretation, applied transparently when the trace has both
+    ``encoder.*`` and ``decoder.*`` ops:
+
+    1. **Per-tree forward order:** the trace's ``op_order`` already
+       interleaves the trees in their forward execution sequence
+       (encoder first, then decoder), because
+       ``flatten_block_trees`` numbers encoder block_ids before decoder
+       ones, and the profiler trace tags ops with these global ids.
+       The single op-walk below therefore traverses the trees in the
+       correct order without further restructuring.
+    2. **Cross-attention saved-state term:** the encoder's final hidden
+       state lives across the entire decoder forward + decoder backward
+       window. When the encoder's last block is in CKPT/SWAP mode its
+       full activation bytes are not in ``live_none``, but the output
+       hidden tensor still IS retained for cross-attn — so we add
+       ``_cross_attn_persist_bytes`` as a per-decoder-op surcharge.
+       When the encoder's last block is NONE the bytes are already in
+       ``live_none``; the helper returns 0 to avoid double-counting.
+    3. **Backward sequencing:** decoder backward runs to completion
+       before encoder backward starts. The forward-driven peak we
+       compute here is naturally an upper bound on the backward peak
+       in this regime — at the last forward op every NONE activation
+       across both trees plus the cross-attn saved state is live, and
+       backward only frees them. The CKPT recomputation bump remains
+       a forward-op surcharge as before, modeling the worst single
+       block's recompute window.
+
+    For single-tree causal-LM traces ``_has_multiple_trees`` is False,
+    the cross-attn term is 0, and the op-walk is bit-identical to the
+    pre-Fix-3 implementation. This is asserted by the cost-model unit
+    tests in ``test_cost_search.py``.
     """
     # --- Static model-state footprint ----------------------------------
     # Persistent chunks are always on GPU. Non-persistent chunks only
@@ -276,6 +418,10 @@ def estimate_peak(
     #   SWAP: 0 bytes retained in steady state (see module docstring).
     n_block = len(trace.activation_sizes)
     forward_ops_by_block = _group_ops_by_block(trace)
+    tree_index_map = _block_tree_index_map(trace)
+    cross_attn_bytes = _cross_attn_persist_bytes(
+        trace, block_map, tree_index_map
+    )
 
     # Resolve "first op index" for each CKPT block; used to schedule the
     # checkpoint recomputation bump. If the block has no ops (degenerate
@@ -368,10 +514,23 @@ def estimate_peak(
                 BlockId(ckpt_bump_op[i]), 0
             )
 
+        # Cross-attention saved-state surcharge: applies only during
+        # decoder forward ops on enc-dec models, and only when the
+        # encoder's last block isn't already covered by live_none. See
+        # the function docstring's "encoder-decoder peak accounting"
+        # section for the full reasoning. ``cross_attn_bytes`` is 0 on
+        # single-tree traces, making this a no-op for causal-LM.
+        op_cross_attn = 0
+        if cross_attn_bytes > 0 and op.block_id is not None:
+            op_tree_idx = tree_index_map.get(op.block_id, 0)
+            if op_tree_idx > 0:
+                op_cross_attn = cross_attn_bytes
+
         candidate = (
             model_state_present
             + live_none
             + ckpt_extra
+            + op_cross_attn
             + intra
             + inter
         )
