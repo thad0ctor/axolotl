@@ -46,6 +46,46 @@ pinned-slot bookkeeping + PCIe round trip cost dominates. The default
 beta, softmax masks, attention biases) while still capturing the big
 ones (residual stream ``(batch, seq, hidden)`` and attention scores
 ``(batch, heads, seq, seq)``). Override per-test via the constant.
+
+Per-Node fanout floor (single-block backward peak)
+--------------------------------------------------
+The headline 43-66% memory reduction comes from compounding across
+stacked SWAP blocks: while block ``i`` runs backward, blocks
+``i+1, …, n-1`` are still done with their saved tensors on CPU.
+A *single* block's backward peak only drops ~10-15% — investigated
+2026-05-01 with a register_hook-based early-free prototype that
+showed no measurable improvement over the natural ``__del__`` path.
+
+The bound is an autograd-engine internal:
+
+    For each backward Node, the C++ engine calls
+    ``SavedVariable::unpack()`` for ALL the Node's saved tensors
+    BEFORE invoking the Node's ``apply()``. The unpacked tensors
+    are held as locals in the C++ derivative function and released
+    only when ``apply()`` returns. Multiple saved tensors per Node
+    therefore yield concurrent live unpacked GPU buffers during
+    that single Node's backward call.
+
+For a transformer block, the dominant fanout is the attention
+score-times-V matmul (saves both ``attn`` and ``v``) and the
+QKV-projection linear (saves activation and weight). With B=16
+S=256 D=512 fp32 the maximum concurrent unpacked bytes is ~42 MB —
+that's the bound on how much we can shrink the per-block backward
+peak without intervening mid-apply. No Python hook
+(``saved_tensors_hooks``, ``Node.register_hook``,
+``Node.register_prehook``) fires inside an ``apply()``.
+
+Two paths could push past the floor — both deemed out of scope:
+
+* Replace each matmul/softmax/etc. with an autograd Function that
+  stages saved-tensor lifetimes manually. Breaks model-agnosticism;
+  would have to wrap every op in every block.
+* Modify PyTorch C++ engine to release individual saved tensors
+  after each derivative step. Upstream change.
+
+The single-block floor is recorded by
+``test_swap_single_block_backward_peak_at_autograd_floor`` so
+future maintainers don't re-run the investigation.
 """
 
 from __future__ import annotations

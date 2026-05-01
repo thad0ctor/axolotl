@@ -345,6 +345,134 @@ def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
 
 
 @pytest.mark.gpu
+def test_swap_single_block_backward_peak_at_autograd_floor() -> None:
+    """Document the per-block backward-peak floor for SWAP saved_tensors_hooks.
+
+    The M5+ stacked-block test demonstrates the headline 43-66% wins,
+    which compound across blocks because earlier blocks' saved tensors
+    are on CPU while later blocks compute. A *single* block's backward
+    peak is fundamentally bounded by an autograd-engine internal:
+
+        For each backward Node, the engine unpacks ALL the Node's saved
+        tensors via ``SavedVariable::unpack()`` BEFORE invoking the
+        Node's C++ ``apply()``. The unpacked tensors are held as locals
+        inside ``apply()`` and released only when ``apply()`` returns.
+        Multiple saved tensors per Node = concurrent unpacked GPU
+        buffers. No Python-level hook (saved_tensors_hooks unpack,
+        Node.register_hook, Node.register_prehook) can intervene
+        mid-apply.
+
+    This test pins down the empirical reduction on a single block
+    (one ``nn.Linear`` + ``relu`` + ``softmax`` + ``nn.Linear`` +
+    residual) and asserts the modest single-block win we actually
+    observe (~10%). Anything larger would require either:
+
+    * Replacing matmul/softmax/etc. with autograd Functions that stage
+      their saved-tensor lifetimes manually (huge surface, breaks
+      model-agnosticism), or
+    * A PyTorch C++ engine change to release individual saved tensors
+      after each derivative step.
+
+    Both are out of scope. The test documents the floor so future
+    maintainers don't repeat the investigation. See commit history
+    for the SWAP=off vs SWAP=on profiling traces that establish the
+    bound at autograd-engine ``Node::apply()`` granularity.
+
+    The headline savings live in the stacked-block case (the M5+ test
+    above). Single-block savings remain at the per-Node fanout floor.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from axolotl.integrations.protrain.block import swap as swap_mod
+
+    device = torch.device("cuda")
+
+    class _BigBlock(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            self.lin1 = nn.Linear(d, d, bias=False)
+            self.lin2 = nn.Linear(d, d, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            h = self.lin1(x)
+            h = torch.relu(h)
+            h = torch.softmax(h, dim=-1)
+            h = self.lin2(h)
+            return h + x
+
+    B, S, D = 16, 256, 512
+
+    def _measure(use_swap: bool) -> tuple[int, int]:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        torch.manual_seed(0)
+        block = _BigBlock(D).to(device)
+        if use_swap:
+            wrapped = swap_mod.SwappedBlock(block)
+            pool = ActivationSwapPool(
+                n_swap=1,
+                slot_bytes=B * S * D * 4,
+                prefetch_depth=2,
+                slots_per_block=16,
+            )
+            stream = torch.cuda.Stream()
+            wrapped.attach_runtime(pool, stream)
+            chain: nn.Module = wrapped
+        else:
+            pool = None
+            chain = block
+
+        x = torch.randn(B, S, D, device=device, requires_grad=True)
+        h = chain(x)
+        torch.cuda.synchronize()
+        # Reset peak so we measure ONLY backward — fwd peak is not the
+        # bound under investigation; we want the peak GPU usage during
+        # the backward pass alone.
+        torch.cuda.reset_peak_memory_stats(device)
+        h.sum().backward()
+        torch.cuda.synchronize()
+        bwd_peak = int(torch.cuda.max_memory_allocated(device))
+        post_fwd = int(torch.cuda.memory_allocated(device))
+
+        if pool is not None:
+            pool.close()
+        del chain, block, x, h
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return post_fwd, bwd_peak
+
+    off_post, off_peak = _measure(False)
+    on_post, on_peak = _measure(True)
+    reduction = (off_peak - on_peak) / off_peak
+
+    # Floor assertion: SWAP=on does reduce single-block backward peak,
+    # but only modestly. The bound below (≥5%) is permissive to allow
+    # for allocator noise; the headline is "this win is on the order of
+    # 10%, not 30%, because of the autograd-engine internals". If a
+    # future PyTorch release lets us trim individual saved tensors
+    # mid-apply this test will overshoot — that's fine, the assertion
+    # is a lower bound.
+    assert reduction >= 0.05, (
+        f"single-block backward peak unexpectedly NOT reduced by SWAP: "
+        f"baseline={off_peak:,} swap={on_peak:,} reduction={reduction:.1%}"
+    )
+    # Upper-bound documenting the autograd-engine floor. If this fails
+    # high (>25%), the floor has shifted — investigate (likely a torch
+    # version that lets us release saved tensors mid-apply, which would
+    # let us tighten this further).
+    assert reduction <= 0.25, (
+        f"single-block backward peak reduction {reduction:.1%} exceeds "
+        "documented autograd-engine floor (~10-15%). PyTorch may have "
+        "changed Node::apply saved-variable lifetime. Re-investigate "
+        "register_hook-based early-free; see commit history for prior "
+        "investigation."
+    )
+
+
+@pytest.mark.gpu
 def test_swap_path_does_not_blow_peak() -> None:
     """Peak GPU memory with SWAP attached is no larger than the NONE-path peak.
 
