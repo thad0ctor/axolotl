@@ -110,12 +110,22 @@ def hot_iter_peak_cap(
     return None
 
 
+#: Pool sizing knob mirrored from ``block.swap_pool.ActivationSwapPool``.
+#: The pool holds ``n_swap * SWAP_PREFETCH_DEPTH`` activation slots.
+#: Kept in sync with the wrapper's default (option 2A minimum-viable
+#: single-block lookahead = 2). When tuning this, update both this
+#: constant AND the model_wrapper's ``ActivationSwapPool(prefetch_depth=...)``
+#: argument so the cost model reflects the runtime pool sizing.
+SWAP_PREFETCH_DEPTH: int = 2
+
+
 def estimate_cpu_footprint(
     cfg: CostConfig,
     layout: ChunkLayout,
     hw: HardwareProfile,
+    trace: ProfilerTrace | None = None,
 ) -> int:
-    """Per-rank pinned CPU bytes held by non-persistent chunks.
+    """Per-rank pinned CPU bytes held by non-persistent chunks + SWAP slots.
 
     The non-persistent chunks live on CPU in pinned memory. Under the
     replicated (pre-M7) path every rank holds a FULL copy of each
@@ -123,6 +133,16 @@ def estimate_cpu_footprint(
     ``(N_chunk - n_persist) * S_chunk``. Under the M7 ZeRO-3 sharded
     path each rank holds only ``ceil(chunk_bytes / world_size)`` per
     chunk, so the per-rank footprint divides by ``gpu_count``.
+
+    The activation-swap pool, when ``n_swap > 0`` and a trace is
+    provided, contributes an additional ``n_swap * SWAP_PREFETCH_DEPTH
+    * max_swap_band_activation_bytes`` of pinned CPU. This term is
+    **per-rank** and **NOT divided by gpu_count** — the swap pool is
+    a rank-local allocation; sharding does not split activations
+    across ranks. When ``trace`` is None we conservatively use the
+    average across all blocks as a proxy (used by callers that want a
+    pre-search ballpark; the searcher itself always passes ``trace``
+    so the gate matches the real wrap-time pool size).
 
     This accounting is **orthogonal to** :func:`estimate_peak`, which
     models GPU memory: the gather materializes the full chunk on GPU
@@ -134,19 +154,21 @@ def estimate_cpu_footprint(
     Parameters
     ----------
     cfg:
-        Candidate knob configuration. Only ``n_persist`` is consumed.
+        Candidate knob configuration. ``n_persist`` controls the chunk
+        contribution; ``n_swap`` controls the activation-swap term.
         ``n_buffer``/``n_checkpoint`` never change pinned CPU footprint.
-        ``n_swap`` would, in principle, allocate ``n_swap *
-        max_block_activation_bytes`` of pinned CPU staging — but the
-        SWAP block path is feature-gated (``PROTRAIN_ENABLE_SWAP`` env
-        in ``block/swap.py``) and the searcher therefore never picks
-        ``n_swap > 0`` in production. When SWAP is unstubbed this
-        function must be updated to add the activation-swap term;
-        until then the omission is documented dead code.
     layout:
         Chunk layout. ``S_chunk`` and ``N_chunk`` are read directly.
     hw:
         Hardware profile. Reads ``gpu_count`` and ``zero3_shard``.
+    trace:
+        Optional profiler trace. When provided, the activation-swap
+        term uses the actual swap-band's max activation bytes
+        (``max(activation_sizes[bid])`` over the first ``n_swap``
+        blocks under the swap-early rule from ``assign_modes``). When
+        absent and ``n_swap > 0``, returns the chunk term only — used
+        by older callers that don't have a trace handle. The searcher
+        always passes the trace so its feasibility gate is precise.
 
     Returns
     -------
@@ -163,7 +185,24 @@ def estimate_cpu_footprint(
     # division so small chunks don't underreport for the trailing rank.
     per_rank_divisor = hw.gpu_count if hw.zero3_shard else 1
     per_rank_divisor = max(1, per_rank_divisor)
-    return (total_bytes + per_rank_divisor - 1) // per_rank_divisor
+    chunk_term = (total_bytes + per_rank_divisor - 1) // per_rank_divisor
+
+    # Activation-swap pool term — rank-local; not sharded.
+    swap_term = 0
+    if cfg.n_swap > 0 and trace is not None and trace.activation_sizes:
+        # Swap-early rule: the first ``n_swap`` blocks (in BlockId order)
+        # use SWAP. We take the max activation bytes across that band as
+        # the slot size — the wrap-time pool sizes every slot to the
+        # same width so any SWAP block's activation fits any slot.
+        sorted_bids = sorted(trace.activation_sizes.keys())
+        swap_band = sorted_bids[: cfg.n_swap]
+        if swap_band:
+            slot_bytes = max(
+                int(trace.activation_sizes.get(bid, 0)) for bid in swap_band
+            )
+            swap_term = cfg.n_swap * SWAP_PREFETCH_DEPTH * slot_bytes
+
+    return chunk_term + swap_term
 
 
 def estimate_peak(

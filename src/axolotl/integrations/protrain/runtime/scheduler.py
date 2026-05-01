@@ -93,10 +93,32 @@ class Scheduler:
         self._block_order: list[BlockId] = sorted(block_map.keys())
 
         self._prefetch_stream: "torch.cuda.Stream | None" = None
-        self._init_prefetch_stream()
+        self._swap_stream: "torch.cuda.Stream | None" = None
+        # ActivationSwapPool reference, attached lazily by the model
+        # wrapper when ``n_swap > 0``. Type-erased to ``object`` here so
+        # the scheduler module does not depend on ``block.swap_pool``.
+        self.swap_pool: object | None = None
+        self._init_streams()
 
-    def _init_prefetch_stream(self) -> None:
-        """Create a dedicated CUDA stream for prefetch/gather traffic."""
+    @property
+    def swap_stream(self) -> "torch.cuda.Stream | None":
+        """Public accessor for the dedicated activation-swap stream.
+
+        Returned for the model wrapper to thread into each
+        :class:`SwappedBlock` via :meth:`SwappedBlock.attach_runtime`.
+        ``None`` on CPU-only paths.
+        """
+        return self._swap_stream
+
+    def _init_streams(self) -> None:
+        """Create dedicated CUDA streams for prefetch + activation swap.
+
+        Two independent non-default streams: one for chunk prefetch
+        (parameters), one for activation D2H/H2D under SWAP. Keeping
+        them separate lets the chunk gather for block N+1 overlap with
+        the activation H2D for block N during backward — the same
+        single-block lookahead pattern the chunk prefetch already uses.
+        """
         try:
             import torch
         except ImportError:  # pragma: no cover — torch is required at runtime
@@ -104,15 +126,22 @@ class Scheduler:
 
         if not torch.cuda.is_available():
             LOG.debug(
-                "Scheduler: CUDA unavailable; prefetch stream is None "
-                "(scheduler degrades to synchronous gather)."
+                "Scheduler: CUDA unavailable; prefetch/swap streams are None "
+                "(scheduler degrades to synchronous transfers)."
             )
             self._prefetch_stream = None
+            self._swap_stream = None
             return
 
         # A non-default stream lets the allocator / kernel launches on
         # the compute stream continue while PCIe copies are in flight.
         self._prefetch_stream = torch.cuda.Stream()
+        # Activation SWAP runs on its own stream so D2H/H2D from the
+        # block wrapper does not contend with chunk prefetch traffic.
+        # Even on PCIe-bound 3090s where overlap with compute is
+        # limited, isolating the streams keeps the cost model honest
+        # (it already assumes the swap stream is independent).
+        self._swap_stream = torch.cuda.Stream()
 
     # ---- helpers -------------------------------------------------------
 
@@ -258,23 +287,34 @@ class Scheduler:
         """Ensure the chunks for ``block_id`` are resident before its backward runs.
 
         Backward walks blocks in reverse order. The SWAP wrapper takes
-        care of activation prefetch itself (`SwappedBlock` saves a CPU
-        copy in fwd and pulls it back in bwd via autograd). We only need
-        to cover the chunk-state path.
+        care of activation prefetch itself (`SwappedBlock`'s autograd
+        Function schedules the H2D on the scheduler's ``_swap_stream``
+        and synchronises the compute stream against it). We only need
+        to cover the chunk-state path here.
 
         Fast path: if the chunk is still tagged in the buffer pool
         (``lookup_resident`` returns non-None) the gather call is a
         cheap re-tag + no-copy return. Otherwise the chunk manager
         re-gathers from the CPU shard with a fresh H2D copy.
+
+        Lookahead: the chunk-prefetch lookahead at the bottom of this
+        method already covers parameter chunks for block N-1 (the next
+        backward block). For activation H2D the lookahead is implicit
+        in the autograd graph — when block N's backward runs its
+        ``_SwapOffloadFunction.backward``, the H2D for block N's
+        activation lands on ``_swap_stream`` and the compute stream
+        wait happens before block N's gradient kernels run. Block
+        N-1's activation H2D will fire when *its* backward Function
+        executes; the swap pool's ``prefetch_depth=2`` slots ensure
+        block N's slot can be in-flight while block N-1's is being
+        scheduled, mirroring the chunk-prefetch single-block
+        lookahead pattern.
         """
         mode = self.block_map.get(block_id, BlockMode.NONE)
         if mode is BlockMode.SWAP:
-            # SwappedBlock's autograd.Function schedules its own
-            # activation prefetch; we just have to keep chunk state
-            # consistent below.
             LOG.debug(
                 "Scheduler.pre_block_backward: block=%d is SWAP; "
-                "activation prefetch handled by SwappedBlock",
+                "activation H2D scheduled by SwappedBlock on swap_stream",
                 block_id,
             )
 
@@ -351,11 +391,15 @@ class Scheduler:
             self.chunk_manager.wait_cpu_optim()
             return
 
-        # Make sure any prefetch traffic that's still inflight completes
-        # before we declare the iteration done — callers inspecting peak
-        # memory stats right after drain expect a stable picture.
-        if self._prefetch_stream is not None and torch.cuda.is_available():
-            self._prefetch_stream.synchronize()
+        # Make sure any prefetch / swap traffic that's still inflight
+        # completes before we declare the iteration done — callers
+        # inspecting peak memory stats right after drain expect a stable
+        # picture.
+        if torch.cuda.is_available():
+            if self._prefetch_stream is not None:
+                self._prefetch_stream.synchronize()
+            if self._swap_stream is not None:
+                self._swap_stream.synchronize()
 
         self.chunk_manager.wait_cpu_optim()
 

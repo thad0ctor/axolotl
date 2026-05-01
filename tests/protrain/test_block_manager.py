@@ -179,44 +179,50 @@ def test_wrap_block_ckpt_roundtrip() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SWAP env-gating
+# SWAP construction
 # ---------------------------------------------------------------------------
 
 
-def test_swap_without_flag_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without PROTRAIN_ENABLE_SWAP, constructing SwappedBlock must raise."""
-    monkeypatch.delenv("PROTRAIN_ENABLE_SWAP", raising=False)
-    with pytest.raises(RuntimeError, match="PROTRAIN_ENABLE_SWAP"):
-        SwappedBlock(nn.Linear(8, 8))
+def test_swap_constructs_unconditionally() -> None:
+    """SwappedBlock construction is no longer env-gated.
 
-
-def test_swap_with_flag_constructs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With PROTRAIN_ENABLE_SWAP=1, SwappedBlock must construct cleanly.
-
-    We do NOT exercise forward here — that is integration work gated by
-    M4's scheduler.
+    The historical ``PROTRAIN_ENABLE_SWAP`` flag was a stub-protection
+    guard. With option 2A's real D2H/H2D path in place, gating happens
+    via the searcher's ``n_swap`` decision; the env flag is gone.
     """
-    monkeypatch.setenv("PROTRAIN_ENABLE_SWAP", "1")
     wrapped = SwappedBlock(nn.Linear(8, 8))
     assert wrapped._protrain_wrapped_mode is BlockMode.SWAP
 
 
+def test_swap_without_runtime_is_identity_passthrough() -> None:
+    """Without attach_runtime, SwappedBlock degrades to identity (CPU OK)."""
+    block = nn.Linear(8, 8)
+    wrapped = SwappedBlock(block)
+    x = torch.randn(2, 8, requires_grad=True)
+    out = wrapped(x)
+    # Forward must equal the unwrapped block's output.
+    expected = block(x.detach())
+    assert torch.allclose(out, expected, atol=1e-6)
+    # Backward must still flow grads.
+    out.sum().backward()
+    assert x.grad is not None
+    assert block.weight.grad is not None
+
+
 @pytest.mark.gpu
-def test_swap_forward_backward_with_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_swap_forward_backward_correctness() -> None:
     """Forward/backward through a SwappedBlock must match the unwrapped block.
 
-    Contract here is **correctness-only**: the M3 SwappedBlock schedules
-    async D2H/H2D copies as a placeholder, but the MLSys 2026 paper is
-    explicit that M3 provides the interface while M4's scheduler drives
-    the actual overlap. This test validates the math is unaffected — the
-    forward output, backward grad, and parameter grad all match an
-    unwrapped reference module to fp32 tolerance. It does NOT claim any
-    memory saving or throughput improvement; those live with M4.
+    Validates correctness with the activation pool + swap stream
+    attached. The forward output, backward grad, and parameter grad
+    all match an unwrapped reference module to fp32 tolerance.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
-    monkeypatch.setenv("PROTRAIN_ENABLE_SWAP", "1")
+    from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
+        ActivationSwapPool,
+    )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -225,6 +231,13 @@ def test_swap_forward_backward_with_flag(monkeypatch: pytest.MonkeyPatch) -> Non
     ref_block.load_state_dict(block.state_dict())
 
     wrapped = SwappedBlock(block)
+    pool = ActivationSwapPool(
+        n_swap=1,
+        slot_bytes=4 * 16 * 4,  # batch * features * fp32
+        prefetch_depth=2,
+    )
+    swap_stream = torch.cuda.Stream()
+    wrapped.attach_runtime(pool, swap_stream)
 
     x_a = torch.randn(4, 16, device=device, requires_grad=True)
     x_b = x_a.detach().clone().requires_grad_(True)
@@ -252,6 +265,13 @@ def test_swap_forward_backward_with_flag(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     # Input grads match as well.
     assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
+
+    # Pool slots must be returned to free list after backward completes.
+    torch.cuda.synchronize()
+    assert pool.inflight_count == 0, (
+        "SwappedBlock did not release pool slots after backward"
+    )
+    pool.close()
 
 
 # ---------------------------------------------------------------------------

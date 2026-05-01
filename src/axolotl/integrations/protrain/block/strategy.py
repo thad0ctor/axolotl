@@ -16,8 +16,7 @@ from axolotl.integrations.protrain.types import BlockMode, BlockStrategyMap
 class StrategyError(RuntimeError):
     """Raised when a block-mode dispatch cannot produce a valid wrapper.
 
-    Examples: unknown enum value, SWAP mode requested without the
-    ``PROTRAIN_ENABLE_SWAP`` env flag, or attempting to unwrap a module
+    Examples: unknown enum value, or attempting to unwrap a module
     that was never wrapped by the ProTrain dispatcher.
     """
 

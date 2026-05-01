@@ -437,7 +437,9 @@ def search(
                     # CPU; sharding is reflected via hw.zero3_shard
                     # inside ``estimate_cpu_footprint``.
                     if cpu_capacity_bytes is not None:
-                        cpu_footprint = estimate_cpu_footprint(cfg, layout, hw)
+                        cpu_footprint = estimate_cpu_footprint(
+                            cfg, layout, hw, trace=trace
+                        )
                         if cpu_footprint > cpu_capacity_bytes:
                             n_cpu_rejected += 1
                             continue
