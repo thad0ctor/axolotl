@@ -225,6 +225,34 @@ def _effective_persistent_ids(chunk_manager: Any) -> list[int]:
     return sorted(int(cid) for cid in chunk_manager._persistent_ids)
 
 
+def _build_layout_fingerprint(
+    chunk_manager: Any, world_size: int, zero3_shard: bool
+) -> dict[str, Any]:
+    """Raw fingerprint dict whose SHA-256 is :func:`_layout_signature`.
+
+    Exposed separately so the offline cross-world-size reshard tool
+    (``scripts/protrain/reshard_optim.py``) can recompute the signature
+    against a new ``world_size`` without re-deriving the model layout
+    from scratch. Mode-C save persists the dict as ``layout_fingerprint``
+    in metadata.json so the reshard tool can read it directly.
+    """
+    layout = chunk_manager.layout
+    return {
+        "S_chunk": int(layout.S_chunk),
+        "N_chunk": int(layout.N_chunk),
+        "chunks": [list(map(str, c)) for c in layout.chunks],
+        "persistent_ids": _effective_persistent_ids(chunk_manager),
+        "world_size": int(world_size),
+        "zero3_shard": bool(zero3_shard),
+    }
+
+
+def _layout_signature_from_fingerprint(fingerprint: dict[str, Any]) -> str:
+    """SHA-256 over a layout fingerprint dict (deterministic, JSON-canonical)."""
+    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _layout_signature(
     chunk_manager: Any, world_size: int, zero3_shard: bool
 ) -> str:
@@ -236,17 +264,9 @@ def _layout_signature(
     full per-chunk param-name ordering, S_chunk, N_chunk, the
     effective persistent set, world_size, and zero3_shard.
     """
-    layout = chunk_manager.layout
-    fingerprint = {
-        "S_chunk": int(layout.S_chunk),
-        "N_chunk": int(layout.N_chunk),
-        "chunks": [list(map(str, c)) for c in layout.chunks],
-        "persistent_ids": _effective_persistent_ids(chunk_manager),
-        "world_size": int(world_size),
-        "zero3_shard": bool(zero3_shard),
-    }
-    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return _layout_signature_from_fingerprint(
+        _build_layout_fingerprint(chunk_manager, world_size, zero3_shard)
+    )
 
 
 def _estimate_optim_state_bytes(optim: Any) -> int:
@@ -636,11 +656,20 @@ def _save_protrain_optim_dir(
             if rank == 0:
                 os.makedirs(target, exist_ok=True)
 
+                _fp = _build_layout_fingerprint(
+                    chunk_manager, world_size, zero3_shard
+                )
                 metadata = {
                     "format_version": SCHEMA_FORMAT_VERSION,
-                    "protrain_layout_signature": _layout_signature(
-                        chunk_manager, world_size, zero3_shard
-                    ),
+                    "protrain_layout_signature":
+                        _layout_signature_from_fingerprint(_fp),
+                    # Raw fingerprint persisted so the offline cross-world-
+                    # size reshard tool can recompute the signature for a
+                    # new world_size without re-deriving the model layout.
+                    # Mode-C only: Mode-B doesn't need it (replicated
+                    # state is rank-independent and the load path
+                    # tolerates world_size drift natively).
+                    "layout_fingerprint": _fp,
                     "protrain_persistent_ids": _effective_persistent_ids(
                         chunk_manager
                     ),
@@ -916,8 +945,13 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
             raise RuntimeError(
                 "ProTrain optimizer load: Mode-C sharded resume requires "
                 f"identical world_size — saved={saved_world} "
-                f"current={current_world}. Cross-world-size resume needs "
-                "a re-shard step that's out of scope for Phase 2; resume "
+                f"current={current_world}. Online cross-world-size resume "
+                "is intentionally out-of-scope (too brittle); use the "
+                "offline reshard tool to convert the saved checkpoint to "
+                "the new world_size before resuming: "
+                "``python -m scripts.protrain.reshard_optim --src "
+                f"<saved-protrain_optim-dir> --dst <new-protrain_optim-dir> "
+                f"--target-world {current_world}``. Alternatively, resume "
                 "with the original world_size or set "
                 "protrain_save_optimizer_state=False to discard the "
                 "saved optimizer state."
