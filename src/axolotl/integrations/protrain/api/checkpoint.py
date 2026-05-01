@@ -826,6 +826,91 @@ def _save_protrain_optim_dir(
 # ---------------------------------------------------------------------------
 
 
+def _perform_online_reshard(
+    original_target: str,
+    saved_world: int,
+    current_world: int,
+) -> str:
+    """Run the online Mode-C reshard against a sibling temp dir.
+
+    Rank-0 invokes :func:`reshard_mode_c_shards` on
+    ``original_target`` writing to ``original_target/.reshard_to_N<W>/``.
+    Every rank then participates in the lockstep failure protocol via
+    :func:`_broadcast_status_or_raise` (mirrors the Mode-C save side's
+    rank-0-writes-only sections), and a trailing barrier ensures
+    non-zero ranks see the temp dir's files before they read them.
+
+    Returns the temp-dir path on success. Raises ``RuntimeError`` on
+    any rank if the rank-0 reshard failed. The temp dir is left on
+    disk for post-mortem inspection on failure — the caller is
+    responsible for cleanup on the success path (after every rank
+    has finished reading).
+    """
+    # Source-of-truth import: the offline CLI also imports from here.
+    from axolotl.integrations.protrain.api.reshard import (  # noqa: PLC0415
+        reshard_mode_c_shards,
+    )
+
+    temp_dir = os.path.join(
+        original_target,
+        f".reshard_to_N{int(current_world)}",
+    )
+
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        rank_for_reshard = int(torch.distributed.get_rank())
+    else:
+        rank_for_reshard = 0
+
+    # Lockstep failure protocol (mirrors Mode-C save's rank-0 sections,
+    # e.g. metadata.json / gpu_optim.pt): rank-0 attempts the reshard
+    # inside try/except, broadcasts a 0/1 status via
+    # ``_broadcast_status_or_raise``. Non-zero status raises a
+    # synthesised RuntimeError on every non-source rank so the cluster
+    # fails together rather than wedging the surviving ranks at the
+    # trailing barrier.
+    reshard_status = 0
+    try:
+        if rank_for_reshard == 0:
+            LOG.info(
+                "ProTrain optimizer load: online reshard "
+                "saved_world=%d → current_world=%d (opt-in via "
+                "protrain_allow_online_reshard). Writing to %s",
+                saved_world,
+                current_world,
+                temp_dir,
+            )
+            # Pre-clean stale temp dir from a previous interrupted run
+            # so we never read mixed bytes.
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            reshard_mode_c_shards(
+                original_target,
+                temp_dir,
+                int(current_world),
+                log_fn=LOG.info,
+            )
+    except Exception:
+        reshard_status = 1
+        raise
+    finally:
+        _broadcast_status_or_raise(
+            reshard_status,
+            src=0,
+            op="load (online reshard)",
+        )
+
+    # Barrier so non-rank-0 ranks see the temp dir's files before they
+    # try to read them. The reshard writes
+    # cpu_optim/chunk_*_rank_*.pt and metadata.json under ``temp_dir``;
+    # without this barrier, a fast rank-1 could enter the per-rank
+    # read block before rank-0 finishes the last torch.save().
+    _barrier_or_noop()
+
+    return temp_dir
+
+
 def _load_protrain_optim_dir(
     optim: Any,
     checkpoint_dir: str,
@@ -874,10 +959,6 @@ def _load_protrain_optim_dir(
     """
     original_target = os.path.join(checkpoint_dir, PROTRAIN_OPTIM_DIRNAME)
     target = original_target
-    # Track whether ``target`` is a transient resharded directory we
-    # own; on successful load rank-0 deletes it. On failure we leave
-    # it behind so a developer can inspect what went wrong.
-    online_reshard_temp_dir: str | None = None
     if not os.path.isdir(target):
         return False
 
@@ -994,74 +1075,19 @@ def _load_protrain_optim_dir(
                     "discard the saved optimizer state."
                 )
 
-            # Online reshard. Source-of-truth import: pull the reshard
-            # function from the api module that the offline CLI also
-            # uses. ``original_target`` is the saved Mode-C dir; we
-            # write the resharded copy to a sibling temp dir whose
-            # name encodes both world sizes for forensic clarity.
-            from axolotl.integrations.protrain.api.reshard import (  # noqa: PLC0415
-                reshard_mode_c_shards,
-            )
-
-            online_reshard_temp_dir = os.path.join(
+            # Online reshard: rank-0 writes a sibling temp dir whose
+            # name encodes the new world size for forensic clarity;
+            # ``_perform_online_reshard`` runs the lockstep failure
+            # protocol and the trailing barrier so non-zero ranks see
+            # the resharded files before they read them. The temp dir
+            # is intentionally left on disk if the helper raises so a
+            # developer can inspect the failure; on success the caller
+            # cleans it up after every rank has finished reading.
+            online_reshard_temp_dir = _perform_online_reshard(
                 original_target,
-                f".reshard_to_N{int(current_world)}",
+                saved_world=saved_world,
+                current_world=current_world,
             )
-
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-            ):
-                rank_for_reshard = int(torch.distributed.get_rank())
-            else:
-                rank_for_reshard = 0
-
-            # Lockstep failure protocol (mirrors the save side's
-            # rank-0-writes-only sections, e.g. metadata.json /
-            # gpu_optim.pt): rank-0 attempts the reshard inside a
-            # try/except, then broadcasts a 0/1 status via
-            # ``_broadcast_status_or_raise``. Non-zero status raises a
-            # synthesised RuntimeError on every non-source rank so the
-            # cluster fails together rather than wedging the surviving
-            # ranks at the trailing barrier.
-            reshard_status = 0
-            try:
-                if rank_for_reshard == 0:
-                    LOG.info(
-                        "ProTrain optimizer load: online reshard "
-                        "saved_world=%d → current_world=%d (opt-in "
-                        "via protrain_allow_online_reshard). Writing "
-                        "to %s",
-                        saved_world,
-                        current_world,
-                        online_reshard_temp_dir,
-                    )
-                    # Pre-clean stale temp dir from a previous
-                    # interrupted run so we never read mixed bytes.
-                    shutil.rmtree(online_reshard_temp_dir, ignore_errors=True)
-                    reshard_mode_c_shards(
-                        original_target,
-                        online_reshard_temp_dir,
-                        int(current_world),
-                        log_fn=LOG.info,
-                    )
-            except Exception:
-                reshard_status = 1
-                raise
-            finally:
-                _broadcast_status_or_raise(
-                    reshard_status,
-                    src=0,
-                    op="load (online reshard)",
-                )
-
-            # Barrier so non-rank-0 ranks see the temp dir's files
-            # before they try to read them. The reshard writes
-            # cpu_optim/chunk_*_rank_*.pt and metadata.json under
-            # ``online_reshard_temp_dir``; without this barrier, a
-            # fast rank-1 could enter the per-rank read block before
-            # rank-0 finishes the last torch.save().
-            _barrier_or_noop()
 
             # Re-point the load at the resharded dir and reload
             # metadata. ``saved_world`` is now == ``current_world``
@@ -1076,6 +1102,8 @@ def _load_protrain_optim_dir(
                 f"protrain_world_size={saved_world}, expected "
                 f"{current_world} — bug in reshard_mode_c_shards"
             )
+        else:
+            online_reshard_temp_dir = None
 
         # Region-layout match (§3.5). Every region descriptor must
         # match exactly — any drift in chunk_offset, region_bytes,
