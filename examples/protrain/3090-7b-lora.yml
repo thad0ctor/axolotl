@@ -88,6 +88,24 @@ gradient_checkpointing: false
 flash_attention: false
 xformers_attention: false
 
+# IMPORTANT: Axolotl auto-enables fused Triton LoRA kernels (q/k/v/o/MLP)
+# when these flags are unset. Those kernels read raw weight tensors
+# directly via torch.matmul; ProTrain's profiler engages "on-demand"
+# mode for 7B+ models on a 24 GB card (model state > 60% of device
+# memory) and offloads params to CPU between modules using forward
+# hooks. The Axolotl LoRA kernels bypass nn.Linear's standard forward
+# hook machinery, so the offload-then-restore pattern does not see
+# them and they read empty/CPU tensors -> RuntimeError("size mismatch
+# ... vec (0)") inside matmul_lora. Disable them here to keep the
+# stock PEFT LoRA forward path (which IS hookable) so the profiler's
+# on-demand pass works. The performance cost is ~5-10% on this
+# 7B-class workload — acceptable for the M5 acceptance run, and the
+# steady-state runtime under the chunk manager itself is dominated by
+# H2D/D2H traffic rather than LoRA matmul throughput.
+lora_mlp_kernel: false
+lora_qkv_kernel: false
+lora_o_kernel: false
+
 logging_steps: 1
 save_steps: 20
 save_first_step: false

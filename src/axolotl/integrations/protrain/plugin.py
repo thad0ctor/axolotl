@@ -572,6 +572,48 @@ class ProTrainPlugin(BasePlugin):
         # ``measure_nccl`` internally) sees the live PG.
         _early_init_dist_for_nccl(cfg)
 
+        # ---- Move model to GPU if it isn't already ----------------------
+        # ``protrain_model_wrapper`` reads
+        # ``next(model.parameters()).device`` to seed the profiler
+        # tracker, which calls ``torch.cuda.memory_stats(device)`` —
+        # that raises ``ValueError: Expected a cuda device`` when the
+        # device is CPU. Under ``accelerate launch`` (the path
+        # ``axolotl train`` takes for single-GPU runs), Axolotl's
+        # ``choose_device`` deliberately sets ``cfg.device_map = None``
+        # when ``ACCELERATE_USE_*`` env vars are present (see
+        # ``utils/config/__init__.py``); HF Trainer relies on
+        # ``Accelerator.prepare`` later in the bootstrap to move the
+        # model. By that point our ``post_model_load`` has already
+        # fired with the model still on CPU. The in-process
+        # ``axolotl.train.train`` path doesn't hit this because no
+        # ``ACCELERATE_USE_*`` env vars are set, so ``device_map`` falls
+        # to ``"auto"`` and the model is GPU-resident at load time.
+        # We close the gap by moving the model ourselves; idempotent
+        # when already on the target device.
+        import os as _os
+
+        try:
+            import torch as _torch
+
+            current_device = next(model.parameters()).device
+        except (StopIteration, ImportError):
+            current_device = None
+            _torch = None  # type: ignore[assignment]
+        if (
+            current_device is not None
+            and current_device.type != "cuda"
+            and _torch is not None
+            and _torch.cuda.is_available()
+        ):
+            target = f"cuda:{int(_os.environ.get('LOCAL_RANK', 0))}"
+            LOG.info(
+                "ProTrain: model is on %s; moving to %s before wrap "
+                "(post_model_load fired pre-Accelerate.prepare).",
+                current_device,
+                target,
+            )
+            model.to(target)
+
         hw = _build_hardware_profile(cfg)
 
         # Pull knobs / overrides off the merged cfg. Pydantic already
