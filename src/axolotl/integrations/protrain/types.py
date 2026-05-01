@@ -183,9 +183,11 @@ class ProfilerTrace:
     # Lightweight forward pre/post hooks installed ONLY at block level (tens
     # of blocks, not the ~1000 leaves the main profiling path targets) call
     # ``torch.cuda.reset_peak_memory_stats`` before each block and read
-    # ``torch.cuda.max_memory_allocated`` after. Keys are transformer block
-    # indices discovered via ``discover_blocks``; values are per-block peak
-    # bytes observed during that block's forward.
+    # ``torch.cuda.max_memory_allocated`` after. Keys are global transformer-
+    # block indices discovered via ``flatten_block_trees(discover_blocks(...))``
+    # — encoder blocks own ids ``[0, n_enc)``, decoder blocks own ids
+    # ``[n_enc, n_enc + n_dec)`` on encoder-decoder models; values are
+    # per-block peak bytes observed during that block's forward.
     #
     # The memory cost model consumes ``max(steady_fwd_block_peak_bytes.values())``
     # as a ground-truth upper bound on the FORWARD peak for any NONE/CKPT/SWAP

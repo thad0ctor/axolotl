@@ -281,15 +281,17 @@ def test_swap_forward_backward_correctness() -> None:
 
 @pytest.mark.gpu
 def test_discover_blocks_gpt2() -> None:
-    """Fresh-init GPT-2 with 3 layers; ``discover_blocks`` returns len==3."""
+    """Fresh-init GPT-2 with 3 layers; ``discover_blocks`` returns one tree of 3."""
     transformers = pytest.importorskip("transformers")
 
     cfg = transformers.GPT2Config(n_layer=3)
     # Fresh init, no weight download — from_config, not from_pretrained.
     model = transformers.GPT2LMHeadModel(cfg)
 
-    blocks = discover_blocks(model)
-    assert len(blocks) == 3
+    trees = discover_blocks(model)
+    assert len(trees) == 1, "GPT-2 is single-tree causal-LM"
+    assert trees[0].forward_order == 0
+    assert len(trees[0].blocks) == 3
 
 
 # ---------------------------------------------------------------------------

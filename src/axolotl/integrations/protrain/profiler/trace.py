@@ -255,6 +255,46 @@ def run_trace(
 
     cuda_available = device.type == "cuda" and torch.cuda.is_available()
 
+    # Build an authoritative path -> global BlockId registry from
+    # ``discover_blocks`` so encoder.block.0 vs decoder.block.0 don't
+    # collapse to BlockId(0) (which the path-fragment heuristic in
+    # ``_infer_block_id`` would do for T5). Falls back to the heuristic
+    # when discovery fails (non-standard model shape).
+    path_to_global_bid: dict[str, BlockId] = {}
+    block_path_prefixes: tuple[str, ...] = ()
+    try:
+        from axolotl.integrations.protrain.block.layout_rules import (
+            block_id_path_map,
+            discover_blocks as _discover_blocks_for_trace,
+        )
+
+        _trees_for_trace = _discover_blocks_for_trace(model)
+        path_to_global_bid = block_id_path_map(model, _trees_for_trace)
+        # Sort by descending length so longest-prefix match wins for
+        # ops inside nested submodules (e.g. ``encoder.block.0.layer.0``
+        # resolves to ``encoder.block.0``).
+        block_path_prefixes = tuple(
+            sorted(path_to_global_bid.keys(), key=len, reverse=True)
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.debug(
+            "trace: block_id_path_map unavailable (%s); falling back "
+            "to single-tree path-fragment heuristic", exc
+        )
+
+    def _resolve_block_id(path: str) -> BlockId | None:
+        """Map ``path`` to its global ``BlockId`` via the registry.
+
+        Falls back to ``_infer_block_id`` (single-tree path-fragment
+        heuristic) when the registry was not populated.
+        """
+        if block_path_prefixes:
+            for prefix in block_path_prefixes:
+                if path == prefix or path.startswith(prefix + "."):
+                    return path_to_global_bid[prefix]
+            return None
+        return _infer_block_id(path)
+
     def _module_path(m: "nn.Module") -> str:
         """Dotted path of ``m`` inside ``model`` (root -> '')."""
         for name, candidate in model.named_modules():
@@ -278,7 +318,7 @@ def run_trace(
             module_path=path,
             qualified_name=type(module).__name__,
             shape_signature=_shape_sig(inputs),
-            block_id=_infer_block_id(path),
+            block_id=_resolve_block_id(path),
             is_forward=True,
             allocated_before=snap.allocated_bytes,
             prev_end_before=tracker.last_end_bytes,
@@ -442,9 +482,10 @@ def run_trace(
         try:
             from axolotl.integrations.protrain.block.layout_rules import (
                 discover_blocks,
+                flatten_block_trees,
             )
 
-            blocks = discover_blocks(model)
+            blocks = flatten_block_trees(discover_blocks(model))
         except Exception as exc:  # pragma: no cover - defensive
             LOG.debug(
                 "profiler: discover_blocks failed (%s); skipping per-block "

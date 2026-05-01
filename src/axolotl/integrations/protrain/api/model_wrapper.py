@@ -27,6 +27,7 @@ from torch import nn
 from axolotl.integrations.protrain.block import (
     assign_modes,
     discover_blocks,
+    flatten_block_trees,
     unwrap_block,
     wrap_block,
 )
@@ -133,8 +134,14 @@ def _infer_vocab_size(model: nn.Module) -> int:
 def _build_block_spans(
     model: nn.Module,
 ) -> tuple[list[nn.Module], dict[BlockId, list[ParamId]]]:
-    """Return (blocks_list, block_id -> list[ParamId]) for the model."""
-    blocks = discover_blocks(model)
+    """Return (blocks_list, block_id -> list[ParamId]) for the model.
+
+    For encoder-decoder models the returned ``blocks_list`` is the flat
+    concatenation of every tree's blocks in forward order (encoder first,
+    then decoder); the ``BlockId`` keys span ``[0, n_enc + n_dec)`` to
+    match the global numbering every other ProTrain consumer uses.
+    """
+    blocks = flatten_block_trees(discover_blocks(model))
     named = list(model.named_parameters())
 
     # Build a reverse index: for each block, find the dotted-path prefix
@@ -959,15 +966,26 @@ def _construct_runtime(
     )
 
     # ---- 5. wrap blocks -------------------------------------------------
-    # Locate the parent ModuleList so we can swap in the wrapped blocks in-place.
-    module_list = _find_parent_module_list(model, blocks)
+    # Locate the parent ModuleList(s) so we can swap in the wrapped blocks
+    # in-place. Encoder-decoder models have two ModuleLists (encoder.block
+    # and decoder.block); ``_find_block_parent_map`` returns one per block.
+    block_parent_map = _find_block_parent_map(model, blocks)
     for idx, block in enumerate(blocks):
         mode = result.block_map.get(BlockId(idx))
         if mode is None:
             continue
         wrapped_block = wrap_block(block, mode)
-        if wrapped_block is not block and module_list is not None:
-            module_list[idx] = wrapped_block
+        if wrapped_block is not block:
+            parent = block_parent_map.get(id(block))
+            if parent is not None:
+                # Find the slot index within the parent ModuleList
+                # (cannot reuse ``idx`` — that's the global block index,
+                # which differs from the within-tree position for
+                # decoder blocks of an encoder-decoder model).
+                for slot, child in enumerate(parent):
+                    if child is block:
+                        parent[slot] = wrapped_block
+                        break
             blocks[idx] = wrapped_block
 
     # ---- 5.5. wire up the activation SWAP pool --------------------------
@@ -998,13 +1016,29 @@ def _construct_runtime(
             )
         else:
             from axolotl.integrations.protrain.block.swap_pool import (
+                DEFAULT_SLOTS_PER_BLOCK,
                 ActivationSwapPool,
             )
+            from axolotl.integrations.protrain.cost.memory import (
+                SWAP_PREFETCH_DEPTH,
+            )
 
+            # Each slot must be large enough for the worst-case single
+            # saved tensor. We don't have per-tensor profiling, so use
+            # the per-block aggregate divided by ``slots_per_block`` as
+            # a proxy — for typical transformers this approximates
+            # "max single tensor" since the residual stream is the
+            # dominant contributor (~1/4 to 1/3 of the aggregate).
+            # Round up so an exact-fit residual still slots in.
+            slots_per_block = DEFAULT_SLOTS_PER_BLOCK
+            per_slot = (max_act_bytes + slots_per_block - 1) // slots_per_block
+            # Floor at 1 byte to satisfy the pool's positive-size invariant.
+            per_slot = max(1, per_slot)
             swap_pool = ActivationSwapPool(
                 n_swap=result.cfg.n_swap,
-                slot_bytes=max_act_bytes,
-                prefetch_depth=2,
+                slot_bytes=per_slot,
+                prefetch_depth=SWAP_PREFETCH_DEPTH,
+                slots_per_block=slots_per_block,
             )
             scheduler.swap_pool = swap_pool
             for block in blocks:
@@ -1663,11 +1697,16 @@ def protrain_model_wrapper(
                         "phase-2 fallback teardown: hook handle "
                         "remove failed: %s", exc,
                     )
-            module_list_unwrap = _find_parent_module_list(model, blocks)
+            block_parent_map_unwrap = _find_block_parent_map(model, blocks)
             for idx, block in enumerate(blocks):
                 unwrapped = unwrap_block(block)
-                if unwrapped is not block and module_list_unwrap is not None:
-                    module_list_unwrap[idx] = unwrapped
+                if unwrapped is not block:
+                    parent = block_parent_map_unwrap.get(id(block))
+                    if parent is not None:
+                        for slot, child in enumerate(parent):
+                            if child is block:
+                                parent[slot] = unwrapped
+                                break
                     blocks[idx] = unwrapped
             chunk_manager.restore_to_gpu()
             del boot_wrapped, boot_optim, chunk_manager, scheduler, handles
@@ -1802,11 +1841,16 @@ def protrain_model_wrapper(
                             "phase-2 teardown: hook handle remove "
                             "failed: %s", exc,
                         )
-                module_list_unwrap = _find_parent_module_list(model, blocks)
+                block_parent_map_unwrap = _find_block_parent_map(model, blocks)
                 for idx, block in enumerate(blocks):
                     unwrapped = unwrap_block(block)
-                    if unwrapped is not block and module_list_unwrap is not None:
-                        module_list_unwrap[idx] = unwrapped
+                    if unwrapped is not block:
+                        parent = block_parent_map_unwrap.get(id(block))
+                        if parent is not None:
+                            for slot, child in enumerate(parent):
+                                if child is block:
+                                    parent[slot] = unwrapped
+                                    break
                         blocks[idx] = unwrapped
                 chunk_manager.restore_to_gpu()
                 del boot_wrapped, boot_optim, chunk_manager, scheduler, handles
@@ -1875,28 +1919,36 @@ def protrain_model_wrapper(
     return wrapped
 
 
-def _find_parent_module_list(
+def _find_block_parent_map(
     model: nn.Module, blocks: list[nn.Module]
-) -> "nn.ModuleList | None":
-    """Locate the ``nn.ModuleList`` whose children are ``blocks``.
+) -> dict[int, "nn.ModuleList"]:
+    """Map ``id(block)`` to the ``nn.ModuleList`` containing it.
 
-    ``discover_blocks`` returns a plain ``list``; to swap in wrapped
-    modules we need a reference to the underlying container so the
-    swap is visible to the rest of the model.
+    ``flatten_block_trees(discover_blocks(model))`` returns a plain
+    ``list`` whose elements may live in **multiple** ``nn.ModuleList``
+    instances (encoder.block + decoder.block on T5). To swap in wrapped
+    modules we need each block's true parent so the in-place
+    ``parent[slot] = wrapped`` reassignment propagates to the rest of
+    the model.
+
+    Walks every ``nn.ModuleList`` under ``model`` once and records the
+    parent for every block's ``id()`` it sees. Blocks not found in any
+    ``ModuleList`` (defensive — should not happen for blocks returned
+    by ``discover_blocks``) are silently absent from the map; the
+    wrap/unwrap path then leaves them in place.
     """
+    out: dict[int, "nn.ModuleList"] = {}
     if not blocks:
-        return None
-    first = blocks[0]
+        return out
+    target_ids = {id(b) for b in blocks}
     for module in model.modules():
-        if isinstance(module, nn.ModuleList) and len(module) == len(blocks):
-            # Identity check on the first child is enough — ModuleLists
-            # don't repeat modules.
-            try:
-                if module[0] is first:
-                    return module
-            except IndexError:
-                continue
-    return None
+        if not isinstance(module, nn.ModuleList):
+            continue
+        for child in module:
+            cid = id(child)
+            if cid in target_ids and cid not in out:
+                out[cid] = module
+    return out
 
 
 __all__ = ["protrain_model_wrapper"]

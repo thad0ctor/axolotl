@@ -88,8 +88,11 @@ class Scheduler:
         self.effective_d2h_bps = float(effective_d2h_bps)
 
         # Ordered list of block ids — matches forward traversal order
-        # by construction (``discover_blocks`` returns a list). Used to
-        # resolve "next block" for the prefetch rule.
+        # by construction (``flatten_block_trees(discover_blocks(...))``
+        # emits encoder ids before decoder ids; sorted(block_map.keys())
+        # therefore reproduces the forward traversal order on both
+        # single-tree and encoder-decoder models). Used to resolve
+        # "next block" for the prefetch rule.
         self._block_order: list[BlockId] = sorted(block_map.keys())
 
         self._prefetch_stream: "torch.cuda.Stream | None" = None
