@@ -290,17 +290,7 @@ _PROTRAIN_WORKER_SCRIPT = textwrap.dedent(
             loss = out.loss.detach().clone()
             out.loss.backward()
             optim.step()
-            # set_to_none=False preserves shard_param.grad as a zero
-            # tensor between iters. The chunk manager's
-            # reduce_scatter_and_offload_shard does an unconditional
-            # ``shard_param.grad.copy_(...)`` in the next iter (not an
-            # add), so the prior values don't matter — we only need the
-            # tensor to exist. The default ``set_to_none=True`` would
-            # null shard_param.grad, then iter N+1's reduce_scatter
-            # AttributeErrors trying to copy_ into None. (Latent issue
-            # under sharded-with-CPU-Adam-enabled mode; out of scope of
-            # this M6 baseline test, the workaround is sound.)
-            optim.zero_grad(set_to_none=False)
+            optim.zero_grad()
 
             torch.cuda.synchronize()
             dist.barrier()
