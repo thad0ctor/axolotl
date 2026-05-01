@@ -1752,6 +1752,17 @@ class ChunkManager:
                 op=dist.ReduceOp.AVG,
             )
 
+            # Re-bind shard_param.grad to its canonical pinned-CPU view
+            # if a caller (e.g. HF Trainer with default args) cleared
+            # it via ``optim.zero_grad(set_to_none=True)``. The Adam
+            # adapter operates on the persistent ``cpu_shard_grad_bytes``
+            # pinned buffer; we just need ``.grad`` to point at it again
+            # so ``.copy_()`` lands in the right place.
+            if region.shard_param.grad is None:
+                region.shard_param.grad = region.cpu_shard_grad_bytes.view(
+                    region.dtype
+                ).view(shard_numel_r)
+
             if my_shard_grad_gpu.is_cuda:
                 region.shard_param.grad.copy_(  # type: ignore[union-attr]
                     my_shard_grad_gpu, non_blocking=True
