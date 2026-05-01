@@ -665,13 +665,24 @@ def _save_worker_modec(rank: int, world_size: int, tmpdir: str, tag: str) -> Non
 
 
 def _load_worker_modec(
-    rank: int, world_size: int, tmpdir: str, save_subdir: str, sentinel_tag: str
+    rank: int,
+    world_size: int,
+    tmpdir: str,
+    save_subdir: str,
+    sentinel_tag: str,
+    allow_online_reshard: bool = False,
 ) -> None:
     """One rank in a Mode-C load phase. Builds fresh model + manager,
     loads from ``tmpdir/save_subdir/protrain_optim``, takes one
     optimizer step on a deterministic fixed batch, writes a hash of
     the post-step inner-state and post-step model parameters to a
     sentinel file.
+
+    ``allow_online_reshard`` is forwarded into
+    :func:`_load_protrain_optim_dir`. When True the loader handles
+    cross-world-size resume internally (rank-0 reshards into a temp
+    dir; all ranks load from there). When False (the default) the
+    legacy behaviour applies: world-size mismatch is a hard error.
     """
     import os
 
@@ -709,7 +720,9 @@ def _load_worker_modec(
         # contains a ``protrain_optim/`` child. Our save_dir is
         # exactly such a parent (see _save_protrain_optim_dir's
         # ``target = os.path.join(output_dir, PROTRAIN_OPTIM_DIRNAME)``).
-        loaded = _load_dir(optim, save_dir)
+        loaded = _load_dir(
+            optim, save_dir, allow_online_reshard=allow_online_reshard
+        )
         if not loaded:
             raise RuntimeError(
                 f"rank {rank}: _load_protrain_optim_dir({save_dir!r}) "
@@ -1014,3 +1027,365 @@ def test_sharded_world_size_reshard_4_to_2_offline(tmp_path):
             f"rank {r}: post-step parameter hash differs between "
             f"resharded and native paths."
         )
+
+
+# ===========================================================================
+# Mode-C (ZeRO-3 sharded) — online reshard on load (opt-in)
+# ===========================================================================
+#
+# Mirror of the offline test above. The save phases (N=4 and N=2 reference)
+# are reused verbatim. Phase 2 — instead of running the offline CLI — the
+# load workers pass ``allow_online_reshard=True`` against the original N=4
+# save dir. The loader does the reshard internally:
+#
+#   * rank-0 invokes ``reshard_mode_c_shards`` against a sibling temp dir
+#     (``<save_dir>/protrain_optim/.reshard_to_N2/``)
+#   * all ranks barrier
+#   * load proceeds against the temp dir as if it were a natively-N=2 save
+#   * rank-0 cleans up the temp dir post-load.
+#
+# Acceptance is identical to the offline test: per-rank post-load hash,
+# post-step hash, and post-step parameter hash must match the natively-
+# N=2 reference path.
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_world_size_reshard_4_to_2_online(tmp_path):
+    """Live Mode-C 4→2 reshard via the online opt-in path.
+
+    Phase 1: spawn 4 ranks → save Mode-C with deterministic state pattern.
+    Phase 1b: spawn 2 ranks → save Mode-C natively-N=2 (reference).
+    Phase 2: spawn 2 ranks → load the original N=4 dir with
+        ``allow_online_reshard=True``. The loader reshards internally.
+    Phase 3: spawn 2 ranks → load the natively-N=2 dir as a control.
+        Phase 2 and Phase 3 hashes must match — proves the online
+        reshard produced semantically identical state, with no CLI
+        invocation in the loop.
+
+    Sanity: after the online load completes, the temp dir
+    ``protrain_optim/.reshard_to_N2/`` must be cleaned up by rank-0.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    n_visible = torch.cuda.device_count()
+    if n_visible < 4:
+        pytest.skip(
+            f"online reshard test needs >= 4 visible GPUs (got {n_visible})"
+        )
+
+    import torch.multiprocessing as mp
+
+    # ---- Phase 1: save N=4 ------------------------------------------
+    save_world_4 = 4
+    mp.spawn(
+        _save_worker_modec,
+        args=(save_world_4, str(tmp_path), "n4"),
+        nprocs=save_world_4,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("save_modec_n4_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 1 (N=4 save) errors:\n{bodies}")
+    for r in range(save_world_4):
+        assert (tmp_path / f"save_modec_n4_rank{r}.done").is_file(), (
+            f"N=4 save rank {r} did not reach sentinel"
+        )
+
+    save_n4_root = tmp_path / "save_n4" / PROTRAIN_OPTIM_DIRNAME
+    assert save_n4_root.is_dir()
+    n4_meta = json.loads((save_n4_root / METADATA_FILENAME).read_text())
+    assert n4_meta["protrain_save_mode"] == SAVE_MODE_SHARDED
+    assert n4_meta["protrain_world_size"] == save_world_4
+
+    # ---- Phase 1b: save N=2 (reference) -----------------------------
+    save_world_2 = 2
+    mp.spawn(
+        _save_worker_modec,
+        args=(save_world_2, str(tmp_path), "n2"),
+        nprocs=save_world_2,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("save_modec_n2_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 1b (N=2 save) errors:\n{bodies}")
+
+    # ---- Phase 2: online load N=4 → N=2 with opt-in flag ------------
+    # Pointed at the ORIGINAL N=4 save dir; the loader handles the
+    # reshard internally. Sentinel tag "online" namespaces the .done /
+    # .hash artifacts so they don't collide with the N=2 native load
+    # below.
+    mp.spawn(
+        _load_worker_modec,
+        args=(
+            save_world_2,
+            str(tmp_path),
+            "save_n4",  # original N=4 dir
+            "online",
+            True,  # allow_online_reshard
+        ),
+        nprocs=save_world_2,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("load_modec_online_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 2 (online reshard load) errors:\n{bodies}")
+
+    # ---- Phase 3: load natively-N=2 dir as control ------------------
+    mp.spawn(
+        _load_worker_modec,
+        args=(
+            save_world_2,
+            str(tmp_path),
+            "save_n2",
+            "native_for_online",
+            False,  # native — no reshard needed
+        ),
+        nprocs=save_world_2,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("load_modec_native_for_online_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 3 (native N=2 control load) errors:\n{bodies}")
+
+    # ---- Equivalence check ------------------------------------------
+    for r in range(save_world_2):
+        online_hash = (
+            tmp_path / f"load_modec_online_rank{r}.hash"
+        ).read_text().strip()
+        native_hash = (
+            tmp_path / f"load_modec_native_for_online_rank{r}.hash"
+        ).read_text().strip()
+        oh_post_load, oh_post_step, oh_param = online_hash.split(":")
+        nh_post_load, nh_post_step, nh_param = native_hash.split(":")
+        assert oh_post_load == nh_post_load, (
+            f"rank {r}: post-load inner-state hash differs between "
+            f"online-resharded and native paths.\n"
+            f"  online ={oh_post_load}\n"
+            f"  native ={nh_post_load}\n"
+            "The online reshard produced semantically different state."
+        )
+        assert oh_post_step == nh_post_step, (
+            f"rank {r}: post-step inner-state hash differs between "
+            f"online-resharded and native paths.\n"
+            f"  online ={oh_post_step}\n"
+            f"  native ={nh_post_step}"
+        )
+        assert oh_param == nh_param, (
+            f"rank {r}: post-step parameter hash differs between "
+            f"online-resharded and native paths."
+        )
+
+    # ---- Cleanup sanity: temp dir must be removed -------------------
+    # The online load worker exits cleanly, so rank-0's cleanup should
+    # have run. We verify the temp dir under save_n4/protrain_optim/
+    # is gone — leftover means a regression in the cleanup branch.
+    temp_dir = save_n4_root / f".reshard_to_N{save_world_2}"
+    assert not temp_dir.exists(), (
+        f"online reshard temp dir {temp_dir} still present after "
+        "successful load; rank-0 cleanup must have failed silently"
+    )
+
+
+# ===========================================================================
+# Mode-C (ZeRO-3 sharded) — opt-out default still hard-errors
+# ===========================================================================
+#
+# When ``protrain_allow_online_reshard=False`` (the default) and
+# saved_world != current_world, the load path must hard-error with a
+# message that points the user at BOTH the offline CLI and the opt-in
+# flag. Mirror of the existing single-process metadata-fake test, but
+# this time covers the live cross-world-size error surface from the
+# loader-as-of-2026-04-30.
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_world_size_reshard_4_to_2_default_hard_errors(tmp_path):
+    """Default (no opt-in) Mode-C cross-world-size load is a hard error.
+
+    Phase 1: save N=4 (reuse _save_worker_modec).
+    Phase 2: spawn 2 ranks, attempt to load the N=4 save without
+        ``allow_online_reshard=True``. Each rank must raise; the error
+        message must reference both the offline CLI and the opt-in
+        flag.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    n_visible = torch.cuda.device_count()
+    if n_visible < 4:
+        pytest.skip(
+            f"hard-error opt-out test needs >= 4 visible GPUs (got {n_visible})"
+        )
+
+    import torch.multiprocessing as mp
+
+    # ---- Phase 1: save N=4 ------------------------------------------
+    save_world_4 = 4
+    mp.spawn(
+        _save_worker_modec,
+        args=(save_world_4, str(tmp_path), "n4"),
+        nprocs=save_world_4,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("save_modec_n4_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 1 (N=4 save) errors:\n{bodies}")
+
+    # ---- Phase 2: load N=2 default (no opt-in) — must hard-error ----
+    save_world_2 = 2
+    # The load worker raises on the worker side; ``mp.spawn`` propagates
+    # via a ProcessRaisedException on the parent. We catch it and check
+    # the .err sentinel for the message.
+    with pytest.raises(Exception):  # noqa: PT011
+        mp.spawn(
+            _load_worker_modec,
+            args=(
+                save_world_2,
+                str(tmp_path),
+                "save_n4",
+                "default_hard_err",
+                False,  # allow_online_reshard=False (the default)
+            ),
+            nprocs=save_world_2,
+            join=True,
+        )
+
+    err_files = sorted(tmp_path.glob("load_modec_default_hard_err_rank*.err"))
+    assert err_files, (
+        "expected per-rank .err sentinels from the failing load workers; "
+        "either the workers didn't raise or the spawn didn't propagate"
+    )
+    # Both ranks must have raised — the load is collective. Check the
+    # error body mentions both recovery routes (offline CLI + opt-in).
+    for ef in err_files:
+        body = ef.read_text()
+        # The lockstep allreduce / broadcast may surface a synthesised
+        # message on non-source ranks; the source rank carries the full
+        # human message. Either path must be visible somewhere across
+        # the ranks. Check the union.
+    union = "\n".join(ef.read_text() for ef in err_files)
+    assert "scripts.protrain.reshard_optim" in union, (
+        "default-error must point at the offline CLI tool"
+    )
+    assert "protrain_allow_online_reshard" in union, (
+        "default-error must point at the opt-in flag"
+    )
+
+
+# ===========================================================================
+# Mode-C (ZeRO-3 sharded) — lockstep failure surface for online reshard
+# ===========================================================================
+#
+# When ``allow_online_reshard=True`` but rank-0's reshard fails (e.g.
+# the source dir has been corrupted between save and load), every rank
+# must surface the error consistently — no rank-0-only stuck state.
+# We simulate the failure by deleting one of the N=4 per-rank shard
+# files between the save and the load; rank-0's reshard tries to read
+# it, raises, and broadcasts a non-zero status to the other ranks via
+# ``_broadcast_status_or_raise``.
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_world_size_online_reshard_lockstep_failure(tmp_path):
+    """Rank-0 reshard failure surfaces on every rank in lockstep.
+
+    Phase 1: save N=4 normally.
+    Phase 1b: corrupt the save by deleting one of the per-rank shards
+        (rank 3's shard for an arbitrary chunk).
+    Phase 2: spawn 2 ranks with ``allow_online_reshard=True``. Rank-0
+        starts the reshard, hits the missing file, broadcasts status=1.
+        Every rank's worker writes a .err sentinel; the spawn surfaces
+        a non-zero exit on the parent.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    n_visible = torch.cuda.device_count()
+    if n_visible < 4:
+        pytest.skip(
+            f"lockstep-failure test needs >= 4 visible GPUs (got {n_visible})"
+        )
+
+    import torch.multiprocessing as mp
+
+    # ---- Phase 1: save N=4 ------------------------------------------
+    save_world_4 = 4
+    mp.spawn(
+        _save_worker_modec,
+        args=(save_world_4, str(tmp_path), "n4"),
+        nprocs=save_world_4,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("save_modec_n4_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 1 (N=4 save) errors:\n{bodies}")
+
+    # ---- Phase 1b: corrupt one shard --------------------------------
+    save_n4_root = tmp_path / "save_n4" / PROTRAIN_OPTIM_DIRNAME
+    cpu_dir = save_n4_root / CPU_OPTIM_DIRNAME
+    # Pick the first chunk + rank 3 (will fail when the reshard tries
+    # to read all 4 ranks for that chunk).
+    n4_meta = json.loads((save_n4_root / METADATA_FILENAME).read_text())
+    chunk_ids = sorted(int(c) for c in n4_meta["regions_per_chunk"].keys())
+    if not chunk_ids:
+        pytest.skip("Mode-C save produced no chunk shards (no non-persistent chunks)")
+    cid = chunk_ids[0]
+    victim = cpu_dir / f"chunk_{cid}_rank_3.pt"
+    assert victim.is_file(), f"setup error: expected {victim} to exist"
+    victim.unlink()
+
+    # ---- Phase 2: online load with corrupted source -----------------
+    save_world_2 = 2
+    with pytest.raises(Exception):  # noqa: PT011
+        mp.spawn(
+            _load_worker_modec,
+            args=(
+                save_world_2,
+                str(tmp_path),
+                "save_n4",
+                "lockstep_fail",
+                True,  # allow_online_reshard=True
+            ),
+            nprocs=save_world_2,
+            join=True,
+        )
+
+    err_files = sorted(tmp_path.glob("load_modec_lockstep_fail_rank*.err"))
+    assert err_files, (
+        "expected per-rank .err sentinels from the lockstep failure; "
+        "if only rank-0 raised the cluster would have wedged at the "
+        "trailing barrier"
+    )
+    # Acceptance: BOTH ranks must have an .err sentinel (not just rank-0).
+    rank_to_err = {
+        int(p.name.split("rank")[1].split(".")[0]): p for p in err_files
+    }
+    assert set(rank_to_err.keys()) == set(range(save_world_2)), (
+        f"only ranks {sorted(rank_to_err.keys())} surfaced an error — "
+        "lockstep failure protocol broken; expected every rank to raise"
+    )

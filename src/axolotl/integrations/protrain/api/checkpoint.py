@@ -825,7 +825,12 @@ def _save_protrain_optim_dir(
 # ---------------------------------------------------------------------------
 
 
-def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
+def _load_protrain_optim_dir(
+    optim: Any,
+    checkpoint_dir: str,
+    *,
+    allow_online_reshard: bool = False,
+) -> bool:
     """Load a previously saved protrain_optim/ subdirectory in-place.
 
     Returns True iff the directory existed and was loaded (or False if
@@ -837,11 +842,17 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
     persistent_ids set, missing per-chunk file).
 
     World-size mismatch policy (CHECKPOINT_DESIGN_PHASE2.md §4.1
-    Option B): Mode-B replicated saves are tolerated across world_size
-    changes — the on-disk state is rank-independent. Mode-C sharded
-    saves require identical world_size — the shard arithmetic depends
-    on it, and cross-world-size resume needs a re-shard step that's
-    out of scope for Phase 2.
+    Option B + opt-in C): Mode-B replicated saves are tolerated across
+    world_size changes — the on-disk state is rank-independent. Mode-C
+    sharded saves default to a hard error on world_size mismatch (the
+    shard arithmetic depends on world_size). When the caller passes
+    ``allow_online_reshard=True``, the load path instead invokes the
+    same reshard logic as the offline tool
+    (:func:`axolotl.integrations.protrain.api.reshard.reshard_mode_c_shards`)
+    on rank-0 against a temp dir, barriers all ranks, then loads from
+    the temp dir as if it had been natively saved at the current
+    world_size. The temp dir is cleaned up on successful load (rank-0
+    only); failures leave it behind for post-mortem.
 
     Mode-C also enforces the per-chunk dtype-region layout: the saved
     ``regions_per_chunk`` descriptors must match the current run's
@@ -860,7 +871,12 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
     CPU), which is correct because the inner state_dicts already hold
     the right device tags.
     """
-    target = os.path.join(checkpoint_dir, PROTRAIN_OPTIM_DIRNAME)
+    original_target = os.path.join(checkpoint_dir, PROTRAIN_OPTIM_DIRNAME)
+    target = original_target
+    # Track whether ``target`` is a transient resharded directory we
+    # own; on successful load rank-0 deletes it. On failure we leave
+    # it behind so a developer can inspect what went wrong.
+    online_reshard_temp_dir: str | None = None
     if not os.path.isdir(target):
         return False
 
@@ -937,24 +953,130 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
         # resume path.
 
         # World-size policy (§4.1): Mode-C is hard-error on world_size
-        # mismatch. Sharded shard arithmetic (region_bytes_padded /
-        # world_size = shard_bytes) depends on world_size, so cross-
-        # world-size resume would need a re-shard step that's out of
-        # scope for Phase 2.
+        # mismatch by default. Sharded shard arithmetic
+        # (region_bytes_padded / world_size = shard_bytes) depends on
+        # world_size, so cross-world-size resume requires a re-shard
+        # step. Two routes exist:
+        #
+        # * Default (``allow_online_reshard=False``): hard error,
+        #   point the user at the offline tool. The offline path is
+        #   the conservative default — explicit user action means the
+        #   user knows world_size changed and accepts the cost.
+        # * Opt-in (``allow_online_reshard=True``): rank-0 invokes the
+        #   shared reshard logic against a temp dir under
+        #   ``original_target/.reshard_to_N<W>/``, all ranks barrier on
+        #   the result via ``_broadcast_status_or_raise`` (mirroring
+        #   the Mode-C save's lockstep failure protocol), then the
+        #   load proceeds against the temp dir as if it were a
+        #   natively-N=W save. Cleanup on successful load.
         if saved_world != current_world:
-            raise RuntimeError(
-                "ProTrain optimizer load: Mode-C sharded resume requires "
-                f"identical world_size — saved={saved_world} "
-                f"current={current_world}. Online cross-world-size resume "
-                "is intentionally out-of-scope (too brittle); use the "
-                "offline reshard tool to convert the saved checkpoint to "
-                "the new world_size before resuming: "
-                "``python -m scripts.protrain.reshard_optim --src "
-                f"<saved-protrain_optim-dir> --dst <new-protrain_optim-dir> "
-                f"--target-world {current_world}``. Alternatively, resume "
-                "with the original world_size or set "
-                "protrain_save_optimizer_state=False to discard the "
-                "saved optimizer state."
+            if not allow_online_reshard:
+                raise RuntimeError(
+                    "ProTrain optimizer load: Mode-C sharded resume "
+                    f"requires identical world_size — saved={saved_world} "
+                    f"current={current_world}. Two ways to recover:\n"
+                    "  (a) Offline reshard via the CLI before resuming:\n"
+                    "      ``python -m scripts.protrain.reshard_optim "
+                    "--src <saved-protrain_optim-dir> "
+                    "--dst <new-protrain_optim-dir> --target-world "
+                    f"{current_world}``\n"
+                    "  (b) Online reshard on load by setting "
+                    "``protrain_allow_online_reshard: True`` in the "
+                    "ProTrain config (off by default — opt-in because "
+                    "online resharding writes a temp dir under the "
+                    "checkpoint and silent automatic resharding can "
+                    "mask configuration drift the user might want to "
+                    "see). Both paths use the same reshard logic; "
+                    "(a) is the conservative default. Alternatively, "
+                    "resume with the original world_size or set "
+                    "``protrain_save_optimizer_state=False`` to "
+                    "discard the saved optimizer state."
+                )
+
+            # Online reshard. Source-of-truth import: pull the reshard
+            # function from the api module that the offline CLI also
+            # uses. ``original_target`` is the saved Mode-C dir; we
+            # write the resharded copy to a sibling temp dir whose
+            # name encodes both world sizes for forensic clarity.
+            from axolotl.integrations.protrain.api.reshard import (  # noqa: PLC0415
+                reshard_mode_c_shards,
+            )
+
+            online_reshard_temp_dir = os.path.join(
+                original_target,
+                f".reshard_to_N{int(current_world)}",
+            )
+
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                rank_for_reshard = int(torch.distributed.get_rank())
+            else:
+                rank_for_reshard = 0
+
+            # Lockstep failure protocol (mirrors the save side's
+            # rank-0-writes-only sections, e.g. metadata.json /
+            # gpu_optim.pt): rank-0 attempts the reshard inside a
+            # try/except, then broadcasts a 0/1 status via
+            # ``_broadcast_status_or_raise``. Non-zero status raises a
+            # synthesised RuntimeError on every non-source rank so the
+            # cluster fails together rather than wedging the surviving
+            # ranks at the trailing barrier.
+            reshard_status = 0
+            try:
+                if rank_for_reshard == 0:
+                    LOG.info(
+                        "ProTrain optimizer load: online reshard "
+                        "saved_world=%d → current_world=%d (opt-in "
+                        "via protrain_allow_online_reshard). Writing "
+                        "to %s",
+                        saved_world,
+                        current_world,
+                        online_reshard_temp_dir,
+                    )
+                    # Pre-clean stale temp dir from a previous
+                    # interrupted run so we never read mixed bytes.
+                    if os.path.isdir(online_reshard_temp_dir):
+                        import shutil as _shutil  # noqa: PLC0415
+
+                        _shutil.rmtree(online_reshard_temp_dir)
+                    reshard_mode_c_shards(
+                        original_target,
+                        online_reshard_temp_dir,
+                        int(current_world),
+                        log_fn=LOG.info,
+                    )
+            except Exception:
+                reshard_status = 1
+                raise
+            finally:
+                _broadcast_status_or_raise(
+                    reshard_status,
+                    src=0,
+                    op="load (online reshard)",
+                )
+
+            # Barrier so non-rank-0 ranks see the temp dir's files
+            # before they try to read them. The reshard writes
+            # cpu_optim/chunk_*_rank_*.pt and metadata.json under
+            # ``online_reshard_temp_dir``; without this barrier, a
+            # fast rank-1 could enter the per-rank read block before
+            # rank-0 finishes the last torch.save().
+            _barrier_or_noop()
+
+            # Re-point the load at the resharded dir and reload
+            # metadata. ``saved_world`` is now == ``current_world``
+            # by construction so the rest of the Mode-C body becomes
+            # the standard same-world load path.
+            target = online_reshard_temp_dir
+            with open(os.path.join(target, METADATA_FILENAME)) as f:
+                metadata = json.load(f)
+            saved_world = int(metadata["protrain_world_size"])
+            assert saved_world == current_world, (
+                "online reshard produced metadata with "
+                f"protrain_world_size={saved_world}, expected "
+                f"{current_world} — bug in reshard_mode_c_shards"
             )
 
         # Region-layout match (§3.5). Every region descriptor must
@@ -1155,6 +1277,30 @@ def _load_protrain_optim_dir(optim: Any, checkpoint_dir: str) -> bool:
             SAVE_MODE_SHARDED,
             current_rank,
         )
+
+        # Cleanup: if we used the online reshard path, rank-0 deletes
+        # the temp dir now that every rank has finished reading from
+        # it. We barrier first so rank-0 can't unlink shard files
+        # mid-read. On exception above, the function exits without
+        # hitting this block — the temp dir is intentionally left for
+        # post-mortem inspection.
+        if online_reshard_temp_dir is not None:
+            _barrier_or_noop()
+            if current_rank == 0 and os.path.isdir(online_reshard_temp_dir):
+                import shutil as _shutil  # noqa: PLC0415
+
+                try:
+                    _shutil.rmtree(online_reshard_temp_dir)
+                except OSError as cleanup_exc:
+                    # Cleanup failure is non-fatal — the load already
+                    # succeeded. Log and continue; user can manually
+                    # rm -rf the temp dir later.
+                    LOG.warning(
+                        "ProTrain optimizer load: failed to clean up "
+                        "online reshard temp dir %s: %s",
+                        online_reshard_temp_dir,
+                        cleanup_exc,
+                    )
         return True
 
     # Mode-B replicated load (current scope). World-size differences
@@ -1479,7 +1625,9 @@ def make_checkpoint_callback(
 # ---------------------------------------------------------------------------
 
 
-def install_load_hook(trainer: Any, optim: Any) -> None:
+def install_load_hook(
+    trainer: Any, optim: Any, *, allow_online_reshard: bool = False
+) -> None:
     """Wrap ``trainer._load_optimizer_and_scheduler`` to also load ProTrain.
 
     HF's TrainerCallback API has no ``on_load_checkpoint``;
@@ -1494,6 +1642,13 @@ def install_load_hook(trainer: Any, optim: Any) -> None:
     ``post_trainer_create``, BEFORE Accelerate.prepare wraps the
     optimizer), so it's already raw. We unwrap defensively in case
     the caller hands in a wrapper.
+
+    The ``allow_online_reshard`` flag plumbs through to
+    :func:`_load_protrain_optim_dir`. Default False keeps the Mode-C
+    cross-world-size load path a hard error; setting True opts the
+    user into the online reshard surface (rank-0 reshards into a temp
+    dir, all ranks barrier and load). See CHECKPOINT_DESIGN_PHASE2.md
+    §4.1.
     """
     raw = _unwrap_protrain_optim(optim)
     if raw is None:
@@ -1509,7 +1664,11 @@ def install_load_hook(trainer: Any, optim: Any) -> None:
         if checkpoint is None:
             return
         try:
-            _load_protrain_optim_dir(raw, checkpoint)
+            _load_protrain_optim_dir(
+                raw,
+                checkpoint,
+                allow_online_reshard=allow_online_reshard,
+            )
         except Exception:
             LOG.exception(
                 "ProTrain optimizer load failed from %s — re-raising. "
