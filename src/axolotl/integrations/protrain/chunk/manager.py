@@ -1347,21 +1347,41 @@ class ChunkManager:
 
         shard_state = self._chunk_shards.get(chunk_id)
 
-        # Consult the pool for a still-resident tag (forward→backward
-        # reuse window). The all_gather path skips this re-use: the
-        # collective cost is < re-running all_gather's worth of data
-        # motion, but the correctness invariant (every rank sees the
-        # SAME full chunk) requires the full chunk to be present —
-        # which is what ``lookup_resident`` guarantees when it returns
-        # a non-None buffer. The shard state's presence doesn't change
-        # the cache-hit semantics; only the cache-miss path diverges.
-        resident = self.buffer_pool.lookup_resident(chunk_id)
-        if resident is not None:
+        # Forward→backward reuse fast path (paper §3.1.1: "buffer-cached
+        # chunks skip re-gather in backward"). The buffer pool preserves
+        # the chunk's tag on ``release`` and only drops it when the slot
+        # is re-acquired for a different chunk (see BufferPool.acquire's
+        # eviction branch). Consequently:
+        #
+        # * If ``lookup_resident(chunk_id)`` returns a buffer, the slot's
+        #   bytes are still the SAME bytes the previous gather wrote
+        #   there — every rank's full-chunk reconstruction is intact and
+        #   we can skip both the H2D copy (replicated path) AND the
+        #   ``all_gather_into_tensor`` collective (sharded path).
+        # * If it returns None, an intervening ``acquire`` for some
+        #   other chunk evicted the tag (and overwrote the bytes); we
+        #   take the full miss path below.
+        #
+        # The skip is the single biggest throughput win on PCIe-bound
+        # 4-GPU 3090 setups (Item 5 profiling pass): each avoided
+        # all_gather is ~290MB of cross-PCIe motion at the 10-12 GB/s
+        # NCCL ring ceiling. Skipping it costs nothing in correctness:
+        # the sharded gather's only output is the full-chunk byte image
+        # in the pool buffer, and ``lookup_resident`` is the proof that
+        # image is still there.
+        resident_buf = self.buffer_pool.lookup_resident(chunk_id)
+        if resident_buf is not None:
+            # Re-claim the slot (idempotent if already in-use; pops the
+            # free list if it was released after forward).
             buf = self.buffer_pool.acquire(chunk_id)
             self._rebind_params_to_buffer(chunk_id, buf, needs_copy=False)
             return
 
-        # Cache miss.
+        # Cache miss: the slot was evicted or never populated. Acquire a
+        # fresh slot (which evicts some OTHER chunk's tag if the free
+        # list is non-empty), then either (a) issue per-region
+        # all_gathers in sharded mode or (b) per-slot H2D copies in
+        # replicated mode.
         buf = self.buffer_pool.acquire(chunk_id)
         if shard_state is not None:
             self._gather_sharded(chunk_id, buf, shard_state)
@@ -1517,28 +1537,38 @@ class ChunkManager:
             # Distributed grad-sync policy. When another layer above
             # ProTrain owns the cross-rank reduction (the M6 stack wraps
             # the protrain'd module in ``DistributedDataParallel``, which
-            # fires its own bucketed allreduce via autograd hooks),
-            # this in-manager all_reduce would be a redundant second
-            # sync — and a costly one on pure-PCIe 3090 pairs because
-            # it runs per-param without bucketing. ``self.skip_internal_grad_reduce``
-            # (set by the wrapper when it detects DDP composition) tells
-            # us to leave the grads alone.
+            # fires its own bucketed allreduce via autograd hooks), this
+            # in-manager all_reduce would be a redundant second sync —
+            # so ``self.skip_internal_grad_reduce`` (set by the wrapper
+            # when it detects DDP composition) tells us to leave the
+            # grads alone.
             #
-            # In the non-DDP distributed path (e.g. a bare ZeRO-3 run)
-            # the flag is False and we do the reduction per-param with
-            # AVG semantics — correct, if slower than a bucketed path.
+            # In the non-DDP distributed path (e.g. a bare ZeRO-3 run
+            # or Mode-A-no-DDP / Mode-C-no-DDP) the flag is False and
+            # we own the cross-rank reduction. To minimize NCCL launch
+            # latency on small persistent chunks (Item 5 profiling
+            # showed ~19 ops × 17MB unbucketed on a Llama-3B 4-GPU run,
+            # ~30 ms / 1300 ms iter), we COALESCE every same-dtype grad
+            # in the chunk into a single flat buffer and issue one
+            # ``all_reduce`` per dtype group. PyTorch's
+            # ``_flatten_dense_tensors`` / ``_unflatten_dense_tensors``
+            # is the same primitive DDP uses internally; it handles
+            # the contiguous-buffer staging and the per-tensor view
+            # restoration without any copy back when the grads were
+            # already contiguous (the common case).
+            #
+            # Mixed-dtype chunks (e.g. fp16 attention weights next to
+            # fp32 layernorm scales in a Llama block) issue ONE
+            # all_reduce per dtype run, not one per param. Homogeneous
+            # chunks issue exactly one collective — the structurally
+            # cleanest case.
             if (
                 torch.distributed.is_available()
                 and torch.distributed.is_initialized()
                 and torch.distributed.get_world_size() > 1
                 and not self.skip_internal_grad_reduce
             ):
-                for pid in self.layout.chunks[int(chunk_id)]:
-                    param = self._params_by_id.get(pid)
-                    if param is not None and param.grad is not None:
-                        torch.distributed.all_reduce(
-                            param.grad, op=torch.distributed.ReduceOp.AVG
-                        )
+                self._coalesced_all_reduce_persistent_grads(chunk_id)
             return
 
         # ---- Non-persistent sharded path -------------------------------
@@ -1554,6 +1584,82 @@ class ChunkManager:
         # param.data placeholder so the GPU storage is fully freed and
         # the params are in a clean state for the next gather.
         self.offload(chunk_id)
+
+    def _coalesced_all_reduce_persistent_grads(
+        self, chunk_id: ChunkId
+    ) -> None:
+        """Bucket persistent-chunk grads by dtype and issue one all_reduce per bucket.
+
+        Replaces the per-param ``dist.all_reduce`` loop that dominated
+        launch latency on the Mode-C / Mode-A-no-DDP path (Item 5
+        profiling: 19 ops × 17MB unbucketed → ~30 ms/iter). Equivalent
+        to PyTorch DDP's internal bucketed allreduce (which uses the
+        same ``_flatten_dense_tensors`` primitive).
+
+        Algorithm:
+
+        1. Group every live ``param.grad`` in ``chunk_id`` by dtype.
+        2. For each dtype group: flatten into one contiguous buffer,
+           ``all_reduce(op=AVG)`` it once, then unflatten back to
+           per-param views and copy each view into the original
+           ``param.grad``. The copy_back handles the case where
+           ``_flatten_dense_tensors`` materialized a fresh buffer (it
+           always does — the input grads' storage is independent).
+
+        Mixed-dtype chunks (Llama: fp16 weights + fp32 RMSNorm scales)
+        issue one collective per dtype run, exactly like the sharded
+        path's per-region collectives. Empty chunks issue zero
+        collectives.
+        """
+        import torch
+        import torch.distributed as dist
+        from torch._utils import (
+            _flatten_dense_tensors,
+            _unflatten_dense_tensors,
+        )
+
+        # Collect all live grads for this chunk, grouped by dtype.
+        # Maintaining param-order within each dtype group is important:
+        # the unflatten step relies on the order matching the input
+        # tensors so the typed views land back on the right grads.
+        grads_by_dtype: dict[
+            "torch.dtype", list[tuple["torch.Tensor", "torch.Tensor"]]
+        ] = {}
+        for pid in self.layout.chunks[int(chunk_id)]:
+            param = self._params_by_id.get(pid)
+            if param is None or param.grad is None:
+                continue
+            grads_by_dtype.setdefault(param.grad.dtype, []).append(
+                (param.grad, param.grad)  # (input_view, target_for_writeback)
+            )
+
+        for dtype, pairs in grads_by_dtype.items():
+            if not pairs:
+                continue
+            grads = [p[0] for p in pairs]
+            if len(grads) == 1:
+                # Single-grad dtype group: skip the flatten/unflatten
+                # round-trip entirely (it would be a wasteful copy +
+                # copy_back for no bandwidth saving). One all_reduce
+                # on the grad in-place matches the legacy path's
+                # behaviour exactly.
+                dist.all_reduce(grads[0], op=dist.ReduceOp.AVG)
+                continue
+
+            # Flatten -> one collective -> unflatten back into the
+            # original grads' storage. ``_flatten_dense_tensors`` always
+            # returns a fresh contiguous buffer; the unflattened views
+            # alias INTO that buffer, so we must copy each view back to
+            # the corresponding original ``param.grad`` (autograd /
+            # FusedAdam read from the original storage, not the
+            # flattened one).
+            flat = _flatten_dense_tensors(grads)
+            dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+            for orig, view in zip(grads, _unflatten_dense_tensors(flat, grads)):
+                # ``copy_`` works in-place on ``orig``'s storage. Same
+                # device by construction (every grad in this group was
+                # already on the same device as the param).
+                orig.copy_(view)
 
     def _reduce_scatter_and_offload_shard(
         self, chunk_id: ChunkId, shard_state: "_ChunkShardState"
