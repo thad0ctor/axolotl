@@ -54,10 +54,12 @@ from tests.protrain.test_optimizer_checkpoint import (  # noqa: E402
 )
 
 from axolotl.integrations.protrain.api.checkpoint import (  # noqa: E402
+    CPU_OPTIM_DIRNAME,
     DEFAULT_SAVE_MAX_BYTES,
     METADATA_FILENAME,
     PROTRAIN_OPTIM_DIRNAME,
     SAVE_MODE_REPLICATED,
+    SAVE_MODE_SHARDED,
     _load_protrain_optim_dir,
     _save_protrain_optim_dir,
 )
@@ -384,4 +386,631 @@ def test_replicated_world_size_reshard_4_to_2(tmp_path):
     for r in range(load_world):
         assert (tmp_path / f"load_rank{r}.done").is_file(), (
             f"load rank {r} did not reach post-load sentinel"
+        )
+
+
+# ===========================================================================
+# Mode-C (ZeRO-3 sharded) — offline reshard tool round-trip
+# ===========================================================================
+#
+# Mode-C explicitly hard-errors on ``saved_world != current_world``
+# (CHECKPOINT_DESIGN_PHASE2.md §4.1, api/checkpoint.py:_load_protrain_optim_dir
+# Mode-C branch). The offline tool ``scripts/protrain/reshard_optim.py``
+# converts the saved per-rank shards from N1 to N2 so the loader sees
+# what looks like a natively-saved-at-N2 directory. This test cell
+# exercises the round-trip end-to-end:
+#
+# Phase 1 (N=4 ranks, GPUs 1,2,4,5): build the sharded chunk_manager
+#     mixed-dtype model, take one fwd+bwd+step, force a deterministic
+#     pattern in the inner state (so the equivalence check below has a
+#     stable target), save Mode-C to ``save_n4/``.
+#
+# Phase 1b (N=2 ranks, GPUs 1,2): same pattern but at world_size=2 so
+#     we have a "natively-N=2" reference save in ``save_n2/`` against
+#     which to verify semantic equivalence.
+#
+# Phase 2 (offline, no GPUs): invoke ``scripts/protrain/reshard_optim.py``
+#     to reshard ``save_n4/`` → ``save_n4_resharded/``.
+#
+# Phase 3 (N=2 ranks, GPUs 1,2): two parallel paths run in the SAME
+#     mp.spawn worker, one after the other:
+#       (a) load ``save_n4_resharded/``, take one optimizer step on a
+#           fixed deterministic batch, snapshot the post-step weights.
+#       (b) load ``save_n2/`` (the natively-N=2 reference), take the
+#           same step, snapshot the post-step weights.
+#     Acceptance: (a) and (b) match within float-tolerance — the
+#     resharded state is semantically equivalent to natively-N=2 state.
+#
+# The "build the sharded chunk_manager" helpers (mixed-dtype model
+# + materialize_offload + optim pair) are reused from
+# tests.protrain.test_optimizer_checkpoint.
+
+from tests.protrain.test_optimizer_checkpoint import (  # noqa: E402
+    _build_optim_pair,
+    _build_sharded_chunk_manager_mixed_dtype,
+)
+
+
+def _force_pattern_inner_state(optim) -> None:
+    """Fill every inner-state tensor with a deterministic pattern.
+
+    The pattern depends only on the (region_idx, state_key) and the
+    flat element index within the rank's shard slice. This lets the
+    test set up the SAME logical full-padded-region content at both
+    world_size=4 and world_size=2: each rank's slice of the global
+    pattern is determined by the (rank, world_size, region_idx)
+    identity, derived from the offset in the global flat array.
+
+    Specifically: for region ``i``, state key ``k``, the global
+    flat tensor is ``[ (i+1) * (k_idx+1) * (g_idx + 1) ]`` for
+    ``g_idx in [0, region_bytes_padded / elem_size)``. The trailing
+    pad positions are zeroed. Each rank's shard is its
+    ``[rank * shard_numel, (rank+1) * shard_numel)`` slice.
+
+    Inputs use float-dtype tensors so the cast doesn't truncate.
+    """
+    import torch as _torch
+
+    if optim._cpu_optim is None:
+        return
+
+    chunk_manager = optim._chunk_manager
+    world_size = int(getattr(chunk_manager, "world_size", 1))
+    rank = int(getattr(chunk_manager, "rank", 0))
+
+    state_key_idx = {"exp_avg": 0, "exp_avg_sq": 1}
+
+    for cid, inner in optim._cpu_optim._optims.items():
+        shard_state = chunk_manager._chunk_shards.get(cid)
+        if shard_state is None:
+            continue
+        regions = shard_state.regions
+        for region_idx, region in enumerate(regions):
+            inner_state = inner.state.get(region.shard_param)
+            if inner_state is None:
+                continue
+            elem_size = region.element_size
+            region_bytes = region.region_bytes
+            region_bytes_padded = region.region_bytes_padded
+            shard_bytes = region.shard_bytes
+
+            valid_numel = region_bytes // elem_size
+            padded_numel = region_bytes_padded // elem_size
+            shard_numel = shard_bytes // elem_size
+
+            # Build the global flat pattern (length padded_numel),
+            # zero-pad the trailing [valid_numel:padded_numel) slice.
+            for k, k_idx in state_key_idx.items():
+                v = inner_state.get(k)
+                if not isinstance(v, _torch.Tensor):
+                    continue
+                base = float((region_idx + 1) * (k_idx + 1))
+                global_flat = _torch.zeros(padded_numel, dtype=v.dtype)
+                if valid_numel > 0:
+                    indices = _torch.arange(valid_numel, dtype=_torch.float64)
+                    global_flat[:valid_numel] = (
+                        base * (indices + 1.0)
+                    ).to(v.dtype)
+                # This rank's slice.
+                slice_ = global_flat[
+                    rank * shard_numel : (rank + 1) * shard_numel
+                ]
+                # In-place copy preserves the inner optimizer's pointer
+                # identity (DeepSpeedCPUAdam tracks tensors by id).
+                v.copy_(slice_)
+
+
+def _hash_inner_state(optim) -> str:
+    """Stable cross-process hash over the rank's inner CPU optim state."""
+    import hashlib
+
+    import torch as _torch
+
+    h = hashlib.sha256()
+    if optim._cpu_optim is None:
+        return h.hexdigest()
+    for cid in sorted(optim._cpu_optim._optims):
+        inner = optim._cpu_optim._optims[cid]
+        h.update(f"chunk:{int(cid)}:".encode("utf-8"))
+        for region_idx, (_param, st) in enumerate(inner.state.items()):
+            h.update(f"region:{region_idx}:".encode("utf-8"))
+            for k in sorted(st.keys()):
+                v = st[k]
+                if isinstance(v, _torch.Tensor):
+                    h.update(f"{k}:".encode("utf-8"))
+                    h.update(str(v.dtype).encode("utf-8"))
+                    h.update(b":")
+                    if v.numel() > 0:
+                        h.update(
+                            v.detach()
+                            .contiguous()
+                            .cpu()
+                            .flatten()
+                            .view(_torch.uint8)
+                            .numpy()
+                            .tobytes()
+                        )
+    return h.hexdigest()
+
+
+def _save_worker_modec(rank: int, world_size: int, tmpdir: str, tag: str) -> None:
+    """One rank in the Mode-C save phase (used for both N=4 and N=2 saves).
+
+    Builds the mixed-dtype sharded chunk_manager + optim, takes one
+    fwd+bwd+step, FORCES a deterministic pattern via
+    :func:`_force_pattern_inner_state`, then writes its per-rank
+    shard files via the Mode-C save path.
+    """
+    import os
+    import sys
+
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    from axolotl.integrations.protrain.api.checkpoint import (
+        DEFAULT_SAVE_MAX_BYTES as _DEFAULT_SAVE_MAX_BYTES,
+        _save_protrain_optim_dir as _save_dir,
+    )
+
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("worker: CUDA not available")
+
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{tmpdir}/rendezvous-{tag}",
+            rank=rank,
+            world_size=world_size,
+        )
+
+        model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(
+            rank, world_size
+        )
+        mgr.materialize_offload()
+        _, _, optim = _build_optim_pair(model, mgr)
+
+        # One fwd+bwd+step so the inner state has real exp_avg /
+        # exp_avg_sq tensors.
+        #
+        # The Mode-C sharded path defers the CPU Adam step to
+        # ``ChunkManager.reduce_grads_and_offload`` (chunk-level
+        # reduce-scatter, then ``cpu_optim.step_async``). In real
+        # training the block-level model wrapper triggers
+        # reduce_grads_and_offload for each block — without that
+        # wrapper, our hand-built test has to trigger it manually
+        # after backward so the per-chunk CPU adam actually runs and
+        # populates ``inner.state``.
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(123)
+        x = torch.randn(2, 32, generator=cpu_gen).to("cuda").to(torch.float16)
+        for cid in list(mgr._non_persistent_ids):
+            mgr.gather(cid)
+        # set_to_none=False keeps the per-region shard_param.grad
+        # tensor alive — the reduce_scatter path copies into it
+        # in-place, so a None grad would crash with AttributeError
+        # in ChunkManager._reduce_scatter_and_offload_shard.
+        optim.zero_grad(set_to_none=False)
+        out = model.h[0].proj(x)
+        out = model.h[0].norm(out.to(torch.float32))
+        out.sum().backward()
+        # Manually drive each non-persistent chunk's reduce-then-CPU-step
+        # since the wrapper-level scheduler isn't installed in this
+        # hand-built setup.
+        for cid in list(mgr._non_persistent_ids):
+            mgr.reduce_grads_and_offload(cid)
+        optim.step()
+        # Drain pending async adam futures so .state is populated before
+        # the pattern-forcing step below indexes by region.
+        mgr.wait_cpu_optim_all()
+
+        # Force the deterministic cross-world pattern. After this every
+        # rank's inner state is its slice of an identical "global" full-
+        # padded-region tensor — so saving at N=4 and at N=2 produces
+        # the same logical state, just sliced differently.
+        _force_pattern_inner_state(optim)
+
+        save_dir = os.path.join(tmpdir, f"save_{tag}")
+        if rank == 0:
+            os.makedirs(save_dir, exist_ok=True)
+        dist.barrier()
+
+        wrote = _save_dir(
+            optim,
+            save_dir,
+            step=1,
+            save_max_bytes=_DEFAULT_SAVE_MAX_BYTES,
+            rank=rank,
+            world_size=world_size,
+        )
+        if not wrote:
+            raise RuntimeError(f"rank {rank}: save returned False")
+        dist.barrier()
+
+        with open(os.path.join(tmpdir, f"save_modec_{tag}_rank{rank}.done"), "w") as f:
+            f.write("ok")
+
+        # Snapshot the rank's inner-state hash for forensic comparison.
+        with open(os.path.join(tmpdir, f"save_modec_{tag}_rank{rank}.hash"), "w") as f:
+            f.write(_hash_inner_state(optim))
+
+        try:
+            mgr.restore_to_gpu()
+        except Exception:  # noqa: BLE001
+            pass
+        if optim._cpu_optim is not None:
+            try:
+                optim._cpu_optim.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        host.close()
+        del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(os.path.join(tmpdir, f"save_modec_{tag}_rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _load_worker_modec(
+    rank: int, world_size: int, tmpdir: str, save_subdir: str, sentinel_tag: str
+) -> None:
+    """One rank in a Mode-C load phase. Builds fresh model + manager,
+    loads from ``tmpdir/save_subdir/protrain_optim``, takes one
+    optimizer step on a deterministic fixed batch, writes a hash of
+    the post-step inner-state and post-step model parameters to a
+    sentinel file.
+    """
+    import os
+
+    import torch
+    import torch.distributed as dist
+
+    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    from axolotl.integrations.protrain.api.checkpoint import (
+        PROTRAIN_OPTIM_DIRNAME as _DIR,
+        _load_protrain_optim_dir as _load_dir,
+    )
+
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("worker: CUDA not available")
+
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{tmpdir}/rendezvous-load-{sentinel_tag}",
+            rank=rank,
+            world_size=world_size,
+        )
+
+        model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(
+            rank, world_size
+        )
+        mgr.materialize_offload()
+        _, _, optim = _build_optim_pair(model, mgr)
+
+        # The inner state is empty pre-load. ``_load_protrain_optim_dir``
+        # must overwrite it with the saved (or resharded) bytes.
+        save_dir = os.path.join(tmpdir, save_subdir)
+        # _load_protrain_optim_dir expects a "checkpoint_dir" that
+        # contains a ``protrain_optim/`` child. Our save_dir is
+        # exactly such a parent (see _save_protrain_optim_dir's
+        # ``target = os.path.join(output_dir, PROTRAIN_OPTIM_DIRNAME)``).
+        loaded = _load_dir(optim, save_dir)
+        if not loaded:
+            raise RuntimeError(
+                f"rank {rank}: _load_protrain_optim_dir({save_dir!r}) "
+                "returned False"
+            )
+
+        post_load_hash = _hash_inner_state(optim)
+
+        # Fixed deterministic batch — identical across the two phase-3
+        # paths (resharded vs natively-N=2) so the post-step state is
+        # comparable.
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(999)
+        x = torch.randn(2, 32, generator=cpu_gen).to("cuda").to(torch.float16)
+        for cid in list(mgr._non_persistent_ids):
+            mgr.gather(cid)
+        # set_to_none=False keeps the per-region shard_param.grad
+        # tensor alive — the reduce_scatter path copies into it
+        # in-place, so a None grad would crash with AttributeError
+        # in ChunkManager._reduce_scatter_and_offload_shard.
+        optim.zero_grad(set_to_none=False)
+        out = model.h[0].proj(x)
+        out = model.h[0].norm(out.to(torch.float32))
+        loss = out.sum()
+        if not bool(torch.isfinite(loss).item()):
+            raise RuntimeError(
+                f"rank {rank}: post-load loss is non-finite"
+            )
+        loss.backward()
+        # Manually fire reduce_grads_and_offload (see save worker note —
+        # without the wrapper-level scheduler, the CPU adam step needs
+        # to be triggered explicitly so .state actually updates).
+        for cid in list(mgr._non_persistent_ids):
+            mgr.reduce_grads_and_offload(cid)
+        optim.step()
+
+        # Drain the async CPU adam queue so we hash a consistent state.
+        mgr.wait_cpu_optim_all()
+
+        post_step_hash = _hash_inner_state(optim)
+
+        # Hash post-step model parameters (after restore to GPU). The
+        # restore copies sharded bytes back into rank-0 view via
+        # all_gather; every rank then sees the same full param values,
+        # so we hash once on rank-0.
+        # NOTE: doing restore_to_gpu would interfere with subsequent
+        # mp.spawn invocations in this process; instead, hash the
+        # params' .data view directly (post-step Adam already wrote
+        # the new values into the CPU shard buffers, and the
+        # ``materialize_offload`` indirection doesn't affect what's on
+        # disk in cpu_shard_bytes).
+        # Hash the rank's CPU shard bytes for every region.
+        import hashlib
+        h = hashlib.sha256()
+        for cid in sorted(mgr._chunk_shards):
+            shard_state = mgr._chunk_shards[cid]
+            for region_idx, region in enumerate(shard_state.regions):
+                h.update(f"chunk:{int(cid)}:region:{region_idx}:".encode("utf-8"))
+                h.update(
+                    region.cpu_shard_bytes.detach()
+                    .cpu()
+                    .numpy()
+                    .tobytes()
+                )
+        param_hash = h.hexdigest()
+
+        with open(os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.done"), "w") as f:
+            f.write(f"loss={float(loss.detach())}\n")
+        with open(
+            os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.hash"), "w"
+        ) as f:
+            # post_load_hash:post_step_hash:param_hash
+            f.write(f"{post_load_hash}:{post_step_hash}:{param_hash}\n")
+
+        try:
+            mgr.restore_to_gpu()
+        except Exception:  # noqa: BLE001
+            pass
+        if optim._cpu_optim is not None:
+            try:
+                optim._cpu_optim.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        host.close()
+        del model, optim, mgr
+    except Exception as exc:
+        import traceback as _tb
+
+        with open(os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.err"), "w") as f:
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            _tb.print_exc(file=f)
+        raise
+    finally:
+        try:
+            dist.barrier()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_sharded_world_size_reshard_4_to_2_offline(tmp_path):
+    """Live Mode-C 4→2 reshard via the offline tool.
+
+    Phase 1: spawn 4 ranks → save Mode-C with deterministic state pattern.
+    Phase 1b: spawn 2 ranks → save Mode-C with the SAME pattern (the
+        per-rank slicing differs, but the underlying logical full-
+        padded-region content is identical). This is the "natively-N=2"
+        reference.
+    Phase 2: invoke scripts/protrain/reshard_optim.py to reshard 4→2,
+        producing a directory whose layout matches the natively-N=2 one.
+    Phase 3a: spawn 2 ranks → load the resharded dir → step → hash.
+    Phase 3b: spawn 2 ranks → load the natively-N=2 dir → step → hash.
+        Phase 3a and 3b's hashes must match — the resharded state is
+        semantically equivalent to natively-N=2 state.
+    """
+    pytest.importorskip("torch")
+    import subprocess
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+
+    n_visible = torch.cuda.device_count()
+    if n_visible < 4:
+        pytest.skip(
+            f"reshard test needs >= 4 visible GPUs (got {n_visible})"
+        )
+
+    import torch.multiprocessing as mp
+
+    # ---- Phase 1: save N=4 ------------------------------------------
+    save_world_4 = 4
+    mp.spawn(
+        _save_worker_modec,
+        args=(save_world_4, str(tmp_path), "n4"),
+        nprocs=save_world_4,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("save_modec_n4_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 1 (N=4 save) errors:\n{bodies}")
+    for r in range(save_world_4):
+        assert (tmp_path / f"save_modec_n4_rank{r}.done").is_file(), (
+            f"N=4 save rank {r} did not reach sentinel"
+        )
+
+    save_n4_root = tmp_path / "save_n4" / PROTRAIN_OPTIM_DIRNAME
+    assert save_n4_root.is_dir(), f"save_n4 root {save_n4_root} missing post-spawn"
+    n4_meta = json.loads((save_n4_root / METADATA_FILENAME).read_text())
+    assert n4_meta["protrain_save_mode"] == SAVE_MODE_SHARDED
+    assert n4_meta["protrain_world_size"] == save_world_4
+    assert "layout_fingerprint" in n4_meta, (
+        "save metadata must record layout_fingerprint for offline reshard"
+    )
+
+    # ---- Phase 1b: save N=2 (reference) -----------------------------
+    save_world_2 = 2
+    mp.spawn(
+        _save_worker_modec,
+        args=(save_world_2, str(tmp_path), "n2"),
+        nprocs=save_world_2,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("save_modec_n2_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 1b (N=2 save) errors:\n{bodies}")
+    save_n2_root = tmp_path / "save_n2" / PROTRAIN_OPTIM_DIRNAME
+    assert save_n2_root.is_dir()
+
+    # ---- Phase 2: offline reshard 4→2 -------------------------------
+    save_n4_resharded_root = tmp_path / "save_n4_resharded" / PROTRAIN_OPTIM_DIRNAME
+    save_n4_resharded_root.parent.mkdir(parents=True, exist_ok=True)
+
+    # Run the reshard tool as a subprocess so it exercises the CLI path.
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    reshard_script = os.path.join(
+        repo_root, "scripts", "protrain", "reshard_optim.py"
+    )
+    assert os.path.isfile(reshard_script), (
+        f"reshard tool not found at {reshard_script}"
+    )
+
+    cmd = [
+        sys.executable,
+        reshard_script,
+        "--src",
+        str(save_n4_root),
+        "--dst",
+        str(save_n4_resharded_root),
+        "--target-world",
+        str(save_world_2),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        pytest.fail(
+            f"reshard tool failed: rc={proc.returncode}\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+
+    # Sanity: resharded metadata records new world_size and matching
+    # per-rank shard files exist.
+    resharded_meta = json.loads(
+        (save_n4_resharded_root / METADATA_FILENAME).read_text()
+    )
+    assert resharded_meta["protrain_world_size"] == save_world_2, (
+        f"resharded metadata still records world_size="
+        f"{resharded_meta['protrain_world_size']}"
+    )
+    assert resharded_meta["protrain_save_mode"] == SAVE_MODE_SHARDED
+    assert resharded_meta["resharded_from_world_size"] == save_world_4
+    cpu_dir = save_n4_resharded_root / CPU_OPTIM_DIRNAME
+    for cid in resharded_meta["regions_per_chunk"]:
+        for r in range(save_world_2):
+            shard_path = cpu_dir / f"chunk_{int(cid)}_rank_{r}.pt"
+            assert shard_path.is_file(), (
+                f"resharded dir missing per-rank shard {shard_path.name}"
+            )
+        # No leftover N=4 ranks.
+        for r in range(save_world_2, save_world_4):
+            stale = cpu_dir / f"chunk_{int(cid)}_rank_{r}.pt"
+            assert not stale.exists(), (
+                f"resharded dir contains leftover N=4 shard {stale.name}"
+            )
+
+    # ---- Phase 3a: load resharded dir, step --------------------------
+    mp.spawn(
+        _load_worker_modec,
+        args=(
+            save_world_2,
+            str(tmp_path),
+            os.path.join("save_n4_resharded"),
+            "resharded",
+        ),
+        nprocs=save_world_2,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("load_modec_resharded_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 3a (resharded load) errors:\n{bodies}")
+
+    # ---- Phase 3b: load natively-N=2 dir, step -----------------------
+    mp.spawn(
+        _load_worker_modec,
+        args=(
+            save_world_2,
+            str(tmp_path),
+            os.path.join("save_n2"),
+            "native",
+        ),
+        nprocs=save_world_2,
+        join=True,
+    )
+    err_files = sorted(tmp_path.glob("load_modec_native_rank*.err"))
+    if err_files:
+        bodies = "\n---\n".join(f.read_text() for f in err_files)
+        pytest.fail(f"phase 3b (native N=2 load) errors:\n{bodies}")
+
+    # ---- Equivalence check: per-rank, all three hashes must match ----
+    # post_load_hash, post_step_hash, param_hash all should match
+    # between the resharded and the native paths (the deterministic
+    # state pattern, the deterministic gradient batch, and the
+    # deterministic Adam step combine to give bit-identical results
+    # IFF the reshard preserved the underlying logical state).
+    for r in range(save_world_2):
+        resharded_hash = (
+            tmp_path / f"load_modec_resharded_rank{r}.hash"
+        ).read_text().strip()
+        native_hash = (
+            tmp_path / f"load_modec_native_rank{r}.hash"
+        ).read_text().strip()
+        rh_post_load, rh_post_step, rh_param = resharded_hash.split(":")
+        nh_post_load, nh_post_step, nh_param = native_hash.split(":")
+        assert rh_post_load == nh_post_load, (
+            f"rank {r}: post-load inner-state hash differs between "
+            f"resharded and native paths.\n"
+            f"  resharded={rh_post_load}\n"
+            f"  native   ={nh_post_load}\n"
+            "The reshard tool produced semantically different state."
+        )
+        assert rh_post_step == nh_post_step, (
+            f"rank {r}: post-step inner-state hash differs between "
+            f"resharded and native paths.\n"
+            f"  resharded={rh_post_step}\n"
+            f"  native   ={nh_post_step}\n"
+            "One Adam step on the resharded state diverged from one "
+            "step on natively-saved-N=2 state — semantic equivalence "
+            "broken."
+        )
+        assert rh_param == nh_param, (
+            f"rank {r}: post-step parameter hash differs between "
+            f"resharded and native paths."
         )
