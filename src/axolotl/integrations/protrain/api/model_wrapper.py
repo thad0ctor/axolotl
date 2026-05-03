@@ -52,8 +52,13 @@ from axolotl.integrations.protrain.profiler.trace import _arch_hash
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
 from axolotl.integrations.protrain.runtime.scheduler import Scheduler
 from axolotl.integrations.protrain.search import search
+from axolotl.integrations.protrain.search.exhaustive import (
+    block_map_runtime_admissible,
+    min_n_buffer_for,
+)
 from axolotl.integrations.protrain.types import (
     BlockId,
+    ChunkId,
     CostConfig,
     HardwareProfile,
     ParamId,
@@ -224,10 +229,10 @@ def _param_exec_order(
     for rec in trace.op_order:
         if not rec.is_forward:
             continue
-        names = module_to_param_names.get(rec.module_path)
-        if not names:
+        param_names = module_to_param_names.get(rec.module_path)
+        if not param_names:
             continue
-        for name in names:
+        for name in param_names:
             if name in seen_names:
                 continue
             param = name_to_param.get(name)
@@ -717,14 +722,14 @@ def _construct_runtime(
     for _bid, pids in _build_block_spans(model)[1].items():
         for pid in pids:
             param_is_in_block[str(pid)] = True
-    chunks_with_nonblock: set[int] = set()
+    chunks_with_nonblock: set[ChunkId] = set()
     for cid, pid_tuple in enumerate(layout.chunks):
         for pid in pid_tuple:
             if not param_is_in_block.get(str(pid), False):
-                chunks_with_nonblock.add(cid)
+                chunks_with_nonblock.add(ChunkId(cid))
                 break
-    effective_persistent_ids: set[int] = (
-        set(range(n_persist)) | chunks_with_nonblock
+    effective_persistent_ids: set[ChunkId] = (
+        {ChunkId(i) for i in range(n_persist)} | chunks_with_nonblock
     )
 
     # Partition params: persistent chunks get the GPU optimizer, the rest
@@ -1502,6 +1507,36 @@ def protrain_model_wrapper(
             n_checkpoint=n_checkpoint,
             N_block=n_block,
         )
+
+        # Replicate the searcher's two runtime-safety invariants. Without
+        # these, the override path can ship configs that the searcher
+        # would never select — e.g. an n_buffer too small for the
+        # scheduler's lookahead prefetch (current-block ∪ next-block
+        # non-persistent chunks must fit simultaneously) or a block_map
+        # where a NONE/SWAP block owns offloaded chunks (the runtime
+        # rebinds param.data to an empty sentinel after offload, so any
+        # non-CKPT block must own only persistent chunks).
+        min_buffer = min_n_buffer_for(layout, n_persist)
+        if n_buffer < min_buffer:
+            raise ValueError(
+                f"n_buffer_override={n_buffer} below scheduler minimum "
+                f"{min_buffer} for n_persist={n_persist} on this layout "
+                f"(N_chunk={layout.N_chunk}). The lookahead prefetch "
+                "needs the union of current+next non-persistent chunks "
+                "to fit in the pool simultaneously."
+            )
+        if not block_map_runtime_admissible(layout, block_map, n_persist):
+            raise ValueError(
+                f"override block_map for n_swap={n_swap} n_checkpoint={n_checkpoint} "
+                f"is runtime-unsafe at n_persist={n_persist}: at least one "
+                "block owns non-persistent chunks but is NOT in CKPT mode. "
+                "After offload the runtime rebinds param.data to an empty "
+                "sentinel; only CKPT blocks (which re-gather chunks during "
+                "recompute) tolerate this. Either raise n_persist to make "
+                "those blocks fully resident, or raise n_checkpoint so "
+                "they recompute."
+            )
+
         result = SearchResult(
             cfg=synth_cfg,
             block_map=block_map,

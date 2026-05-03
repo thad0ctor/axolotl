@@ -43,7 +43,7 @@ def derive_bounds(trace: ProfilerTrace, layout: ChunkLayout) -> Bounds:
         ``Bounds(N_chunk, N_block, N_interval)``.
     """
     n_chunk = int(layout.N_chunk)
-    n_block = int(len(trace.activation_sizes))
+    n_block = len(trace.activation_sizes)
 
     # ``N_interval`` is the number of forward ops per block. If
     # activation_sizes is empty (degenerate test input) use 1 to keep

@@ -58,7 +58,7 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 
-def _min_n_buffer_for(layout: ChunkLayout, n_persist: int) -> int:
+def min_n_buffer_for(layout: ChunkLayout, n_persist: int) -> int:
     """Minimum n_buffer the scheduler needs at this n_persist.
 
     The scheduler's lookahead prefetch (runtime/scheduler.py::pre_block_forward)
@@ -92,7 +92,7 @@ def _min_n_buffer_for(layout: ChunkLayout, n_persist: int) -> int:
     return max(1, need)
 
 
-def _block_map_runtime_admissible(
+def block_map_runtime_admissible(
     layout: ChunkLayout,
     block_map: BlockStrategyMap,
     n_persist: int,
@@ -427,10 +427,10 @@ def search(
                 # prefetch in runtime/scheduler.py::pre_block_forward
                 # works. Skip n_persist values that can't support that
                 # minimum within the capacity budget.
-                min_buffer = _min_n_buffer_for(layout, n_persist)
+                min_buffer = min_n_buffer_for(layout, n_persist)
                 if min_buffer > max_buffer:
                     continue
-                if not _block_map_runtime_admissible(
+                if not block_map_runtime_admissible(
                     layout, block_map, n_persist
                 ):
                     continue
@@ -454,7 +454,11 @@ def search(
                 # unchanged — we still scan within ``[min_buffer,
                 # max_buffer]`` so the GPU gate stays enforced.
                 if cpu_capacity_bytes is None:
-                    n_buffer_candidates: Iterable[int] = {max_buffer, min_buffer}
+                    # Ordered tuple (min first) so tie-breaks prefer the
+                    # smaller buffer — matches the searcher's
+                    # strict ``<`` replacement rule below where the first
+                    # candidate iterated wins on equal predicted cost.
+                    n_buffer_candidates: Iterable[int] = (min_buffer, max_buffer)
                 else:
                     n_buffer_candidates = range(min_buffer, max_buffer + 1)
                 for n_buffer in n_buffer_candidates:
@@ -565,4 +569,8 @@ def search(
     )
 
 
-__all__ = ["search"]
+__all__ = [
+    "block_map_runtime_admissible",
+    "min_n_buffer_for",
+    "search",
+]

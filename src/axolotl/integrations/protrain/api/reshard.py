@@ -400,7 +400,7 @@ def reshard_mode_c_shards(
     for cid in sorted(chunk_paths.keys()):
         per_rank_paths = chunk_paths[cid]
         per_rank_state_dicts = [
-            torch.load(p, map_location="cpu", weights_only=False)
+            torch.load(p, map_location="cpu", weights_only=True)
             for p in per_rank_paths
         ]
         regs = saved_regions[str(cid)]

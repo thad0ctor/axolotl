@@ -182,8 +182,13 @@ class PinnedHostMemory:
     def _init_fallback(self) -> None:
         import torch
 
+        # ``pin_memory=True`` requires a working CUDA driver; on CPU-only
+        # hosts the call raises. Gate on availability so unit tests + CI
+        # without a GPU can still exercise the fallback path with
+        # paged host memory.
+        pin = bool(torch.cuda.is_available())
         self._fallback_tensor = torch.empty(
-            self.total_bytes, dtype=torch.uint8, pin_memory=True
+            self.total_bytes, dtype=torch.uint8, pin_memory=pin
         )
         self._torch_tensor = self._fallback_tensor
         self._is_precise_size = False
@@ -297,7 +302,9 @@ class PinnedHostMemory:
                 self._live_borrows = 0
             self.close()
         except Exception:  # noqa: BLE001 — destructors must not throw
-            pass
+            LOG.exception(
+                "Error during PinnedHostMemory.__del__ cleanup"
+            )
 
 
 __all__ = ["PinnedHostMemory"]

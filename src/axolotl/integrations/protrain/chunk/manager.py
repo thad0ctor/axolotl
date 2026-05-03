@@ -542,7 +542,7 @@ class ChunkManager:
             # gaps.
             aligned_offsets: list[int] = []
             offset = 0
-            for nbytes, esz in zip(per_param_bytes, element_sizes):
+            for nbytes, esz in zip(per_param_bytes, element_sizes, strict=True):
                 if nbytes == 0 or esz == 0:
                     aligned_offsets.append(offset)
                     continue
@@ -578,7 +578,11 @@ class ChunkManager:
                 cur_start = 0
                 cur_end = 0
                 for pid, nbytes, off, esz in zip(
-                    param_ids, per_param_bytes, aligned_offsets, element_sizes
+                    param_ids,
+                    per_param_bytes,
+                    aligned_offsets,
+                    element_sizes,
+                    strict=True,
                 ):
                     if nbytes == 0 or esz == 0:
                         continue
@@ -682,7 +686,7 @@ class ChunkManager:
             slots: list[_CpuParamSlot] = []
             trainable_count = 0
             for pid, nbytes, off in zip(
-                param_ids, per_param_bytes, aligned_offsets
+                param_ids, per_param_bytes, aligned_offsets, strict=True
             ):
                 param = self._params_by_id.get(pid)
                 if param is None or nbytes == 0:
@@ -1634,7 +1638,6 @@ class ChunkManager:
         path's per-region collectives. Empty chunks issue zero
         collectives.
         """
-        import torch
         import torch.distributed as dist
         from torch._utils import (
             _flatten_dense_tensors,
@@ -1656,7 +1659,7 @@ class ChunkManager:
                 (param.grad, param.grad)  # (input_view, target_for_writeback)
             )
 
-        for dtype, pairs in grads_by_dtype.items():
+        for _dtype, pairs in grads_by_dtype.items():
             if not pairs:
                 continue
             grads = [p[0] for p in pairs]
@@ -1678,7 +1681,9 @@ class ChunkManager:
             # flattened one).
             flat = _flatten_dense_tensors(grads)
             dist.all_reduce(flat, op=dist.ReduceOp.AVG)
-            for orig, view in zip(grads, _unflatten_dense_tensors(flat, grads)):
+            for orig, view in zip(
+                grads, _unflatten_dense_tensors(flat, grads), strict=True
+            ):
                 # ``copy_`` works in-place on ``orig``'s storage. Same
                 # device by construction (every grad in this group was
                 # already on the same device as the param).

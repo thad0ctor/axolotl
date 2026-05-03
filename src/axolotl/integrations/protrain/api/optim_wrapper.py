@@ -87,13 +87,48 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
         Non-persistent chunks: per-param post-accumulate-grad hooks
         (installed by :meth:`ChunkManager.materialize_offload`) already
         kicked off the CPU FusedAdam step the instant each chunk's last
-        grad landed on CPU. Here we just wait on every outstanding
-        future so the next forward sees the updated CPU master params.
+        grad landed on CPU — except in the **sharded** path
+        (``zero3_shard=True``), where the per-param hook is intentionally
+        a counter-only no-op and the chunk-level reduce_scatter +
+        CPU-Adam kick lives in :meth:`reduce_grads_and_offload`, which
+        the block-backward hook fires through
+        :meth:`Scheduler.post_block_backward`.
+
+        Block-backward hooks only attach to modules discovered as
+        transformer blocks. Chunks owned by **non-block** modules
+        (top-level ``lm_head`` / ``embed_tokens`` on a ``LlamaForCausalLM``,
+        anything outside the decoder layer stack) therefore have no
+        hook driving their ``reduce_grads_and_offload`` call — in the
+        sharded path that means their grads sit unscattered, the CPU
+        Adam step never fires, and those params silently DON'T update
+        across iterations. Empirically this is enough to flatline the
+        M6 Mode-C loss curve (the lm_head dominates the iter-1 logits
+        and never leaves its init).
+
+        Fix: before we wait on the CPU futures, sweep every
+        non-persistent chunk and call ``reduce_grads_and_offload`` on
+        it. The call is idempotent — chunks already processed by a
+        block-backward hook find no live ``param.grad`` and early-return
+        out of ``_reduce_scatter_and_offload_shard`` without re-issuing
+        the collective; chunks whose block-backward hook never fired
+        (the lm_head / embed-tokens orphans above) get their reduce_scatter
+        + CPU-Adam kick HERE, then the wait_cpu_optim_all() below drains
+        them in the same window as the block-driven kicks.
         """
+        # Orphan sweep: ensure every non-persistent chunk has been
+        # reduced+offloaded before we wait. See the docstring above for
+        # why this is necessary in the sharded path.
+        cm = self._chunk_manager
+        non_persist = getattr(cm, "_non_persistent_ids", None)
+        if non_persist:
+            for cid in list(non_persist):
+                cm.reduce_grads_and_offload(cid)
+
         if self._gpu_optim is not None:
             self._gpu_optim.step()
         # Drain every in-flight CPU Adam future (M4.5 Gap 2: per-param
-        # grad offload enqueued these from the grad hooks).
+        # grad offload enqueued these from the grad hooks; the orphan
+        # sweep above enqueued the rest).
         self._chunk_manager.wait_cpu_optim_all()
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
