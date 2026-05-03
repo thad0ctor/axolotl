@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from axolotl.integrations.protrain.types import (
     BlockId,
-    ChunkLayout,
     ParamId,
 )
 
+if TYPE_CHECKING:
+    from axolotl.integrations.protrain.chunk import ChunkManager
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -313,9 +314,7 @@ def test_sizing_picks_min_waste():
     # pairs fit (2*63=126 ≤ 128) → 4 chunks, 3 preceding × 2 MB = 6 MB
     # waste. At S=256 quadruples fit → 2 chunks, 1 preceding × 4 MB = 4 MB.
     # So S=32 (waste 0) strictly wins; S=256 is the runner-up.
-    sizes_a: dict[ParamId, int] = {
-        cast(ParamId, f"p{i}"): 63 * MB for i in range(8)
-    }
+    sizes_a: dict[ParamId, int] = {cast(ParamId, f"p{i}"): 63 * MB for i in range(8)}
     picked_a = pick_S_chunk(sizes_a)
     assert picked_a == 32 * MB, (
         f"overflow-clamp scenario: expected S=32 MB (waste=0); got {picked_a}"
@@ -327,9 +326,7 @@ def test_sizing_picks_min_waste():
     # exactly (waste=0); at S=256 all four fit in a single chunk (waste=0
     # since tail slack is excluded). Every candidate ties at 0 waste, so
     # the tie-break rule ("prefer larger S_chunk") selects 256 MB.
-    sizes_b: dict[ParamId, int] = {
-        cast(ParamId, f"q{i}"): 64 * MB for i in range(4)
-    }
+    sizes_b: dict[ParamId, int] = {cast(ParamId, f"q{i}"): 64 * MB for i in range(4)}
     picked_b = pick_S_chunk(sizes_b)
     assert picked_b == 256 * MB, (
         f"tie-at-zero-waste scenario: expected S=256 MB via tie-break; got {picked_b}"
@@ -343,9 +340,7 @@ def test_sizing_picks_min_waste():
     # 256-200 = 56 MB preceding. Ties between 32/64 at 0 and between 128/
     # 256 at 56; the zero-waste bucket wins, and within it S=64 beats S=32
     # by tie-break. So the *overall* pick is S=64 MB.
-    sizes_c: dict[ParamId, int] = {
-        cast(ParamId, f"r{i}"): 100 * MB for i in range(3)
-    }
+    sizes_c: dict[ParamId, int] = {cast(ParamId, f"r{i}"): 100 * MB for i in range(3)}
     picked_c = pick_S_chunk(sizes_c)
     assert picked_c == 64 * MB, (
         f"mixed-waste scenario: expected S=64 MB (waste=0, larger of the "
@@ -455,7 +450,11 @@ def test_buffer_pool_acquire_release():
 
         # Keep silencing unused-var warnings — verify distinctness.
         assert buf0.data_ptr() != buf2.data_ptr()
-        assert buf3.data_ptr() not in {buf0.data_ptr(), buf1.data_ptr(), buf2.data_ptr()}
+        assert buf3.data_ptr() not in {
+            buf0.data_ptr(),
+            buf1.data_ptr(),
+            buf2.data_ptr(),
+        }
     finally:
         host.close()
 
@@ -551,9 +550,9 @@ def test_loss_parity_n_persist_extremes():
                 capacity_bytes=2 * (1 << 30),
                 force_all_persistent=True,
             )
-            n_chunk = probe.chunk_manager.layout.N_chunk
+            n_chunk = cast("ChunkManager", probe.chunk_manager).layout.N_chunk
             # Tear down and rebuild without CKPT.
-            for h in probe._hook_handles:
+            for h in cast("list[Any]", probe._hook_handles):
                 try:
                     h.remove()
                 except Exception:
@@ -588,8 +587,8 @@ def test_loss_parity_n_persist_extremes():
                 capacity_bytes=2 * (1 << 30),
                 force_all_persistent=True,
             )
-            n_chunk = probe.chunk_manager.layout.N_chunk
-            for h in probe._hook_handles:
+            n_chunk = cast("ChunkManager", probe.chunk_manager).layout.N_chunk
+            for h in cast("list[Any]", probe._hook_handles):
                 try:
                     h.remove()
                 except Exception:
@@ -628,7 +627,7 @@ def test_loss_parity_n_persist_extremes():
             losses.append(float(out.loss.detach()))
 
         # Teardown.
-        for h in wrapped._hook_handles:
+        for h in cast("list[Any]", wrapped._hook_handles):
             try:
                 h.remove()
             except Exception:
@@ -646,10 +645,10 @@ def test_loss_parity_n_persist_extremes():
     print(f"loss trajectory (n_persist=0):        {losses_none}")
 
     assert len(losses_all) == len(losses_none) == 5
-    for i, (a, b) in enumerate(zip(losses_all, losses_none)):
+    for i, (a, b) in enumerate(zip(losses_all, losses_none, strict=True)):
         assert abs(a - b) < 5e-2, (
             f"loss divergence at step {i}: n_persist=N_chunk->{a:.6f} "
-            f"vs n_persist=0->{b:.6f} (|Δ|={abs(a-b):.6f})"
+            f"vs n_persist=0->{b:.6f} (|Δ|={abs(a - b):.6f})"
         )
 
 
@@ -764,9 +763,7 @@ def test_persistent_grad_reduce_coalesces_same_dtype_grads(monkeypatch):
             # are identity anyway, so this is faithful.
             return None
 
-        monkeypatch.setattr(
-            torch.distributed, "all_reduce", fake_all_reduce
-        )
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
         mgr._coalesced_all_reduce_persistent_grads(cast("ChunkId", 0))
 
@@ -778,9 +775,7 @@ def test_persistent_grad_reduce_coalesces_same_dtype_grads(monkeypatch):
         )
         # The coalesced buffer should match the dtype of the param
         # grads and span all of them.
-        total_grad_numel = sum(
-            int(p.grad.numel()) for _, p in model.named_parameters()
-        )
+        total_grad_numel = sum(int(p.grad.numel()) for _, p in model.named_parameters())
         # _flatten_dense_tensors may pack with no padding; numel covers
         # every element.
         assert calls[0]["numel"] == total_grad_numel, (
@@ -795,8 +790,7 @@ def test_persistent_grad_reduce_coalesces_same_dtype_grads(monkeypatch):
         # writes the right slices into the right grads.
         for n, p in model.named_parameters():
             assert torch.equal(p.grad, original_grads[n]), (
-                f"unflatten/copy_back perturbed grad for '{n}' under "
-                f"identity reduction"
+                f"unflatten/copy_back perturbed grad for '{n}' under identity reduction"
             )
     finally:
         mgr.uninstall()
@@ -873,9 +867,7 @@ def test_persistent_grad_reduce_one_collective_per_dtype_group(monkeypatch):
                 calls.append(tensor.dtype)
                 return None
 
-            monkeypatch.setattr(
-                torch.distributed, "all_reduce", fake_all_reduce
-            )
+            monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
             mgr._coalesced_all_reduce_persistent_grads(cast("ChunkId", 0))
 
@@ -930,7 +922,6 @@ def test_gather_skips_collective_on_pool_resident_hit(monkeypatch):
     from axolotl.integrations.protrain.chunk.manager import (
         ChunkManager,
         _ChunkShardState,
-        _DtypeRegion,
     )
     from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
     from axolotl.integrations.protrain.types import ChunkId
@@ -1011,9 +1002,7 @@ def test_gather_skips_collective_on_pool_resident_hit(monkeypatch):
                 sharded_calls["n"] += 1
                 return orig_gather_sharded(*args, **kwargs)
 
-            monkeypatch.setattr(
-                mgr, "_gather_sharded", _recording_gather_sharded
-            )
+            monkeypatch.setattr(mgr, "_gather_sharded", _recording_gather_sharded)
 
             mgr.gather(chunk_id)
 

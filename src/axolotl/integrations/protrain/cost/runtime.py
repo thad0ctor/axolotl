@@ -188,7 +188,9 @@ def _block_compute_time(trace: ProfilerTrace, block_id: BlockId) -> float:
     return total_s
 
 
-def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[BlockId, float], bool]:
+def _fwd_compute_time_from_trace(
+    trace: ProfilerTrace,
+) -> tuple[float, dict[BlockId, float], bool]:
     """Return (total_fwd_compute_s, per_block_compute_s, used_measured).
 
     Preference order (highest first):
@@ -241,9 +243,7 @@ def _fwd_compute_time_from_trace(trace: ProfilerTrace) -> tuple[float, dict[Bloc
             lat = trace.op_latencies.get(op.op_id)
             if lat is None:
                 continue
-            hooked_per_block[op.block_id] = (
-                hooked_per_block.get(op.block_id, 0.0) + lat
-            )
+            hooked_per_block[op.block_id] = hooked_per_block.get(op.block_id, 0.0) + lat
             hooked_total += lat
         for bid_raw in trace.activation_sizes:
             bid = BlockId(int(bid_raw))
@@ -490,8 +490,8 @@ def estimate_runtime(
     # block when the profiler recorded them; otherwise the activation-size
     # roofline proxy. SWAP blocks add activation H2D/D2H on top of compute.
     n_block = len(trace.activation_sizes)
-    t_fwd_compute_total, per_block_compute, used_measured = _fwd_compute_time_from_trace(
-        trace
+    t_fwd_compute_total, per_block_compute, used_measured = (
+        _fwd_compute_time_from_trace(trace)
     )
     if not used_measured:
         LOG.warning(
@@ -510,7 +510,10 @@ def estimate_runtime(
         LOG.debug(
             "estimate_runtime: applied per-SKU compute scale %.3f (trace=%s "
             "live_TFLOPS=%.1f trace_TFLOPS=%.1f)",
-            sku_scale, trace.sku, hw.gpu_compute_tflops, trace.compute_rate_tflops,
+            sku_scale,
+            trace.sku,
+            hw.gpu_compute_tflops,
+            trace.compute_rate_tflops,
         )
     t_fwd_swap_transfer = 0.0
     for bid_raw, act_sz in trace.activation_sizes.items():
@@ -559,9 +562,7 @@ def estimate_runtime(
             t_fwd_compute_per_chunk, t_fwd_comm_per_chunk
         )
         t_fwd = (
-            t_fwd_persistent_chunks
-            + t_fwd_nonpersistent_chunks
-            + t_fwd_swap_transfer
+            t_fwd_persistent_chunks + t_fwd_nonpersistent_chunks + t_fwd_swap_transfer
         )
 
     # ----- Backward compute --------------------------------------------
@@ -620,12 +621,8 @@ def estimate_runtime(
         # ``t_bwd_comm_per_chunk_uncached - t_bwd_comm_per_chunk_cached =
         # nccl_gather`` in the analytical branch below, keeping the two
         # paths' n_buffer-coefficients consistent.
-        n_nonpersist_bootstrap = max(
-            0, layout.N_chunk - trace.phase2_n_persist
-        )
-        bootstrap_cached = min(
-            trace.phase2_n_buffer, n_nonpersist_bootstrap
-        )
+        n_nonpersist_bootstrap = max(0, layout.N_chunk - trace.phase2_n_persist)
+        bootstrap_cached = min(trace.phase2_n_buffer, n_nonpersist_bootstrap)
         candidate_cached = min(n_buffer, n_nonpersist)
         delta_cached = candidate_cached - bootstrap_cached
         # Savings per cache hit = backward gather collective skipped.
@@ -719,16 +716,12 @@ def estimate_runtime(
     # ``n_nonpersist``. Mode-B (DDP-replicated, no sharding) leaves every
     # rank stepping the full chunk, so the divide stays gated on
     # ``zero3_shard``.
-    cpu_shard_divisor = (
-        max(1, hw.gpu_count) if hw.zero3_shard else 1
-    )
+    cpu_shard_divisor = max(1, hw.gpu_count) if hw.zero3_shard else 1
     if cpu_adam_bps <= 0.0:
         # CPU Adam unavailable — no step happens at runtime.
         t_cpu_optim = 0.0
     else:
-        t_cpu_optim = (
-            n_nonpersist * (ms_per_chunk / cpu_shard_divisor) / cpu_adam_bps
-        )
+        t_cpu_optim = n_nonpersist * (ms_per_chunk / cpu_shard_divisor) / cpu_adam_bps
 
     # TODO(coderabbit-pr10-7b-residual): the phase-2 chunked-wall
     # measurements (``trace.steady_fwd_chunked_wall_s`` /

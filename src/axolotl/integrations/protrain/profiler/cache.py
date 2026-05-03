@@ -211,8 +211,12 @@ def _trace_to_dict(trace: ProfilerTrace) -> dict[str, Any]:
         "trace_version": TRACE_VERSION,
         "op_order": [_op_record_to_dict(op) for op in trace.op_order],
         # dict[OpId, int|float] — JSON requires string keys.
-        "intra_op_delta": {str(int(k)): int(v) for k, v in trace.intra_op_delta.items()},
-        "inter_op_delta": {str(int(k)): int(v) for k, v in trace.inter_op_delta.items()},
+        "intra_op_delta": {
+            str(int(k)): int(v) for k, v in trace.intra_op_delta.items()
+        },
+        "inter_op_delta": {
+            str(int(k)): int(v) for k, v in trace.inter_op_delta.items()
+        },
         "activation_sizes": {
             str(int(k)): int(v) for k, v in trace.activation_sizes.items()
         },
@@ -220,16 +224,18 @@ def _trace_to_dict(trace: ProfilerTrace) -> dict[str, Any]:
         "pcie_h2d_bps": float(trace.pcie_h2d_bps),
         "pcie_d2h_bps": float(trace.pcie_d2h_bps),
         # nccl tables: dict[int, float], JSON requires string keys.
-        "nccl_gather_s": {str(int(k)): float(v) for k, v in trace.nccl_gather_s.items()},
-        "nccl_reduce_s": {str(int(k)): float(v) for k, v in trace.nccl_reduce_s.items()},
+        "nccl_gather_s": {
+            str(int(k)): float(v) for k, v in trace.nccl_gather_s.items()
+        },
+        "nccl_reduce_s": {
+            str(int(k)): float(v) for k, v in trace.nccl_reduce_s.items()
+        },
         "arch_hash": str(trace.arch_hash),
         "bs": int(trace.bs),
         "seq": int(trace.seq),
         "sku": str(trace.sku),
         "world": int(trace.world),
-        "op_latencies": {
-            str(int(k)): float(v) for k, v in trace.op_latencies.items()
-        },
+        "op_latencies": {str(int(k)): float(v) for k, v in trace.op_latencies.items()},
         "cpu_adam_bytes_per_sec": float(trace.cpu_adam_bytes_per_sec),
         "gpu_adam_bytes_per_sec": float(trace.gpu_adam_bytes_per_sec),
         "hooked_fwd_wall_s": float(trace.hooked_fwd_wall_s),
@@ -264,8 +270,12 @@ def _trace_from_dict(data: dict[str, Any]) -> ProfilerTrace:
     """
     return ProfilerTrace(
         op_order=tuple(_op_record_from_dict(d) for d in data["op_order"]),
-        intra_op_delta={OpId(int(k)): int(v) for k, v in data["intra_op_delta"].items()},
-        inter_op_delta={OpId(int(k)): int(v) for k, v in data["inter_op_delta"].items()},
+        intra_op_delta={
+            OpId(int(k)): int(v) for k, v in data["intra_op_delta"].items()
+        },
+        inter_op_delta={
+            OpId(int(k)): int(v) for k, v in data["inter_op_delta"].items()
+        },
         activation_sizes={
             BlockId(int(k)): int(v) for k, v in data["activation_sizes"].items()
         },
@@ -300,11 +310,12 @@ def _trace_from_dict(data: dict[str, Any]) -> ProfilerTrace:
         phase2_n_persist=int(data.get("phase2_n_persist", 0)),
         phase2_n_buffer=int(data.get("phase2_n_buffer", 0)),
         phase2_n_checkpoint=int(data.get("phase2_n_checkpoint", 0)),
-        phase2_per_block_recompute_s=float(data.get("phase2_per_block_recompute_s", 0.0)),
+        phase2_per_block_recompute_s=float(
+            data.get("phase2_per_block_recompute_s", 0.0)
+        ),
         steady_fwd_chunked_wall_s=float(data.get("steady_fwd_chunked_wall_s", 0.0)),
         block_tree_index={
-            BlockId(int(k)): int(v)
-            for k, v in data.get("block_tree_index", {}).items()
+            BlockId(int(k)): int(v) for k, v in data.get("block_tree_index", {}).items()
         },
     )
 

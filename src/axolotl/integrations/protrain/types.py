@@ -44,9 +44,9 @@ ChunkId = NewType("ChunkId", int)
 class BlockMode(str, Enum):
     """Activation strategy selected per transformer block."""
 
-    NONE = "none"   # keep activations on GPU, no checkpoint, no swap
-    CKPT = "ckpt"   # drop + recompute in backward
-    SWAP = "swap"   # offload to CPU in forward, prefetch in backward (feature-flagged)
+    NONE = "none"  # keep activations on GPU, no checkpoint, no swap
+    CKPT = "ckpt"  # drop + recompute in backward
+    SWAP = "swap"  # offload to CPU in forward, prefetch in backward (feature-flagged)
 
 
 # Per-block mode selection, output of `block.layout_rules.assign_modes`.
@@ -63,11 +63,11 @@ class OpRecord:
     """One op captured during the profiler trace."""
 
     op_id: OpId
-    module_path: str                                  # dotted nn.Module path owning this op
-    qualified_name: str                               # e.g. "aten::addmm", "prim::Constant"
-    shape_signature: tuple[tuple[int, ...], ...]     # input tensor shapes
-    block_id: BlockId | None                          # transformer block, if inside one
-    is_forward: bool                                  # True for fwd, False for bwd
+    module_path: str  # dotted nn.Module path owning this op
+    qualified_name: str  # e.g. "aten::addmm", "prim::Constant"
+    shape_signature: tuple[tuple[int, ...], ...]  # input tensor shapes
+    block_id: BlockId | None  # transformer block, if inside one
+    is_forward: bool  # True for fwd, False for bwd
 
 
 @dataclass(frozen=True)
@@ -76,9 +76,9 @@ class ProfilerConfig:
 
     batch_size: int
     seq_len: int
-    device: str                                       # e.g. "cuda:2"
+    device: str  # e.g. "cuda:2"
     include_backward: bool = True
-    on_demand: bool = True                            # OnDemandTensorMgr for models > single-GPU
+    on_demand: bool = True  # OnDemandTensorMgr for models > single-GPU
     # Distributed world size. ``None`` (default) means "auto-detect" — the
     # tracer probes ``torch.distributed.get_world_size()`` if a process
     # group is initialized and falls back to 1 otherwise. Pass an explicit
@@ -97,27 +97,27 @@ class ProfilerTrace:
 
     # Operator trace
     op_order: tuple[OpRecord, ...]
-    intra_op_delta: dict[OpId, int]                   # bytes; peak_during_op - allocated_before_op
-    inter_op_delta: dict[OpId, int]                   # bytes; peak_between_hooks - allocated_prev_end
+    intra_op_delta: dict[OpId, int]  # bytes; peak_during_op - allocated_before_op
+    inter_op_delta: dict[OpId, int]  # bytes; peak_between_hooks - allocated_prev_end
 
     # Per-block summaries
-    activation_sizes: dict[BlockId, int]              # retained-activation bytes per block
+    activation_sizes: dict[BlockId, int]  # retained-activation bytes per block
 
     # Model-state constants (constant across the run given the model + dtype config)
-    model_state_bytes: int                            # fp16 params + grads + fp32 master + momentums
+    model_state_bytes: int  # fp16 params + grads + fp32 master + momentums
 
     # Hardware microbenchmarks (§3.2 hardware profiling)
     pcie_h2d_bps: float
     pcie_d2h_bps: float
-    nccl_gather_s: dict[int, float]                   # keyed by payload size in bytes
+    nccl_gather_s: dict[int, float]  # keyed by payload size in bytes
     nccl_reduce_s: dict[int, float]
 
     # Cache key components
-    arch_hash: str                                    # deterministic hash of model architecture
+    arch_hash: str  # deterministic hash of model architecture
     bs: int
     seq: int
-    sku: str                                          # torch.cuda.get_device_name() result
-    world: int                                        # world_size at profile time
+    sku: str  # torch.cuda.get_device_name() result
+    world: int  # world_size at profile time
 
     # Per-op wall-clock latencies (seconds), measured via torch.cuda.Event during
     # the same single-iteration trace. Keys match ``op_order[i].op_id``. Populated
@@ -339,9 +339,9 @@ class ProfilerTrace:
 class ChunkLayout:
     """Per-rank chunk assignment plus intra-chunk ordering. Output of M2 layout pass."""
 
-    S_chunk: int                                      # bytes per chunk
-    N_chunk: int                                      # total chunks
-    chunks: tuple[tuple[ParamId, ...], ...]           # exec-order within each chunk
+    S_chunk: int  # bytes per chunk
+    N_chunk: int  # total chunks
+    chunks: tuple[tuple[ParamId, ...], ...]  # exec-order within each chunk
     param_to_chunk: dict[ParamId, ChunkId]
     block_to_chunks: dict[BlockId, tuple[ChunkId, ...]]
 
@@ -355,10 +355,10 @@ class ChunkLayout:
 class CostConfig:
     """The four tunable knobs (§3.3 table)."""
 
-    n_persist: int                                    # chunks pinned on GPU
-    n_buffer: int                                     # pre-allocated chunk buffers
-    n_swap: int                                       # blocks using activation swap
-    n_checkpoint: int                                 # blocks using gradient checkpointing
+    n_persist: int  # chunks pinned on GPU
+    n_buffer: int  # pre-allocated chunk buffers
+    n_swap: int  # blocks using activation swap
+    n_checkpoint: int  # blocks using gradient checkpointing
 
 
 @dataclass(frozen=True)
@@ -367,7 +367,7 @@ class Bounds:
 
     N_chunk: int
     N_block: int
-    N_interval: int                                   # swap-interval bound in compute units
+    N_interval: int  # swap-interval bound in compute units
 
 
 @dataclass(frozen=True)
@@ -402,11 +402,11 @@ class HardwareProfile:
 
     gpu_sku: str
     gpu_memory_bytes: int
-    gpu_count: int                                    # world size for this run
+    gpu_count: int  # world size for this run
     pcie_h2d_bps: float
     pcie_d2h_bps: float
-    has_nvlink: bool                                  # informational; we never use NVLink paths
-    zero3_shard: bool = False                         # True when M7 chunk-sharding is active
+    has_nvlink: bool  # informational; we never use NVLink paths
+    zero3_shard: bool = False  # True when M7 chunk-sharding is active
     # Measured Adam throughput (bytes/sec). 0.0 means "unavailable" —
     # ``cost/runtime.estimate_runtime`` falls back to a hardcoded prior in
     # that case. Populated by
@@ -422,6 +422,8 @@ class HardwareProfile:
     # scale. Populated by ``profiler.hw_bench.measure_compute_rate`` from
     # the model_wrapper just before the searcher runs.
     gpu_compute_tflops: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -435,7 +437,7 @@ class WrappedModel:
     this module pure data — see `chunk.manager`, `runtime.scheduler`, etc.
     """
 
-    module: "nn.Module"                               # the original model, with hooks installed
+    module: "nn.Module"  # the original model, with hooks installed
     search_result: SearchResult
     chunk_manager: object = None
     scheduler: object = None

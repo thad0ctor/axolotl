@@ -187,9 +187,7 @@ def protrain_optimizer_wrapper(
     """
     chunk_manager = cast("ChunkManager", wrapped.chunk_manager)
     layout = chunk_manager.layout
-    persistent_ids = set(
-        chunk_manager._persistent_ids
-    )
+    persistent_ids = set(chunk_manager._persistent_ids)
 
     # Partition params the same way ``protrain_model_wrapper`` did —
     # persistent chunks go to GPU FusedAdam, the rest to per-chunk
@@ -282,8 +280,7 @@ def protrain_optimizer_wrapper(
             )
             if is_cuda_mismatch:
                 LOG.error(
-                    base_msg
-                    + " Detected DeepSpeed CUDAMismatchException — "
+                    base_msg + " Detected DeepSpeed CUDAMismatchException — "
                     "system CUDA does not match torch's CUDA wheel. "
                     "Workaround: set env DS_SKIP_CUDA_CHECK=1 (CPU Adam "
                     "JIT-compiles correctly despite the mismatch on "
@@ -293,8 +290,7 @@ def protrain_optimizer_wrapper(
                 )
             else:
                 LOG.error(
-                    base_msg
-                    + " Install DeepSpeed (or fix its dependencies) to "
+                    base_msg + " Install DeepSpeed (or fix its dependencies) to "
                     "enable async CPU Adam.",
                     err_kind,
                     err_str,

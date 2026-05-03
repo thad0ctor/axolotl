@@ -137,6 +137,7 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
     # mode. Hard-code-checked rather than imported from the module so
     # a careless default flip surfaces here with a clear failure.
     from axolotl.integrations.protrain.args import ProTrainArgs
+
     assert ProTrainArgs.model_fields["protrain_auto_mode"].default is True, (
         "protrain_auto_mode default must be True — flipping it silently "
         "breaks the M7 ZeRO-3 footgun fix."
@@ -160,9 +161,8 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
     PluginManager.get_instance().cfg = cfg
 
     _marker("loading datasets")
-    from axolotl.common.datasets import load_datasets
-
     from axolotl.cli.args import TrainerCliArgs
+    from axolotl.common.datasets import load_datasets
 
     cli_args = TrainerCliArgs()
     dataset_meta = load_datasets(cfg=cfg, cli_args=cli_args)
@@ -176,9 +176,7 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
     # Grab losses off trainer.state.log_history. The HF Trainer logs
     # train/loss for every `logging_steps` entry; we asked for 1.
     losses: list[float] = [
-        float(rec["loss"])
-        for rec in trainer.state.log_history
-        if "loss" in rec
+        float(rec["loss"]) for rec in trainer.state.log_history if "loss" in rec
     ]
     assert len(losses) >= 2, (
         f"expected at least 2 training-loss log entries, got {losses}"
@@ -192,8 +190,7 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
             f"loss at step {i} is not finite: {loss}. losses={losses}"
         )
         assert 0.0 <= loss < 20.0, (
-            f"loss at step {i} is out of a sane bf16-LoRA band: {loss}. "
-            f"losses={losses}"
+            f"loss at step {i} is out of a sane bf16-LoRA band: {loss}. losses={losses}"
         )
     _marker(f"losses={losses}")
 
@@ -213,10 +210,12 @@ def test_plugin_e2e_tiny_llama(tmp_path: Path) -> None:
     # working. The lora_B-zero check fires precisely on the failure
     # mode the original assertion was trying to catch (no-op step), and
     # never flakes.
-    model = trainer.model_wrapped if getattr(trainer, "model_wrapped", None) is not None else trainer.model
-    lora_b_params = [
-        (n, p) for n, p in model.named_parameters() if "lora_B" in n
-    ]
+    model = (
+        trainer.model_wrapped
+        if getattr(trainer, "model_wrapped", None) is not None
+        else trainer.model
+    )
+    lora_b_params = [(n, p) for n, p in model.named_parameters() if "lora_B" in n]
     assert lora_b_params, (
         "no lora_B weights found on trainer.model — test assumption "
         "broken (LoRA wiring missing? PEFT version drift?)."
@@ -312,8 +311,8 @@ def test_plugin_e2e_7b_lora_smoke(tmp_path: Path) -> None:
         )
     pytest.importorskip("torch")
 
-    from axolotl.cli.config import load_cfg
     from axolotl.cli.args import TrainerCliArgs
+    from axolotl.cli.config import load_cfg
     from axolotl.cli.train import do_train
 
     yaml_path = (

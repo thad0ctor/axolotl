@@ -113,9 +113,7 @@ _DTYPE_NAME_TO_TORCH: dict[str, "torch.dtype"] = {
 
 
 def _dist_is_active() -> bool:
-    return bool(
-        torch.distributed.is_available() and torch.distributed.is_initialized()
-    )
+    return bool(torch.distributed.is_available() and torch.distributed.is_initialized())
 
 
 def _broadcast_object_list_or_noop(obj_list: list, src: int = 0) -> None:
@@ -150,9 +148,7 @@ def _dist_status_tensor(status: int) -> torch.Tensor:
     return torch.tensor([int(status)], dtype=torch.int64, device=device)
 
 
-def _broadcast_status_or_raise(
-    status: int, *, src: int, op: str
-) -> None:
+def _broadcast_status_or_raise(status: int, *, src: int, op: str) -> None:
     """Broadcast a 0/1 status flag from ``src`` and raise on every rank if non-zero.
 
     Used to guard barriers around single-rank-writes-only sections (Mode-C
@@ -268,9 +264,7 @@ def _layout_signature_from_fingerprint(fingerprint: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _layout_signature(
-    chunk_manager: Any, world_size: int, zero3_shard: bool
-) -> str:
+def _layout_signature(chunk_manager: Any, world_size: int, zero3_shard: bool) -> str:
     """SHA-256 over the load-bearing layout fields.
 
     The signature catches model/architecture drift between save and
@@ -475,10 +469,7 @@ def _normalize_hp(hp: dict[str, Any]) -> dict[str, Any]:
     list values back to tuples here keeps round-tripped data from
     triggering a spurious mismatch warning.
     """
-    return {
-        k: (tuple(v) if isinstance(v, list) else v)
-        for k, v in hp.items()
-    }
+    return {k: (tuple(v) if isinstance(v, list) else v) for k, v in hp.items()}
 
 
 def _is_raw_protrain_optimizer(optim: Any) -> bool:
@@ -588,9 +579,7 @@ def _hash_inner_state_dicts(optim: Any) -> str:
     if optim._cpu_optim is not None:
         for cid in sorted(optim._cpu_optim._optims):
             h.update(f"cpu:{int(cid)}:".encode("utf-8"))
-            h.update(
-                _hash_state_dict(optim._cpu_optim._optims[cid].state_dict())
-            )
+            h.update(_hash_state_dict(optim._cpu_optim._optims[cid].state_dict()))
     return h.hexdigest()
 
 
@@ -609,9 +598,7 @@ def _verify_replicated_state_across_ranks(optim: Any, *, world_size: int) -> Non
     gathered: list[str] = [""] * world_size
     torch.distributed.all_gather_object(gathered, local_hash)
     rank0 = gathered[0]
-    diverged = [
-        (r, h) for r, h in enumerate(gathered) if h != rank0
-    ]
+    diverged = [(r, h) for r, h in enumerate(gathered) if h != rank0]
     if diverged:
         raise RuntimeError(
             "ProTrain optimizer save: Mode-B precondition violated — "
@@ -709,13 +696,12 @@ def _save_protrain_optim_dir(
             if rank == 0:
                 os.makedirs(target, exist_ok=True)
 
-                _fp = _build_layout_fingerprint(
-                    chunk_manager, world_size, zero3_shard
-                )
+                _fp = _build_layout_fingerprint(chunk_manager, world_size, zero3_shard)
                 metadata = {
                     "format_version": SCHEMA_FORMAT_VERSION,
-                    "protrain_layout_signature":
-                        _layout_signature_from_fingerprint(_fp),
+                    "protrain_layout_signature": _layout_signature_from_fingerprint(
+                        _fp
+                    ),
                     # Raw fingerprint persisted so the offline cross-world-
                     # size reshard tool can recompute the signature for a
                     # new world_size without re-deriving the model layout.
@@ -723,12 +709,8 @@ def _save_protrain_optim_dir(
                     # state is rank-independent and the load path
                     # tolerates world_size drift natively).
                     "layout_fingerprint": _fp,
-                    "protrain_persistent_ids": _effective_persistent_ids(
-                        chunk_manager
-                    ),
-                    "protrain_n_buffer": int(
-                        getattr(chunk_manager, "n_buffer", 0)
-                    ),
+                    "protrain_persistent_ids": _effective_persistent_ids(chunk_manager),
+                    "protrain_n_buffer": int(getattr(chunk_manager, "n_buffer", 0)),
                     "protrain_world_size": int(world_size),
                     "protrain_zero3_shard": zero3_shard,
                     "protrain_save_mode": SAVE_MODE_SHARDED,
@@ -807,9 +789,7 @@ def _save_protrain_optim_dir(
                 target,
                 estimate,
                 len(_effective_persistent_ids(chunk_manager)),
-                len(optim._cpu_optim._optims)
-                if optim._cpu_optim is not None
-                else 0,
+                len(optim._cpu_optim._optims) if optim._cpu_optim is not None else 0,
                 step,
                 world_size,
                 SAVE_MODE_SHARDED,
@@ -817,60 +797,73 @@ def _save_protrain_optim_dir(
         return True
 
     # ---------- Mode-B replicated save (rank-0-only write) ----------
-    if rank != 0:
-        # Mode-B: only rank-0 writes. Other ranks just return True so
-        # the caller knows the save was performed cluster-wide.
-        return True
-
-    os.makedirs(target, exist_ok=True)
-
+    # Failure protocol: only rank-0 writes here, while every rank
+    # participates in the callback's trailing barrier. Any exception
+    # during rank-0's write block would leave the other ranks blocked on
+    # that barrier forever. Wrap the rank-0 write in try/except/finally
+    # and broadcast a 0/1 status flag from rank-0 BEFORE rank-0 re-raises
+    # its original exception, so non-rank-0 ranks raise a synthetic
+    # RuntimeError and the cluster fails in lockstep.
     persistent_ids = _effective_persistent_ids(chunk_manager)
-    metadata = {
-        "format_version": SCHEMA_FORMAT_VERSION,
-        "protrain_layout_signature": _layout_signature(
-            chunk_manager, world_size, zero3_shard
-        ),
-        "protrain_persistent_ids": persistent_ids,
-        "protrain_n_buffer": int(getattr(chunk_manager, "n_buffer", 0)),
-        "protrain_world_size": int(world_size),
-        "protrain_zero3_shard": zero3_shard,
-        "protrain_save_mode": SAVE_MODE_REPLICATED,
-        "saving_rank": int(rank),
-        "param_groups_meta": _hyperparam_snapshot(optim),
-        "saved_at_step": int(step),
-        "torch_version": str(torch.__version__),
-        "estimated_optim_state_bytes": int(estimate),
-    }
-    with open(os.path.join(target, METADATA_FILENAME), "w") as f:
-        json.dump(metadata, f, indent=2, sort_keys=True)
+    rank0_status = 0
+    try:
+        if rank == 0:
+            os.makedirs(target, exist_ok=True)
 
-    if optim._gpu_optim is not None:
-        torch.save(
-            optim._gpu_optim._optim.state_dict(),
-            os.path.join(target, GPU_OPTIM_FILENAME),
+            metadata = {
+                "format_version": SCHEMA_FORMAT_VERSION,
+                "protrain_layout_signature": _layout_signature(
+                    chunk_manager, world_size, zero3_shard
+                ),
+                "protrain_persistent_ids": persistent_ids,
+                "protrain_n_buffer": int(getattr(chunk_manager, "n_buffer", 0)),
+                "protrain_world_size": int(world_size),
+                "protrain_zero3_shard": zero3_shard,
+                "protrain_save_mode": SAVE_MODE_REPLICATED,
+                "saving_rank": int(rank),
+                "param_groups_meta": _hyperparam_snapshot(optim),
+                "saved_at_step": int(step),
+                "torch_version": str(torch.__version__),
+                "estimated_optim_state_bytes": int(estimate),
+            }
+            with open(os.path.join(target, METADATA_FILENAME), "w") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+
+            if optim._gpu_optim is not None:
+                torch.save(
+                    optim._gpu_optim._optim.state_dict(),
+                    os.path.join(target, GPU_OPTIM_FILENAME),
+                )
+
+            if optim._cpu_optim is not None and optim._cpu_optim._optims:
+                cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
+                os.makedirs(cpu_dir, exist_ok=True)
+                for cid, inner in optim._cpu_optim._optims.items():
+                    torch.save(
+                        inner.state_dict(),
+                        os.path.join(cpu_dir, f"chunk_{int(cid)}.pt"),
+                    )
+    except Exception:
+        rank0_status = 1
+        raise
+    finally:
+        _broadcast_status_or_raise(
+            rank0_status, src=0, op="save (replicated rank-0 write)"
         )
 
-    if optim._cpu_optim is not None and optim._cpu_optim._optims:
-        cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
-        os.makedirs(cpu_dir, exist_ok=True)
-        for cid, inner in optim._cpu_optim._optims.items():
-            torch.save(
-                inner.state_dict(),
-                os.path.join(cpu_dir, f"chunk_{int(cid)}.pt"),
-            )
-
-    LOG.info(
-        "ProTrain optimizer save: wrote %s (estimate=%d bytes, "
-        "persistent=%d chunks, cpu_chunks=%d, step=%d, "
-        "world_size=%d, save_mode=%s)",
-        target,
-        estimate,
-        len(persistent_ids),
-        len(optim._cpu_optim._optims) if optim._cpu_optim is not None else 0,
-        step,
-        world_size,
-        SAVE_MODE_REPLICATED,
-    )
+    if rank == 0:
+        LOG.info(
+            "ProTrain optimizer save: wrote %s (estimate=%d bytes, "
+            "persistent=%d chunks, cpu_chunks=%d, step=%d, "
+            "world_size=%d, save_mode=%s)",
+            target,
+            estimate,
+            len(persistent_ids),
+            len(optim._cpu_optim._optims) if optim._cpu_optim is not None else 0,
+            step,
+            world_size,
+            SAVE_MODE_REPLICATED,
+        )
     return True
 
 
@@ -909,10 +902,7 @@ def _perform_online_reshard(
         f".reshard_to_N{int(current_world)}",
     )
 
-    if (
-        torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-    ):
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank_for_reshard = int(torch.distributed.get_rank())
     else:
         rank_for_reshard = 0
@@ -1055,9 +1045,7 @@ def _load_protrain_optim_dir(
     saved_world = int(metadata["protrain_world_size"])
     saved_zero3 = bool(metadata["protrain_zero3_shard"])
     saved_mode = str(metadata["protrain_save_mode"])
-    current_mode = (
-        SAVE_MODE_SHARDED if current_zero3 else SAVE_MODE_REPLICATED
-    )
+    current_mode = SAVE_MODE_SHARDED if current_zero3 else SAVE_MODE_REPLICATED
 
     if saved_mode not in (SAVE_MODE_REPLICATED, SAVE_MODE_SHARDED):
         raise RuntimeError(
@@ -1176,9 +1164,7 @@ def _load_protrain_optim_dir(
         # against the saved values for the comparison since saved_world
         # == current_world here.
         saved_sig = metadata["protrain_layout_signature"]
-        expected_sig = _layout_signature(
-            chunk_manager, saved_world, saved_zero3
-        )
+        expected_sig = _layout_signature(chunk_manager, saved_world, saved_zero3)
         if saved_sig != expected_sig:
             raise RuntimeError(
                 "ProTrain optimizer load: layout signature mismatch.\n"
@@ -1213,9 +1199,7 @@ def _load_protrain_optim_dir(
                     "inner — partition mismatch slipped past the layout-"
                     "signature check."
                 )
-            loaded = torch.load(
-                gpu_path, map_location="cpu", weights_only=True
-            )
+            loaded = torch.load(gpu_path, map_location="cpu", weights_only=True)
             optim._gpu_optim._optim.load_state_dict(loaded)
         elif optim._gpu_optim is not None:
             raise RuntimeError(
@@ -1229,10 +1213,7 @@ def _load_protrain_optim_dir(
         # have ready access to the HF TrainingArguments, so fall back
         # to torch.distributed.get_rank() when dist is initialised; on
         # single-rank runs (zero3_shard degraded to no-op) rank=0.
-        if (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
             current_rank = int(torch.distributed.get_rank())
         else:
             current_rank = 0
@@ -1311,18 +1292,13 @@ def _load_protrain_optim_dir(
                     # that pointer. Force CPU after load_state_dict.
                     for state in inner.state.values():
                         for k, v in state.items():
-                            if (
-                                isinstance(v, torch.Tensor)
-                                and v.device.type != "cpu"
-                            ):
+                            if isinstance(v, torch.Tensor) and v.device.type != "cpu":
                                 state[k] = v.cpu()
         except Exception:
             load_status = 1
             raise
         finally:
-            _allreduce_status_or_raise(
-                load_status, op="load (per-rank shard read)"
-            )
+            _allreduce_status_or_raise(load_status, op="load (per-rank shard read)")
 
         # Hyperparam drift: warn but accept.
         saved_hp = metadata.get("param_groups_meta", [])
@@ -1344,9 +1320,7 @@ def _load_protrain_optim_dir(
             target,
             int(metadata.get("saved_at_step", -1)),
             len(saved_pids),
-            len(optim._cpu_optim._optims)
-            if optim._cpu_optim is not None
-            else 0,
+            len(optim._cpu_optim._optims) if optim._cpu_optim is not None else 0,
             SAVE_MODE_SHARDED,
             current_rank,
         )
@@ -1392,9 +1366,7 @@ def _load_protrain_optim_dir(
     # the only legitimately load-bearing layout fields here are chunk
     # geometry + persistent_ids + zero3_shard.
     saved_sig = metadata["protrain_layout_signature"]
-    expected_sig = _layout_signature(
-        chunk_manager, current_world, saved_zero3
-    )
+    expected_sig = _layout_signature(chunk_manager, current_world, saved_zero3)
     if saved_sig != expected_sig:
         raise RuntimeError(
             "ProTrain optimizer load: layout signature mismatch.\n"
@@ -1415,71 +1387,102 @@ def _load_protrain_optim_dir(
             "protrain_n_persist_override (and related overrides) to resume."
         )
 
-    # GPU optim: load if both saved file and current optim slot exist.
-    gpu_path = os.path.join(target, GPU_OPTIM_FILENAME)
-    if os.path.isfile(gpu_path):
-        if optim._gpu_optim is None:
-            raise RuntimeError(
-                "ProTrain optimizer load: gpu_optim.pt present on disk but "
-                "current optimizer has no persistent (GPU) inner — partition "
-                "mismatch slipped past the layout-signature check."
-            )
-        loaded = torch.load(gpu_path, map_location="cpu", weights_only=True)
-        optim._gpu_optim._optim.load_state_dict(loaded)
-    elif optim._gpu_optim is not None:
-        raise RuntimeError(
-            "ProTrain optimizer load: current optimizer has a persistent "
-            "(GPU) inner but gpu_optim.pt is absent on disk."
-        )
-
-    # CPU optim: walk saved chunk files; require an exact match against the
-    # current set of non-persistent chunk IDs.
-    cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
-    saved_chunks: dict[int, str] = {}
-    if os.path.isdir(cpu_dir):
-        for name in os.listdir(cpu_dir):
-            m = CHUNK_FILE_RE.match(name)
-            if m is None:
+    # Failure protocol (Mode-B replicated load): every rank reads the
+    # same shared files (gpu_optim.pt + cpu_optim/chunk_<N>.pt). A
+    # ``torch.load`` or ``load_state_dict`` failure on ANY rank would
+    # cause that rank to raise and bypass the install_load_hook trailing
+    # barrier — surviving ranks would then deadlock. All-reduce a SUM of
+    # per-rank statuses across the whole read block; if any rank failed,
+    # every rank raises so the cluster fails in lockstep. Mirrors the
+    # Mode-C per-rank shard load pattern.
+    load_status = 0
+    captured_exc: Exception | None = None
+    try:
+        # GPU optim: load if both saved file and current optim slot exist.
+        gpu_path = os.path.join(target, GPU_OPTIM_FILENAME)
+        if os.path.isfile(gpu_path):
+            if optim._gpu_optim is None:
                 raise RuntimeError(
-                    f"ProTrain optimizer load: unexpected file {name!r} in "
-                    f"{cpu_dir!r} — refusing to load."
+                    "ProTrain optimizer load: gpu_optim.pt present on disk but "
+                    "current optimizer has no persistent (GPU) inner — partition "
+                    "mismatch slipped past the layout-signature check."
                 )
-            saved_chunks[int(m.group(1))] = os.path.join(cpu_dir, name)
-
-    current_cpu_ids = (
-        set(int(cid) for cid in optim._cpu_optim._optims)
-        if optim._cpu_optim is not None
-        else set()
-    )
-    saved_cpu_ids = set(saved_chunks)
-    if saved_cpu_ids != current_cpu_ids:
-        missing_on_disk = current_cpu_ids - saved_cpu_ids
-        extra_on_disk = saved_cpu_ids - current_cpu_ids
-        raise RuntimeError(
-            "ProTrain optimizer load: CPU chunk set mismatch — "
-            f"missing on disk: {sorted(missing_on_disk)}, "
-            f"extra on disk: {sorted(extra_on_disk)}."
-        )
-
-    if optim._cpu_optim is not None:
-        for cid, inner in optim._cpu_optim._optims.items():
-            loaded = torch.load(
-                saved_chunks[int(cid)], map_location="cpu", weights_only=True
+            loaded = torch.load(gpu_path, map_location="cpu", weights_only=True)
+            optim._gpu_optim._optim.load_state_dict(loaded)
+        elif optim._gpu_optim is not None:
+            raise RuntimeError(
+                "ProTrain optimizer load: current optimizer has a persistent "
+                "(GPU) inner but gpu_optim.pt is absent on disk."
             )
-            inner.load_state_dict(loaded)
-            # ``torch.optim.Optimizer.load_state_dict`` auto-casts every
-            # state tensor to the device of the matching param. After
-            # ``ChunkManager.materialize_offload`` runs, the user-facing
-            # params held by the inner CPU adam have empty GPU
-            # placeholders for ``.data`` — so torch silently moves the
-            # loaded ``exp_avg`` / ``exp_avg_sq`` tensors to CUDA. The
-            # DeepSpeedCPUAdam C++ kernel then segfaults on the next
-            # step trying to write through a GPU pointer. Force the
-            # inner CPU adam state back to CPU after the cast.
-            for state in inner.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor) and v.device.type != "cpu":
-                        state[k] = v.cpu()
+
+        # CPU optim: walk saved chunk files; require an exact match against the
+        # current set of non-persistent chunk IDs.
+        cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
+        saved_chunks: dict[int, str] = {}
+        if os.path.isdir(cpu_dir):
+            for name in os.listdir(cpu_dir):
+                m = CHUNK_FILE_RE.match(name)
+                if m is None:
+                    raise RuntimeError(
+                        f"ProTrain optimizer load: unexpected file {name!r} in "
+                        f"{cpu_dir!r} — refusing to load."
+                    )
+                saved_chunks[int(m.group(1))] = os.path.join(cpu_dir, name)
+
+        current_cpu_ids = (
+            set(int(cid) for cid in optim._cpu_optim._optims)
+            if optim._cpu_optim is not None
+            else set()
+        )
+        saved_cpu_ids = set(saved_chunks)
+        if saved_cpu_ids != current_cpu_ids:
+            missing_on_disk = current_cpu_ids - saved_cpu_ids
+            extra_on_disk = saved_cpu_ids - current_cpu_ids
+            raise RuntimeError(
+                "ProTrain optimizer load: CPU chunk set mismatch — "
+                f"missing on disk: {sorted(missing_on_disk)}, "
+                f"extra on disk: {sorted(extra_on_disk)}."
+            )
+
+        if optim._cpu_optim is not None:
+            for cid, inner in optim._cpu_optim._optims.items():
+                loaded = torch.load(
+                    saved_chunks[int(cid)], map_location="cpu", weights_only=True
+                )
+                inner.load_state_dict(loaded)
+                # ``torch.optim.Optimizer.load_state_dict`` auto-casts every
+                # state tensor to the device of the matching param. After
+                # ``ChunkManager.materialize_offload`` runs, the user-facing
+                # params held by the inner CPU adam have empty GPU
+                # placeholders for ``.data`` — so torch silently moves the
+                # loaded ``exp_avg`` / ``exp_avg_sq`` tensors to CUDA. The
+                # DeepSpeedCPUAdam C++ kernel then segfaults on the next
+                # step trying to write through a GPU pointer. Force the
+                # inner CPU adam state back to CPU after the cast.
+                for state in inner.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                            state[k] = v.cpu()
+    except Exception as exc:
+        load_status = 1
+        captured_exc = exc
+    try:
+        _allreduce_status_or_raise(load_status, op="load (replicated read)")
+    except Exception:
+        # When dist is inactive and our local status is non-zero, the
+        # helper synthesizes a generic RuntimeError. Prefer the caller's
+        # original exception (captured below) over the helper's
+        # synthesized one — it carries the actual error context (e.g.
+        # "CPU chunk set mismatch", "weights_only=True rejected ...").
+        # When dist IS active and our local status is non-zero, the
+        # helper short-circuits and returns silently so we never reach
+        # this branch on the local-failure path. The branch fires on
+        # remote-rank failures (helper raises a synthetic RuntimeError),
+        # which is the right exception to surface.
+        if captured_exc is None:
+            raise
+    if captured_exc is not None:
+        raise captured_exc
 
     # Hyperparam drift: warn but accept. JSON serialization turns
     # ``betas`` tuples into lists; normalize before comparing so
@@ -1645,9 +1648,7 @@ def _make_callback_class():
                 and world_size > 1
                 and not zero3_shard
             ):
-                _verify_replicated_state_across_ranks(
-                    raw, world_size=world_size
-                )
+                _verify_replicated_state_across_ranks(raw, world_size=world_size)
                 self._verify_replicated_done = True
 
             # ---------- 4. Write per-mode ----------

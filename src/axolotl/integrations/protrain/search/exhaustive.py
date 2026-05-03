@@ -193,9 +193,7 @@ def _block_map_peak_contribution(
             ckpt_bump_op[op_idxs[0]] = int(block_id)
 
     # Cumulative NONE-block activation bytes at each forward-op index.
-    block_first_op = {
-        bid: ops[0] for bid, ops in forward_ops_by_block.items() if ops
-    }
+    block_first_op = {bid: ops[0] for bid, ops in forward_ops_by_block.items() if ops}
     blocks_in_fwd_order = sorted(block_first_op.items(), key=lambda kv: kv[1])
     cumulative_none: list[tuple[int, int]] = []  # (first_op_idx, cumulative)
     running = 0
@@ -216,9 +214,7 @@ def _block_map_peak_contribution(
 
     if tree_index_map is None:
         tree_index_map = block_tree_index_map(trace)
-    cross_attn_bytes = cross_attn_persist_bytes(
-        trace, block_map, tree_index_map
-    )
+    cross_attn_bytes = cross_attn_persist_bytes(trace, block_map, tree_index_map)
 
     best = 0
     have_any_forward = False
@@ -231,12 +227,8 @@ def _block_map_peak_contribution(
         live_none = _none_live_at(i)
         ckpt_extra = 0
         if i in ckpt_bump_op:
-            ckpt_extra = trace.activation_sizes.get(
-                BlockId(ckpt_bump_op[i]), 0
-            )
-        op_cross_attn = op_cross_attn_surcharge(
-            op, cross_attn_bytes, tree_index_map
-        )
+            ckpt_extra = trace.activation_sizes.get(BlockId(ckpt_bump_op[i]), 0)
+        op_cross_attn = op_cross_attn_surcharge(op, cross_attn_bytes, tree_index_map)
         candidate = live_none + ckpt_extra + op_cross_attn + intra + inter
         if candidate > best:
             best = candidate
@@ -266,13 +258,9 @@ def _quick_peak_proxy(
     feasible".
     """
     model_state = (cfg.n_persist + cfg.n_buffer) * layout.S_chunk
-    avg_act = (
-        sum(trace.activation_sizes.values()) / max(1, len(trace.activation_sizes))
-    )
+    avg_act = sum(trace.activation_sizes.values()) / max(1, len(trace.activation_sizes))
     # CKPT and SWAP both reduce retained activations.
-    retained_blocks = (
-        len(trace.activation_sizes) - cfg.n_checkpoint - cfg.n_swap
-    )
+    retained_blocks = len(trace.activation_sizes) - cfg.n_checkpoint - cfg.n_swap
     retained_bytes = int(max(0, retained_blocks) * avg_act)
     return model_state + retained_bytes
 
@@ -407,7 +395,37 @@ def search(
             # Peak bound on (n_persist + n_buffer):
             #   int(alpha * (sum * S_chunk + F_bm)) <= capacity
             #   => sum <= floor((capacity/alpha - F_bm) / S_chunk)
-            if alpha > 0 and s_chunk > 0:
+            #
+            # CAVEAT: this bound uses the uncapped ``F_bm`` raw-peak
+            # decomposition. The inner loop later applies
+            # ``hot_iter_peak_cap`` which can LOWER ``raw_peak`` when
+            # the per-block trace shows the F_bm op-walk overestimates
+            # the true hot-iter peak. When the cap fires
+            # (``raw_peak > hot_cap``), ``predicted_peak`` collapses to
+            # ``alpha * hot_cap`` — independent of (n_persist+n_buffer).
+            # If ``alpha * hot_cap <= capacity_bytes``, EVERY config
+            # with sum > max_sum (which the F_bm bound would prune)
+            # actually clears the GPU gate via the cap. Compute the cap
+            # once per (n_swap, n_ckpt) pair — it depends only on
+            # ``trace``, ``block_map``, and ``cfg.n_checkpoint``/
+            # ``cfg.n_swap`` (see ``cost/memory.py::hot_iter_peak_cap``;
+            # n_persist/n_buffer are not read) — and widen ``max_sum``
+            # to the natural ``N_chunk`` ceiling when the cap rescues
+            # the whole sum-axis. Probe cfg uses n_persist=n_buffer=0
+            # because those fields are unused by ``hot_iter_peak_cap``.
+            _cap_probe_cfg = CostConfig(
+                n_persist=0,
+                n_buffer=0,
+                n_swap=n_swap,
+                n_checkpoint=n_ckpt,
+            )
+            _hot_cap = hot_iter_peak_cap(trace, block_map, _cap_probe_cfg)
+            _cap_dominates = (
+                _hot_cap is not None and int(alpha * _hot_cap) <= capacity_bytes
+            )
+            if _cap_dominates:
+                max_sum = bounds.N_chunk
+            elif alpha > 0 and s_chunk > 0:
                 max_sum = int((capacity_bytes / alpha - f_bm) / s_chunk)
             else:
                 max_sum = bounds.N_chunk
@@ -430,9 +448,7 @@ def search(
                 min_buffer = min_n_buffer_for(layout, n_persist)
                 if min_buffer > max_buffer:
                     continue
-                if not block_map_runtime_admissible(
-                    layout, block_map, n_persist
-                ):
+                if not block_map_runtime_admissible(layout, block_map, n_persist):
                     continue
 
                 # Optimum n_buffer is the max feasible: cached chunks
@@ -479,9 +495,7 @@ def search(
                     _cap = hot_iter_peak_cap(trace, block_map, _cfg_for_cap)
                     if _cap is not None and raw_peak > _cap:
                         raw_peak = _cap
-                    predicted_peak = (
-                        int(alpha * raw_peak) if raw_peak > 0 else 0
-                    )
+                    predicted_peak = int(alpha * raw_peak) if raw_peak > 0 else 0
                     if predicted_peak > capacity_bytes:
                         continue
                     n_gpu_feasible += 1

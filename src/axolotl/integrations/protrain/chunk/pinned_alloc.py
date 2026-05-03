@@ -302,9 +302,7 @@ class PinnedHostMemory:
                 self._live_borrows = 0
             self.close()
         except Exception:  # noqa: BLE001 — destructors must not throw
-            LOG.exception(
-                "Error during PinnedHostMemory.__del__ cleanup"
-            )
+            LOG.exception("Error during PinnedHostMemory.__del__ cleanup")
 
 
 __all__ = ["PinnedHostMemory"]

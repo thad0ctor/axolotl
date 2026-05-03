@@ -130,7 +130,9 @@ def measure_cpu_adam(n_params: int = 10_000_000, n_iters: int = 10) -> float:
         ``0.0`` on compile / import failure.
     """
     try:
-        from deepspeed.ops.adam import DeepSpeedCPUAdam  # type: ignore[import-not-found]
+        from deepspeed.ops.adam import (
+            DeepSpeedCPUAdam,  # type: ignore[import-not-found]
+        )
     except Exception as exc:  # noqa: BLE001 - import OR compile failure
         LOG.warning(
             "measure_cpu_adam: DeepSpeedCPUAdam unavailable (%s); "
@@ -177,8 +179,7 @@ def measure_cpu_adam(n_params: int = 10_000_000, n_iters: int = 10) -> float:
         optim = DeepSpeedCPUAdam([param], lr=1e-4)
     except Exception as exc:  # noqa: BLE001 - CUDA toolchain mismatch etc.
         LOG.warning(
-            "measure_cpu_adam: DeepSpeedCPUAdam constructor failed (%s); "
-            "returning 0.0",
+            "measure_cpu_adam: DeepSpeedCPUAdam constructor failed (%s); returning 0.0",
             repr(exc),
         )
         # Drop the exception traceback before returning so it can't pin
@@ -352,11 +353,11 @@ def measure_gpu_adam(
 # at the centre of the sweep. The 1/4/16 MiB end captures the small-collective
 # regime where launch latency dominates over bandwidth.
 NCCL_PAYLOAD_SIZES_BYTES: tuple[int, ...] = (
-    1 << 20,        # 1 MiB
-    4 << 20,        # 4 MiB
-    16 << 20,       # 16 MiB
-    64 << 20,       # 64 MiB
-    256 << 20,      # 256 MiB
+    1 << 20,  # 1 MiB
+    4 << 20,  # 4 MiB
+    16 << 20,  # 16 MiB
+    64 << 20,  # 64 MiB
+    256 << 20,  # 256 MiB
 )
 
 
@@ -443,9 +444,7 @@ def measure_nccl(
             "measure_nccl requires CUDA — NCCL collectives need GPU tensors."
         )
     device = torch.device(
-        f"cuda:{torch.cuda.current_device()}"
-        if torch.cuda.is_available()
-        else "cpu"
+        f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     )
 
     gather_table: dict[int, float] = {}
@@ -463,9 +462,7 @@ def measure_nccl(
         # the cost model thinks in chunk-transfer units.
         element_size = 4  # float32
         elements_per_shard = max(1, (payload_bytes // world_size) // element_size)
-        shard = torch.zeros(
-            elements_per_shard, dtype=torch.float32, device=device
-        )
+        shard = torch.zeros(elements_per_shard, dtype=torch.float32, device=device)
         gathered = torch.zeros(
             elements_per_shard * world_size,
             dtype=torch.float32,
@@ -497,9 +494,7 @@ def measure_nccl(
             dtype=torch.float32,
             device=device,
         )
-        reduced = torch.zeros(
-            elements_per_shard, dtype=torch.float32, device=device
-        )
+        reduced = torch.zeros(elements_per_shard, dtype=torch.float32, device=device)
 
         # Warmup
         for _ in range(n_warmup):
@@ -613,12 +608,15 @@ def measure_compute_rate(
 
     # FLOP count for a square matmul: 2 * N^3 (one multiply + one add per
     # element of the output, summed over the inner dim).
-    flops_per_iter = 2.0 * (matrix_size ** 3)
+    flops_per_iter = 2.0 * (matrix_size**3)
     tflops = flops_per_iter / median_iter / 1e12
 
     LOG.debug(
         "measure_compute_rate device=%d N=%d median_iter=%.4fs throughput=%.2f TFLOPS",
-        device_idx, matrix_size, median_iter, tflops,
+        device_idx,
+        matrix_size,
+        median_iter,
+        tflops,
     )
 
     # Cleanup

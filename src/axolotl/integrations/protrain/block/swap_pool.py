@@ -112,13 +112,9 @@ class ActivationSwapPool:
         if slot_bytes <= 0:
             raise ValueError(f"slot_bytes must be positive, got {slot_bytes}")
         if prefetch_depth < 1:
-            raise ValueError(
-                f"prefetch_depth must be >= 1, got {prefetch_depth}"
-            )
+            raise ValueError(f"prefetch_depth must be >= 1, got {prefetch_depth}")
         if slots_per_block < 1:
-            raise ValueError(
-                f"slots_per_block must be >= 1, got {slots_per_block}"
-            )
+            raise ValueError(f"slots_per_block must be >= 1, got {slots_per_block}")
 
         self.n_swap = int(n_swap)
         self.slot_bytes = int(slot_bytes)
@@ -127,9 +123,7 @@ class ActivationSwapPool:
         self.n_slot = self.n_swap * self.slots_per_block * self.prefetch_depth
 
         # Backing pinned-host region (split into ``n_slot`` equal slots).
-        self._pinned = PinnedHostMemory(
-            n_buffer=self.n_slot, S_chunk=self.slot_bytes
-        )
+        self._pinned = PinnedHostMemory(n_buffer=self.n_slot, S_chunk=self.slot_bytes)
         self._closed = False
         # Free-list of available slot indices. We use a plain list as a
         # LIFO stack — locality of reuse is irrelevant for pinned host

@@ -57,7 +57,9 @@ class CpuFusedAdamAdapter:
     ) -> None:
         """Build one ``DeepSpeedCPUAdam`` instance per chunk and a single worker thread."""
         try:
-            from deepspeed.ops.adam import DeepSpeedCPUAdam  # type: ignore[import-not-found]
+            from deepspeed.ops.adam import (
+                DeepSpeedCPUAdam,  # type: ignore[import-not-found]
+            )
         except ImportError as err:
             raise ImportError(
                 "CpuFusedAdamAdapter requires DeepSpeed's CPU Adam kernel — "
@@ -106,6 +108,7 @@ class CpuFusedAdamAdapter:
                 class _NoopDsAdam:  # noqa: N801 — internal stub
                     def destroy_adam(self, _opt_id):
                         return None
+
                 try:
                     opt.ds_opt_adam = _NoopDsAdam()  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001 — best-effort cleanup

@@ -21,7 +21,6 @@ from axolotl.integrations.protrain.types import (
     ProfilerTrace,
 )
 
-
 _TINY_MODEL_CANDIDATES = (
     "sshleifer/tiny-gpt2",
     "hf-internal-testing/tiny-random-gpt2",
@@ -45,7 +44,6 @@ def _load_tiny_gpt2():
 
 
 def _build_batch(tok, bs: int, seq: int, device):
-    import torch
 
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token or "<|endoftext|>"
@@ -201,6 +199,7 @@ def test_measure_nccl_single_rank_returns_empty_tuple():
 def test_measure_nccl_multi_rank_without_dist_raises():
     """world_size>1 without an initialized process group must fail loudly."""
     import torch.distributed as dist
+
     from axolotl.integrations.protrain.profiler.hw_bench import measure_nccl
 
     if dist.is_available() and dist.is_initialized():
@@ -315,9 +314,7 @@ def test_on_demand_enabled_param_offload_and_restore(gpu_device):
     ).to(device)
 
     # Snapshot original params so we can verify byte-exact restore later.
-    original_state = {
-        name: p.detach().clone() for name, p in model.named_parameters()
-    }
+    original_state = {name: p.detach().clone() for name, p in model.named_parameters()}
 
     from axolotl.integrations.protrain.profiler.on_demand import (
         OnDemandTensorMgr,
@@ -479,6 +476,8 @@ def test_on_demand_engaged_cost_model_finite(gpu_device, monkeypatch):
     # block count. The cost model only cares that block_to_chunks covers
     # every block in trace.activation_sizes; a 1-chunk-per-block layout is
     # the simplest valid topology for this smoke test.
+    from axolotl.integrations.protrain.block.layout_rules import assign_modes
+    from axolotl.integrations.protrain.cost import estimate_runtime
     from axolotl.integrations.protrain.types import (
         BlockId as _BlockId,
         ChunkLayout,
@@ -486,8 +485,6 @@ def test_on_demand_engaged_cost_model_finite(gpu_device, monkeypatch):
         HardwareProfile,
         ParamId,
     )
-    from axolotl.integrations.protrain.cost import estimate_runtime
-    from axolotl.integrations.protrain.block.layout_rules import assign_modes
 
     block_ids = sorted(trace.activation_sizes.keys())
     n_block = len(block_ids)
@@ -496,9 +493,7 @@ def test_on_demand_engaged_cost_model_finite(gpu_device, monkeypatch):
     n_chunk = max(n_block, 1)
     chunks = tuple((ParamId(f"p.{i}"),) for i in range(n_chunk))
     param_to_chunk = {ParamId(f"p.{i}"): i for i in range(n_chunk)}
-    block_to_chunks = {
-        _BlockId(int(bid)): (i,) for i, bid in enumerate(block_ids)
-    }
+    block_to_chunks = {_BlockId(int(bid)): (i,) for i, bid in enumerate(block_ids)}
     layout = ChunkLayout(
         S_chunk=4 * (1 << 20),  # 4 MiB; tiny but positive
         N_chunk=n_chunk,
@@ -509,9 +504,7 @@ def test_on_demand_engaged_cost_model_finite(gpu_device, monkeypatch):
 
     hw = HardwareProfile(
         gpu_sku=trace.sku,
-        gpu_memory_bytes=int(
-            torch.cuda.get_device_properties(device).total_memory
-        ),
+        gpu_memory_bytes=int(torch.cuda.get_device_properties(device).total_memory),
         gpu_count=1,
         pcie_h2d_bps=trace.pcie_h2d_bps if trace.pcie_h2d_bps > 0 else 12e9,
         pcie_d2h_bps=trace.pcie_d2h_bps if trace.pcie_d2h_bps > 0 else 12e9,

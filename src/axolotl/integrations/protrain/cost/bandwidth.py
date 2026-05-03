@@ -20,9 +20,7 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 
-def effective_bw(
-    cfg: CostConfig, hw: HardwareProfile
-) -> tuple[float, float]:
+def effective_bw(cfg: CostConfig, hw: HardwareProfile) -> tuple[float, float]:
     """Return ``(effective_h2d_bps, effective_d2h_bps)`` under SWAP contention.
 
     When ``cfg.n_swap == 0`` the raw PCIe bandwidths are returned unchanged.

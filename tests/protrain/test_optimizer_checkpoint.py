@@ -49,7 +49,6 @@ from axolotl.integrations.protrain.api.checkpoint import (
 )
 from axolotl.integrations.protrain.types import BlockId, ChunkId, ParamId
 
-
 # ---------------------------------------------------------------------------
 # Helpers — mirror test_chunk_manager_offload.py's fixture style
 # ---------------------------------------------------------------------------
@@ -86,9 +85,7 @@ def _build_layout_for(model, S_chunk: int):
     for name, _ in model.named_parameters():
         if name.startswith("h."):
             idx = int(name.split(".")[1])
-            block_spans.setdefault(cast(BlockId, idx), []).append(
-                cast(ParamId, name)
-            )
+            block_spans.setdefault(cast(BlockId, idx), []).append(cast(ParamId, name))
     exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
     return build_layout(model, exec_order, S_chunk, block_spans)
 
@@ -169,9 +166,7 @@ def _build_optim_pair(model, mgr, *, lr: float = 1e-3):
             cpu_params_for_optim[cid] = ps
 
     if any(cpu_params_for_optim.values()):
-        cpu_optim = CpuFusedAdamAdapter(
-            params_per_chunk=cpu_params_for_optim, lr=lr
-        )
+        cpu_optim = CpuFusedAdamAdapter(params_per_chunk=cpu_params_for_optim, lr=lr)
 
     mgr.cpu_optim = cpu_optim
     mgr.gpu_optim = gpu_optim
@@ -180,7 +175,13 @@ def _build_optim_pair(model, mgr, *, lr: float = 1e-3):
     for ps in cpu_params_per_chunk.values():
         all_params.extend(ps)
     seen: set[int] = set()
-    unique = [p for p in all_params if not (id(p) in seen or seen.add(id(p)))]
+    unique = []
+    for p in all_params:
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        unique.append(p)
     if not unique:
         unique = [torch.nn.Parameter(torch.zeros(1, device="cuda"))]
 
@@ -243,15 +244,15 @@ def test_estimate_optim_state_bytes_walks_inner_state():
     fake_inner_gpu = mock.MagicMock()
     fake_inner_gpu.state = {
         0: {
-            "exp_avg": torch.zeros(10, dtype=torch.float32),     # 10 * 4 = 40 bytes
+            "exp_avg": torch.zeros(10, dtype=torch.float32),  # 10 * 4 = 40 bytes
             "exp_avg_sq": torch.zeros(10, dtype=torch.float32),  # 40 bytes
-            "step": 1,                                           # int — not counted
+            "step": 1,  # int — not counted
         },
     }
     fake_inner_cpu_chunk_0 = mock.MagicMock()
     fake_inner_cpu_chunk_0.state = {
         0: {
-            "exp_avg": torch.zeros(20, dtype=torch.float32),     # 80 bytes
+            "exp_avg": torch.zeros(20, dtype=torch.float32),  # 80 bytes
             "exp_avg_sq": torch.zeros(20, dtype=torch.float32),  # 80 bytes
         },
     }
@@ -321,14 +322,10 @@ def test_layout_signature_changes_with_world_size_or_zero3():
       of the hash — different ranks hold different shards, and
       cross-world resume requires the offline reshard tool.
     """
-    fake_layout = mock.MagicMock(
-        S_chunk=1024, N_chunk=2, chunks=(("a",), ("b",))
-    )
+    fake_layout = mock.MagicMock(S_chunk=1024, N_chunk=2, chunks=(("a",), ("b",)))
     fake_mgr = mock.MagicMock(layout=fake_layout, _persistent_ids={0})
     base = _layout_signature(fake_mgr, world_size=1, zero3_shard=False)
-    same_ws_replicated = _layout_signature(
-        fake_mgr, world_size=2, zero3_shard=False
-    )
+    same_ws_replicated = _layout_signature(fake_mgr, world_size=2, zero3_shard=False)
     z3_ws1 = _layout_signature(fake_mgr, world_size=1, zero3_shard=True)
     z3_ws2 = _layout_signature(fake_mgr, world_size=2, zero3_shard=True)
     # Mode-B: world_size delta does NOT change signature (Phase-2 fix).
@@ -378,9 +375,7 @@ def test_hash_state_dict_handles_empty_tensor():
 
 def test_is_protrain_optimizer_duck_types():
     assert _is_protrain_optimizer(mock.MagicMock(spec=[])) is False
-    has_all = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    has_all = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
     assert _is_protrain_optimizer(has_all) is True
     assert _is_raw_protrain_optimizer(has_all) is True
 
@@ -427,9 +422,16 @@ def test_unwrap_real_accelerated_optimizer():
     Accelerator()
 
     raw_protrain = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager",
-              "state_dict", "load_state_dict", "param_groups", "state",
-              "defaults"]
+        spec=[
+            "_gpu_optim",
+            "_cpu_optim",
+            "_chunk_manager",
+            "state_dict",
+            "load_state_dict",
+            "param_groups",
+            "state",
+            "defaults",
+        ]
     )
     raw_protrain.state_dict.return_value = {"state": {}, "param_groups": []}
     raw_protrain.load_state_dict.return_value = None
@@ -499,9 +501,7 @@ def test_save_skipped_when_offloaded_state_exceeds_threshold(tmp_path, caplog):
     fake_optim = mock.MagicMock()
     fake_optim.param_groups = [{"params": [empty_placeholder]}]  # red herring
     fake_optim._gpu_optim = None
-    fake_optim._cpu_optim = mock.MagicMock(
-        _optims={0: fake_inner_cpu_chunk_0}
-    )
+    fake_optim._cpu_optim = mock.MagicMock(_optims={0: fake_inner_cpu_chunk_0})
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
     fake_optim._chunk_manager.layout = mock.MagicMock(
         S_chunk=1024, N_chunk=1, chunks=(("a",),)
@@ -512,7 +512,9 @@ def test_save_skipped_when_offloaded_state_exceeds_threshold(tmp_path, caplog):
         wrote = _save_protrain_optim_dir(
             fake_optim, str(tmp_path), step=1, save_max_bytes=1024
         )
-    assert wrote is False, "estimator must count offloaded inner state, not outer placeholders"
+    assert wrote is False, (
+        "estimator must count offloaded inner state, not outer placeholders"
+    )
     assert not (tmp_path / PROTRAIN_OPTIM_DIRNAME).exists()
 
 
@@ -525,9 +527,7 @@ def test_install_load_hook_wraps_trainer_method():
     fake_trainer = mock.MagicMock()
     original = mock.MagicMock()
     fake_trainer._load_optimizer_and_scheduler = original
-    fake_optim = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    fake_optim = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
 
     install_load_hook(fake_trainer, fake_optim)
     assert fake_trainer._load_optimizer_and_scheduler is not original
@@ -541,9 +541,7 @@ def test_callback_skips_when_optim_is_not_protrain(tmp_path):
     import torch
 
     cb = make_checkpoint_callback(save_max_bytes=DEFAULT_SAVE_MAX_BYTES)
-    fake_args = mock.MagicMock(
-        output_dir=str(tmp_path), process_index=0, world_size=1
-    )
+    fake_args = mock.MagicMock(output_dir=str(tmp_path), process_index=0, world_size=1)
     fake_state = mock.MagicMock(global_step=1)
     fake_control = mock.MagicMock()
 
@@ -580,7 +578,9 @@ def saved_checkpoint(tmp_path_factory):
     _step_once(model, mgr, optim, "cuda")
 
     wrote = _save_protrain_optim_dir(
-        optim, str(saved_dir), step=42,
+        optim,
+        str(saved_dir),
+        step=42,
         save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
     )
     assert wrote is True
@@ -651,7 +651,9 @@ def test_save_drains_cpu_optim_before_snapshot(tmp_path, saved_checkpoint):
         mgr, "wait_cpu_optim_all", wraps=mgr.wait_cpu_optim_all
     ) as spy:
         _save_protrain_optim_dir(
-            optim, str(target), step=99,
+            optim,
+            str(target),
+            step=99,
             save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
         )
         assert spy.called
@@ -806,9 +808,7 @@ def test_load_uses_map_location_cpu(fresh_checkpoint_dir, saved_checkpoint):
         seen.append(kwargs.get("map_location"))
         return real_load(*args, **kwargs)
 
-    with mock.patch(
-        "axolotl.integrations.protrain.api.checkpoint.torch.load", spy
-    ):
+    with mock.patch("axolotl.integrations.protrain.api.checkpoint.torch.load", spy):
         _load_protrain_optim_dir(optim, str(fresh_checkpoint_dir))
 
     assert seen, "no torch.load calls observed"
@@ -816,9 +816,7 @@ def test_load_uses_map_location_cpu(fresh_checkpoint_dir, saved_checkpoint):
 
 
 @pytest.mark.gpu
-def test_load_rejects_layout_signature_mismatch(
-    fresh_checkpoint_dir, saved_checkpoint
-):
+def test_load_rejects_layout_signature_mismatch(fresh_checkpoint_dir, saved_checkpoint):
     _, _, optim = saved_checkpoint
     meta_path = fresh_checkpoint_dir / PROTRAIN_OPTIM_DIRNAME / "metadata.json"
     meta = json.loads(meta_path.read_text())
@@ -830,9 +828,7 @@ def test_load_rejects_layout_signature_mismatch(
 
 
 @pytest.mark.gpu
-def test_load_rejects_unknown_format_version(
-    fresh_checkpoint_dir, saved_checkpoint
-):
+def test_load_rejects_unknown_format_version(fresh_checkpoint_dir, saved_checkpoint):
     _, _, optim = saved_checkpoint
     meta_path = fresh_checkpoint_dir / PROTRAIN_OPTIM_DIRNAME / "metadata.json"
     meta = json.loads(meta_path.read_text())
@@ -954,9 +950,7 @@ def _arm_continuous_training(
 
         torch.manual_seed(0)
         model = _tiny_model().to("cuda")
-        mgr, _host = _build_chunk_manager(
-            model, n_persist=1, S_chunk=64 * 1024
-        )
+        mgr, _host = _build_chunk_manager(model, n_persist=1, S_chunk=64 * 1024)
         mgr.materialize_offload()
         _, _, optim = _build_optim_pair(model, mgr)
 
@@ -996,8 +990,8 @@ def _arm_continuous_training(
 
         if save_dir is not None:
             from axolotl.integrations.protrain.api.checkpoint import (
-                _save_protrain_optim_dir,
                 DEFAULT_SAVE_MAX_BYTES,
+                _save_protrain_optim_dir,
             )
 
             # Save model weights AND optimizer state. Mirrors HF
@@ -1025,10 +1019,7 @@ def _arm_continuous_training(
             # placeholders again).
             for cid in list(mgr._non_persistent_ids):
                 mgr.gather(cid)
-            snap = {
-                n: p.detach().cpu().clone()
-                for n, p in model.named_parameters()
-            }
+            snap = {n: p.detach().cpu().clone() for n, p in model.named_parameters()}
             torch.save(snap, output_path)
 
     except BaseException:
@@ -1082,9 +1073,7 @@ def test_continued_training_matches_continuous_via_subprocess(tmp_path):
             pytest.fail(f"arm {tag!r} timed out after 180s")
         if p.exitcode != 0:
             err_text = err.read_text() if err.exists() else "(no traceback captured)"
-            pytest.fail(
-                f"arm {tag!r} exited with code {p.exitcode}:\n{err_text}"
-            )
+            pytest.fail(f"arm {tag!r} exited with code {p.exitcode}:\n{err_text}")
 
     # Reference: 4 continuous steps from scratch
     _spawn_arm(0, 4, None, None, str(ref_out), tag="reference")
@@ -1142,9 +1131,7 @@ def test_load_rejects_v2_metadata_missing_save_mode(tmp_path):
         "estimated_optim_state_bytes": 0,
     }
     (proot / "metadata.json").write_text(json.dumps(bad_meta))
-    fake_optim = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    fake_optim = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
     with pytest.raises(RuntimeError, match="protrain_save_mode"):
         _load_protrain_optim_dir(fake_optim, str(tmp_path))
@@ -1174,9 +1161,7 @@ def test_load_rejects_save_mode_mismatch_replicated_to_sharded(tmp_path):
         "estimated_optim_state_bytes": 0,
     }
     (proot / "metadata.json").write_text(json.dumps(meta))
-    fake_optim = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    fake_optim = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
     with pytest.raises(RuntimeError, match="save_mode mismatch"):
         _load_protrain_optim_dir(fake_optim, str(tmp_path))
@@ -1205,9 +1190,7 @@ def test_load_rejects_save_mode_mismatch_sharded_to_replicated(tmp_path):
         "estimated_optim_state_bytes": 0,
     }
     (proot / "metadata.json").write_text(json.dumps(meta))
-    fake_optim = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    fake_optim = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=False)
     with pytest.raises(RuntimeError, match="save_mode mismatch"):
         _load_protrain_optim_dir(fake_optim, str(tmp_path))
@@ -1344,9 +1327,7 @@ def test_load_rejects_sharded_metadata_missing_regions_per_chunk(tmp_path):
         # regions_per_chunk missing on purpose
     }
     (proot / "metadata.json").write_text(json.dumps(meta))
-    fake_optim = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    fake_optim = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
     # Pretend we're in a 2-rank sharded run so we get past the
     # save_mode/world_size guards and reach the regions check.
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
@@ -1383,9 +1364,7 @@ def test_load_rejects_sharded_world_size_change(tmp_path):
         "regions_per_chunk": {"0": [_make_region_dict()]},
     }
     (proot / "metadata.json").write_text(json.dumps(meta))
-    fake_optim = mock.MagicMock(
-        spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"]
-    )
+    fake_optim = mock.MagicMock(spec=["_gpu_optim", "_cpu_optim", "_chunk_manager"])
     fake_optim._chunk_manager = mock.MagicMock(zero3_shard=True)
     fake_optim._chunk_manager._chunk_shards = {}
     # Saved world=2; pretend current world=4 → must error.
@@ -1475,9 +1454,7 @@ def _common_worker_setup(rank: int, world_size: int, tmpdir: str, tag: str):
 
     cpu_gen = _torch.Generator(device="cpu")
     cpu_gen.manual_seed(123)
-    x = _torch.randn(
-        2, model.embed.in_features, generator=cpu_gen
-    ).to("cuda")
+    x = _torch.randn(2, model.embed.in_features, generator=cpu_gen).to("cuda")
     for cid in list(mgr._non_persistent_ids):
         mgr.gather(cid)
     optim.zero_grad()
@@ -1529,7 +1506,6 @@ def _worker_replicated_save_only_rank_0_writes(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -1546,9 +1522,7 @@ def _worker_replicated_save_only_rank_0_writes(
                 _os.makedirs(ckpt_dir, exist_ok=True)
             dist.barrier()
 
-            cb = make_checkpoint_callback(
-                save_max_bytes=DEFAULT_SAVE_MAX_BYTES
-            )
+            cb = make_checkpoint_callback(save_max_bytes=DEFAULT_SAVE_MAX_BYTES)
             fake_args = mock.MagicMock(
                 output_dir=output_dir,
                 process_index=rank,
@@ -1684,9 +1658,7 @@ def _worker_replicated_load_succeeds_on_all_ranks(
             def _snap():
                 snap = {}
                 if optim._gpu_optim is not None:
-                    snap["gpu"] = copy.deepcopy(
-                        optim._gpu_optim._optim.state_dict()
-                    )
+                    snap["gpu"] = copy.deepcopy(optim._gpu_optim._optim.state_dict())
                 if optim._cpu_optim is not None:
                     snap["cpu"] = {
                         cid: copy.deepcopy(inner.state_dict())
@@ -1736,9 +1708,7 @@ def _worker_replicated_load_succeeds_on_all_ranks(
                     if isinstance(sa, dict) and isinstance(sb, dict):
                         if not _states_match(sa, sb):
                             return False
-                    elif isinstance(sa, torch.Tensor) and isinstance(
-                        sb, torch.Tensor
-                    ):
+                    elif isinstance(sa, torch.Tensor) and isinstance(sb, torch.Tensor):
                         if not torch.equal(sa, sb):
                             return False
                     else:
@@ -1811,9 +1781,7 @@ def test_replicated_load_succeeds_on_all_ranks(tmp_path):
         )
 
 
-def _worker_estimate_gate_broadcast(
-    rank: int, world_size: int, tmpdir: str
-) -> None:
+def _worker_estimate_gate_broadcast(rank: int, world_size: int, tmpdir: str) -> None:
     """Rank-0's estimate trips the threshold; rank-1's wouldn't on its own.
 
     Mocks ``_estimate_optim_state_bytes`` per-rank: rank-0 returns
@@ -1823,7 +1791,6 @@ def _worker_estimate_gate_broadcast(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -1924,13 +1891,10 @@ def test_save_estimate_gate_broadcast_from_rank_0(tmp_path):
     )
 
 
-def _worker_verify_replicated_clean(
-    rank: int, world_size: int, tmpdir: str
-) -> None:
+def _worker_verify_replicated_clean(rank: int, world_size: int, tmpdir: str) -> None:
     """Verify flag ON, identical state across ranks → save proceeds."""
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -2080,23 +2044,17 @@ def _worker_verify_replicated_divergent(
             fake_control = mock.MagicMock()
 
             try:
-                cb.on_save(
-                    fake_args, fake_state, fake_control, optimizer=optim
-                )
+                cb.on_save(fake_args, fake_state, fake_control, optimizer=optim)
             except RuntimeError as exc:
                 if "Mode-B precondition violated" in str(exc):
-                    with open(
-                        _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-                    ) as f:
+                    with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                         f.write(str(exc))
                 else:
                     raise
             else:
                 # No raise == bug. Mark sentinel so the parent test
                 # fails loudly.
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.no_raise"), "w") as f:
                     f.write("verify did not raise on divergent state")
         finally:
             _teardown_mgr(mgr, optim)
@@ -2165,8 +2123,7 @@ def test_replicated_save_with_verify_flag_catches_divergence(tmp_path):
     # The error message names the divergent ranks.
     msgs = [f.read_text() for f in caught]
     assert any(
-        "divergent ranks" in m and "Mode-B precondition violated" in m
-        for m in msgs
+        "divergent ranks" in m and "Mode-B precondition violated" in m for m in msgs
     ), f"verify error did not mention divergent ranks: {msgs}"
 
     err_files = list(tmp_path.glob("rank*.err"))
@@ -2185,9 +2142,7 @@ def test_replicated_save_with_verify_flag_catches_divergence(tmp_path):
 # the multi-region branch of regions_per_chunk.
 
 
-def _build_sharded_chunk_manager_mixed_dtype(
-    rank: int, world_size: int
-):
+def _build_sharded_chunk_manager_mixed_dtype(rank: int, world_size: int):
     """Mixed-dtype 1-block model + sharded ChunkManager for Mode-C tests.
 
     Uses an fp16 Linear + fp32 LayerNorm (mirrors
@@ -2232,9 +2187,7 @@ def _build_sharded_chunk_manager_mixed_dtype(
     for name, _p in model.named_parameters():
         if name.startswith("h."):
             idx = int(name.split(".")[1])
-            block_spans.setdefault(cast(BlockId, idx), []).append(
-                cast(ParamId, name)
-            )
+            block_spans.setdefault(cast(BlockId, idx), []).append(cast(ParamId, name))
     exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
     S_chunk = 1 << 14  # plenty for the tiny mixed layer
     layout = build_layout(model, exec_order, S_chunk, block_spans)
@@ -2262,9 +2215,7 @@ def _build_sharded_chunk_manager_mixed_dtype(
     return model, mgr, host
 
 
-def _common_sharded_worker_setup(
-    rank: int, world_size: int, tmpdir: str, tag: str
-):
+def _common_sharded_worker_setup(rank: int, world_size: int, tmpdir: str, tag: str):
     """Init gloo + build mixed-dtype sharded chunk_manager + optim.
 
     Mode-C analog of :func:`_common_worker_setup`. Returns
@@ -2288,9 +2239,7 @@ def _common_sharded_worker_setup(
         world_size=world_size,
     )
 
-    model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(
-        rank, world_size
-    )
+    model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(rank, world_size)
     mgr.materialize_offload()
     _, _, optim = _build_optim_pair(model, mgr)
     # Take one step against a deterministic batch so the inner state
@@ -2323,7 +2272,6 @@ def _worker_sharded_save_writes_per_rank_files(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -2340,9 +2288,7 @@ def _worker_sharded_save_writes_per_rank_files(
                 _os.makedirs(ckpt_dir, exist_ok=True)
             dist.barrier()
 
-            cb = make_checkpoint_callback(
-                save_max_bytes=DEFAULT_SAVE_MAX_BYTES
-            )
+            cb = make_checkpoint_callback(save_max_bytes=DEFAULT_SAVE_MAX_BYTES)
             fake_args = mock.MagicMock(
                 output_dir=output_dir,
                 process_index=rank,
@@ -2434,15 +2380,12 @@ def test_sharded_save_writes_per_rank_shard_files(tmp_path):
     for cid in meta["regions_per_chunk"]:
         for r in range(world_size):
             shard_path = cpu_dir / f"chunk_{int(cid)}_rank_{r}.pt"
-            assert shard_path.is_file(), (
-                f"missing per-rank shard {shard_path.name}"
-            )
+            assert shard_path.is_file(), f"missing per-rank shard {shard_path.name}"
 
     # No unsuffixed Mode-B-style chunk_<N>.pt files in this dir.
     for entry in cpu_dir.iterdir():
         assert "_rank_" in entry.name, (
-            f"Mode-C cpu_optim/ contains a non-rank-suffixed file: "
-            f"{entry.name}"
+            f"Mode-C cpu_optim/ contains a non-rank-suffixed file: {entry.name}"
         )
 
 
@@ -2452,7 +2395,6 @@ def _worker_sharded_metadata_contains_regions(
     """Save and verify ``regions_per_chunk`` matches runtime descriptors."""
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -2488,9 +2430,7 @@ def _worker_sharded_metadata_contains_regions(
                 )
                 meta = json.loads(open(meta_path).read())
                 saved_regions = meta["regions_per_chunk"]
-                assert set(saved_regions.keys()) == set(
-                    current_regions.keys()
-                ), (
+                assert set(saved_regions.keys()) == set(current_regions.keys()), (
                     f"rank 0: saved chunk-id set {set(saved_regions)} "
                     f"!= current {set(current_regions)}"
                 )
@@ -2498,10 +2438,9 @@ def _worker_sharded_metadata_contains_regions(
                     s = saved_regions[cid]
                     c = current_regions[cid]
                     assert len(s) == len(c), (
-                        f"rank 0: chunk {cid} region count diff: "
-                        f"{len(s)} vs {len(c)}"
+                        f"rank 0: chunk {cid} region count diff: {len(s)} vs {len(c)}"
                     )
-                    for i, (sr, cr) in enumerate(zip(s, c)):
+                    for i, (sr, cr) in enumerate(zip(s, c, strict=True)):
                         for k in (
                             "chunk_offset",
                             "region_bytes",
@@ -2582,9 +2521,7 @@ def test_sharded_metadata_contains_regions_per_chunk(tmp_path):
         assert (tmp_path / f"rank{r}.done").is_file()
 
 
-def _worker_sharded_load_round_trip(
-    rank: int, world_size: int, tmpdir: str
-) -> None:
+def _worker_sharded_load_round_trip(rank: int, world_size: int, tmpdir: str) -> None:
     """Save, mutate state, load, verify state matches pre-save snapshot."""
     import copy
     import os as _os
@@ -2612,9 +2549,7 @@ def _worker_sharded_load_round_trip(
             def _snap():
                 snap = {}
                 if optim._gpu_optim is not None:
-                    snap["gpu"] = copy.deepcopy(
-                        optim._gpu_optim._optim.state_dict()
-                    )
+                    snap["gpu"] = copy.deepcopy(optim._gpu_optim._optim.state_dict())
                 if optim._cpu_optim is not None:
                     snap["cpu"] = {
                         cid: copy.deepcopy(inner.state_dict())
@@ -2658,9 +2593,7 @@ def _worker_sharded_load_round_trip(
                     if isinstance(sa, dict) and isinstance(sb, dict):
                         if not _states_match(sa, sb):
                             return False
-                    elif isinstance(sa, torch.Tensor) and isinstance(
-                        sb, torch.Tensor
-                    ):
+                    elif isinstance(sa, torch.Tensor) and isinstance(sb, torch.Tensor):
                         if not torch.equal(sa, sb):
                             return False
                     else:
@@ -2745,7 +2678,6 @@ def _worker_sharded_load_rejects(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -2785,9 +2717,7 @@ def _worker_sharded_load_rejects(
                 elif mode == "region_dtype":
                     # Flip the first region's dtype to something that
                     # won't match the runtime.
-                    meta["regions_per_chunk"][first_cid][0]["dtype"] = (
-                        "torch.float64"
-                    )
+                    meta["regions_per_chunk"][first_cid][0]["dtype"] = "torch.float64"
                     open(meta_path, "w").write(json.dumps(meta))
                 elif mode == "missing_shard":
                     # Delete rank-1's chunk-0 shard.
@@ -2814,18 +2744,14 @@ def _worker_sharded_load_rejects(
                 _load_protrain_optim_dir(optim, save_dir)
             except RuntimeError as exc:
                 msg = str(exc)
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                     f.write(msg)
             else:
                 # Some ranks legitimately don't error in missing_shard
                 # mode (only rank-1 does). Mark a sentinel so we can
                 # tell "load succeeded on this rank" from "load
                 # silently skipped".
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.no_raise"), "w") as f:
                     f.write("load did not raise on this rank")
         finally:
             _teardown_mgr(mgr, optim)
@@ -2925,9 +2851,9 @@ def test_sharded_load_rejects_missing_rank_shard(tmp_path):
     """
     msgs = _spawn_sharded_load_rejects(tmp_path, mode="missing_shard")
     assert msgs, "no rank caught the missing-shard RuntimeError"
-    assert any(
-        "missing rank shard" in m and "rank_1.pt" in m for m in msgs
-    ), f"missing-shard error did not name the file: {msgs}"
+    assert any("missing rank shard" in m and "rank_1.pt" in m for m in msgs), (
+        f"missing-shard error did not name the file: {msgs}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2949,7 +2875,6 @@ def _worker_sharded_verify_replicated_is_noop(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -2973,9 +2898,7 @@ def _worker_sharded_verify_replicated_is_noop(
             def _tripwire(*args, **kwargs):
                 with open(sentinel_path, "w") as f:
                     f.write("called")
-                raise RuntimeError(
-                    "verify_replicated should be a no-op in Mode-C"
-                )
+                raise RuntimeError("verify_replicated should be a no-op in Mode-C")
 
             cb = make_checkpoint_callback(
                 save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
@@ -3083,7 +3006,6 @@ def _worker_sharded_inverted_gate_writes_all_shards(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -3238,7 +3160,6 @@ def _worker_sharded_save_rank0_failure_lockstep(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -3274,14 +3195,10 @@ def _worker_sharded_save_rank0_failure_lockstep(
                         world_size=world_size,
                     )
             except RuntimeError as exc:
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                     f.write(f"{type(exc).__name__}: {exc}")
             else:
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.no_raise"), "w") as f:
                     f.write("save did not raise on this rank")
 
             with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
@@ -3292,9 +3209,7 @@ def _worker_sharded_save_rank0_failure_lockstep(
             del model, optim, mgr
     except Exception as exc:
         if isinstance(exc, RuntimeError):
-            with open(
-                _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-            ) as f:
+            with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                 f.write(f"{type(exc).__name__}: {exc}")
             return
         import traceback as _tb
@@ -3389,7 +3304,6 @@ def _worker_sharded_load_rank_failure_lockstep(
     """
     import os as _os
 
-    import torch
     import torch.distributed as dist
 
     try:
@@ -3425,9 +3339,7 @@ def _worker_sharded_load_rank_failure_lockstep(
                     if name.endswith("_rank_1.pt"):
                         victim_name = name
                         break
-                assert victim_name is not None, (
-                    "no rank-1 shard found to corrupt"
-                )
+                assert victim_name is not None, "no rank-1 shard found to corrupt"
                 with open(_os.path.join(cpu_dir, victim_name), "wb") as f:
                     f.write(b"\x00garbage_not_a_pickle\x00")
             dist.barrier()
@@ -3435,14 +3347,10 @@ def _worker_sharded_load_rank_failure_lockstep(
             try:
                 _load_protrain_optim_dir(optim, save_dir)
             except Exception as exc:
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                     f.write(f"{type(exc).__name__}: {exc}")
             else:
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.no_raise"), "w") as f:
                     f.write("load did not raise on this rank")
 
             with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
@@ -3453,9 +3361,7 @@ def _worker_sharded_load_rank_failure_lockstep(
             del model, optim, mgr
     except Exception as exc:
         if isinstance(exc, (RuntimeError, Exception)):
-            with open(
-                _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-            ) as f:
+            with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                 f.write(f"{type(exc).__name__}: {exc}")
             return
         import traceback as _tb
@@ -3522,9 +3428,7 @@ def test_sharded_load_single_rank_failure_propagates_lockstep(tmp_path):
     # At least one rank surfaces the synthetic "rank(s) failed during the
     # per-rank phase" error from the all_reduce path; the originating
     # rank surfaces the real torch.load error.
-    assert any(
-        "per-rank phase" in b or "rank(s) failed" in b for b in bodies
-    ), (
+    assert any("per-rank phase" in b or "rank(s) failed" in b for b in bodies), (
         f"no rank reported the lockstep all_reduce error: {bodies}"
     )
 
@@ -3580,12 +3484,8 @@ def _worker_sharded_load_rejects_stray_file(
                     if name.endswith("_rank_0.pt"):
                         some_cid = name.split("_")[1]
                         break
-                assert some_cid is not None, (
-                    "no rank-0 shard found to clone"
-                )
-                stray = _os.path.join(
-                    cpu_dir, f"chunk_{int(some_cid)}_rank_99.pt"
-                )
+                assert some_cid is not None, "no rank-0 shard found to clone"
+                stray = _os.path.join(cpu_dir, f"chunk_{int(some_cid)}_rank_99.pt")
                 # Make it a valid pickle so the loader can't reject on
                 # corruption — we want the regex check to be the gate,
                 # not torch.load.
@@ -3599,14 +3499,10 @@ def _worker_sharded_load_rejects_stray_file(
             try:
                 _load_protrain_optim_dir(optim, save_dir)
             except Exception as exc:
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                     f.write(f"{type(exc).__name__}: {exc}")
             else:
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.no_raise"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.no_raise"), "w") as f:
                     f.write("load did not raise")
 
             with open(_os.path.join(tmpdir, f"rank{rank}.done"), "w") as f:
@@ -3617,9 +3513,7 @@ def _worker_sharded_load_rejects_stray_file(
             del model, optim, mgr
     except Exception as exc:
         if isinstance(exc, (RuntimeError, Exception)):
-            with open(
-                _os.path.join(tmpdir, f"rank{rank}.caught"), "w"
-            ) as f:
+            with open(_os.path.join(tmpdir, f"rank{rank}.caught"), "w") as f:
                 f.write(f"{type(exc).__name__}: {exc}")
             return
         import traceback as _tb
@@ -3681,9 +3575,6 @@ def test_sharded_load_rejects_stray_file_in_cpu_optim(tmp_path):
         f"no_raise sentinels: {[p.name for p in tmp_path.glob('rank*.no_raise')]}"
     )
     bodies = [c.read_text() for c in caught]
-    assert any(
-        "unexpected file" in b and "rank_99.pt" in b for b in bodies
-    ), (
-        "stray-file rejection error did not name the offending file: "
-        f"{bodies}"
+    assert any("unexpected file" in b and "rank_99.pt" in b for b in bodies), (
+        f"stray-file rejection error did not name the offending file: {bodies}"
     )

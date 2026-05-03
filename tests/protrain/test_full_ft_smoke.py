@@ -43,7 +43,12 @@ def test_protrain_full_ft_smoke_smollm2() -> None:
     if not torch.cuda.is_available():
         pytest.skip("ProTrain full-FT smoke requires CUDA.")
 
-    from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        LlamaConfig,
+        LlamaForCausalLM,
+    )
 
     # Try the cached SmolLM2-135M first (Llama architecture, ~135M
     # params); fall back to a fresh-init tiny Llama if the HF cache is

@@ -82,16 +82,16 @@ def test_protrain_seq_cls_smoke_bert() -> None:
         protrain_model_wrapper,
         protrain_optimizer_wrapper,
     )
-    from axolotl.integrations.protrain.profiler.cache import (
-        ProfilerCacheKey,
-        load_cached_trace,
-    )
+    from axolotl.integrations.protrain.api.model_wrapper import _arch_hash, _sku
     from axolotl.integrations.protrain.profiler.batch_factory import (
         TASK_SEQ_CLASSIFICATION,
         detect_task_type,
     )
+    from axolotl.integrations.protrain.profiler.cache import (
+        ProfilerCacheKey,
+        load_cached_trace,
+    )
     from axolotl.integrations.protrain.types import HardwareProfile
-    from axolotl.integrations.protrain.api.model_wrapper import _arch_hash, _sku
 
     # Pre-flight: detect_task_type must classify this as seq-cls so the
     # batch_factory uses ``seq_classification_batch_factory`` for the

@@ -19,7 +19,6 @@ from axolotl.integrations.protrain.types import (
     ParamId,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -63,9 +62,7 @@ def _build_layout_for(model, S_chunk: int):
     for name, _ in model.named_parameters():
         if name.startswith("h."):
             idx = int(name.split(".")[1])
-            block_spans.setdefault(cast(BlockId, idx), []).append(
-                cast(ParamId, name)
-            )
+            block_spans.setdefault(cast(BlockId, idx), []).append(cast(ParamId, name))
 
     exec_order = [cast(ParamId, n) for n, _ in model.named_parameters()]
     return build_layout(model, exec_order, S_chunk, block_spans)
@@ -160,8 +157,7 @@ def test_materialize_offload_frees_gpu_memory() -> None:
         f"(before={before}, after={after}, reported_freed={freed})"
     )
     assert freed >= expected_min_freed, (
-        f"materialize_offload reported freed={freed}, expected "
-        f">= {expected_min_freed}"
+        f"materialize_offload reported freed={freed}, expected >= {expected_min_freed}"
     )
 
     # Cleanup.
@@ -341,9 +337,7 @@ def test_materialize_offload_mixed_dtype() -> None:
         assert param.data.device.type == "cuda", (
             f"{name} landed on {param.data.device} after gather"
         )
-        assert param.data.numel() > 0, (
-            f"{name} still empty after gather"
-        )
+        assert param.data.numel() > 0, f"{name} still empty after gather"
 
     mgr.uninstall()
     host.close()
@@ -385,9 +379,7 @@ def test_param_data_empty_between_iters() -> None:
     try:
         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
-        _probe = DeepSpeedCPUAdam(
-            [torch.nn.Parameter(torch.zeros(1))], lr=1e-4
-        )
+        _probe = DeepSpeedCPUAdam([torch.nn.Parameter(torch.zeros(1))], lr=1e-4)
         del _probe
     except Exception:  # noqa: BLE001
         pytest.skip("DeepSpeedCPUAdam unavailable — BUG 4 path requires CPU optim")
@@ -419,9 +411,7 @@ def test_param_data_empty_between_iters() -> None:
         if params:
             cpu_params_per_chunk[cid_int] = params
 
-    cpu_optim = CpuFusedAdamAdapter(
-        params_per_chunk=cpu_params_per_chunk, lr=1e-4
-    )
+    cpu_optim = CpuFusedAdamAdapter(params_per_chunk=cpu_params_per_chunk, lr=1e-4)
     mgr.cpu_optim = cpu_optim
 
     # Drive one fwd+bwd+step cycle. Gather everything manually (no
@@ -497,8 +487,7 @@ def test_grad_offload_hook_fires() -> None:
     loss_ref = y_ref.sum()
     loss_ref.backward()
     ref_grads = {
-        name: p.grad.detach().clone().cpu()
-        for name, p in ref_model.named_parameters()
+        name: p.grad.detach().clone().cpu() for name, p in ref_model.named_parameters()
     }
 
     # ---- ProTrain-wrapped run ------------------------------------------
@@ -571,9 +560,7 @@ def test_grad_offload_hook_fires() -> None:
             ref = ref_grads[str(pid)]
             assert torch.allclose(
                 ref, param.grad.cpu().float(), atol=1e-4, rtol=1e-4
-            ), (
-                f"persistent-chunk grad for {pid} diverged from reference"
-            )
+            ), f"persistent-chunk grad for {pid} diverged from reference"
 
     mgr.uninstall()
     host.close()
@@ -615,16 +602,12 @@ def test_restore_to_gpu_round_trip_preserves_param_values() -> None:
         name: p.detach().clone() for name, p in model.named_parameters()
     }
 
-    mgr, layout, pool, host = _build_chunk_manager(
-        model, n_persist=1, S_chunk=S_chunk
-    )
+    mgr, layout, pool, host = _build_chunk_manager(model, n_persist=1, S_chunk=S_chunk)
 
     freed = mgr.materialize_offload()
     assert freed > 0, "test setup: expected non-persistent bytes to be freed"
 
-    any_empty = any(
-        p.data.numel() == 0 for name, p in model.named_parameters()
-    )
+    any_empty = any(p.data.numel() == 0 for name, p in model.named_parameters())
     assert any_empty, (
         "test setup invariant: at least one param should be offloaded to "
         "an empty placeholder before restore"
@@ -653,9 +636,7 @@ def test_restore_to_gpu_round_trip_preserves_param_values() -> None:
 
     # Internal state cleared so a new manager can rebuild from scratch.
     assert not mgr._cpu_slots, "restore_to_gpu must clear _cpu_slots"
-    assert not mgr._persistent_buffers, (
-        "restore_to_gpu must clear _persistent_buffers"
-    )
+    assert not mgr._persistent_buffers, "restore_to_gpu must clear _persistent_buffers"
     assert not mgr._grad_hook_handles, (
         "restore_to_gpu must remove all grad hook handles"
     )
@@ -679,9 +660,7 @@ def test_restore_to_gpu_idempotent_on_unmaterialized_manager() -> None:
     model = _tiny_model(hidden=hidden, n_layers=4).to("cuda")
     S_chunk = hidden * hidden * 4 + 4096
 
-    mgr, _layout, pool, host = _build_chunk_manager(
-        model, n_persist=1, S_chunk=S_chunk
-    )
+    mgr, _layout, pool, host = _build_chunk_manager(model, n_persist=1, S_chunk=S_chunk)
 
     assert mgr.restore_to_gpu() == 0
     assert mgr.restore_to_gpu() == 0  # twice in a row
@@ -779,9 +758,7 @@ def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
     model = _tiny_model(hidden=hidden, n_layers=4).to("cuda")
     S_chunk = hidden * hidden * 4 + 4096
 
-    mgr, layout, pool, host = _build_chunk_manager(
-        model, n_persist=1, S_chunk=S_chunk
-    )
+    mgr, layout, pool, host = _build_chunk_manager(model, n_persist=1, S_chunk=S_chunk)
     # Force a non-contiguous persistent set: {0, last}. This is the
     # shape the wrapper's non-block-chunk pin produces when an untied
     # lm_head sits at the tail of N_chunk. The fix must route chunk
@@ -793,8 +770,7 @@ def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
     assert last >= 2, "test setup needs N_chunk >= 3 for a useful gap"
     mgr._persistent_ids = {cast(ChunkId, 0), cast(ChunkId, last)}
     mgr._non_persistent_ids = {
-        cast(ChunkId, c) for c in range(layout.N_chunk)
-        if c not in mgr._persistent_ids
+        cast(ChunkId, c) for c in range(layout.N_chunk) if c not in mgr._persistent_ids
     }
 
     # materialize_offload to set up the CPU shards for non-persistent
@@ -824,12 +800,11 @@ def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
 
     class _StubCpuAdam:
         def __init__(self, params_per_chunk, **_kwargs):
-            captured_keys["keys"] = set(
-                int(k) for k in params_per_chunk.keys()
-            )
+            captured_keys["keys"] = set(int(k) for k in params_per_chunk.keys())
             captured_keys["params_per_chunk"] = params_per_chunk
 
-        def zero_grad(self, set_to_none: bool = True): pass
+        def zero_grad(self, set_to_none: bool = True):
+            pass
 
     with patch(
         "axolotl.integrations.protrain.api.optim_wrapper.CpuFusedAdamAdapter",
@@ -872,9 +847,7 @@ def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
 # pool — the byte-level operations are identical to the CUDA path).
 
 
-def _worker_sharded_restore_round_trip(
-    rank: int, world_size: int, tmpdir: str
-) -> None:
+def _worker_sharded_restore_round_trip(rank: int, world_size: int, tmpdir: str) -> None:
     """Child process body: sharded materialize_offload -> restore_to_gpu.
 
     Builds a small mixed-dtype model (fp16 Linear + fp32 LayerNorm) so
@@ -937,8 +910,7 @@ def _worker_sharded_restore_round_trip(
         # Snapshot every param BEFORE materialize_offload — restore must
         # reproduce these bytes exactly.
         pre_data = {
-            str(name): p.detach().clone()
-            for name, p in model.named_parameters()
+            str(name): p.detach().clone() for name, p in model.named_parameters()
         }
 
         mgr = ChunkManager(
@@ -958,9 +930,7 @@ def _worker_sharded_restore_round_trip(
             mgr.materialize_offload()
         except RuntimeError as exc:
             if "gloo" in str(exc).lower():
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
                     f.write(f"gloo-unsupported: {exc}\n")
                 return
             raise
@@ -970,8 +940,7 @@ def _worker_sharded_restore_round_trip(
         # restore through the non-sharded branch and leave the new
         # all_gather code uncovered.
         assert mgr.sharded_chunk_ids() == [ChunkId(0)], (
-            f"rank {rank}: expected chunk 0 sharded, got "
-            f"{mgr.sharded_chunk_ids()}"
+            f"rank {rank}: expected chunk 0 sharded, got {mgr.sharded_chunk_ids()}"
         )
         # Multi-region invariant: mixed-dtype chunk produces 2 regions.
         shard_state = mgr._chunk_shards[ChunkId(0)]
@@ -983,12 +952,8 @@ def _worker_sharded_restore_round_trip(
         # Every param's data should be an empty placeholder after
         # materialize_offload — confirms the test exercises the path
         # where restore_to_gpu has real work to do.
-        any_empty = any(
-            p.data.numel() == 0 for _n, p in model.named_parameters()
-        )
-        assert any_empty, (
-            f"rank {rank}: post-offload param data should be empty"
-        )
+        any_empty = any(p.data.numel() == 0 for _n, p in model.named_parameters())
+        assert any_empty, f"rank {rank}: post-offload param data should be empty"
 
         # The actual round-trip: sharded restore must reassemble every
         # chunk via all_gather and rebind param.data on every rank.
@@ -996,9 +961,7 @@ def _worker_sharded_restore_round_trip(
             moved = mgr.restore_to_gpu()
         except RuntimeError as exc:
             if "not implemented" in str(exc).lower() or "gloo" in str(exc).lower():
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
                     f.write(f"gloo-collective-unsupported: {exc}\n")
                 return
             raise
@@ -1016,12 +979,10 @@ def _worker_sharded_restore_round_trip(
         for name, p in model.named_parameters():
             snap = pre_data[str(name)]
             assert p.data.shape == snap.shape, (
-                f"rank {rank}: shape changed for {name}: "
-                f"{p.data.shape} vs {snap.shape}"
+                f"rank {rank}: shape changed for {name}: {p.data.shape} vs {snap.shape}"
             )
             assert p.data.dtype == snap.dtype, (
-                f"rank {rank}: dtype changed for {name}: "
-                f"{p.data.dtype} vs {snap.dtype}"
+                f"rank {rank}: dtype changed for {name}: {p.data.dtype} vs {snap.dtype}"
             )
             assert torch.equal(p.data, snap), (
                 f"rank {rank}: param {name} bytes diverged across "
@@ -1032,9 +993,7 @@ def _worker_sharded_restore_round_trip(
         # non-sharded restore: every per-chunk dict must be empty
         # after teardown so a fresh manager can be built on the same
         # model.
-        assert not mgr._cpu_slots, (
-            f"rank {rank}: restore_to_gpu must clear _cpu_slots"
-        )
+        assert not mgr._cpu_slots, f"rank {rank}: restore_to_gpu must clear _cpu_slots"
         assert not mgr._chunk_shards, (
             f"rank {rank}: restore_to_gpu must clear _chunk_shards"
         )
@@ -1155,9 +1114,7 @@ def test_sharded_restore_to_gpu_requires_initialized_distributed() -> None:
     # the dict membership before any per-region work happens.
     mgr.zero3_shard = True
     cid = cast(ChunkId, 0)
-    mgr._chunk_shards[cid] = _ChunkShardState(
-        regions=[], chunk_bytes=0, shard_bytes=0
-    )
+    mgr._chunk_shards[cid] = _ChunkShardState(regions=[], chunk_bytes=0, shard_bytes=0)
     # An empty cpu_slots entry keeps the non-sharded copy loop a no-op
     # while still satisfying the "_cpu_slots or _chunk_shards" trigger.
     mgr._cpu_slots[cid] = []

@@ -37,21 +37,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any, cast
 
 import pytest
-
-
-# Reuse the helper machinery from the main optimizer-checkpoint test —
-# mp.spawn workers can re-import the test module fine because pytest's
-# rootdir is on sys.path during test collection.
-from tests.protrain.test_optimizer_checkpoint import (  # noqa: E402
-    _build_chunk_manager,
-    _build_optim_pair,
-    _force_identical_inner_state,
-    _teardown_mgr,
-    _tiny_model,
-)
 
 from axolotl.integrations.protrain.api.checkpoint import (  # noqa: E402
     CPU_OPTIM_DIRNAME,
@@ -64,6 +51,16 @@ from axolotl.integrations.protrain.api.checkpoint import (  # noqa: E402
     _save_protrain_optim_dir,
 )
 
+# Reuse the helper machinery from the main optimizer-checkpoint test —
+# mp.spawn workers can re-import the test module fine because pytest's
+# rootdir is on sys.path during test collection.
+from tests.protrain.test_optimizer_checkpoint import (  # noqa: E402
+    _build_chunk_manager,
+    _build_optim_pair,
+    _force_identical_inner_state,
+    _teardown_mgr,
+    _tiny_model,
+)
 
 # ---- worker bodies ---------------------------------------------------------
 
@@ -367,8 +364,7 @@ def test_replicated_world_size_reshard_4_to_2(tmp_path):
         f"expected replicated save_mode (Mode-B), got {meta['protrain_save_mode']!r}"
     )
     assert meta["protrain_world_size"] == save_world, (
-        f"expected protrain_world_size={save_world}, got "
-        f"{meta['protrain_world_size']}"
+        f"expected protrain_world_size={save_world}, got {meta['protrain_world_size']}"
     )
 
     # ---- Phase 2: load with world_size=2 (different from save) ------
@@ -426,7 +422,6 @@ def test_replicated_world_size_reshard_4_to_2(tmp_path):
 # tests.protrain.test_optimizer_checkpoint.
 
 from tests.protrain.test_optimizer_checkpoint import (  # noqa: E402
-    _build_optim_pair,
     _build_sharded_chunk_manager_mixed_dtype,
 )
 
@@ -455,7 +450,6 @@ def _force_pattern_inner_state(optim) -> None:
         return
 
     chunk_manager = optim._chunk_manager
-    world_size = int(getattr(chunk_manager, "world_size", 1))
     rank = int(getattr(chunk_manager, "rank", 0))
 
     state_key_idx = {"exp_avg": 0, "exp_avg_sq": 1}
@@ -488,13 +482,9 @@ def _force_pattern_inner_state(optim) -> None:
                 global_flat = _torch.zeros(padded_numel, dtype=v.dtype)
                 if valid_numel > 0:
                     indices = _torch.arange(valid_numel, dtype=_torch.float64)
-                    global_flat[:valid_numel] = (
-                        base * (indices + 1.0)
-                    ).to(v.dtype)
+                    global_flat[:valid_numel] = (base * (indices + 1.0)).to(v.dtype)
                 # This rank's slice.
-                slice_ = global_flat[
-                    rank * shard_numel : (rank + 1) * shard_numel
-                ]
+                slice_ = global_flat[rank * shard_numel : (rank + 1) * shard_numel]
                 # In-place copy preserves the inner optimizer's pointer
                 # identity (DeepSpeedCPUAdam tracks tensors by id).
                 v.copy_(slice_)
@@ -542,7 +532,6 @@ def _save_worker_modec(rank: int, world_size: int, tmpdir: str, tag: str) -> Non
     shard files via the Mode-C save path.
     """
     import os
-    import sys
 
     import torch
     import torch.distributed as dist
@@ -565,9 +554,7 @@ def _save_worker_modec(rank: int, world_size: int, tmpdir: str, tag: str) -> Non
             world_size=world_size,
         )
 
-        model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(
-            rank, world_size
-        )
+        model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(rank, world_size)
         mgr.materialize_offload()
         _, _, optim = _build_optim_pair(model, mgr)
 
@@ -692,7 +679,6 @@ def _load_worker_modec(
     os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
 
     from axolotl.integrations.protrain.api.checkpoint import (
-        PROTRAIN_OPTIM_DIRNAME as _DIR,
         _load_protrain_optim_dir as _load_dir,
     )
 
@@ -707,9 +693,7 @@ def _load_worker_modec(
             world_size=world_size,
         )
 
-        model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(
-            rank, world_size
-        )
+        model, mgr, host = _build_sharded_chunk_manager_mixed_dtype(rank, world_size)
         mgr.materialize_offload()
         _, _, optim = _build_optim_pair(model, mgr)
 
@@ -720,13 +704,10 @@ def _load_worker_modec(
         # contains a ``protrain_optim/`` child. Our save_dir is
         # exactly such a parent (see _save_protrain_optim_dir's
         # ``target = os.path.join(output_dir, PROTRAIN_OPTIM_DIRNAME)``).
-        loaded = _load_dir(
-            optim, save_dir, allow_online_reshard=allow_online_reshard
-        )
+        loaded = _load_dir(optim, save_dir, allow_online_reshard=allow_online_reshard)
         if not loaded:
             raise RuntimeError(
-                f"rank {rank}: _load_protrain_optim_dir({save_dir!r}) "
-                "returned False"
+                f"rank {rank}: _load_protrain_optim_dir({save_dir!r}) returned False"
             )
 
         post_load_hash = _hash_inner_state(optim)
@@ -748,9 +729,7 @@ def _load_worker_modec(
         out = model.h[0].norm(out.to(torch.float32))
         loss = out.sum()
         if not bool(torch.isfinite(loss).item()):
-            raise RuntimeError(
-                f"rank {rank}: post-load loss is non-finite"
-            )
+            raise RuntimeError(f"rank {rank}: post-load loss is non-finite")
         loss.backward()
         # Manually fire reduce_grads_and_offload (see save worker note —
         # without the wrapper-level scheduler, the CPU adam step needs
@@ -776,20 +755,18 @@ def _load_worker_modec(
         # disk in cpu_shard_bytes).
         # Hash the rank's CPU shard bytes for every region.
         import hashlib
+
         h = hashlib.sha256()
         for cid in sorted(mgr._chunk_shards):
             shard_state = mgr._chunk_shards[cid]
             for region_idx, region in enumerate(shard_state.regions):
                 h.update(f"chunk:{int(cid)}:region:{region_idx}:".encode("utf-8"))
-                h.update(
-                    region.cpu_shard_bytes.detach()
-                    .cpu()
-                    .numpy()
-                    .tobytes()
-                )
+                h.update(region.cpu_shard_bytes.detach().cpu().numpy().tobytes())
         param_hash = h.hexdigest()
 
-        with open(os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.done"), "w") as f:
+        with open(
+            os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.done"), "w"
+        ) as f:
             f.write(f"loss={float(loss.detach())}\n")
         with open(
             os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.hash"), "w"
@@ -811,7 +788,9 @@ def _load_worker_modec(
     except Exception as exc:
         import traceback as _tb
 
-        with open(os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.err"), "w") as f:
+        with open(
+            os.path.join(tmpdir, f"load_modec_{sentinel_tag}_rank{rank}.err"), "w"
+        ) as f:
             f.write(f"{type(exc).__name__}: {exc}\n")
             _tb.print_exc(file=f)
         raise
@@ -845,6 +824,7 @@ def test_sharded_world_size_reshard_4_to_2_offline(tmp_path):
     """
     pytest.importorskip("torch")
     import subprocess
+
     import torch
 
     if not torch.cuda.is_available():
@@ -854,9 +834,7 @@ def test_sharded_world_size_reshard_4_to_2_offline(tmp_path):
 
     n_visible = torch.cuda.device_count()
     if n_visible < 4:
-        pytest.skip(
-            f"reshard test needs >= 4 visible GPUs (got {n_visible})"
-        )
+        pytest.skip(f"reshard test needs >= 4 visible GPUs (got {n_visible})")
 
     import torch.multiprocessing as mp
 
@@ -909,12 +887,8 @@ def test_sharded_world_size_reshard_4_to_2_offline(tmp_path):
     repo_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
-    reshard_script = os.path.join(
-        repo_root, "scripts", "protrain", "reshard_optim.py"
-    )
-    assert os.path.isfile(reshard_script), (
-        f"reshard tool not found at {reshard_script}"
-    )
+    reshard_script = os.path.join(repo_root, "scripts", "protrain", "reshard_optim.py")
+    assert os.path.isfile(reshard_script), f"reshard tool not found at {reshard_script}"
 
     cmd = [
         sys.executable,
@@ -1000,11 +974,9 @@ def test_sharded_world_size_reshard_4_to_2_offline(tmp_path):
     # IFF the reshard preserved the underlying logical state).
     for r in range(save_world_2):
         resharded_hash = (
-            tmp_path / f"load_modec_resharded_rank{r}.hash"
-        ).read_text().strip()
-        native_hash = (
-            tmp_path / f"load_modec_native_rank{r}.hash"
-        ).read_text().strip()
+            (tmp_path / f"load_modec_resharded_rank{r}.hash").read_text().strip()
+        )
+        native_hash = (tmp_path / f"load_modec_native_rank{r}.hash").read_text().strip()
         rh_post_load, rh_post_step, rh_param = resharded_hash.split(":")
         nh_post_load, nh_post_step, nh_param = native_hash.split(":")
         assert rh_post_load == nh_post_load, (
@@ -1076,9 +1048,7 @@ def test_sharded_world_size_reshard_4_to_2_online(tmp_path):
 
     n_visible = torch.cuda.device_count()
     if n_visible < 4:
-        pytest.skip(
-            f"online reshard test needs >= 4 visible GPUs (got {n_visible})"
-        )
+        pytest.skip(f"online reshard test needs >= 4 visible GPUs (got {n_visible})")
 
     import torch.multiprocessing as mp
 
@@ -1160,12 +1130,12 @@ def test_sharded_world_size_reshard_4_to_2_online(tmp_path):
 
     # ---- Equivalence check ------------------------------------------
     for r in range(save_world_2):
-        online_hash = (
-            tmp_path / f"load_modec_online_rank{r}.hash"
-        ).read_text().strip()
+        online_hash = (tmp_path / f"load_modec_online_rank{r}.hash").read_text().strip()
         native_hash = (
-            tmp_path / f"load_modec_native_for_online_rank{r}.hash"
-        ).read_text().strip()
+            (tmp_path / f"load_modec_native_for_online_rank{r}.hash")
+            .read_text()
+            .strip()
+        )
         oh_post_load, oh_post_step, oh_param = online_hash.split(":")
         nh_post_load, nh_post_step, nh_param = native_hash.split(":")
         assert oh_post_load == nh_post_load, (
@@ -1254,7 +1224,7 @@ def test_sharded_world_size_reshard_4_to_2_default_hard_errors(tmp_path):
     # The load worker raises on the worker side; ``mp.spawn`` propagates
     # via a ProcessRaisedException on the parent. We catch it and check
     # the .err sentinel for the message.
-    with pytest.raises(Exception):  # noqa: PT011
+    with pytest.raises(Exception):  # noqa: PT011, B017
         mp.spawn(
             _load_worker_modec,
             args=(
@@ -1322,9 +1292,7 @@ def test_sharded_world_size_online_reshard_lockstep_failure(tmp_path):
 
     n_visible = torch.cuda.device_count()
     if n_visible < 4:
-        pytest.skip(
-            f"lockstep-failure test needs >= 4 visible GPUs (got {n_visible})"
-        )
+        pytest.skip(f"lockstep-failure test needs >= 4 visible GPUs (got {n_visible})")
 
     import torch.multiprocessing as mp
 
@@ -1357,7 +1325,7 @@ def test_sharded_world_size_online_reshard_lockstep_failure(tmp_path):
 
     # ---- Phase 2: online load with corrupted source -----------------
     save_world_2 = 2
-    with pytest.raises(Exception):  # noqa: PT011
+    with pytest.raises(Exception):  # noqa: PT011, B017
         mp.spawn(
             _load_worker_modec,
             args=(
@@ -1378,9 +1346,7 @@ def test_sharded_world_size_online_reshard_lockstep_failure(tmp_path):
         "trailing barrier"
     )
     # Acceptance: BOTH ranks must have an .err sentinel (not just rank-0).
-    rank_to_err = {
-        int(p.name.split("rank")[1].split(".")[0]): p for p in err_files
-    }
+    rank_to_err = {int(p.name.split("rank")[1].split(".")[0]): p for p in err_files}
     assert set(rank_to_err.keys()) == set(range(save_world_2)), (
         f"only ranks {sorted(rank_to_err.keys())} surfaced an error — "
         "lockstep failure protocol broken; expected every rank to raise"

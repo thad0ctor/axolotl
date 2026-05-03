@@ -27,7 +27,6 @@ import pytest
 
 from axolotl.integrations.protrain.types import BlockId, ChunkId, ParamId
 
-
 # ---------------------------------------------------------------------------
 # Helpers (must be top-level so ``mp.spawn`` can pickle them)
 # ---------------------------------------------------------------------------
@@ -131,9 +130,7 @@ def _worker_reduce_grads_and_offload(rank: int, world_size: int, tmpdir: str) ->
         # through the materialize_offload / _offload_grad hook path.
         torch.manual_seed(0)
         model_a = _tiny_cpu_model()
-        mgr_a, layout_a, pool_a, host_a = _build_chunk_manager_cpu(
-            model_a, n_persist=0
-        )
+        mgr_a, layout_a, pool_a, host_a = _build_chunk_manager_cpu(model_a, n_persist=0)
         mgr_a.materialize_offload()
 
         # Gather the chunk so param.data is GPU-... er, CPU-buffer-
@@ -148,7 +145,7 @@ def _worker_reduce_grads_and_offload(rank: int, world_size: int, tmpdir: str) ->
         # this by hand rather than via loss.backward() so we don't
         # depend on the model's forward matching shape on CPU:
         # manually set param.grad then call the hook.
-        for name, p in model_a.named_parameters():
+        for _name, p in model_a.named_parameters():
             p.grad = torch.full_like(p.data, float(rank))
             # Fire the post-accumulate hook manually — in real
             # training PyTorch fires it at the end of backward. For
@@ -205,19 +202,16 @@ def _worker_reduce_grads_and_offload(rank: int, world_size: int, tmpdir: str) ->
         # (the per-param all_reduce(AVG) at manager.py:644-655).
         torch.manual_seed(0)
         model_b = _tiny_cpu_model()
-        mgr_b, layout_b, pool_b, host_b = _build_chunk_manager_cpu(
-            model_b, n_persist=1
-        )
+        mgr_b, layout_b, pool_b, host_b = _build_chunk_manager_cpu(model_b, n_persist=1)
         # Force every chunk persistent — the helper built the manager
         # with ``n_persist=1`` but if the layout produced >1 chunk we
         # need to expand. This model's 2 params fit in one chunk.
         assert layout_b.N_chunk == 1, (
-            f"test setup expects a single-chunk layout, got "
-            f"N_chunk={layout_b.N_chunk}"
+            f"test setup expects a single-chunk layout, got N_chunk={layout_b.N_chunk}"
         )
 
         # Plant rank-specific grads directly on the param objects.
-        for name, p in model_b.named_parameters():
+        for _name, p in model_b.named_parameters():
             p.grad = torch.full_like(p.data, float(rank))
 
         for cid_int in sorted(mgr_b._persistent_ids):
@@ -300,9 +294,7 @@ def test_reduce_grads_and_offload_distributed(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _worker_zero3_sharded_roundtrip(
-    rank: int, world_size: int, tmpdir: str
-) -> None:
+def _worker_zero3_sharded_roundtrip(rank: int, world_size: int, tmpdir: str) -> None:
     """2-rank gloo test: gather → fake backward → reduce_scatter → step.
 
     Builds a :class:`ChunkManager` with ``zero3_shard=True`` on a CPU
@@ -322,6 +314,7 @@ def _worker_zero3_sharded_roundtrip(
     the installed torch version.
     """
     import os as _os
+
     import torch
     import torch.distributed as dist
 
@@ -348,6 +341,7 @@ def _worker_zero3_sharded_roundtrip(
         torch.manual_seed(0)  # SAME seed on every rank — fresh-init
         # bytes are identical across ranks before training.
         from torch import nn
+
         layer = nn.Linear(4, 4, bias=True).half()
         model = nn.Module()
         model.h = nn.ModuleList([layer])  # type: ignore[attr-defined]
@@ -371,8 +365,7 @@ def _worker_zero3_sharded_roundtrip(
         # Snapshot the original param bytes BEFORE materialize_offload
         # so we can compare the gathered output against the truth.
         pre_data = {
-            str(name): p.detach().clone().cpu()
-            for name, p in model.named_parameters()
+            str(name): p.detach().clone().cpu() for name, p in model.named_parameters()
         }
 
         # zero3_shard=True + world_size=2 should activate the sharded
@@ -589,8 +582,7 @@ def _worker_zero3_sharded_roundtrip_mixed_dtype(
         )
 
         pre_data = {
-            str(name): p.detach().clone().cpu()
-            for name, p in model.named_parameters()
+            str(name): p.detach().clone().cpu() for name, p in model.named_parameters()
         }
 
         mgr = ChunkManager(
@@ -611,9 +603,7 @@ def _worker_zero3_sharded_roundtrip_mixed_dtype(
         except RuntimeError as exc:
             if "gloo" in str(exc).lower():
                 _os.makedirs(tmpdir, exist_ok=True)
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
                     f.write(f"gloo-unsupported: {exc}\n")
                 return
             raise
@@ -646,9 +636,7 @@ def _worker_zero3_sharded_roundtrip_mixed_dtype(
             mgr.gather(ChunkId(0))
         except RuntimeError as exc:
             if "not implemented" in str(exc).lower() or "nccl" in str(exc).lower():
-                with open(
-                    _os.path.join(tmpdir, f"rank{rank}.skip"), "w"
-                ) as f:
+                with open(_os.path.join(tmpdir, f"rank{rank}.skip"), "w") as f:
                     f.write(f"gloo-collective-unsupported: {exc}\n")
                 return
             raise
@@ -736,9 +724,7 @@ def test_zero3_sharded_roundtrip_mixed_dtype_2rank(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _worker_gather_skip_when_resident(
-    rank: int, world_size: int, tmpdir: str
-) -> None:
+def _worker_gather_skip_when_resident(rank: int, world_size: int, tmpdir: str) -> None:
     """2-rank gloo test: a pool-resident chunk skips the backward all_gather.
 
     Builds a single-chunk sharded ChunkManager, gathers the chunk once
@@ -981,13 +967,10 @@ def _worker_persistent_grad_reduce_coalesced(
         # chunk → one dtype group → exactly one all_reduce.
         torch.manual_seed(0)
         model = _tiny_cpu_model()
-        mgr, layout, pool, host = _build_chunk_manager_cpu(
-            model, n_persist=1
-        )
+        mgr, layout, pool, host = _build_chunk_manager_cpu(model, n_persist=1)
         # Sanity: tiny model packs into one chunk.
         assert layout.N_chunk == 1, (
-            f"test setup expects single-chunk layout, got "
-            f"N_chunk={layout.N_chunk}"
+            f"test setup expects single-chunk layout, got N_chunk={layout.N_chunk}"
         )
 
         # Plant rank-specific grads — rank r writes float(r) into every
@@ -1012,8 +995,7 @@ def _worker_persistent_grad_reduce_coalesced(
         expected_mean = sum(range(world_size)) / float(world_size)
         for _n, p in model.named_parameters():
             assert p.grad is not None, (
-                f"rank {rank}: persistent param '{_n}' grad cleared "
-                f"unexpectedly"
+                f"rank {rank}: persistent param '{_n}' grad cleared unexpectedly"
             )
             obs = p.grad.detach().cpu().float()
             assert torch.allclose(

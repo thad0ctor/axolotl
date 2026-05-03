@@ -339,9 +339,7 @@ class ProTrainArgs(BaseModel):
         if not data.get("protrain_auto_memory"):
             return data
         plugins = data.get("plugins") or []
-        if not any(
-            isinstance(p, str) and "protrain" in p.lower() for p in plugins
-        ):
+        if not any(isinstance(p, str) and "protrain" in p.lower() for p in plugins):
             return data
         if data.get("deepspeed"):
             raise ValueError(
@@ -410,9 +408,7 @@ class ProTrainArgs(BaseModel):
         if not data.get("protrain_auto_memory"):
             return data
         plugins = data.get("plugins") or []
-        if not any(
-            isinstance(p, str) and "protrain" in p.lower() for p in plugins
-        ):
+        if not any(isinstance(p, str) and "protrain" in p.lower() for p in plugins):
             return data
         if not (data.get("base_model") or data.get("model_name_or_path")):
             raise ValueError(

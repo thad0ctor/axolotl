@@ -275,7 +275,9 @@ class Scheduler:
         reuse window, §3.1.1 + §5).
         """
         nxt = self._next_block_of(block_id)
-        next_chunks: set[ChunkId] = set(self._chunks_for(nxt)) if nxt is not None else set()
+        next_chunks: set[ChunkId] = (
+            set(self._chunks_for(nxt)) if nxt is not None else set()
+        )
 
         for cid in self._chunks_for(block_id):
             if cid in next_chunks:
