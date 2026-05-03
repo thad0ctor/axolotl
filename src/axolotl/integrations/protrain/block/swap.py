@@ -257,6 +257,15 @@ def _make_pack_unpack(
             )
             gpu_buf.copy_(slot_src, non_blocking=True)
             gpu_buf.record_stream(handle.swap_stream)
+            # Release the borrow taken on the line above (the matching
+            # acquire-time borrow is released by pool.release below).
+            # ``record_stream`` keeps the underlying bytes alive across
+            # streams for the in-flight H2D, so dropping the borrow
+            # here is safe; we must drop it before the slot view
+            # leaves scope or the allocator's close()-guard would see
+            # a phantom outstanding borrow.
+            del slot_view, slot_src
+            handle.pool._pinned.release_buffer(handle.slot_id)  # noqa: SLF001
         _compute_stream_wait_swap(handle.swap_stream)
 
         # Return the slot to the pool. The H2D copy reads from the
@@ -295,6 +304,7 @@ class SwappedBlock(nn.Module):
     """
 
     def __init__(self, block: nn.Module) -> None:
+        """Wrap ``block`` in identity-mode; runtime wiring deferred to :meth:`attach_runtime`."""
         super().__init__()
         self.block = block
         self._protrain_wrapped_mode: BlockMode = BlockMode.SWAP
@@ -322,6 +332,7 @@ class SwappedBlock(nn.Module):
         self._swap_stream = None
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the wrapped block under saved_tensors_hooks that swap to pinned CPU."""
         pool = self._swap_pool
         stream = self._swap_stream
 
@@ -346,6 +357,7 @@ class SwappedBlock(nn.Module):
         return out
 
     def extra_repr(self) -> str:
+        """Return the wrapper's mode tag for ``print(model)``."""
         return f"mode={self._protrain_wrapped_mode.value}"
 
 

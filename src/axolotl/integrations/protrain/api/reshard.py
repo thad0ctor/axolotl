@@ -66,7 +66,6 @@ from typing import Any
 
 import torch
 
-
 # ---- Constants mirrored from api/checkpoint.py ----------------------------
 # We deliberately avoid importing the api module so the offline CLI's
 # importlib loader can pull this file in without dragging in the heavy
@@ -343,6 +342,12 @@ def reshard_mode_c_shards(
         f"src_world={src_world} target_world={target_world_size}"
     )
 
+    if os.path.abspath(src_dir) == os.path.abspath(dst_dir):
+        raise RuntimeError("reshard: dst_dir must differ from src_dir")
+    if os.path.isdir(dst_dir) and os.listdir(dst_dir):
+        raise RuntimeError(
+            f"reshard: refusing to overwrite non-empty dst_dir {dst_dir!r}"
+        )
     os.makedirs(dst_dir, exist_ok=True)
     cpu_dst_dir = os.path.join(dst_dir, CPU_OPTIM_DIRNAME)
 

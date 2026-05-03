@@ -312,16 +312,31 @@ def test_layout_signature_changes_with_persistent_ids():
 
 
 def test_layout_signature_changes_with_world_size_or_zero3():
+    """Mode-aware ``world_size`` semantics:
+
+    * Mode-B (``zero3_shard=False``, replicated): ``world_size`` is
+      IGNORED — replicated state survives cross-world resume so the
+      signature is rank-count-independent.
+    * Mode-C (``zero3_shard=True``, sharded): ``world_size`` IS part
+      of the hash — different ranks hold different shards, and
+      cross-world resume requires the offline reshard tool.
+    """
     fake_layout = mock.MagicMock(
         S_chunk=1024, N_chunk=2, chunks=(("a",), ("b",))
     )
     fake_mgr = mock.MagicMock(layout=fake_layout, _persistent_ids={0})
     base = _layout_signature(fake_mgr, world_size=1, zero3_shard=False)
-    diff_ws = _layout_signature(fake_mgr, world_size=2, zero3_shard=False)
-    diff_z3 = _layout_signature(fake_mgr, world_size=1, zero3_shard=True)
-    assert base != diff_ws
-    assert base != diff_z3
-    assert diff_ws != diff_z3
+    same_ws_replicated = _layout_signature(
+        fake_mgr, world_size=2, zero3_shard=False
+    )
+    z3_ws1 = _layout_signature(fake_mgr, world_size=1, zero3_shard=True)
+    z3_ws2 = _layout_signature(fake_mgr, world_size=2, zero3_shard=True)
+    # Mode-B: world_size delta does NOT change signature (Phase-2 fix).
+    assert base == same_ws_replicated
+    # Mode flip changes signature.
+    assert base != z3_ws1
+    # Mode-C: world_size delta DOES change signature.
+    assert z3_ws1 != z3_ws2
 
 
 def test_effective_persistent_ids_returns_sorted_list():

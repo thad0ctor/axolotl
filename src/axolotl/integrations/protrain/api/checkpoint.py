@@ -137,6 +137,19 @@ def _barrier_or_noop() -> None:
     torch.distributed.barrier()
 
 
+def _dist_status_tensor(status: int) -> torch.Tensor:
+    """Build a 0/1 status tensor on the right device for the active backend.
+
+    NCCL collectives reject CPU tensors, so when the process group is up
+    and using NCCL we must place the flag on the current CUDA device.
+    For Gloo / MPI / single-rank fall-back, CPU is correct.
+    """
+    device = torch.device("cpu")
+    if _dist_is_active() and torch.distributed.get_backend() == "nccl":
+        device = torch.device("cuda", torch.cuda.current_device())
+    return torch.tensor([int(status)], dtype=torch.int64, device=device)
+
+
 def _broadcast_status_or_raise(
     status: int, *, src: int, op: str
 ) -> None:
@@ -160,7 +173,7 @@ def _broadcast_status_or_raise(
                 "(see preceding traceback for the underlying error)."
             )
         return
-    flag = torch.tensor([int(status)], dtype=torch.int64)
+    flag = _dist_status_tensor(status)
     torch.distributed.broadcast(flag, src=src)
     if int(flag.item()) != 0:
         my_rank = int(torch.distributed.get_rank())
@@ -193,7 +206,7 @@ def _allreduce_status_or_raise(status: int, *, op: str) -> None:
                 "status (see preceding traceback for the underlying error)."
             )
         return
-    flag = torch.tensor([int(status)], dtype=torch.int64)
+    flag = _dist_status_tensor(status)
     torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM)
     total = int(flag.item())
     if total != 0:
@@ -216,6 +229,7 @@ def _allreduce_status_or_raise(status: int, *, op: str) -> None:
 
 
 def _current_world_size() -> int:
+    """Return the active ``torch.distributed`` world size, or 1 if uninitialized."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return int(torch.distributed.get_world_size())
     return 1
@@ -263,8 +277,33 @@ def _layout_signature(
     load: a checkpoint built against one chunk geometry must not be
     quietly loaded against a different geometry. Inputs include the
     full per-chunk param-name ordering, S_chunk, N_chunk, the
-    effective persistent set, world_size, and zero3_shard.
+    effective persistent set, and zero3_shard.
+
+    Mode-aware on ``world_size``:
+
+    * Mode-B (``zero3_shard=False``, replicated): every rank holds the
+      FULL optimizer state, so cross-world resume is legitimate. The
+      ``world_size`` argument is IGNORED in the hash so a save at N
+      ranks matches a load at M ranks.
+    * Mode-C (``zero3_shard=True``, sharded): each rank holds a
+      different shard, so ``world_size`` IS part of compatibility and
+      gets mixed into the hash. Cross-world resume must go through
+      the offline reshard tool.
     """
+    if not zero3_shard:
+        # Replicated: drop world_size from the fingerprint so the
+        # signature is rank-count-independent. Build a fresh dict
+        # (rather than reusing _build_layout_fingerprint and popping)
+        # to keep the canonical-JSON payload deterministic.
+        layout = chunk_manager.layout
+        fp = {
+            "S_chunk": int(layout.S_chunk),
+            "N_chunk": int(layout.N_chunk),
+            "chunks": [list(map(str, c)) for c in layout.chunks],
+            "persistent_ids": _effective_persistent_ids(chunk_manager),
+            "zero3_shard": False,
+        }
+        return _layout_signature_from_fingerprint(fp)
     return _layout_signature_from_fingerprint(
         _build_layout_fingerprint(chunk_manager, world_size, zero3_shard)
     )
@@ -391,7 +430,7 @@ def _validate_regions_match(
                 f"current={len(current_regions)}. Likely a dtype-mix change "
                 "(e.g. an fp32 layernorm appearing/disappearing in a chunk)."
             )
-        for idx, (s, c) in enumerate(zip(saved_regions, current_regions)):
+        for idx, (s, c) in enumerate(zip(saved_regions, current_regions, strict=True)):
             for field in (
                 "chunk_offset",
                 "region_bytes",
@@ -427,6 +466,19 @@ def _hyperparam_snapshot(optim: Any) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _normalize_hp(hp: dict[str, Any]) -> dict[str, Any]:
+    """Normalize hyperparameter dict for save/load drift comparison.
+
+    JSON serialization turns ``betas`` tuples into lists; converting
+    list values back to tuples here keeps round-tripped data from
+    triggering a spurious mismatch warning.
+    """
+    return {
+        k: (tuple(v) if isinstance(v, list) else v)
+        for k, v in hp.items()
+    }
 
 
 def _is_raw_protrain_optimizer(optim: Any) -> bool:
@@ -1272,15 +1324,9 @@ def _load_protrain_optim_dir(
             )
 
         # Hyperparam drift: warn but accept.
-        def _normalize_hp(hp: dict[str, Any]) -> dict[str, Any]:
-            return {
-                k: (tuple(v) if isinstance(v, list) else v)
-                for k, v in hp.items()
-            }
-
         saved_hp = metadata.get("param_groups_meta", [])
         current_hp = _hyperparam_snapshot(optim)
-        for i, (s, c) in enumerate(zip(saved_hp, current_hp)):
+        for i, (s, c) in enumerate(zip(saved_hp, current_hp, strict=True)):
             if _normalize_hp(s) != _normalize_hp(c):
                 LOG.warning(
                     "ProTrain optimizer load: param_groups[%d] "
@@ -1346,7 +1392,7 @@ def _load_protrain_optim_dir(
     # geometry + persistent_ids + zero3_shard.
     saved_sig = metadata["protrain_layout_signature"]
     expected_sig = _layout_signature(
-        chunk_manager, saved_world, saved_zero3
+        chunk_manager, current_world, saved_zero3
     )
     if saved_sig != expected_sig:
         raise RuntimeError(
@@ -1437,15 +1483,9 @@ def _load_protrain_optim_dir(
     # Hyperparam drift: warn but accept. JSON serialization turns
     # ``betas`` tuples into lists; normalize before comparing so
     # round-tripped data doesn't trigger a spurious warning.
-    def _normalize_hp(hp: dict[str, Any]) -> dict[str, Any]:
-        return {
-            k: (tuple(v) if isinstance(v, list) else v)
-            for k, v in hp.items()
-        }
-
     saved_hp = metadata.get("param_groups_meta", [])
     current_hp = _hyperparam_snapshot(optim)
-    for i, (s, c) in enumerate(zip(saved_hp, current_hp)):
+    for i, (s, c) in enumerate(zip(saved_hp, current_hp, strict=True)):
         if _normalize_hp(s) != _normalize_hp(c):
             LOG.warning(
                 "ProTrain optimizer load: param_groups[%d] hyperparams drifted "
@@ -1512,6 +1552,7 @@ def _make_callback_class():
             save_max_bytes: int,
             verify_replicated: bool = False,
         ) -> None:
+            """Store save policy and one-shot replication-verify flag."""
             self._save_max_bytes = save_max_bytes
             self._verify_replicated = bool(verify_replicated)
             # Track whether the cross-rank verify already fired for
@@ -1526,6 +1567,7 @@ def _make_callback_class():
             control: "TrainerControl",
             **kwargs: Any,
         ) -> "TrainerControl":
+            """Persist the ProTrain optimizer state alongside the HF checkpoint dir."""
             # Trainer.optimizer is wrapped by AcceleratedOptimizer after
             # prepare runs; the callback receives the wrapped form. Unwrap
             # before the duck-type guard.
@@ -1637,6 +1679,7 @@ def make_checkpoint_callback(
     save_max_bytes: int,
     verify_replicated: bool = False,
 ) -> "TrainerCallback":
+    """Return a fresh ProTrain optimizer-checkpoint TrainerCallback instance."""
     cls = _make_callback_class()
     return cls(
         save_max_bytes=save_max_bytes,

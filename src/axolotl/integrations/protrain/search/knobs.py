@@ -59,7 +59,7 @@ def derive_bounds(trace: ProfilerTrace, layout: ChunkLayout) -> Bounds:
             # Average ops per block; round down so bounds stay
             # conservative. Taking the mean (not the min) avoids
             # punishing blocks that happen to contain a single hot op.
-            n_interval = max(1, sum(per_block.values()) // len(per_block))
+            n_interval = max(1, sum(per_block.values()) // max(1, n_block))
         else:
             # No op has a block_id — fall back to the flat ratio.
             forward_op_count = sum(1 for op in trace.op_order if op.is_forward)

@@ -68,9 +68,13 @@ def wrap_block(block: nn.Module, mode: BlockMode) -> nn.Module:
     if mode is BlockMode.NONE:
         return block
     if mode is BlockMode.CKPT:
-        return CheckpointedBlock(block)
+        wrapped = CheckpointedBlock(block)
+        setattr(wrapped, _MARKER_ATTR, BlockMode.CKPT)
+        return wrapped
     if mode is BlockMode.SWAP:
-        return SwappedBlock(block)
+        wrapped = SwappedBlock(block)
+        setattr(wrapped, _MARKER_ATTR, BlockMode.SWAP)
+        return wrapped
     raise StrategyError(f"unknown BlockMode: {mode!r}")
 
 

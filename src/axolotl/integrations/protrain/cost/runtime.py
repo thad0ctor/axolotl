@@ -439,13 +439,15 @@ def estimate_runtime(
 
     # NCCL table lookup at chunk-payload size. Single-rank -> world==1
     # and the tables should be empty (or contain zero times), yielding
-    # 0s here.
+    # 0s here. The all-reduce (grad reduce-scatter) collective is NOT
+    # used here: the per-chunk backward comm in this model represents
+    # only the gather collective (which a buffer cache hit avoids) plus
+    # the PCIe D2H grad-offload — the reduce-scatter is overlapped with
+    # compute under ZeRO-3 and is accounted for separately when present.
     if hw.gpu_count <= 1 or trace.world <= 1:
         nccl_gather = 0.0
-        nccl_reduce = 0.0
     else:
         nccl_gather = _pick_nccl(trace.nccl_gather_s, layout.S_chunk)
-        nccl_reduce = _pick_nccl(trace.nccl_reduce_s, layout.S_chunk)
 
     # Non-persistent chunks: forward has gather + H2D.
     t_fwd_comm_per_chunk = _comm_time_chunk(
@@ -458,11 +460,19 @@ def estimate_runtime(
     )
     # Backward: buffer-cached chunks (up to n_buffer of them) skip re-
     # gather; the rest pay the full round-trip with reduce-offload.
+    # The collective term passed here is the all-GATHER time at chunk
+    # payload size — that's what a buffer cache hit saves (the gather
+    # is amortised; the reduce always happens regardless of caching).
+    # Must match the phase-2 correction at ~line 626, which subtracts
+    # ``nccl_gather`` per delta cache hit; using ``nccl_reduce`` here
+    # would make the two paths disagree on the n_buffer coefficient
+    # and the searcher's optimum n_buffer would depend on which
+    # branch is taken.
     t_bwd_comm_per_chunk_cached = _comm_time_chunk(
         layout.S_chunk,
         eff_h2d,
         eff_d2h,
-        nccl_reduce,
+        nccl_gather,
         is_backward=True,
         buffer_cached=True,
     )
@@ -470,7 +480,7 @@ def estimate_runtime(
         layout.S_chunk,
         eff_h2d,
         eff_d2h,
-        nccl_reduce,
+        nccl_gather,
         is_backward=True,
         buffer_cached=False,
     )

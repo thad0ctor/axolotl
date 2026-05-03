@@ -41,6 +41,7 @@ class CheckpointedBlock(nn.Module):
     """
 
     def __init__(self, block: nn.Module) -> None:
+        """Wrap ``block`` for activation checkpointing under ``torch.utils.checkpoint``."""
         super().__init__()
         self.block = block
         # Public marker consumed by dispatcher.unwrap_block and inspection code.
@@ -50,21 +51,47 @@ class CheckpointedBlock(nn.Module):
         # because the recompute calls ``self.block`` directly and does
         # not pass through hooks attached to this wrapper module.
         self._protrain_recompute_pre_hook: Callable[[], None] | None = None
+        # Per-call counter on the wrapper. ``torch.utils.checkpoint`` invokes
+        # the closure ``_run`` twice per top-level forward when activations
+        # are dropped: once during the initial forward (count == 1) and once
+        # during the backward replay / recompute pass (count >= 2). The
+        # counter is reset at the top of every ``forward()`` call so the
+        # signal is local to a single block invocation.
+        self._fwd_call_count: int = 0
 
     def set_recompute_pre_hook(self, hook: Callable[[], None] | None) -> None:
-        """Install a callback run before both original and recompute forwards."""
+        """Install a callback run before recompute (backward) forwards only.
+
+        The callback is suppressed on the initial forward — the wrapper's
+        forward-pre hooks already ensure block residency for that pass.
+        It fires only on the recompute that ``torch.utils.checkpoint``
+        triggers during backward, when the dropped activations are
+        reconstructed by re-running ``self.block`` directly (bypassing
+        any hooks attached to this wrapper module).
+        """
         self._protrain_recompute_pre_hook = hook
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the wrapped block under ``torch.utils.checkpoint`` (activations recomputed)."""
         # torch.utils.checkpoint.checkpoint only threads positional args into
         # the wrapped callable. Capture kwargs in a closure so HF blocks that
         # rely on e.g. attention_mask= still see them.
         block = self.block
+        # Reset per-top-level-forward call count. ``_run`` increments this
+        # on every entry; count == 1 is the initial forward, count >= 2 is
+        # the recompute replay during backward. The recompute hook fires
+        # only on the latter.
+        self._fwd_call_count = 0
 
         def _run(*inner_args: Any) -> Any:
-            hook = self._protrain_recompute_pre_hook
-            if hook is not None:
-                hook()
+            self._fwd_call_count += 1
+            # Skip the hook on the initial forward (count == 1): the
+            # wrapper's forward-pre hooks have already gathered this
+            # block's params. Fire only on recompute (count >= 2).
+            if self._fwd_call_count >= 2:
+                hook = self._protrain_recompute_pre_hook
+                if hook is not None:
+                    hook()
             return block(*inner_args, **kwargs)
 
         return torch_checkpoint.checkpoint(
@@ -74,6 +101,7 @@ class CheckpointedBlock(nn.Module):
         )
 
     def extra_repr(self) -> str:
+        """Return the wrapper's mode tag for ``print(model)``."""
         return f"mode={self._protrain_wrapped_mode.value}"
 
 

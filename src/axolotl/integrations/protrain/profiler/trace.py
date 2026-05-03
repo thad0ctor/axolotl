@@ -70,7 +70,30 @@ ON_DEMAND_STATE_BYTES_FRACTION: float = 0.60
 
 @dataclass
 class _OpFrame:
-    """Mutable per-op bookkeeping used only while a forward hook pair is live."""
+    """Mutable per-op bookkeeping used only while a forward hook pair is live.
+
+    ``pre_peak_bytes`` and ``prev_end_peak_bytes`` are snapshots of
+    ``torch.cuda.max_memory_allocated`` (a CUMULATIVE counter that we never
+    reset between modules during the hooked forward). The post-forward hook
+    samples the same counter again and computes:
+
+        intra_inclusive = post_peak - pre_peak_bytes
+        intra_exclusive = max(0, intra_inclusive - children_peak_contribution)
+
+    Reading the counter without resetting avoids the original P4 bug — a
+    nested child pre-hook used to call ``reset_peak_memory_stats`` between
+    its parent's pre/post pair, clobbering the parent's window.
+
+    To produce per-frame EXCLUSIVE peaks while keeping the cumulative-
+    counter design's test-isolation safety, each frame tracks the sum of
+    direct children's inclusive contributions (rolled up by each child's
+    post-hook into its parent's ``children_peak_contribution``). The
+    parent's exclusive intra subtracts that rollup so each op's reported
+    intra reflects only its OWN allocation work, not its descendants'.
+    A ``live_frame_stack`` keyed on Python ``id(module)`` tracks the
+    parent at pre-hook time; the top of the stack BEFORE pushing is the
+    direct parent.
+    """
 
     op_id: OpId
     module_path: str
@@ -78,8 +101,10 @@ class _OpFrame:
     shape_signature: tuple[tuple[int, ...], ...]
     block_id: BlockId | None
     is_forward: bool
-    allocated_before: int
-    prev_end_before: int
+    pre_peak_bytes: int
+    prev_end_peak_bytes: int
+    parent_id: int | None = None
+    children_peak_contribution: int = 0
     # Pair of torch.cuda.Events recorded at pre-/post-forward. ``elapsed_time``
     # is read lazily after the final ``torch.cuda.synchronize`` at the end of
     # ``run_trace`` so the hook path does not stall on a per-op sync.
@@ -123,12 +148,49 @@ def _shape_sig(inputs: Any) -> tuple[tuple[int, ...], ...]:
 def _count_model_state_bytes(
     model: "nn.Module",
     *,
+    param_byte_size: int | None = None,
     param_grad_bytes_per_param: int = DEFAULT_PARAM_GRAD_BYTES_PER_PARAM,
     optim_state_bytes_per_param: int = DEFAULT_OPTIM_STATE_BYTES_PER_PARAM,
 ) -> int:
-    """Constant-size model-state footprint: params + grads + optimizer states."""
-    n = sum(p.numel() for _, p in model.named_parameters() if p.requires_grad)
-    return int(n) * (param_grad_bytes_per_param + optim_state_bytes_per_param)
+    """Constant-size model-state footprint: params + grads + optimizer states.
+
+    Trainable params contribute the legacy
+    ``param_grad_bytes_per_param + optim_state_bytes_per_param`` per-param
+    figure (which already bundles the resident fp16 param, fp16 grad, fp32
+    master, m, and v under the configured knob defaults — see the module-
+    level constants for the breakdown). Frozen params only contribute their
+    resident parameter bytes — no grad, no optimizer slot. Without this
+    split, LoRA / frozen-base traces would miss the resident bytes for the
+    frozen weights entirely.
+
+    Args:
+        model: the module whose parameters to size.
+        param_byte_size: bytes/element for FROZEN parameters' resident
+            tensors. When ``None`` (default), each parameter's actual
+            ``element_size()`` is used (fp16=2, fp32=4, bf16=2, ...). Pass
+            an int to override (e.g. for an offload regime that re-types
+            the resident copy).
+        param_grad_bytes_per_param: per-trainable-param bytes for the
+            resident param + gradient buffer combined — see
+            ``DEFAULT_PARAM_GRAD_BYTES_PER_PARAM``.
+        optim_state_bytes_per_param: per-trainable-param bytes for
+            optimizer state (fp32 master + Adam m + Adam v, with a small
+            buffer) — see ``DEFAULT_OPTIM_STATE_BYTES_PER_PARAM``.
+    """
+    trainable_params = 0
+    frozen_param_bytes = 0
+    for _, p in model.named_parameters():
+        n = int(p.numel())
+        if p.requires_grad:
+            trainable_params += n
+        else:
+            if param_byte_size is None:
+                frozen_param_bytes += n * int(p.element_size())
+            else:
+                frozen_param_bytes += n * int(param_byte_size)
+    return frozen_param_bytes + trainable_params * (
+        int(param_grad_bytes_per_param) + int(optim_state_bytes_per_param)
+    )
 
 
 def _arch_hash(model: "nn.Module") -> str:
@@ -250,6 +312,12 @@ def run_trace(
     # fire pre-hooks before their parent's post-hook; a dict keyed on id()
     # matches that LIFO nesting without needing a real stack type.
     live_frames: dict[int, _OpFrame] = {}
+    # Ordered list of in-flight module ids in pre-hook arrival order. The
+    # top of the stack BEFORE we push a new frame IS the direct parent;
+    # used to roll up child inclusive intra into the parent's
+    # ``children_peak_contribution`` so each frame reports an EXCLUSIVE
+    # intra delta (own allocation work, descendants subtracted).
+    live_frame_stack: list[int] = []
 
     next_op_id = 0
 
@@ -321,13 +389,27 @@ def run_trace(
         nonlocal next_op_id
         op_id = OpId(next_op_id)
         next_op_id += 1
-        tracker.reset()
-        snap = tracker.snapshot()
+        # CRITICAL: do NOT call ``tracker.reset()`` /
+        # ``reset_peak_memory_stats`` here. This hook fires for parents
+        # AND children (we install on every nn.Module), so resetting the
+        # peak counter inside a nested child pre-hook would clobber the
+        # parent's window — the parent's post-hook would only see the
+        # last child's peak, not the parent's full forward (P4 bug).
+        # Instead we sample ``max_memory_allocated`` as a cumulative
+        # counter; intra/inter become differences against per-frame
+        # snapshots and compose correctly under nesting.
+        if cuda_available:
+            pre_peak_bytes = int(torch.cuda.max_memory_allocated(device))
+        else:
+            pre_peak_bytes = tracker.snapshot().allocated_bytes
         path = _module_path(module)
         pre_event = None
         if cuda_available:
             pre_event = torch.cuda.Event(enable_timing=True)
             pre_event.record()
+        # Direct parent = top of stack BEFORE we push; when empty, this is
+        # the root call and parent_id stays None.
+        parent_id = live_frame_stack[-1] if live_frame_stack else None
         live_frames[id(module)] = _OpFrame(
             op_id=op_id,
             module_path=path,
@@ -335,19 +417,50 @@ def run_trace(
             shape_signature=_shape_sig(inputs),
             block_id=_resolve_block_id(path),
             is_forward=True,
-            allocated_before=snap.allocated_bytes,
-            prev_end_before=tracker.last_end_bytes,
+            pre_peak_bytes=pre_peak_bytes,
+            prev_end_peak_bytes=tracker.last_end_bytes,
+            parent_id=parent_id,
             pre_event=pre_event,
         )
+        live_frame_stack.append(id(module))
 
     def _post_forward(module: "nn.Module", inputs, output):
         frame = live_frames.pop(id(module), None)
         if frame is None:
             return
-        snap = tracker.snapshot()
-        intra = intra_op_delta(frame.allocated_before, snap.peak_allocated_bytes)
-        inter = inter_op_delta(frame.prev_end_before, snap.peak_allocated_bytes)
-        tracker.mark_end(snap.allocated_bytes)
+        # Pop this frame from the live stack. We don't strictly require
+        # the top to match (defensive against weird re-entrant hooks) but
+        # in normal nesting it always will.
+        if live_frame_stack and live_frame_stack[-1] == id(module):
+            live_frame_stack.pop()
+        elif id(module) in live_frame_stack:
+            live_frame_stack.remove(id(module))
+        # Re-sample the cumulative ``max_memory_allocated`` counter at
+        # post-time. Inter (peak - prev_end_peak) stays inclusive over
+        # children — it's the rise since this op's last sibling end and
+        # has no notion of nesting. Intra is computed inclusive first
+        # (peak - pre_peak), then made EXCLUSIVE by subtracting the
+        # rolled-up children contribution.
+        if cuda_available:
+            post_peak_bytes = int(torch.cuda.max_memory_allocated(device))
+        else:
+            post_peak_bytes = tracker.snapshot().allocated_bytes
+        intra_inclusive = intra_op_delta(frame.pre_peak_bytes, post_peak_bytes)
+        # Roll the inclusive intra into the parent frame's child-contribution
+        # accumulator (siblings simply sum; that is acceptable since we
+        # only need an upper-bound subtraction).
+        if frame.parent_id is not None:
+            parent = live_frames.get(frame.parent_id)
+            if parent is not None:
+                parent.children_peak_contribution += intra_inclusive
+        intra = max(0, intra_inclusive - frame.children_peak_contribution)
+        inter = inter_op_delta(frame.prev_end_peak_bytes, post_peak_bytes)
+        # ``last_end_bytes`` here represents "the cumulative peak as of
+        # the previous post-hook"; the next sibling's inter-op delta
+        # measures the rise from that watermark. Repurposing
+        # ``mark_end`` (designed for allocated_bytes) for peak bytes is
+        # safe — the tracker treats it as an opaque baseline.
+        tracker.mark_end(post_peak_bytes)
 
         if cuda_available and frame.pre_event is not None:
             post_event = torch.cuda.Event(enable_timing=True)
@@ -409,14 +522,15 @@ def run_trace(
             # the total — a 7B fp16 model is 14 GB params but ~70 GB total
             # state with Adam, so params=58% of a 24 GB card fits the old
             # check yet OOMs on the optimizer-state allocation during
-            # warmup. Per-param: fp16 grad (2 B) + fp32 master (4 B) +
-            # fp32 momentum (4 B) + fp32 variance (4 B) = 14 B above the
-            # raw param tensor (which is ~p.element_size()).
-            state_bytes = sum(
-                p.numel() * p.element_size() for p in model.parameters()
-            )
-            state_bytes += sum(
-                p.numel() * 14 for p in model.parameters() if p.requires_grad
+            # warmup. Routes through ``_count_model_state_bytes`` so the
+            # configured knobs (``param_grad_bytes_per_param`` /
+            # ``optim_state_bytes_per_param``) flow into the gate — without
+            # this, callers who override either knob would either offload
+            # unnecessarily or stay on the fast path until OOM.
+            state_bytes = _count_model_state_bytes(
+                model,
+                param_grad_bytes_per_param=param_grad_bytes_per_param,
+                optim_state_bytes_per_param=optim_state_bytes_per_param,
             )
             if state_bytes > ON_DEMAND_STATE_BYTES_FRACTION * gpu_total:
                 engage_on_demand = True
@@ -508,16 +622,45 @@ def run_trace(
             )
             blocks = []
 
+        # Per-iter peaks of the true whole-forward high-water mark. The
+        # per-block pre-hook resets ``max_memory_allocated`` between blocks
+        # so each block's post-hook sees ONLY that block's peak — but
+        # reading ``max_memory_allocated`` after the forward as a whole-
+        # forward peak would then return "peak since the last block's
+        # reset", underestimating the real cap.
+        #
+        # P3 had the pre-hook do an extra ``max_memory_allocated`` read
+        # before each reset to roll forward an aggregate. On 7B Llama
+        # that's ~32 blocks * 4 steady iters = 128 extra allocator reads
+        # per trace, which inflated per-iter wall time enough to push the
+        # 7B runtime calibration error from ~40% to ~77%.
+        #
+        # Strategy (b): the per-block post-hooks ALREADY measure each
+        # block's peak. The whole-iter aggregate is just the max over
+        # those per-block peaks — no extra reads needed in the hot pre-
+        # hook path. ``iter_block_peaks`` collects the current iter's
+        # per-block peaks; the iter loop body reads ``max(iter_block_peaks)``
+        # AFTER the forward completes and rolls it into
+        # ``steady_fwd_peak_bytes``.
+        iter_block_peaks: list[int] = []
+
         def _make_pre(_dev):
             def _pre(_mod, _inputs):
+                # Hot path: ONLY reset the peak counter so the next block's
+                # post-hook sees this block's peak in isolation. Do NOT
+                # call ``max_memory_allocated`` here — see strategy notes
+                # above; the whole-iter aggregate is recovered post-iter
+                # from the per-block peaks the post-hooks already record.
                 torch.cuda.reset_peak_memory_stats(_dev)
             return _pre
 
         def _make_post(bid, _dev):
             def _post(_mod, _inputs, _output):
-                steady_fwd_block_peak_bytes[bid] = int(
-                    torch.cuda.max_memory_allocated(_dev)
+                block_peak = int(torch.cuda.max_memory_allocated(_dev))
+                steady_fwd_block_peak_bytes[bid] = max(
+                    steady_fwd_block_peak_bytes.get(bid, 0), block_peak
                 )
+                iter_block_peaks.append(block_peak)
             return _post
 
         for idx, block in enumerate(blocks):
@@ -548,6 +691,11 @@ def run_trace(
             for i in range(N_STEADY_ITERS):
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
+                # Clear the per-iter block-peak collector; the per-block
+                # post-hooks below will append each block's peak as they
+                # fire and the whole-iter aggregate is recovered as
+                # ``max(iter_block_peaks)`` AFTER the forward completes.
+                iter_block_peaks.clear()
                 pre_sf = torch.cuda.Event(enable_timing=True)
                 post_sf = torch.cuda.Event(enable_timing=True)
                 pre_sf.record()
@@ -555,9 +703,18 @@ def run_trace(
                 post_sf.record()
                 torch.cuda.synchronize(device)
                 fwd_iter_s.append(pre_sf.elapsed_time(post_sf) / 1000.0)
-                # High-water mark across all iters
+                # High-water mark across all iters. ``max_memory_allocated``
+                # at this point is "peak since the last per-block reset"
+                # (i.e. the LAST block's window), so pair it with
+                # ``max(iter_block_peaks)`` — the largest individual block
+                # peak from this iter — to recover the whole-iter peak
+                # without paying for an extra read inside each hot pre-hook.
+                whole_iter_peak = (
+                    max(iter_block_peaks) if iter_block_peaks else 0
+                )
                 steady_fwd_peak_bytes = max(
                     steady_fwd_peak_bytes,
+                    whole_iter_peak,
                     int(torch.cuda.max_memory_allocated(device)),
                 )
 
@@ -637,8 +794,20 @@ def run_trace(
     hooked_fwd_post_event = None
 
     try:
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
+        if cuda_available:
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            # Re-seed the inter-op baseline against the FRESH peak counter:
+            # the per-op hooks read ``max_memory_allocated`` (cumulative)
+            # and compute ``inter = post_peak - tracker.last_end_bytes``.
+            # Right after reset, the counter equals current ``allocated_bytes``
+            # — that's the watermark the first op should diff against, so
+            # its inter-op delta only counts transient bytes allocated DURING
+            # the first op (not the resident model weights). Without this,
+            # ``last_end_bytes`` still holds the pre-bench allocated value
+            # from line 282 and the first op would silently double-count
+            # any bytes the bench allocated then freed.
+            tracker.mark_end(int(torch.cuda.max_memory_allocated(device)))
         with on_demand_mgr:
             if cuda_available:
                 hooked_fwd_pre_event = torch.cuda.Event(enable_timing=True)
@@ -686,7 +855,8 @@ def run_trace(
                         is_forward=False,
                     )
                 )
-        torch.cuda.synchronize(device)
+        if cuda_available:
+            torch.cuda.synchronize(device)
     finally:
         for h in handles:
             h.remove()

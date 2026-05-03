@@ -1,16 +1,30 @@
-"""On-disk cache for ProfilerTrace, keyed by (arch_hash, bs, seq, sku, world)."""
+"""On-disk cache for ProfilerTrace, keyed by (arch_hash, bs, seq, sku, world).
+
+JSON serialization (not pickle) — pickle.load() is a remote-code-execution
+sink if any attacker can drop a file under ``$XDG_CACHE_HOME/protrain/profiler``,
+and the trace is pure data anyway. JSON has cheap, verifiable round-trip
+semantics here; the only fixups required on load are re-tupling sequence
+fields, re-typing ``BlockId`` keys (JSON dict keys are always strings), and
+reconstructing the ``BlockMode`` str-enum.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-import pickle
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from axolotl.integrations.protrain.types import (
+    BlockId,
+    OpId,
+    OpRecord,
+    ProfilerTrace,
+)
 from axolotl.utils.logging import get_logger
-
-from axolotl.integrations.protrain.types import ProfilerTrace
 
 LOG = get_logger(__name__)
 
@@ -101,7 +115,14 @@ _CACHE_SUBDIR = Path("protrain") / "profiler"
 # / ``decoder.``) to recover tree membership. The string-prefix path
 # stays as a fallback for degenerate test traces but cached profiles
 # carry the authoritative map.
-TRACE_VERSION = 16
+# Version 17 switches the on-disk format from pickle to JSON. Pickle
+# is a remote-code-execution sink (``pickle.load`` calls arbitrary
+# constructors during deserialization) and the cache directory is a
+# local-attacker writable target; JSON has none of those semantics.
+# v16 ``.pkl`` files remain on disk but are never looked up under the
+# v17 ``.json`` extension — the cache is local-only and a re-profile
+# is cheap, so the migration policy is "ignore + retrace".
+TRACE_VERSION = 17
 
 
 @dataclass(frozen=True)
@@ -136,7 +157,156 @@ def _cache_root() -> Path:
 
 
 def _path_for(key: ProfilerCacheKey) -> Path:
-    return _cache_root() / f"{key.fingerprint()}.pkl"
+    return _cache_root() / f"{key.fingerprint()}.json"
+
+
+# ---------------------------------------------------------------------------
+# JSON (de)serialization — ProfilerTrace is pure data so this is a small
+# fixup pass over ``dataclasses.asdict`` output. The contract:
+#   * tuple fields → list on write, retuple on load
+#   * dict[BlockId, ...] → str-keyed dict on write (JSON), int-keyed
+#     ``BlockId`` dict on load
+#   * dict[OpId, ...] → same treatment as BlockId
+#   * BlockMode enum → string ``.value`` on write, ``BlockMode(s)`` on load
+#   * trace_version is embedded in the payload so loaders can reject
+#     mismatched versions (the filename hashes the version too, but a
+#     payload-level check is a defense-in-depth tripwire if the hash
+#     scheme ever changes).
+# ---------------------------------------------------------------------------
+
+
+def _op_record_to_dict(op: OpRecord) -> dict[str, Any]:
+    return {
+        "op_id": int(op.op_id),
+        "module_path": op.module_path,
+        "qualified_name": op.qualified_name,
+        # tuple[tuple[int, ...], ...] → list[list[int]]
+        "shape_signature": [list(s) for s in op.shape_signature],
+        "block_id": None if op.block_id is None else int(op.block_id),
+        "is_forward": bool(op.is_forward),
+    }
+
+
+def _op_record_from_dict(d: dict[str, Any]) -> OpRecord:
+    return OpRecord(
+        op_id=OpId(int(d["op_id"])),
+        module_path=str(d["module_path"]),
+        qualified_name=str(d["qualified_name"]),
+        # list[list[int]] → tuple[tuple[int, ...], ...]
+        shape_signature=tuple(tuple(int(x) for x in s) for s in d["shape_signature"]),
+        block_id=None if d["block_id"] is None else BlockId(int(d["block_id"])),
+        is_forward=bool(d["is_forward"]),
+    )
+
+
+def _trace_to_dict(trace: ProfilerTrace) -> dict[str, Any]:
+    """Convert ``ProfilerTrace`` to a JSON-friendly dict.
+
+    Note we don't use ``dataclasses.asdict`` for the top-level conversion
+    because it would recurse into ``OpRecord`` (fine) but also leave us to
+    re-handle every dict-keyed-by-NewType field anyway — explicit is faster
+    to read and type-check.
+    """
+    payload: dict[str, Any] = {
+        "trace_version": TRACE_VERSION,
+        "op_order": [_op_record_to_dict(op) for op in trace.op_order],
+        # dict[OpId, int|float] — JSON requires string keys.
+        "intra_op_delta": {str(int(k)): int(v) for k, v in trace.intra_op_delta.items()},
+        "inter_op_delta": {str(int(k)): int(v) for k, v in trace.inter_op_delta.items()},
+        "activation_sizes": {
+            str(int(k)): int(v) for k, v in trace.activation_sizes.items()
+        },
+        "model_state_bytes": int(trace.model_state_bytes),
+        "pcie_h2d_bps": float(trace.pcie_h2d_bps),
+        "pcie_d2h_bps": float(trace.pcie_d2h_bps),
+        # nccl tables: dict[int, float], JSON requires string keys.
+        "nccl_gather_s": {str(int(k)): float(v) for k, v in trace.nccl_gather_s.items()},
+        "nccl_reduce_s": {str(int(k)): float(v) for k, v in trace.nccl_reduce_s.items()},
+        "arch_hash": str(trace.arch_hash),
+        "bs": int(trace.bs),
+        "seq": int(trace.seq),
+        "sku": str(trace.sku),
+        "world": int(trace.world),
+        "op_latencies": {
+            str(int(k)): float(v) for k, v in trace.op_latencies.items()
+        },
+        "cpu_adam_bytes_per_sec": float(trace.cpu_adam_bytes_per_sec),
+        "gpu_adam_bytes_per_sec": float(trace.gpu_adam_bytes_per_sec),
+        "hooked_fwd_wall_s": float(trace.hooked_fwd_wall_s),
+        "steady_fwd_wall_s": float(trace.steady_fwd_wall_s),
+        "steady_bwd_wall_s": float(trace.steady_bwd_wall_s),
+        "steady_fwd_peak_bytes": int(trace.steady_fwd_peak_bytes),
+        "steady_fwd_block_peak_bytes": {
+            str(int(k)): int(v) for k, v in trace.steady_fwd_block_peak_bytes.items()
+        },
+        "compute_rate_tflops": float(trace.compute_rate_tflops),
+        "trainable_param_fraction": float(trace.trainable_param_fraction),
+        "steady_bwd_chunked_wall_s": float(trace.steady_bwd_chunked_wall_s),
+        "steady_step_overlap_s": float(trace.steady_step_overlap_s),
+        "steady_phase2_peak_bytes": int(trace.steady_phase2_peak_bytes),
+        "phase2_n_persist": int(trace.phase2_n_persist),
+        "phase2_n_buffer": int(trace.phase2_n_buffer),
+        "phase2_n_checkpoint": int(trace.phase2_n_checkpoint),
+        "phase2_per_block_recompute_s": float(trace.phase2_per_block_recompute_s),
+        "steady_fwd_chunked_wall_s": float(trace.steady_fwd_chunked_wall_s),
+        "block_tree_index": {
+            str(int(k)): int(v) for k, v in trace.block_tree_index.items()
+        },
+    }
+    return payload
+
+
+def _trace_from_dict(data: dict[str, Any]) -> ProfilerTrace:
+    """Reconstruct a ``ProfilerTrace`` from its JSON-decoded dict.
+
+    Raises ``KeyError`` / ``ValueError`` / ``TypeError`` if required fields
+    are missing or malformed; callers treat that as a cache miss.
+    """
+    return ProfilerTrace(
+        op_order=tuple(_op_record_from_dict(d) for d in data["op_order"]),
+        intra_op_delta={OpId(int(k)): int(v) for k, v in data["intra_op_delta"].items()},
+        inter_op_delta={OpId(int(k)): int(v) for k, v in data["inter_op_delta"].items()},
+        activation_sizes={
+            BlockId(int(k)): int(v) for k, v in data["activation_sizes"].items()
+        },
+        model_state_bytes=int(data["model_state_bytes"]),
+        pcie_h2d_bps=float(data["pcie_h2d_bps"]),
+        pcie_d2h_bps=float(data["pcie_d2h_bps"]),
+        nccl_gather_s={int(k): float(v) for k, v in data["nccl_gather_s"].items()},
+        nccl_reduce_s={int(k): float(v) for k, v in data["nccl_reduce_s"].items()},
+        arch_hash=str(data["arch_hash"]),
+        bs=int(data["bs"]),
+        seq=int(data["seq"]),
+        sku=str(data["sku"]),
+        world=int(data["world"]),
+        op_latencies={
+            OpId(int(k)): float(v) for k, v in data.get("op_latencies", {}).items()
+        },
+        cpu_adam_bytes_per_sec=float(data.get("cpu_adam_bytes_per_sec", 0.0)),
+        gpu_adam_bytes_per_sec=float(data.get("gpu_adam_bytes_per_sec", 0.0)),
+        hooked_fwd_wall_s=float(data.get("hooked_fwd_wall_s", 0.0)),
+        steady_fwd_wall_s=float(data.get("steady_fwd_wall_s", 0.0)),
+        steady_bwd_wall_s=float(data.get("steady_bwd_wall_s", 0.0)),
+        steady_fwd_peak_bytes=int(data.get("steady_fwd_peak_bytes", 0)),
+        steady_fwd_block_peak_bytes={
+            BlockId(int(k)): int(v)
+            for k, v in data.get("steady_fwd_block_peak_bytes", {}).items()
+        },
+        compute_rate_tflops=float(data.get("compute_rate_tflops", 0.0)),
+        trainable_param_fraction=float(data.get("trainable_param_fraction", 0.0)),
+        steady_bwd_chunked_wall_s=float(data.get("steady_bwd_chunked_wall_s", 0.0)),
+        steady_step_overlap_s=float(data.get("steady_step_overlap_s", 0.0)),
+        steady_phase2_peak_bytes=int(data.get("steady_phase2_peak_bytes", 0)),
+        phase2_n_persist=int(data.get("phase2_n_persist", 0)),
+        phase2_n_buffer=int(data.get("phase2_n_buffer", 0)),
+        phase2_n_checkpoint=int(data.get("phase2_n_checkpoint", 0)),
+        phase2_per_block_recompute_s=float(data.get("phase2_per_block_recompute_s", 0.0)),
+        steady_fwd_chunked_wall_s=float(data.get("steady_fwd_chunked_wall_s", 0.0)),
+        block_tree_index={
+            BlockId(int(k)): int(v)
+            for k, v in data.get("block_tree_index", {}).items()
+        },
+    )
 
 
 def load_cached_trace(key: ProfilerCacheKey) -> ProfilerTrace | None:
@@ -145,15 +315,35 @@ def load_cached_trace(key: ProfilerCacheKey) -> ProfilerTrace | None:
     if not path.exists():
         return None
     try:
-        with path.open("rb") as fh:
-            trace = pickle.load(fh)
-    except (pickle.UnpicklingError, EOFError, OSError) as exc:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
         LOG.warning("profiler cache miss due to read error at %s: %s", path, exc)
         return None
-    if not isinstance(trace, ProfilerTrace):
-        LOG.warning("profiler cache at %s is not a ProfilerTrace (got %s)", path, type(trace))
+    if not isinstance(data, dict):
+        LOG.warning(
+            "profiler cache at %s is not a dict (got %s); treating as miss.",
+            path,
+            type(data).__name__,
+        )
         return None
-    return trace
+    if data.get("trace_version") != TRACE_VERSION:
+        LOG.info(
+            "profiler cache at %s has trace_version=%s, current=%s; treating as miss.",
+            path,
+            data.get("trace_version"),
+            TRACE_VERSION,
+        )
+        return None
+    try:
+        return _trace_from_dict(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        LOG.warning(
+            "profiler cache at %s failed deserialization (%s); treating as miss.",
+            path,
+            exc,
+        )
+        return None
 
 
 def save_cached_trace(key: ProfilerCacheKey, trace: ProfilerTrace) -> Path:
@@ -161,10 +351,28 @@ def save_cached_trace(key: ProfilerCacheKey, trace: ProfilerTrace) -> Path:
     root = _cache_root()
     root.mkdir(parents=True, exist_ok=True)
     path = _path_for(key)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("wb") as fh:
-        pickle.dump(trace, fh, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, path)
+    data = _trace_to_dict(trace)
+    # Per-rank unique temp via mkstemp(dir=path.parent) so two ranks racing
+    # on the same key can't clobber each other's in-flight writes; os.replace
+    # then promotes whichever finished last to the final filename atomically.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f"{path.stem}.",
+        suffix=".tmp",
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            # Compact separators keep the file size close to the pickle
+            # output; trace files are O(MB) on real models so the savings
+            # over the default ", " / ": " are non-trivial.
+            json.dump(data, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    finally:
+        # Cleanup is a no-op on the success path (replace already moved tmp);
+        # on failure it removes the partial JSON. ``missing_ok=True``
+        # covers both cases.
+        tmp.unlink(missing_ok=True)
     LOG.debug("saved profiler trace to %s", path)
     return path
 

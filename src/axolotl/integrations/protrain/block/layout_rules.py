@@ -393,6 +393,32 @@ def discover_blocks(model: nn.Module) -> list[BlockTree]:
     for path, mlist in _iter_module_lists_with_path(model):
         if len(mlist) == 0:
             continue
+        # Reject ModuleLists nested inside a block-shaped ancestor that is
+        # itself an indexed ModuleList entry (e.g. ``T5Block``'s inner
+        # ``.layer`` ModuleList, where the ancestor at ``encoder.block.0``
+        # is the block instance). Without this guard the T5Block's inner
+        # list of T5LayerSelfAttention / T5LayerCrossAttention / T5LayerFF
+        # — all of which can superficially satisfy ``_looks_like_block`` —
+        # would be picked up as the block sequence. Restricting the reject
+        # to ancestors whose final path segment is numeric leaves
+        # non-indexed wrappers (e.g. ``bert.encoder`` is a ``BertEncoder``
+        # that itself looks block-shaped but is the right intermediate)
+        # untouched.
+        skip = False
+        ancestor_path = path
+        while "." in ancestor_path:
+            ancestor_path, _, _ = ancestor_path.rpartition(".")
+            ancestor = _resolve(model, ancestor_path)
+            ancestor_leaf = ancestor_path.rsplit(".", 1)[-1]
+            if (
+                isinstance(ancestor, nn.Module)
+                and ancestor_leaf.isdigit()
+                and _looks_like_block(ancestor)
+            ):
+                skip = True
+                break
+        if skip:
+            continue
         if all(_looks_like_block(child) for child in mlist):
             LOG.debug(
                 "discover_blocks: matched ModuleList via attention heuristic "

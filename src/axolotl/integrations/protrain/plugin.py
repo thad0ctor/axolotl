@@ -279,11 +279,17 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
     hw = getattr(wrapped, "_hardware_profile", None)
     capacity = getattr(wrapped, "_capacity_bytes", None)
     cache_key = getattr(wrapped, "_cache_key", None)
-    if trace is None or layout is None or hw is None or capacity is None:
+    if (
+        trace is None
+        or layout is None
+        or hw is None
+        or capacity is None
+        or cache_key is None
+    ):
         LOG.warning(
             "ProTrain: NCCL re-measurement skipped — wrapped model is "
             "missing one of {_trace,_layout,_hardware_profile,"
-            "_capacity_bytes}. Cost-model NCCL terms will fall back to "
+            "_capacity_bytes,_cache_key}. Cost-model NCCL terms will fall back to "
             "the empty-table path."
         )
         return (False, False)

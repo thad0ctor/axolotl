@@ -50,12 +50,11 @@ from __future__ import annotations
 import json
 import os
 import statistics
-import subprocess
+import subprocess  # nosec B404
 import sys
 import textwrap
 import time
 from pathlib import Path
-
 
 # The multi-rank worker script is a heredoc string so this file is
 # self-contained and has no sibling module dependency. Environment
@@ -379,7 +378,7 @@ def _launch_mode(
     script_path.write_text(_WORKER_SCRIPT)
     log_path = work_dir / f"worker_{mode}.log"
     with log_path.open("w") as log_f:
-        proc = subprocess.run(
+        proc = subprocess.run(  # nosec B603
             [sys.executable, str(script_path)],
             env=env,
             stdout=log_f,
@@ -534,6 +533,7 @@ def main() -> int:
 
     # Persist JSON (ordered + with wall clock).
     summary_order = ["single", "ddp", "replicated", "zero3"]
+    summaries: list[dict] = [results[m] for m in summary_order if m in results]
     payload = {
         "workload": {
             "model": "Llama-3B (fresh-init, LoRA r=8)",
@@ -545,13 +545,13 @@ def main() -> int:
             "gpus": "1,4,5,7 (RTX 3090)",
         },
         "wall_clock_s": wall_s,
-        "summaries": [results[m] for m in summary_order if m in results],
+        "summaries": summaries,
     }
     out_json = root / "multi_gpu_benchmark_results.json"
     with out_json.open("w") as f:
         json.dump(payload, f, indent=2)
 
-    md = _render_markdown(payload["summaries"])
+    md = _render_markdown(summaries)
     print("\n" + "=" * 72)
     print("ProTrain multi-GPU benchmark — 4x RTX 3090 (GPUs 1,4,5,7)")
     print("=" * 72)
