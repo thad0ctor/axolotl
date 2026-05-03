@@ -68,9 +68,7 @@ def _min_n_buffer_for_layout(layout: "ChunkLayout", n_persist: int) -> int:
         return 0
     need = 0
     for i, bid in enumerate(block_ids):
-        cur_np = [
-            c for c in layout.block_to_chunks.get(bid, ()) if c not in persistent
-        ]
+        cur_np = [c for c in layout.block_to_chunks.get(bid, ()) if c not in persistent]
         nxt_np: list[ChunkId] = []
         if i + 1 < len(block_ids):
             nxt_np = [
@@ -193,8 +191,7 @@ def measure_chunked_steady(
 
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "Phase-2 measurement requires CUDA; got "
-            "torch.cuda.is_available() == False"
+            "Phase-2 measurement requires CUDA; got torch.cuda.is_available() == False"
         )
 
     model.train()
@@ -259,9 +256,7 @@ def measure_chunked_steady(
     return fwd_median, bwd_median, step_median, peak_bytes
 
 
-def estimate_per_block_recompute_s(
-    trace: "ProfilerTrace", n_block: int
-) -> float:
+def estimate_per_block_recompute_s(trace: "ProfilerTrace", n_block: int) -> float:
     """Mean per-block forward compute time (≡ recompute under CKPT).
 
     Uses :func:`cost.runtime._fwd_compute_time_from_trace` to derive
@@ -281,9 +276,7 @@ def estimate_per_block_recompute_s(
 
     if n_block <= 0:
         return 0.0
-    t_fwd_total, per_block_compute, _used_measured = (
-        _fwd_compute_time_from_trace(trace)
-    )
+    t_fwd_total, per_block_compute, _used_measured = _fwd_compute_time_from_trace(trace)
     if per_block_compute:
         # Mean of measured per-block times — this is what the cost
         # model adds per CKPT block via ``per_block_compute.get(bid)``.

@@ -211,9 +211,7 @@ def _make_pack_unpack(
         # reading ``t``.
         _swap_stream_wait_compute(swap_stream)
         with torch.cuda.stream(swap_stream):
-            slot_target = (
-                slot_view[:nbytes].view(t.dtype).reshape(t.shape)
-            )
+            slot_target = slot_view[:nbytes].view(t.dtype).reshape(t.shape)
             slot_target.copy_(t.detach(), non_blocking=True)
             # Tell the allocator: this storage is in use by swap_stream
             # too, so don't reuse it until swap_stream catches up.
@@ -244,16 +242,12 @@ def _make_pack_unpack(
         # ``record_stream`` keeps the slot alive across streams; the
         # compute stream waits on the H2D event before any kernel reads
         # ``gpu_buf``.
-        gpu_buf = torch.empty(
-            handle.shape, dtype=handle.dtype, device=handle.device
-        )
+        gpu_buf = torch.empty(handle.shape, dtype=handle.dtype, device=handle.device)
         _swap_stream_wait_compute(handle.swap_stream)
         with torch.cuda.stream(handle.swap_stream):
             slot_view = handle.pool._pinned.buffer(handle.slot_id)  # noqa: SLF001
             slot_src = (
-                slot_view[: handle.nbytes]
-                .view(handle.dtype)
-                .reshape(handle.shape)
+                slot_view[: handle.nbytes].view(handle.dtype).reshape(handle.shape)
             )
             gpu_buf.copy_(slot_src, non_blocking=True)
             gpu_buf.record_stream(handle.swap_stream)

@@ -23,6 +23,7 @@ import pytest
 
 from axolotl.integrations.protrain.api.model_wrapper import _select_mode
 from axolotl.integrations.protrain.types import (
+    BlockId,
     BlockMode,
     BlockStrategyMap,
     ChunkLayout,
@@ -63,10 +64,7 @@ def _mk_search(*, n_persist: int, n_block: int = 4) -> SearchResult:
         n_swap=0,
         n_checkpoint=0,
     )
-    block_map: BlockStrategyMap = {
-        # BlockId is a NewType(int); plain ints work for the dict shape.
-        i: BlockMode.NONE for i in range(n_block)  # type: ignore[misc]
-    }
+    block_map: BlockStrategyMap = {BlockId(i): BlockMode.NONE for i in range(n_block)}
     return SearchResult(
         cfg=cfg,
         block_map=block_map,

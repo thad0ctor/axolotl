@@ -34,7 +34,12 @@ RTX 3090 reachable via ``CUDA_VISIBLE_DEVICES``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 import pytest
+
+if TYPE_CHECKING:
+    from axolotl.integrations.protrain.chunk import ChunkManager
 
 
 def _mark(stage: str) -> None:
@@ -87,9 +92,7 @@ def test_protrain_7b_end_to_end() -> None:
 
     _mark("constructing fresh-init Llama-7B on CPU")
     model = LlamaForCausalLM(cfg).half().to("cuda")
-    _mark(
-        f"base model on GPU: {torch.cuda.memory_allocated()/1e9:.2f} GB allocated"
-    )
+    _mark(f"base model on GPU: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated")
 
     _mark("applying LoRA adapters (r=8 on q/k/v/o_proj)")
     lora_cfg = LoraConfig(
@@ -104,8 +107,8 @@ def test_protrain_7b_end_to_end() -> None:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     _mark(
-        f"LoRA applied: trainable={trainable/1e6:.2f}M total={total/1e9:.2f}B "
-        f"gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
+        f"LoRA applied: trainable={trainable / 1e6:.2f}M total={total / 1e9:.2f}B "
+        f"gpu_alloc={torch.cuda.memory_allocated() / 1e9:.2f} GB"
     )
 
     # ---- Small synthetic batch ----------------------------------------
@@ -144,13 +147,16 @@ def test_protrain_7b_end_to_end() -> None:
         hardware_profile=hw,
         batch_size=bs,
         seq_len=seq,
-        capacity_bytes=20 * (1 << 30),  # 3.5 GiB headroom: 24 GB card gives only ~23.55 GB usable, minus PyTorch allocator reserve
+        capacity_bytes=20
+        * (
+            1 << 30
+        ),  # 3.5 GiB headroom: 24 GB card gives only ~23.55 GB usable, minus PyTorch allocator reserve
     )
     _mark(
         f"wrapper done: cfg={wrapped.search_result.cfg} "
-        f"peak_pred={wrapped.search_result.predicted_peak_bytes/1e9:.2f} GB "
+        f"peak_pred={wrapped.search_result.predicted_peak_bytes / 1e9:.2f} GB "
         f"iter_pred={wrapped.search_result.predicted_iter_s:.3f} s "
-        f"gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
+        f"gpu_alloc={torch.cuda.memory_allocated() / 1e9:.2f} GB"
     )
 
     # Calibration premise check: this test asserts <10% runtime
@@ -181,9 +187,7 @@ def test_protrain_7b_end_to_end() -> None:
         )
 
     optim = protrain_optimizer_wrapper(wrapped, lr=1e-4)
-    _mark(
-        f"optimizer built; gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
-    )
+    _mark(f"optimizer built; gpu_alloc={torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
     # ---- Measure N_ITERS training iterations ---------------------------
     # The first one or two iterations eat JIT / kernel-compile / allocator
@@ -212,7 +216,7 @@ def test_protrain_7b_end_to_end() -> None:
             raise
         _mark(
             f"iter {i} forward done: loss={float(out.loss):.4f} "
-            f"gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
+            f"gpu_alloc={torch.cuda.memory_allocated() / 1e9:.2f} GB"
         )
         loss = out.loss
         try:
@@ -221,7 +225,7 @@ def test_protrain_7b_end_to_end() -> None:
             _mark(f"iter {i} backward FAILED: {type(e).__name__}: {e!s:.400}")
             raise
         _mark(
-            f"iter {i} backward done: gpu_alloc={torch.cuda.memory_allocated()/1e9:.2f} GB"
+            f"iter {i} backward done: gpu_alloc={torch.cuda.memory_allocated() / 1e9:.2f} GB"
         )
         optim.step()
         optim.zero_grad()
@@ -245,14 +249,14 @@ def test_protrain_7b_end_to_end() -> None:
     # ---- Report --------------------------------------------------------
     print(
         "\nProTrain 7B integration:\n"
-        f"  predicted peak: {predicted_peak/1e9:.2f} GB  "
-        f"actual: {actual_peak/1e9:.2f} GB\n"
+        f"  predicted peak: {predicted_peak / 1e9:.2f} GB  "
+        f"actual: {actual_peak / 1e9:.2f} GB\n"
         f"  predicted iter: {predicted_iter_s:.2f} s    "
         f"actual (median iters 2-3): {actual_iter_s:.3f} s\n"
         f"  all iter times (s): {[round(t, 3) for t in iter_s_all]}\n"
         f"  chosen config: {wrapped.search_result.cfg}\n"
-        f"  S_chunk={wrapped.chunk_manager.layout.S_chunk} "
-        f"N_chunk={wrapped.chunk_manager.layout.N_chunk}"
+        f"  S_chunk={cast('ChunkManager', wrapped.chunk_manager).layout.S_chunk} "
+        f"N_chunk={cast('ChunkManager', wrapped.chunk_manager).layout.N_chunk}"
     )
 
     peak_err = abs(predicted_peak - actual_peak) / max(1, actual_peak)
@@ -262,14 +266,14 @@ def test_protrain_7b_end_to_end() -> None:
     # respected. A concurrent regression in predicted+actual both drifting over
     # capacity would pass the relative-error test silently — this catches it.
     assert actual_peak < 20 * (1 << 30), (
-        f"actual peak {actual_peak/1e9:.2f} GB exceeded 20 GiB capacity budget"
+        f"actual peak {actual_peak / 1e9:.2f} GB exceeded 20 GiB capacity budget"
     )
     # Peak under-predict invariant (strict): if the cost model under-predicts,
     # the searcher can pick a config that OOMs. Predicted must be within 5%
     # below actual.
     assert predicted_peak >= actual_peak * 0.95, (
-        f"peak UNDER-predict: predicted {predicted_peak/1e9:.2f} GB < actual "
-        f"{actual_peak/1e9:.2f} GB — cost model's α fragmentation factor too "
+        f"peak UNDER-predict: predicted {predicted_peak / 1e9:.2f} GB < actual "
+        f"{actual_peak / 1e9:.2f} GB — cost model's α fragmentation factor too "
         "low or memory op-walk missing a term"
     )
     # Peak over-predict tolerance (loosened): the cost model is designed
@@ -290,7 +294,7 @@ def test_protrain_7b_end_to_end() -> None:
     #
     # Peak stays strict at 10% — that is the OOM-safety invariant
     # (paper Eqs. 8-11 with ALPHA_FRAGMENTATION = 1.10).
-    assert peak_err < 0.10, f"peak prediction off by {peak_err*100:.1f}%"
+    assert peak_err < 0.10, f"peak prediction off by {peak_err * 100:.1f}%"
     # Runtime tolerance: 10% ceiling.
     #
     # Calibration history on this workload (TRACE_VERSION → measured error):
@@ -341,7 +345,7 @@ def test_protrain_7b_end_to_end() -> None:
     # Above 10% indicates a regression in phase-2 measurement, cache
     # invalidation, or the checkpoint replay gather path.
     assert runtime_err < 0.10, (
-        f"runtime prediction off by {runtime_err*100:.1f}% — TRACE_VERSION=15 "
+        f"runtime prediction off by {runtime_err * 100:.1f}% — TRACE_VERSION=15 "
         "phase-2 chunked runtime calibration. Above 10% indicates a regression. "
         f"iter_s_all={iter_s_all}"
     )

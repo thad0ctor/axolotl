@@ -7,8 +7,6 @@ on-disk cache.
 
 from __future__ import annotations
 
-from axolotl.integrations.protrain.types import ProfilerTrace
-
 from axolotl.integrations.protrain.profiler.batch_factory import (
     build_batch,
     detect_task_type,
@@ -26,6 +24,7 @@ from axolotl.integrations.protrain.profiler.hw_bench import (
     measure_pcie,
 )
 from axolotl.integrations.protrain.profiler.trace import run_trace
+from axolotl.integrations.protrain.types import ProfilerTrace
 
 
 def reconstruct_peak_bytes(trace: ProfilerTrace) -> int:

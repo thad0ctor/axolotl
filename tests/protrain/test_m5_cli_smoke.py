@@ -65,7 +65,6 @@ from pathlib import Path
 
 import pytest
 
-
 # Path to the PYTHONPATH src dir (this worktree's ``src/``). Used to
 # point the subprocess at the in-tree axolotl package rather than
 # whatever editable install the venv currently has registered.
@@ -169,9 +168,7 @@ def _parse_losses(stdout: str) -> list[float]:
     """
     losses: list[float] = []
     # Match either: 'loss': 2.357  OR  'loss': '2.357'  OR  "loss": ...
-    pat = re.compile(
-        r"['\"]loss['\"]\s*:\s*['\"]?([0-9.eE+-]+)['\"]?[,}]"
-    )
+    pat = re.compile(r"['\"]loss['\"]\s*:\s*['\"]?([0-9.eE+-]+)['\"]?[,}]")
     for line in stdout.splitlines():
         # Skip the final summary line (HF logs ``'train_loss': ...``
         # for the run-mean and ``'loss': ...`` for per-step; both
@@ -281,9 +278,7 @@ def test_m5_cli_axolotl_train_7b_lora(tmp_path: Path) -> None:
     # Resolve the axolotl CLI binary. The venv editable install points
     # at the wrong worktree's ``src/`` — relying on PYTHONPATH to
     # override is the documented pattern (memory: protrain_branch_state).
-    venv_axolotl = Path(
-        "/home/rgilbreth/Desktop/AI-Software/axolotl/.venv/bin/axolotl"
-    )
+    venv_axolotl = Path("/home/rgilbreth/Desktop/AI-Software/axolotl/.venv/bin/axolotl")
     if venv_axolotl.exists():
         cli = str(venv_axolotl)
     else:

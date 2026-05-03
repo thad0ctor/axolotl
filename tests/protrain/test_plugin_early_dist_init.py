@@ -21,7 +21,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -145,9 +144,8 @@ def test_early_init_invokes_init_process_group_when_multi_rank():
     cfg = _FakeCfg()  # ddp_backend unset
 
     with _multi_rank_env(world_size=4):
-        patches = (
-            _patch_dist_module(initialized=False, world_size=4)
-            + _patch_cuda(available=True)
+        patches = _patch_dist_module(initialized=False, world_size=4) + _patch_cuda(
+            available=True
         )
         mocks = _start_all(patches)
         init_pg_mock = mocks[3]
@@ -170,9 +168,8 @@ def test_early_init_idempotent_when_already_initialized():
     from axolotl.integrations.protrain.plugin import _early_init_dist_for_nccl
 
     with _multi_rank_env(world_size=2):
-        patches = (
-            _patch_dist_module(initialized=True, world_size=2)
-            + _patch_cuda(available=True)
+        patches = _patch_dist_module(initialized=True, world_size=2) + _patch_cuda(
+            available=True
         )
         mocks = _start_all(patches)
         init_pg_mock = mocks[3]
@@ -195,9 +192,8 @@ def test_early_init_skips_on_custom_ddp_backend():
     cfg = _FakeCfg(ddp_backend="gloo")
 
     with _multi_rank_env(world_size=4):
-        patches = (
-            _patch_dist_module(initialized=False, world_size=4)
-            + _patch_cuda(available=True)
+        patches = _patch_dist_module(initialized=False, world_size=4) + _patch_cuda(
+            available=True
         )
         mocks = _start_all(patches)
         init_pg_mock = mocks[3]
@@ -219,9 +215,8 @@ def test_early_init_accepts_explicit_nccl_backend():
     cfg = _FakeCfg(ddp_backend="nccl")
 
     with _multi_rank_env(world_size=2):
-        patches = (
-            _patch_dist_module(initialized=False, world_size=2)
-            + _patch_cuda(available=True)
+        patches = _patch_dist_module(initialized=False, world_size=2) + _patch_cuda(
+            available=True
         )
         mocks = _start_all(patches)
         init_pg_mock = mocks[3]
@@ -248,9 +243,8 @@ def test_early_init_skips_when_local_rank_unset():
         os.environ["WORLD_SIZE"] = "4"
         # Deliberately leave LOCAL_RANK / RANK / MASTER_* unset.
 
-        patches = (
-            _patch_dist_module(initialized=False, world_size=4)
-            + _patch_cuda(available=True)
+        patches = _patch_dist_module(initialized=False, world_size=4) + _patch_cuda(
+            available=True
         )
         mocks = _start_all(patches)
         init_pg_mock = mocks[3]
@@ -276,9 +270,8 @@ def test_early_init_skips_without_cuda():
     from axolotl.integrations.protrain.plugin import _early_init_dist_for_nccl
 
     with _multi_rank_env(world_size=2):
-        patches = (
-            _patch_dist_module(initialized=False, world_size=2)
-            + _patch_cuda(available=False)
+        patches = _patch_dist_module(initialized=False, world_size=2) + _patch_cuda(
+            available=False
         )
         mocks = _start_all(patches)
         init_pg_mock = mocks[3]
@@ -295,9 +288,9 @@ def test_early_init_swallows_init_failure():
     """If ``init_process_group`` raises, fall back gracefully without crashing."""
     pytest.importorskip("torch")
 
-    from axolotl.integrations.protrain.plugin import _early_init_dist_for_nccl
-
     import torch.distributed as dist
+
+    from axolotl.integrations.protrain.plugin import _early_init_dist_for_nccl
 
     with _multi_rank_env(world_size=2):
         patches = [
@@ -334,9 +327,7 @@ def test_post_model_load_calls_early_init_before_wrapper():
     import torch
 
     if not torch.cuda.is_available():
-        pytest.skip(
-            "post_model_load builds a HardwareProfile from a real CUDA device."
-        )
+        pytest.skip("post_model_load builds a HardwareProfile from a real CUDA device.")
 
     from axolotl.integrations.protrain import plugin as plugin_mod
 
@@ -356,9 +347,7 @@ def test_post_model_load_calls_early_init_before_wrapper():
 
         return SimpleNamespace(
             search_result=SimpleNamespace(
-                cfg=SimpleNamespace(
-                    n_persist=1, n_buffer=1, n_swap=0, n_checkpoint=0
-                ),
+                cfg=SimpleNamespace(n_persist=1, n_buffer=1, n_swap=0, n_checkpoint=0),
                 block_map={},
             ),
             chunk_manager=SimpleNamespace(
@@ -386,7 +375,9 @@ def test_post_model_load_calls_early_init_before_wrapper():
     fake_model = torch.nn.Linear(4, 4)
 
     patches = [
-        patch.object(plugin_mod, "_early_init_dist_for_nccl", side_effect=fake_early_init),
+        patch.object(
+            plugin_mod, "_early_init_dist_for_nccl", side_effect=fake_early_init
+        ),
         patch(
             "axolotl.integrations.protrain.api.protrain_model_wrapper",
             side_effect=fake_wrapper,
@@ -412,9 +403,7 @@ def test_post_model_load_idempotent_when_already_wrapped():
     import torch
 
     if not torch.cuda.is_available():
-        pytest.skip(
-            "post_model_load builds a HardwareProfile from a real CUDA device."
-        )
+        pytest.skip("post_model_load builds a HardwareProfile from a real CUDA device.")
 
     from axolotl.integrations.protrain import plugin as plugin_mod
 

@@ -106,9 +106,9 @@ def test_protrain_enc_dec_smoke_t5() -> None:
         f"T5 BlockTree forward_orders should be [0, 1]; got {forward_orders}"
     )
     flat_blocks = flatten_block_trees(trees)
-    assert (
-        len(flat_blocks) == len(model.encoder.block) + len(model.decoder.block)
-    ), "flatten_block_trees should concatenate encoder + decoder blocks"
+    assert len(flat_blocks) == len(model.encoder.block) + len(model.decoder.block), (
+        "flatten_block_trees should concatenate encoder + decoder blocks"
+    )
 
     from axolotl.integrations.protrain.api import (
         protrain_model_wrapper,
@@ -154,9 +154,7 @@ def test_protrain_enc_dec_smoke_t5() -> None:
             labels=labels,
         )
         loss_value = float(out.loss.detach())
-        assert math.isfinite(loss_value), (
-            f"iter {i}: non-finite loss {loss_value}"
-        )
+        assert math.isfinite(loss_value), f"iter {i}: non-finite loss {loss_value}"
         out.loss.backward()
         optim.step()
         optim.zero_grad()

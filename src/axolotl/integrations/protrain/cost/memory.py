@@ -172,9 +172,7 @@ def cross_attn_persist_bytes(
     """
     if not _has_multiple_trees(tree_index_map):
         return 0
-    encoder_bids = sorted(
-        bid for bid, idx in tree_index_map.items() if idx == 0
-    )
+    encoder_bids = sorted(bid for bid, idx in tree_index_map.items() if idx == 0)
     if not encoder_bids:
         return 0
     last_enc_bid = encoder_bids[-1]
@@ -447,9 +445,7 @@ def estimate_peak(
     n_block = len(trace.activation_sizes)
     forward_ops_by_block = _group_ops_by_block(trace)
     tree_index_map = block_tree_index_map(trace)
-    cross_attn_bytes = cross_attn_persist_bytes(
-        trace, block_map, tree_index_map
-    )
+    cross_attn_bytes = cross_attn_persist_bytes(trace, block_map, tree_index_map)
 
     # Resolve "first op index" for each CKPT block; used to schedule the
     # checkpoint recomputation bump. If the block has no ops (degenerate
@@ -496,9 +492,7 @@ def estimate_peak(
     # before this op. Blocks without a position in forward_ops_by_block
     # contribute no ordering, so we sort blocks by their first forward
     # op index.
-    block_first_op = {
-        bid: ops[0] for bid, ops in forward_ops_by_block.items() if ops
-    }
+    block_first_op = {bid: ops[0] for bid, ops in forward_ops_by_block.items() if ops}
     blocks_in_fwd_order = sorted(block_first_op.items(), key=lambda kv: kv[1])
 
     cumulative_none: list[tuple[int, int]] = []  # (first_op_idx, cumulative_bytes)
@@ -538,21 +532,12 @@ def estimate_peak(
         # this op's forward-equivalent workload.
         ckpt_extra = 0
         if i in ckpt_bump_op:
-            ckpt_extra = trace.activation_sizes.get(
-                BlockId(ckpt_bump_op[i]), 0
-            )
+            ckpt_extra = trace.activation_sizes.get(BlockId(ckpt_bump_op[i]), 0)
 
-        op_cross_attn = op_cross_attn_surcharge(
-            op, cross_attn_bytes, tree_index_map
-        )
+        op_cross_attn = op_cross_attn_surcharge(op, cross_attn_bytes, tree_index_map)
 
         candidate = (
-            model_state_present
-            + live_none
-            + ckpt_extra
-            + op_cross_attn
-            + intra
-            + inter
+            model_state_present + live_none + ckpt_extra + op_cross_attn + intra + inter
         )
         if candidate > raw_peak:
             raw_peak = candidate

@@ -25,6 +25,7 @@ from axolotl.integrations.protrain.search import derive_bounds, search
 from axolotl.integrations.protrain.types import (
     BlockId,
     BlockMode,
+    ChunkId,
     ChunkLayout,
     CostConfig,
     HardwareProfile,
@@ -35,7 +36,6 @@ from axolotl.integrations.protrain.types import (
     SearchResult,
 )
 
-
 # ---------------------------------------------------------------------------
 # Synthetic fixtures
 # ---------------------------------------------------------------------------
@@ -45,9 +45,7 @@ MB = 1 << 20
 GB = 1 << 30
 
 
-def _make_op_order(
-    n_block: int, ops_per_block: int
-) -> tuple[OpRecord, ...]:
+def _make_op_order(n_block: int, ops_per_block: int) -> tuple[OpRecord, ...]:
     """Build a forward op sequence with ``ops_per_block`` ops per block."""
     out: list[OpRecord] = []
     op_id = 0
@@ -73,13 +71,13 @@ def _make_trace(
     ops_per_block: int = 5,
     activation_bytes_per_block: int = 32 * MB,
     model_state_bytes: int = 768 * MB,
-    pcie_h2d_bps: float = 12e9,   # ~12 GB/s, 3090-like PCIe4 x16
+    pcie_h2d_bps: float = 12e9,  # ~12 GB/s, 3090-like PCIe4 x16
     pcie_d2h_bps: float = 12e9,
     intra_delta_bytes: int = 8 * MB,
     inter_delta_bytes: int = 2 * MB,
     world: int = 1,
-    op_latency_s: float = 0.0002,   # 200 µs per forward op; toy but >0
-    hook_scale_ratio: float = 1.0,   # steady/hooked forward wall ratio; 1.0 = no-op
+    op_latency_s: float = 0.0002,  # 200 µs per forward op; toy but >0
+    hook_scale_ratio: float = 1.0,  # steady/hooked forward wall ratio; 1.0 = no-op
 ) -> ProfilerTrace:
     op_order = _make_op_order(n_block, ops_per_block)
     intra_op_delta: dict[OpId, int] = {op.op_id: intra_delta_bytes for op in op_order}
@@ -126,10 +124,10 @@ def _make_layout(
     chunks: list[tuple[ParamId, ...]] = [
         (ParamId(f"param.{i}"),) for i in range(n_chunk)
     ]
-    param_to_chunk = {ParamId(f"param.{i}"): i for i in range(n_chunk)}
+    param_to_chunk = {ParamId(f"param.{i}"): ChunkId(i) for i in range(n_chunk)}
     # Distribute chunks across blocks roughly 1:1 then wrap.
     block_to_chunks: dict[BlockId, tuple] = {
-        BlockId(b): (b % n_chunk,) for b in range(n_block)
+        BlockId(b): (ChunkId(b % n_chunk),) for b in range(n_block)
     }
     return ChunkLayout(
         S_chunk=s_chunk,
@@ -210,7 +208,7 @@ def test_estimate_peak_monotonic_in_n_checkpoint(toy_trace, toy_layout, toy_hw):
     peaks = _peaks_for_ckpt_sweep(
         toy_trace, toy_layout, toy_hw, n_persist=2, n_buffer=2, n_swap=0
     )
-    for prev, nxt in zip(peaks, peaks[1:]):
+    for prev, nxt in zip(peaks, peaks[1:], strict=False):
         assert nxt <= prev, (
             f"peak should be non-increasing in n_checkpoint; got {peaks}"
         )
@@ -224,14 +222,12 @@ def test_estimate_peak_increases_with_n_persist_until_activations_dominate(
     # buffer contribution is constant.
     peaks = []
     for n_persist in range(0, toy_layout.N_chunk + 1):
-        cfg = CostConfig(
-            n_persist=n_persist, n_buffer=0, n_swap=0, n_checkpoint=0
-        )
+        cfg = CostConfig(n_persist=n_persist, n_buffer=0, n_swap=0, n_checkpoint=0)
         bm = assign_modes(0, 0, len(toy_trace.activation_sizes))
         peaks.append(estimate_peak(cfg, toy_trace, toy_layout, bm, toy_hw))
 
     # Must be strictly non-decreasing across the sweep.
-    for prev, nxt in zip(peaks, peaks[1:]):
+    for prev, nxt in zip(peaks, peaks[1:], strict=False):
         assert nxt >= prev
     # And the first-to-last jump should be at least S_chunk * N_chunk
     # worth of model-state bytes after alpha scaling.
@@ -280,37 +276,29 @@ def test_estimate_peak_uses_per_block_caps(toy_layout, toy_hw):
     )
 
     # All-NONE config: ckpt_recomp_bump = 0, cap = per_block_peak.
-    cfg_all_none = CostConfig(
-        n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0
-    )
+    cfg_all_none = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
     bm_all_none = assign_modes(0, 0, n_block)
-    peak_all_none = estimate_peak(
-        cfg_all_none, trace, toy_layout, bm_all_none, toy_hw
-    )
+    peak_all_none = estimate_peak(cfg_all_none, trace, toy_layout, bm_all_none, toy_hw)
     # Scaled cap = ALPHA_FRAGMENTATION * per_block_peak; op-walk would
     # otherwise be > 1 GB * alpha. The cap should pin peak near the
     # scaled per_block_peak value.
     assert peak_all_none <= int(ALPHA_FRAGMENTATION * per_block_peak) + 1, (
-        f"all-NONE peak {peak_all_none/1e6:.1f}MB should be capped at "
+        f"all-NONE peak {peak_all_none / 1e6:.1f}MB should be capped at "
         f"~{ALPHA_FRAGMENTATION * per_block_peak / 1e6:.1f}MB"
     )
 
     # Fractional-NONE config: 3 blocks CKPT. ckpt_recomp_bump =
     # max activation across CKPT blocks = activation_bytes_per_block.
-    cfg_mixed = CostConfig(
-        n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=3
-    )
+    cfg_mixed = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=3)
     bm_mixed = assign_modes(0, 3, n_block)
-    peak_mixed = estimate_peak(
-        cfg_mixed, trace, toy_layout, bm_mixed, toy_hw
-    )
+    peak_mixed = estimate_peak(cfg_mixed, trace, toy_layout, bm_mixed, toy_hw)
     expected_cap = int(
         ALPHA_FRAGMENTATION * (per_block_peak + activation_bytes_per_block)
     )
     # 1% slack for ALPHA_FRAGMENTATION * int() rounding.
     assert peak_mixed <= expected_cap + 1, (
-        f"mixed-CKPT peak {peak_mixed/1e6:.1f}MB should be capped at "
-        f"~{expected_cap/1e6:.1f}MB (forward_max_block + max_ckpt_activation)"
+        f"mixed-CKPT peak {peak_mixed / 1e6:.1f}MB should be capped at "
+        f"~{expected_cap / 1e6:.1f}MB (forward_max_block + max_ckpt_activation)"
     )
     # Without per-block cap the op-walk raw_peak would dwarf this
     # (intra_delta=1GB per op). Sanity check: the capped value is well
@@ -341,9 +329,7 @@ def test_estimate_peak_per_block_cap_respects_under_predict_floor(toy_layout, to
 
     trace = replace(
         trace,
-        steady_fwd_block_peak_bytes={
-            BlockId(b): 10 * GB for b in range(n_block)
-        },
+        steady_fwd_block_peak_bytes={BlockId(b): 10 * GB for b in range(n_block)},
     )
     cfg = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
     bm = assign_modes(0, 0, n_block)
@@ -351,7 +337,7 @@ def test_estimate_peak_per_block_cap_respects_under_predict_floor(toy_layout, to
     # The per-block cap is 10 GB+; the op-walk gives a much smaller
     # peak (<< 1 GB). The cap must NOT raise raw_peak — only lower it.
     assert peak < int(ALPHA_FRAGMENTATION * 1 * GB), (
-        f"peak {peak/1e9:.3f}GB should track the tight op-walk, not the "
+        f"peak {peak / 1e9:.3f}GB should track the tight op-walk, not the "
         "10 GB per-block measurement"
     )
 
@@ -515,9 +501,7 @@ def test_estimate_peak_enc_dec_walks_two_trees(toy_layout, toy_hw):
 
     cfg = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
     bm_all_none = assign_modes(0, 0, n_block)
-    peak_encdec_none = estimate_peak(
-        cfg, encdec_trace, toy_layout, bm_all_none, toy_hw
-    )
+    peak_encdec_none = estimate_peak(cfg, encdec_trace, toy_layout, bm_all_none, toy_hw)
 
     # CKPT the encoder's last block. Without the Fix-3 cross-attn
     # term, peak would drop by ``activation_sizes[3]`` (32 MB *
@@ -556,9 +540,7 @@ def test_estimate_peak_enc_dec_walks_two_trees(toy_layout, toy_hw):
         inter_delta_bytes=1 * MB,
     )
     bm_enc_only = assign_modes(0, 0, 4)
-    cfg_enc_only = CostConfig(
-        n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0
-    )
+    cfg_enc_only = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
     peak_enc_only = estimate_peak(
         cfg_enc_only, enc_only_trace, toy_layout, bm_enc_only, toy_hw
     )
@@ -625,12 +607,8 @@ def test_estimate_peak_cross_attn_term_scales_with_seq_hidden(toy_layout, toy_hw
     # cross-attn surcharge plus the live_none restoration.
     bm_no_xattn = bm.copy()
     bm_no_xattn[BlockId(3)] = BlockMode.NONE
-    peak_base_no_xattn = estimate_peak(
-        cfg, base, toy_layout, bm_no_xattn, toy_hw
-    )
-    peak_larger_no_xattn = estimate_peak(
-        cfg, larger, toy_layout, bm_no_xattn, toy_hw
-    )
+    peak_base_no_xattn = estimate_peak(cfg, base, toy_layout, bm_no_xattn, toy_hw)
+    peak_larger_no_xattn = estimate_peak(cfg, larger, toy_layout, bm_no_xattn, toy_hw)
     # Sanity: the cross-attn term itself isn't zero in the CKPT case
     # but IS in the NONE case. Both peaks are positive.
     assert peak_base_no_xattn > 0
@@ -658,9 +636,7 @@ def test_estimate_cpu_footprint_scales_with_world_size():
     n_chunk = 12
     s_chunk = 128 * MB
     n_persist = 4
-    cfg = CostConfig(
-        n_persist=n_persist, n_buffer=2, n_swap=0, n_checkpoint=0
-    )
+    cfg = CostConfig(n_persist=n_persist, n_buffer=2, n_swap=0, n_checkpoint=0)
     layout = _make_layout(n_chunk=n_chunk, s_chunk=s_chunk, n_block=8)
 
     expected_total = (n_chunk - n_persist) * s_chunk  # 1 GB
@@ -725,12 +701,8 @@ def test_estimate_runtime_ckpt_adds_recompute(toy_trace, toy_layout, toy_hw):
     # bump shows up directly in T_bwd.
     n_block = len(toy_trace.activation_sizes)
     n_chunk = toy_layout.N_chunk
-    cfg_zero = CostConfig(
-        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
-    cfg_ckpt = CostConfig(
-        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=4
-    )
+    cfg_zero = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
+    cfg_ckpt = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=4)
 
     bm_zero = assign_modes(0, 0, n_block)
     bm_ckpt = assign_modes(0, 4, n_block)
@@ -739,8 +711,7 @@ def test_estimate_runtime_ckpt_adds_recompute(toy_trace, toy_layout, toy_hw):
     t_ckpt = estimate_runtime(cfg_ckpt, toy_trace, toy_layout, bm_ckpt, toy_hw)
 
     assert t_ckpt > t_zero, (
-        f"CKPT must add recomputation time: t_zero={t_zero:.6f} "
-        f"t_ckpt={t_ckpt:.6f}"
+        f"CKPT must add recomputation time: t_zero={t_zero:.6f} t_ckpt={t_ckpt:.6f}"
     )
 
 
@@ -933,13 +904,10 @@ def test_fwd_compute_time_uses_phase2_chunked_fwd_when_present():
     # With chunked fwd populated — total = chunked wall.
     chunked_fwd = 0.30
     trace_with = replace(base_trace, steady_fwd_chunked_wall_s=chunked_fwd)
-    total_with, per_block_with, used_with = _fwd_compute_time_from_trace(
-        trace_with
-    )
+    total_with, per_block_with, used_with = _fwd_compute_time_from_trace(trace_with)
     assert used_with is True
     assert total_with == pytest.approx(chunked_fwd, abs=1e-9), (
-        f"phase-2 fwd path should return chunked wall {chunked_fwd}, "
-        f"got {total_with}"
+        f"phase-2 fwd path should return chunked wall {chunked_fwd}, got {total_with}"
     )
     # Per-block stays at per-op-derived shape — does NOT rescale.
     for bid in per_block_no:
@@ -995,9 +963,7 @@ def test_estimate_runtime_uses_phase2_chunked_fwd_measurement():
     # chunked_fwd - per_op_sum ≈ 0.192s (forward is the only
     # phase-2-affected term in this all-NONE config).
     trace_no_fwd = replace(trace, steady_fwd_chunked_wall_s=0.0)
-    t_without = estimate_runtime(
-        cfg_high_persist, trace_no_fwd, layout, bm, hw
-    )
+    t_without = estimate_runtime(cfg_high_persist, trace_no_fwd, layout, bm, hw)
     delta = t_with - t_without
     expected_delta = 0.20 - 8 * 5 * 0.0002  # ~0.192
     assert delta == pytest.approx(expected_delta, abs=1e-3), (
@@ -1035,9 +1001,7 @@ def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
     n_chunk = layout.N_chunk
 
     # All-persistent so CPU-Adam doesn't mask backward changes.
-    cfg_zero = CostConfig(
-        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
+    cfg_zero = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
     cfg_full_ckpt = CostConfig(
         n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=n_block
     )
@@ -1106,12 +1070,8 @@ def test_estimate_runtime_phase2_bwd_credits_n_buffer_cache_hits():
     n_chunk = layout.N_chunk
     bm_none = assign_modes(0, 0, n_block)
 
-    cfg_uncached = CostConfig(
-        n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
-    cfg_cached = CostConfig(
-        n_persist=0, n_buffer=n_chunk, n_swap=0, n_checkpoint=0
-    )
+    cfg_uncached = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
+    cfg_cached = CostConfig(n_persist=0, n_buffer=n_chunk, n_swap=0, n_checkpoint=0)
 
     t_uncached = estimate_runtime(cfg_uncached, trace, layout, bm_none, hw)
     t_cached = estimate_runtime(cfg_cached, trace, layout, bm_none, hw)
@@ -1131,17 +1091,13 @@ def test_estimate_runtime_phase2_bwd_credits_n_buffer_cache_hits():
     assert t_uncached - t_cached == pytest.approx(expected_delta, abs=1e-9)
 
     # CKPT recompute composes additively with the buffer-cache correction.
-    cfg_ckpt = CostConfig(
-        n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_block
-    )
+    cfg_ckpt = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_block)
     bm_ckpt = assign_modes(0, n_block, n_block)
     t_ckpt = estimate_runtime(cfg_ckpt, trace, layout, bm_ckpt, hw)
     assert t_ckpt - t_uncached == pytest.approx(per_op_sum, abs=1e-9)
 
 
-def test_phase2_bootstrap_uses_low_persistence_all_ckpt(
-    toy_trace, toy_layout, toy_hw
-):
+def test_phase2_bootstrap_uses_low_persistence_all_ckpt(toy_trace, toy_layout, toy_hw):
     """Phase-2 should measure the low-persistence offload family."""
     from axolotl.integrations.protrain.profiler.phase2 import (
         select_bootstrap_config,
@@ -1214,7 +1170,9 @@ def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
     )
 
 
-def test_estimate_runtime_sku_scale_identity_when_unmeasured(toy_trace, toy_layout, toy_hw):
+def test_estimate_runtime_sku_scale_identity_when_unmeasured(
+    toy_trace, toy_layout, toy_hw
+):
     """0.0 on either side of the SKU ratio falls back to identity scale."""
     from dataclasses import replace
 
@@ -1393,9 +1351,7 @@ def test_search_cpu_capacity_filter_excludes_high_offload_configs(
     capacity = 600 * MB
     # Sanity: unfiltered pick has non-zero CPU footprint on this fixture.
     baseline = search(toy_trace, toy_layout, capacity, toy_hw)
-    baseline_cpu = (
-        toy_layout.N_chunk - baseline.cfg.n_persist
-    ) * toy_layout.S_chunk
+    baseline_cpu = (toy_layout.N_chunk - baseline.cfg.n_persist) * toy_layout.S_chunk
     assert baseline_cpu > 0, (
         f"fixture sanity: baseline must offload >0B to CPU for the "
         f"filter to have anything to reject; got cfg={baseline.cfg}"
@@ -1468,7 +1424,6 @@ def test_search_raises_cpu_pressure_specific_message_when_no_cfg_fits_both(
     CPU envelope, the failure message must explicitly cite the host RAM
     budget so the user knows to scale up RAM, not GPU memory.
     """
-    capacity = 12 * GB  # roomy GPU — many configs clear the GPU gate
     # Tight CPU budget: 0 bytes means only the all-persistent
     # (n_persist=N_chunk → 0 non-persistent chunks on CPU) cfg could
     # fit. But the toy layout's min_n_buffer_for at n_persist=N_chunk
@@ -1610,9 +1565,7 @@ def test_search_picks_high_n_buffer_for_llama_3b_mode_c_4gpu_inputs():
     inter_op_delta = {op.op_id: 1 * MB for op in op_order}
     chunks = tuple((ParamId(f"param.{i}"),) for i in range(n_chunk))
     param_to_chunk = {ParamId(f"param.{i}"): i for i in range(n_chunk)}
-    block_to_chunks = {
-        BlockId(b): (min(b, n_chunk - 1),) for b in range(n_block)
-    }
+    block_to_chunks = {BlockId(b): (min(b, n_chunk - 1),) for b in range(n_block)}
     layout = ChunkLayout(
         S_chunk=s_chunk,
         N_chunk=n_chunk,

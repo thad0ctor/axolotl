@@ -25,7 +25,11 @@ def _nvidia_smi_gpu_count() -> int:
             stderr=subprocess.DEVNULL,
             timeout=10,
         ).decode("utf-8", errors="replace")
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         return 0
     return sum(1 for line in out.splitlines() if line.strip())
 
@@ -103,8 +107,8 @@ def test_benchmark_multi_gpu_runs(tmp_path) -> None:
     rep_cpu = summaries["replicated"]["cpu_pinned_bytes_max"]
     assert rep_cpu > 0, "replicated mode reported zero CPU bytes — mode did not engage"
     assert z3_cpu <= 0.4 * rep_cpu, (
-        f"ZeRO-3 CPU footprint {z3_cpu/1e9:.3f} GB not <= 0.4 x replicated "
-        f"{rep_cpu/1e9:.3f} GB (sharding may not have engaged)"
+        f"ZeRO-3 CPU footprint {z3_cpu / 1e9:.3f} GB not <= 0.4 x replicated "
+        f"{rep_cpu / 1e9:.3f} GB (sharding may not have engaged)"
     )
 
     # (3) DDP scaling invariant (M6 threshold): DDP throughput > 2.5x
@@ -130,9 +134,7 @@ def test_benchmark_multi_gpu_runs(tmp_path) -> None:
 # thresholds before the change is shipped.
 
 _BENCH_JSON_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "scripts"
-    / "multi_gpu_benchmark_results.json"
+    Path(__file__).resolve().parents[2] / "scripts" / "multi_gpu_benchmark_results.json"
 )
 
 # The recorded thresholds below were calibrated on the canonical 4x RTX 3090
@@ -226,11 +228,8 @@ def test_recorded_pinned_cpu_drops_with_sharding() -> None:
     rep_pinned = summaries["replicated"]["cpu_pinned_bytes_max"]
     z3_pinned = summaries["zero3"]["cpu_pinned_bytes_max"]
     if z3_pinned == 0:
-        pytest.fail(
-            "zero3 pinned-CPU dropped to 0 — sharded chunks not allocated"
-        )
+        pytest.fail("zero3 pinned-CPU dropped to 0 — sharded chunks not allocated")
     ratio = rep_pinned / z3_pinned
     assert ratio >= 3.0, (
-        f"replicated/sharded pinned-CPU ratio regressed: {ratio:.2f}x "
-        f"vs >=3.0x target."
+        f"replicated/sharded pinned-CPU ratio regressed: {ratio:.2f}x vs >=3.0x target."
     )

@@ -130,7 +130,11 @@ def _nvidia_smi_gpu_count() -> int:
             stderr=subprocess.DEVNULL,
             timeout=10,
         ).decode("utf-8", errors="replace")
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         return 0
     return sum(1 for line in out.splitlines() if line.strip())
 
@@ -754,7 +758,8 @@ def test_modec_vs_deepspeed_stage3_4gpu(tmp_path) -> None:
         f"expected={_N_STEPS}"
     )
     import math
-    for i, (a, b) in enumerate(zip(pt_losses, ds_losses)):
+
+    for i, (a, b) in enumerate(zip(pt_losses, ds_losses, strict=True)):
         assert math.isfinite(a), f"protrain iter {i} loss not finite: {a}"
         assert math.isfinite(b), f"deepspeed iter {i} loss not finite: {b}"
 
@@ -764,7 +769,7 @@ def test_modec_vs_deepspeed_stage3_4gpu(tmp_path) -> None:
     # CPU-offloaded master weights moves the convergence rate without
     # implying a correctness bug — see module docstring).
     iter0_rel_diff = abs(pt_losses[0] - ds_losses[0]) / max(abs(ds_losses[0]), 1e-9)
-    abs_devs = [abs(a - b) for a, b in zip(pt_losses, ds_losses)]
+    abs_devs = [abs(a - b) for a, b in zip(pt_losses, ds_losses, strict=True)]
     median_loss = sorted(ds_losses)[len(ds_losses) // 2]
     mad = sum(abs_devs) / len(abs_devs)
     rel_mad = mad / max(abs(median_loss), 1e-9)
@@ -795,12 +800,12 @@ def test_modec_vs_deepspeed_stage3_4gpu(tmp_path) -> None:
         f"({'descended' if pt_descended else 'NOT descended'})\n"
         f"      deepspeed first/last: {ds_losses[0]:.4f} / {ds_losses[-1]:.4f} "
         f"({'descended' if ds_descended else 'NOT descended'})\n"
-        f"      iter-0 rel-diff:      {iter0_rel_diff*100:.2f}%   (threshold 5%)\n"
-        f"      mean-abs-dev (info):  {mad:.4f}  rel-MAD: {rel_mad*100:.2f}%\n"
+        f"      iter-0 rel-diff:      {iter0_rel_diff * 100:.2f}%   (threshold 5%)\n"
+        f"      mean-abs-dev (info):  {mad:.4f}  rel-MAD: {rel_mad * 100:.2f}%\n"
         f"\n"
         f"  [2] PEAK GPU MEMORY (max across ranks):\n"
-        f"      protrain mode-c:      {pt_peak/1e9:.3f} GB\n"
-        f"      deepspeed stage3:     {ds_peak/1e9:.3f} GB\n"
+        f"      protrain mode-c:      {pt_peak / 1e9:.3f} GB\n"
+        f"      deepspeed stage3:     {ds_peak / 1e9:.3f} GB\n"
         f"      ratio (pt/ds):        {mem_ratio:.3f}x  (threshold <= 1.50x)\n"
         f"\n"
         f"  [3] THROUGHPUT (samples/s aggregated across {world_size} ranks):\n"
@@ -818,7 +823,7 @@ def test_modec_vs_deepspeed_stage3_4gpu(tmp_path) -> None:
     assert iter0_rel_diff < 0.05, (
         f"iter-0 losses diverge between ProTrain Mode-C "
         f"({pt_losses[0]:.4f}) and DeepSpeed Stage 3 "
-        f"({ds_losses[0]:.4f}): relative diff {iter0_rel_diff*100:.2f}% "
+        f"({ds_losses[0]:.4f}): relative diff {iter0_rel_diff * 100:.2f}% "
         f"exceeds 5%. With identical seed + init, iter-0 loss should "
         f"agree modulo dtype precision — a larger gap means the two "
         f"systems are not running the same model."
@@ -841,8 +846,8 @@ def test_modec_vs_deepspeed_stage3_4gpu(tmp_path) -> None:
     # silently fell back to replicated); within 1.5x is the documented
     # workload-dependent overhead.
     assert mem_ratio <= 1.50, (
-        f"ProTrain Mode-C peak GPU memory {pt_peak/1e9:.3f} GB exceeds "
-        f"1.50x DeepSpeed Stage 3 peak {ds_peak/1e9:.3f} GB "
+        f"ProTrain Mode-C peak GPU memory {pt_peak / 1e9:.3f} GB exceeds "
+        f"1.50x DeepSpeed Stage 3 peak {ds_peak / 1e9:.3f} GB "
         f"(ratio={mem_ratio:.3f}x). At >=1.5x the gap is large enough "
         f"to suspect a regression in the chunk-buffer layout or a "
         f"silent sharded->replicated fall-back; investigate per-rank "

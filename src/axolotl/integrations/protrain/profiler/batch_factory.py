@@ -217,9 +217,7 @@ def seq_classification_batch_factory(
         device=device,
         dtype=torch.long,
     )
-    attention_mask = torch.ones(
-        (batch_size, seq_len), device=device, dtype=torch.long
-    )
+    attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
     labels = torch.randint(
         low=0,
         high=max(num_labels, 1),
@@ -258,9 +256,7 @@ def token_classification_batch_factory(
         device=device,
         dtype=torch.long,
     )
-    attention_mask = torch.ones(
-        (batch_size, seq_len), device=device, dtype=torch.long
-    )
+    attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
     labels = torch.randint(
         low=0,
         high=max(num_labels, 1),
@@ -299,9 +295,7 @@ def seq2seq_lm_batch_factory(
         device=device,
         dtype=torch.long,
     )
-    attention_mask = torch.ones(
-        (batch_size, seq_len), device=device, dtype=torch.long
-    )
+    attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
     labels = torch.randint(
         low=0,
         high=vocab_size,

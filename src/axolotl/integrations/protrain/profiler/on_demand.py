@@ -62,10 +62,10 @@ class _ParamSpill:
       the target device on demand.
     """
 
-    param: Any                    # torch.nn.Parameter — Any keeps import light
-    cpu_storage: Any              # torch.Tensor on CPU (pinned if possible)
-    original_device: Any          # torch.device the param was on at __enter__
-    original_data: Any            # GPU tensor at __enter__, or None for CPU-original
+    param: Any  # torch.nn.Parameter — Any keeps import light
+    cpu_storage: Any  # torch.Tensor on CPU (pinned if possible)
+    original_device: Any  # torch.device the param was on at __enter__
+    original_data: Any  # GPU tensor at __enter__, or None for CPU-original
 
 
 class OnDemandTensorMgr:
@@ -159,9 +159,7 @@ class OnDemandTensorMgr:
         if self.device is None and torch.cuda.is_available():
             self.device = torch.device("cuda", torch.cuda.current_device())
 
-        target_device = (
-            torch.device(self.device) if self.device is not None else None
-        )
+        target_device = torch.device(self.device) if self.device is not None else None
 
         # 1. Spill every parameter to pinned CPU; replace .data with empty.
         # 2. Install module-level pre/post-forward hooks.
@@ -281,7 +279,8 @@ class OnDemandTensorMgr:
                 LOG.warning(
                     "OnDemandTensorMgr: failed to restore param to %s during "
                     "partial-setup unwind (%s); param may be left wedged",
-                    spill.original_device, _e,
+                    spill.original_device,
+                    _e,
                 )
         if torch is not None and torch.cuda.is_available():
             try:
@@ -337,7 +336,8 @@ class OnDemandTensorMgr:
                 LOG.warning(
                     "OnDemandTensorMgr: failed to restore param to %s (%s); "
                     "leaving on CPU storage",
-                    spill.original_device, _e,
+                    spill.original_device,
+                    _e,
                 )
         # Sync once after all restores; cheaper than per-param sync.
         if torch.cuda.is_available():
@@ -395,9 +395,7 @@ class OnDemandTensorMgr:
             return
 
         original_data = param.data
-        placeholder = torch.empty(
-            0, dtype=original_data.dtype, device=original_device
-        )
+        placeholder = torch.empty(0, dtype=original_data.dtype, device=original_device)
         param.data = placeholder
         self._spills[id(param)] = _ParamSpill(
             param=param,
@@ -418,7 +416,11 @@ class OnDemandTensorMgr:
 
         if self.device is None:
             return None
-        return torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        return (
+            torch.device(self.device)
+            if not isinstance(self.device, torch.device)
+            else self.device
+        )
 
     def _pre_gather(self, module: "nn.Module", inputs: Any) -> None:
         """Copy the module's *direct* params from CPU to target_device before forward."""
@@ -442,9 +444,7 @@ class OnDemandTensorMgr:
                 else:
                     param.data = spill.cpu_storage
 
-    def _post_release(
-        self, module: "nn.Module", inputs: Any, output: Any
-    ) -> None:
+    def _post_release(self, module: "nn.Module", inputs: Any, output: Any) -> None:
         """Replace the module's *direct* params with empty placeholders."""
         import torch
 

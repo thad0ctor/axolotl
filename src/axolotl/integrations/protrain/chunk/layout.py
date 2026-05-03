@@ -37,7 +37,9 @@ def _param_bytes(model: "nn.Module") -> dict[ParamId, int]:
     return sizes
 
 
-def _block_of(pid: ParamId, block_spans: Mapping[BlockId, Sequence[ParamId]]) -> BlockId | None:
+def _block_of(
+    pid: ParamId, block_spans: Mapping[BlockId, Sequence[ParamId]]
+) -> BlockId | None:
     """Find the ``BlockId`` owning ``pid``, or ``None`` if the param is unaffiliated.
 
     Linear scan; block_spans is typically small (N_block on the order of tens

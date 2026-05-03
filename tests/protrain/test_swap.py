@@ -23,16 +23,22 @@ bound at 12 GB/s and SWAP cannot recover throughput. Acceptance is
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any, cast
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from torch import nn  # noqa: E402
+from torch import Tensor, nn  # noqa: E402
 
 from axolotl.integrations.protrain.block.swap import SwappedBlock  # noqa: E402
 from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
     ActivationSwapPool,
 )
+
+if TYPE_CHECKING:
+    from axolotl.integrations.protrain.chunk import ChunkManager
+    from axolotl.integrations.protrain.runtime.scheduler import Scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +195,7 @@ def test_swap_correctness_matches_reference_three_steps() -> None:
 
     torch.cuda.synchronize()
 
-    for ls, lr in zip(losses_swap, losses_ref):
+    for ls, lr in zip(losses_swap, losses_ref, strict=True):
         assert abs(ls - lr) < 1e-4, (
             f"SWAP loss diverges from reference: swap={losses_swap} ref={losses_ref}"
         )
@@ -248,7 +254,7 @@ def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
             self.lin1 = nn.Linear(d, d, bias=False)
             self.lin2 = nn.Linear(d, d, bias=False)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def forward(self, x: Tensor) -> Tensor:
             h = self.lin1(x)
             h = torch.relu(h)
             h = torch.softmax(h, dim=-1)
@@ -262,7 +268,7 @@ def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
     B, S, D = 16, 256, 512
     n_blocks = 4
 
-    def _measure(use_swap: bool) -> dict[str, int | torch.Tensor]:
+    def _measure(use_swap: bool) -> dict[str, int | Tensor]:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats(device)
@@ -271,9 +277,7 @@ def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
         blocks = nn.ModuleList(_BigBlock(D) for _ in range(n_blocks)).to(device)
 
         if use_swap:
-            wrapped_blocks = nn.ModuleList(
-                swap_mod.SwappedBlock(b) for b in blocks
-            )
+            wrapped_blocks = nn.ModuleList(swap_mod.SwappedBlock(b) for b in blocks)
             # Pool: enough capacity for all blocks × all saved tensors.
             # slot_bytes = exactly one (B, S, D) fp32 tensor.
             pool = ActivationSwapPool(
@@ -318,9 +322,9 @@ def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
 
     # 1) Post-forward residency must drop ≥30% — this is the headline
     # M5+ guarantee: saved activations leave GPU between fwd and bwd.
-    resident_red = (
-        off["post_fwd_resident"] - on["post_fwd_resident"]
-    ) / off["post_fwd_resident"]
+    resident_red = (off["post_fwd_resident"] - on["post_fwd_resident"]) / off[
+        "post_fwd_resident"
+    ]
     assert resident_red >= 0.30, (
         f"SWAP=on did not free GPU activations after forward: "
         f"baseline={off['post_fwd_resident']:,} "
@@ -394,7 +398,7 @@ def test_swap_single_block_backward_peak_at_autograd_floor() -> None:
             self.lin1 = nn.Linear(d, d, bias=False)
             self.lin2 = nn.Linear(d, d, bias=False)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def forward(self, x: Tensor) -> Tensor:
             h = self.lin1(x)
             h = torch.relu(h)
             h = torch.softmax(h, dim=-1)
@@ -550,8 +554,10 @@ def test_searcher_prunes_swap_under_tight_cpu_budget() -> None:
     from axolotl.integrations.protrain.search.exhaustive import search
     from axolotl.integrations.protrain.types import (
         BlockId,
+        ChunkId,
         ChunkLayout,
         HardwareProfile,
+        OpId,
         OpRecord,
         ParamId,
         ProfilerTrace,
@@ -566,17 +572,15 @@ def test_searcher_prunes_swap_under_tight_cpu_budget() -> None:
     layout = ChunkLayout(
         S_chunk=s_chunk,
         N_chunk=n_chunk,
-        chunks=tuple(
-            (ParamId(f"b{b}.w"),) for b in range(n_chunk)
-        ),
-        param_to_chunk={ParamId(f"b{b}.w"): b for b in range(n_chunk)},
-        block_to_chunks={BlockId(b): (b,) for b in range(n_block)},
+        chunks=tuple((ParamId(f"b{b}.w"),) for b in range(n_chunk)),
+        param_to_chunk={ParamId(f"b{b}.w"): ChunkId(b) for b in range(n_chunk)},
+        block_to_chunks={BlockId(b): (ChunkId(b),) for b in range(n_block)},
     )
 
     # Profiler trace: one fwd op per block, no backward ops.
     op_records = tuple(
         OpRecord(
-            op_id=i,
+            op_id=OpId(i),
             module_path=f"layers.{i}",
             qualified_name="aten::linear",
             shape_signature=((1, 32),),
@@ -585,13 +589,11 @@ def test_searcher_prunes_swap_under_tight_cpu_budget() -> None:
         )
         for i in range(n_block)
     )
-    activation_sizes = {
-        BlockId(b): activation_per_block for b in range(n_block)
-    }
+    activation_sizes = {BlockId(b): activation_per_block for b in range(n_block)}
     trace = ProfilerTrace(
         op_order=op_records,
-        intra_op_delta={i: 0 for i in range(n_block)},
-        inter_op_delta={i: 0 for i in range(n_block)},
+        intra_op_delta={OpId(i): 0 for i in range(n_block)},
+        inter_op_delta={OpId(i): 0 for i in range(n_block)},
         activation_sizes=activation_sizes,
         model_state_bytes=n_chunk * s_chunk,
         pcie_h2d_bps=12e9,
@@ -647,8 +649,10 @@ def test_searcher_admits_swap_under_generous_cpu_budget() -> None:
     from axolotl.integrations.protrain.search.exhaustive import search
     from axolotl.integrations.protrain.types import (
         BlockId,
+        ChunkId,
         ChunkLayout,
         HardwareProfile,
+        OpId,
         OpRecord,
         ParamId,
         ProfilerTrace,
@@ -661,15 +665,13 @@ def test_searcher_admits_swap_under_generous_cpu_budget() -> None:
     layout = ChunkLayout(
         S_chunk=s_chunk,
         N_chunk=n_chunk,
-        chunks=tuple(
-            (ParamId(f"b{b}.w"),) for b in range(n_chunk)
-        ),
-        param_to_chunk={ParamId(f"b{b}.w"): b for b in range(n_chunk)},
-        block_to_chunks={BlockId(b): (b,) for b in range(n_block)},
+        chunks=tuple((ParamId(f"b{b}.w"),) for b in range(n_chunk)),
+        param_to_chunk={ParamId(f"b{b}.w"): ChunkId(b) for b in range(n_chunk)},
+        block_to_chunks={BlockId(b): (ChunkId(b),) for b in range(n_block)},
     )
     op_records = tuple(
         OpRecord(
-            op_id=i,
+            op_id=OpId(i),
             module_path=f"layers.{i}",
             qualified_name="aten::linear",
             shape_signature=((1, 32),),
@@ -680,8 +682,8 @@ def test_searcher_admits_swap_under_generous_cpu_budget() -> None:
     )
     trace = ProfilerTrace(
         op_order=op_records,
-        intra_op_delta={i: 0 for i in range(n_block)},
-        inter_op_delta={i: 0 for i in range(n_block)},
+        intra_op_delta={OpId(i): 0 for i in range(n_block)},
+        inter_op_delta={OpId(i): 0 for i in range(n_block)},
         activation_sizes={BlockId(b): 1 << 20 for b in range(n_block)},
         model_state_bytes=n_chunk * s_chunk,
         pcie_h2d_bps=12e9,
@@ -779,9 +781,10 @@ def test_swap_smoke_n_swap_override_runs_three_iters() -> None:
         )
     except Exception:
         pytest.skip("baseline wrap failed on this GPU/env")
-    n_chunk = wrapped.chunk_manager.layout.N_chunk
-    # Tear down probe.
-    for h in wrapped._hook_handles:
+    n_chunk = cast("ChunkManager", wrapped.chunk_manager).layout.N_chunk
+    # Tear down probe. ``_hook_handles`` is dynamically attached; cast for
+    # mypy so each handle's ``.remove`` resolves against ``RemovableHandle``.
+    for h in cast("list[Any]", wrapped._hook_handles):
         try:
             h.remove()
         except Exception:
@@ -806,7 +809,8 @@ def test_swap_smoke_n_swap_override_runs_three_iters() -> None:
         n_checkpoint_override=0,
     )
     # Verify the SWAP pool was wired.
-    swap_pool = getattr(wrapped.scheduler, "swap_pool", None)
+    scheduler = cast("Scheduler", wrapped.scheduler)
+    swap_pool = getattr(scheduler, "swap_pool", None)
     assert swap_pool is not None, "SWAP pool was not constructed"
     assert swap_pool.n_swap == 2
 
@@ -820,14 +824,14 @@ def test_swap_smoke_n_swap_override_runs_three_iters() -> None:
         assert torch.isfinite(loss), f"non-finite loss at iter {_i}"
         loss.backward()
         # Drain so swap stream + chunk prefetch settle before next iter.
-        wrapped.scheduler.drain()
+        scheduler.drain()
         # Pool should have no in-flight slots between iterations.
         assert swap_pool.inflight_count == 0, (
             f"SWAP pool leaked slots at iter {_i}: inflight={swap_pool.inflight_count}"
         )
 
     # Tear down hooks.
-    for h in wrapped._hook_handles:
+    for h in cast("list[Any]", wrapped._hook_handles):
         try:
             h.remove()
         except Exception:

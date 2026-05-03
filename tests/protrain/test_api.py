@@ -13,7 +13,6 @@ import importlib.util
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Serialization guard: the searcher is written by a parallel agent. If it
 # hasn't landed at test time, skip the smoke tests instead of failing.

@@ -163,16 +163,16 @@ def _assert_counts(
 # handled specially by ``discover_blocks`` (it walks the encoder/decoder pair
 # together when both resolve, rather than returning the first match).
 _KNOWN_BLOCK_PATHS: tuple[str, ...] = (
-    "transformer.h",                   # GPT-2, GPT-Neo, GPT-J (some), Falcon (some)
-    "model.layers",                    # Llama, Mistral, Qwen, most modern HF LLMs
-    "transformer.layers",              # MPT, some GPT-NeoX variants
-    "base_model.layers",               # PEFT / LoRA-wrapped models (short form)
-    "base_model.model.model.layers",   # PEFT + LlamaForCausalLM (LoraModel wraps CausalLM)
+    "transformer.h",  # GPT-2, GPT-Neo, GPT-J (some), Falcon (some)
+    "model.layers",  # Llama, Mistral, Qwen, most modern HF LLMs
+    "transformer.layers",  # MPT, some GPT-NeoX variants
+    "base_model.layers",  # PEFT / LoRA-wrapped models (short form)
+    "base_model.model.model.layers",  # PEFT + LlamaForCausalLM (LoraModel wraps CausalLM)
     "base_model.model.transformer.h",  # PEFT + GPT-2
-    "encoder.block",                   # T5 / FLAN-T5 encoder tree
-    "decoder.block",                   # T5 / FLAN-T5 decoder tree
-    "encoder.layers",                  # BART / mBART encoder tree
-    "decoder.layers",                  # BART / mBART decoder tree
+    "encoder.block",  # T5 / FLAN-T5 encoder tree
+    "decoder.block",  # T5 / FLAN-T5 decoder tree
+    "encoder.layers",  # BART / mBART encoder tree
+    "decoder.layers",  # BART / mBART decoder tree
 )
 
 
@@ -183,7 +183,7 @@ _KNOWN_BLOCK_PATHS: tuple[str, ...] = (
 # the encoder (forward_order=0) runs first; the decoder (forward_order=1)
 # consumes the encoder's last-layer hidden state via cross-attention.
 _ENC_DEC_PATH_PAIRS: tuple[tuple[str, str], ...] = (
-    ("encoder.block", "decoder.block"),    # T5 / FLAN-T5
+    ("encoder.block", "decoder.block"),  # T5 / FLAN-T5
     ("encoder.layers", "decoder.layers"),  # BART / mBART
 )
 
@@ -276,7 +276,9 @@ def _looks_like_block(m: nn.Module) -> bool:
         return True
     # CheckpointedBlock stores the original in ``.block``; check one level in.
     inner = getattr(m, "block", None)
-    if inner is not None and (hasattr(inner, "attention") or hasattr(inner, "self_attn")):
+    if inner is not None and (
+        hasattr(inner, "attention") or hasattr(inner, "self_attn")
+    ):
         return True
     # T5Block-style nested layer ModuleList. T5LayerSelfAttention exposes
     # ``SelfAttention``; T5LayerCrossAttention exposes ``EncDecAttention``;
@@ -445,9 +447,7 @@ def discover_blocks(model: nn.Module) -> list[BlockTree]:
     )
 
 
-def block_id_path_map(
-    model: nn.Module, trees: list[BlockTree]
-) -> dict[str, BlockId]:
+def block_id_path_map(model: nn.Module, trees: list[BlockTree]) -> dict[str, BlockId]:
     """Map each block's dotted module path to its global ``BlockId``.
 
     Walked across ``flatten_block_trees(trees)`` so the returned ids

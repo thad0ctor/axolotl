@@ -73,7 +73,11 @@ def _nvidia_smi_gpu_count() -> int:
             stderr=subprocess.DEVNULL,
             timeout=10,
         ).decode("utf-8", errors="replace")
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         return 0
     return sum(1 for line in out.splitlines() if line.strip())
 
@@ -428,9 +432,7 @@ def test_protrain_4gpu_throughput_scaling(tmp_path) -> None:
 
     gpu_count = _nvidia_smi_gpu_count()
     if gpu_count < 4:
-        pytest.skip(
-            f"requires >= 4 GPUs; nvidia-smi reports {gpu_count}"
-        )
+        pytest.skip(f"requires >= 4 GPUs; nvidia-smi reports {gpu_count}")
 
     # Per-rank batch size 2 amortizes the Python-level hook overhead
     # (4 hooks x 32 blocks x 2 passes = 256 callbacks per iter) across
@@ -498,7 +500,7 @@ def test_protrain_4gpu_throughput_scaling(tmp_path) -> None:
 
 
 _ZERO3_WORKER_SCRIPT = textwrap.dedent(
-    '''
+    """
     # M7 ZeRO-3 worker: drives ProTrain WITHOUT DDP, with auto-enabled
     # chunk sharding. Builds a fresh-init Llama-3B, wraps with
     # protrain_model_wrapper (searcher-driven, not force_all_persistent),
@@ -762,7 +764,7 @@ _ZERO3_WORKER_SCRIPT = textwrap.dedent(
 
     if __name__ == "__main__":
         sys.exit(main())
-    '''
+    """
 )
 
 
@@ -950,17 +952,18 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
     print(
         "\nProTrain M7 ZeRO-3 sharding:\n"
         f"  shard losses:         {shard_losses}\n"
-        f"  shard peak mem (max): {shard_peak/1e9:.3f} GB\n"
+        f"  shard peak mem (max): {shard_peak / 1e9:.3f} GB\n"
         f"  shard rank agreement: max_diff={shard_max_diff:.6f}\n"
         f"  replicate losses:     {replicate_losses}\n"
-        f"  replicate peak mem:   {replicate_peak/1e9:.3f} GB\n"
+        f"  replicate peak mem:   {replicate_peak / 1e9:.3f} GB\n"
         f"  memory delta:         "
-        f"{(replicate_peak-shard_peak)/1e9:+.3f} GB "
-        f"({(1.0 - shard_peak/replicate_peak)*100:+.1f}%)"
+        f"{(replicate_peak - shard_peak) / 1e9:+.3f} GB "
+        f"({(1.0 - shard_peak / replicate_peak) * 100:+.1f}%)"
     )
 
     # Loss sanity + monotonicity.
     import math as _math
+
     assert len(shard_losses) == n_iters, (
         f"sharded run produced {len(shard_losses)} losses, expected {n_iters}"
     )
@@ -971,8 +974,7 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
     # First > last — the paper's correctness smoke: updates via
     # reduce_scatter + shard-local CPU Adam are reducing the loss.
     assert shard_losses[0] > shard_losses[-1], (
-        f"sharded loss did not decrease over {n_iters} iters: "
-        f"{shard_losses}"
+        f"sharded loss did not decrease over {n_iters} iters: {shard_losses}"
     )
 
     # Per-rank agreement: each rank sees the same post-train params.
@@ -1004,8 +1006,8 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
     # indicate a leaked staging buffer or missed free).
     peak_ratio = shard_peak / max(replicate_peak, 1)
     assert 0.75 <= peak_ratio <= 1.25, (
-        f"sharded peak ({shard_peak/1e9:.3f} GB) diverges too much "
-        f"from replicated peak ({replicate_peak/1e9:.3f} GB); "
+        f"sharded peak ({shard_peak / 1e9:.3f} GB) diverges too much "
+        f"from replicated peak ({replicate_peak / 1e9:.3f} GB); "
         f"ratio={peak_ratio:.2f} — investigate for leaked staging "
         f"buffers in the all_gather / reduce_scatter paths"
     )
@@ -1064,20 +1066,17 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
 
     print(
         "  shard per-rank CPU:  "
-        f"{[b/1e9 for b in shard_cpu_bytes]} GB "
-        f"(total_non_persist={total_np_shard/1e9:.3f} GB)"
+        f"{[b / 1e9 for b in shard_cpu_bytes]} GB "
+        f"(total_non_persist={total_np_shard / 1e9:.3f} GB)"
     )
-    print(
-        "  replicate per-rank CPU: "
-        f"{[b/1e9 for b in replicate_cpu_bytes]} GB"
-    )
+    print(f"  replicate per-rank CPU: {[b / 1e9 for b in replicate_cpu_bytes]} GB")
 
     if shard_cpu_bytes and total_np_shard > 0:
         expected_shard_bytes = total_np_shard / world_size
         max_shard_bytes = max(shard_cpu_bytes)
         assert max_shard_bytes < 1.5 * expected_shard_bytes, (
-            f"sharded per-rank CPU footprint {max_shard_bytes/1e9:.3f} GB "
-            f"exceeds 1.5 * expected shard {expected_shard_bytes/1e9:.3f} GB — "
+            f"sharded per-rank CPU footprint {max_shard_bytes / 1e9:.3f} GB "
+            f"exceeds 1.5 * expected shard {expected_shard_bytes / 1e9:.3f} GB — "
             f"sharding may not be partitioning bytes as intended"
         )
 
@@ -1103,7 +1102,7 @@ def test_protrain_4gpu_zero3_sharding(tmp_path) -> None:
 
 
 _MISTRAL_MODEC_WORKER_SCRIPT = textwrap.dedent(
-    '''
+    """
     # Item 9 cell A worker: 2-rank tiny-Mistral Mode-C smoke. Builds a
     # fresh-init MistralForCausalLM with GQA + sliding-window enabled,
     # wraps with LoRA + ProTrain Mode-C (zero3_shard=True, explicit
@@ -1329,7 +1328,7 @@ _MISTRAL_MODEC_WORKER_SCRIPT = textwrap.dedent(
 
     if __name__ == "__main__":
         sys.exit(main())
-    '''
+    """
 )
 
 
@@ -1395,8 +1394,7 @@ def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
     if proc.returncode != 0:
         tail = log_path.read_text()[-6000:]
         raise RuntimeError(
-            f"mistral Mode-C worker failed (exit={proc.returncode}); "
-            f"log tail:\n{tail}"
+            f"mistral Mode-C worker failed (exit={proc.returncode}); log tail:\n{tail}"
         )
 
     stats_path = out_dir / "mistral_modec_stats.out"
@@ -1430,9 +1428,7 @@ def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
         f"expected {n_iters} losses, got {len(losses)}: {losses}"
     )
     for i, lv in enumerate(losses):
-        assert math.isfinite(lv), (
-            f"iter {i}: non-finite loss {lv}; losses={losses}"
-        )
+        assert math.isfinite(lv), f"iter {i}: non-finite loss {lv}; losses={losses}"
 
     # Secondary check: when the chunk layout actually produces
     # non-persistent chunks (the only condition under which the sharded

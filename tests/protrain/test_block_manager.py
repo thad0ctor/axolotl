@@ -12,7 +12,12 @@ Covers:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any, cast
+
 import pytest
+
+if TYPE_CHECKING:
+    from axolotl.integrations.protrain.chunk import ChunkManager
 
 torch = pytest.importorskip("torch")
 
@@ -25,9 +30,10 @@ from axolotl.integrations.protrain.block import (  # noqa: E402
     unwrap_block,
     wrap_block,
 )
-from axolotl.integrations.protrain.block.checkpoint import CheckpointedBlock  # noqa: E402
+from axolotl.integrations.protrain.block.checkpoint import (  # noqa: E402
+    CheckpointedBlock,
+)
 from axolotl.integrations.protrain.block.swap import SwappedBlock  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # assign_modes
@@ -326,7 +332,9 @@ def test_monotonic_memory_reduction_sweep() -> None:
     from axolotl.integrations.protrain.types import HardwareProfile
 
     device = torch.device("cuda")
-    cfg = transformers.GPT2Config(n_layer=4, n_head=2, n_embd=64, vocab_size=128, n_positions=16)
+    cfg = transformers.GPT2Config(
+        n_layer=4, n_head=2, n_embd=64, vocab_size=128, n_positions=16
+    )
 
     hw = HardwareProfile(
         gpu_sku=torch.cuda.get_device_name(device),
@@ -375,9 +383,9 @@ def test_monotonic_memory_reduction_sweep() -> None:
             )
         except Exception:
             pytest.skip("probe wrap failed on this GPU/env")
-        n_chunk = probe.chunk_manager.layout.N_chunk
+        n_chunk = cast("ChunkManager", probe.chunk_manager).layout.N_chunk
         # Uninstall hooks from the probe so we can rebuild.
-        for h in probe._hook_handles:
+        for h in cast("list[Any]", probe._hook_handles):
             try:
                 h.remove()
             except Exception:
@@ -405,7 +413,9 @@ def test_monotonic_memory_reduction_sweep() -> None:
             n_checkpoint_override=min(n_checkpoint, n_block),
         )
 
-        input_ids = torch.randint(0, cfg.vocab_size, (1, 8), device=device, dtype=torch.long)
+        input_ids = torch.randint(
+            0, cfg.vocab_size, (1, 8), device=device, dtype=torch.long
+        )
         batch = {"input_ids": input_ids, "labels": input_ids.clone()}
 
         torch.cuda.synchronize()
@@ -417,7 +427,7 @@ def test_monotonic_memory_reduction_sweep() -> None:
         peak = torch.cuda.max_memory_allocated()
 
         # Teardown: remove hooks.
-        for h in wrapped._hook_handles:
+        for h in cast("list[Any]", wrapped._hook_handles):
             try:
                 h.remove()
             except Exception:
@@ -436,7 +446,7 @@ def test_monotonic_memory_reduction_sweep() -> None:
 
     # Assert monotonic non-increase as n_checkpoint grows.
     sorted_keys = sorted(peaks.keys())
-    for prev_k, next_k in zip(sorted_keys, sorted_keys[1:]):
+    for prev_k, next_k in zip(sorted_keys, sorted_keys[1:], strict=False):
         # Allow a small slack for allocator fragmentation noise (<5% of
         # the smaller value). On a tiny model the absolute deltas are
         # small, so the slack prevents flakes without masking regressions.

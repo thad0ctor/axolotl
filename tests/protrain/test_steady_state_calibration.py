@@ -25,6 +25,7 @@ from axolotl.integrations.protrain.block.layout_rules import assign_modes
 from axolotl.integrations.protrain.cost import estimate_runtime
 from axolotl.integrations.protrain.types import (
     BlockId,
+    ChunkId,
     ChunkLayout,
     CostConfig,
     HardwareProfile,
@@ -33,7 +34,6 @@ from axolotl.integrations.protrain.types import (
     ParamId,
     ProfilerTrace,
 )
-
 
 MB = 1 << 20
 GB = 1 << 30
@@ -93,14 +93,16 @@ def _build_synthetic_trace(
     )
 
 
-def _build_layout(n_chunk: int = 12, s_chunk: int = 64 * MB, n_block: int = 8) -> ChunkLayout:
+def _build_layout(
+    n_chunk: int = 12, s_chunk: int = 64 * MB, n_block: int = 8
+) -> ChunkLayout:
     chunks = tuple((ParamId(f"p.{i}"),) for i in range(n_chunk))
     return ChunkLayout(
         S_chunk=s_chunk,
         N_chunk=n_chunk,
         chunks=chunks,
-        param_to_chunk={ParamId(f"p.{i}"): i for i in range(n_chunk)},
-        block_to_chunks={BlockId(b): (b % n_chunk,) for b in range(n_block)},
+        param_to_chunk={ParamId(f"p.{i}"): ChunkId(i) for i in range(n_chunk)},
+        block_to_chunks={BlockId(b): (ChunkId(b % n_chunk),) for b in range(n_block)},
     )
 
 
@@ -300,9 +302,7 @@ def test_runtime_scale_applied():
     # All chunks persistent + no swap/ckpt keeps t_cpu_optim off the critical
     # path so the difference between A and B is dominated by t_fwd scaling.
     n_block = 8
-    cfg = CostConfig(
-        n_persist=layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
+    cfg = CostConfig(n_persist=layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
     block_map = assign_modes(0, 0, n_block)
 
     trace_a = _build_synthetic_trace(hooked_fwd_wall_s=1.0, steady_fwd_wall_s=1.0)
@@ -326,8 +326,7 @@ def test_runtime_scale_applied():
     # floor (t_a includes t_fwd + 2 t_fwd ~= 3 t_fwd of scale=1 budget
     # vs 1.5 t_fwd for scale=0.5).
     assert t_a / t_b >= 1.4, (
-        f"t_a should be at least 1.4x t_b when hook-scale halves; "
-        f"ratio={t_a / t_b:.3f}"
+        f"t_a should be at least 1.4x t_b when hook-scale halves; ratio={t_a / t_b:.3f}"
     )
 
 
@@ -347,9 +346,7 @@ def test_scale_clamp_on_absurd_ratio():
     layout = _build_layout()
     hw = _build_hw()
     n_block = 8
-    cfg = CostConfig(
-        n_persist=layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
+    cfg = CostConfig(n_persist=layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
     block_map = assign_modes(0, 0, n_block)
 
     absurd_trace = _build_synthetic_trace(

@@ -20,7 +20,6 @@ initialised models — no network calls, no GPU needed, fast lane.
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from axolotl.integrations.protrain.profiler.batch_factory import (
@@ -35,7 +34,6 @@ from axolotl.integrations.protrain.profiler.batch_factory import (
     register_factory,
     reset_factories,
 )
-
 
 # ---- detection ----------------------------------------------------------
 
@@ -242,8 +240,7 @@ def test_seq_classification_batch_drives_forward_and_backward_cpu():
     out.loss.backward()
     # At least one parameter received a non-zero gradient.
     grad_seen = any(
-        (p.grad is not None and p.grad.abs().sum() > 0)
-        for p in model.parameters()
+        (p.grad is not None and p.grad.abs().sum() > 0) for p in model.parameters()
     )
     assert grad_seen, "no parameter received a gradient on the seq-cls head"
 
@@ -351,9 +348,7 @@ def test_build_batch_explicit_task_type_override():
     """Caller can force a task type, bypassing detection."""
     # GPT-2 model but force seq-classification batch shape.
     model = _make_causal_model()
-    batch = build_batch(
-        model, 2, 8, "cpu", task_type=TASK_SEQ_CLASSIFICATION
-    )
+    batch = build_batch(model, 2, 8, "cpu", task_type=TASK_SEQ_CLASSIFICATION)
     # Per-sequence labels — shape (B,) — matches forced override, not
     # GPT-2's natural causal-LM shape.
     assert batch["labels"].shape == (2,)

@@ -20,7 +20,7 @@ to opt into ProTrain without Axolotl orchestration.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from torch import nn
 
@@ -165,9 +165,7 @@ def _build_block_spans(
         for idx, prefix in enumerate(block_prefixes):
             # Prefix match on dotted path, with a trailing "." to avoid
             # matching ``h.10`` when the prefix is ``h.1``.
-            if prefix and (
-                param_name == prefix or param_name.startswith(prefix + ".")
-            ):
+            if prefix and (param_name == prefix or param_name.startswith(prefix + ".")):
                 spans[BlockId(idx)].append(cast(ParamId, param_name))
                 break
     return blocks, spans
@@ -270,9 +268,7 @@ def _chunk_bytes(layout, chunk_manager) -> dict[int, int]:
     builder packs params greedily but never splits a param, so residual
     slack at the end of each chunk is common.
     """
-    params_by_id = {
-        str(name): p for name, p in chunk_manager.model.named_parameters()
-    }
+    params_by_id = {str(name): p for name, p in chunk_manager.model.named_parameters()}
     out: dict[int, int] = {}
     for cid, pids in enumerate(layout.chunks):
         total = 0
@@ -349,9 +345,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
     # intra_delta (to conservatively cover any peaking attention
     # kernel).
     if trace is not None and block_map is not None:
-        n_ckpt = sum(
-            1 for m in block_map.values() if m is BlockMode.CKPT
-        )
+        n_ckpt = sum(1 for m in block_map.values() if m is BlockMode.CKPT)
         if n_ckpt >= max(1, len(block_map) - 2):
             # CKPT-dominant config — most blocks drop their activations.
             act_sizes = dict(trace.activation_sizes)
@@ -465,9 +459,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
     if trace is not None and block_map is not None:
         phase2_peak = int(getattr(trace, "steady_phase2_peak_bytes", 0) or 0)
         if phase2_peak > 0:
-            n_ckpt = sum(
-                1 for m in block_map.values() if m is BlockMode.CKPT
-            )
+            n_ckpt = sum(1 for m in block_map.values() if m is BlockMode.CKPT)
             phase2_matches_cfg = (
                 n_persist == int(getattr(trace, "phase2_n_persist", -1))
                 and n_buffer == int(getattr(trace, "phase2_n_buffer", -1))
@@ -555,7 +547,8 @@ def _default_cpu_capacity_for_search(gpu_count: int) -> int | None:
     except Exception as exc:  # noqa: BLE001 — defensive on exotic platforms
         LOG.warning(
             "psutil.virtual_memory() raised %s; ProTrain search-time CPU "
-            "feasibility filter is disabled for this run.", exc,
+            "feasibility filter is disabled for this run.",
+            exc,
         )
         return None
     per_rank = available // gc - _DEFAULT_CPU_HEADROOM_BYTES
@@ -662,7 +655,7 @@ def _construct_runtime(
     trace,
     zero3_shard,
     device,
-) -> tuple[object, object, list[object], SearchResult]:
+) -> tuple["ChunkManager", "Scheduler", list[Any], SearchResult]:
     """Build chunk_manager + scheduler + hooks under a given ``result``.
 
     Encapsulates the post-search runtime-construction half of
@@ -728,9 +721,9 @@ def _construct_runtime(
             if not param_is_in_block.get(str(pid), False):
                 chunks_with_nonblock.add(ChunkId(cid))
                 break
-    effective_persistent_ids: set[ChunkId] = (
-        {ChunkId(i) for i in range(n_persist)} | chunks_with_nonblock
-    )
+    effective_persistent_ids: set[ChunkId] = {
+        ChunkId(i) for i in range(n_persist)
+    } | chunks_with_nonblock
 
     # Partition params: persistent chunks get the GPU optimizer, the rest
     # get per-chunk CPU FusedAdam adapters keyed on ChunkId.
@@ -906,8 +899,8 @@ def _construct_runtime(
         alloc_after / (1 << 30),
     )
     _sys2.stderr.write(
-        f"[protrain] materialize_offload: freed {freed/1e9:.2f}GB "
-        f"(alloc {alloc_before/1e9:.2f}->{alloc_after/1e9:.2f}GB)\n"
+        f"[protrain] materialize_offload: freed {freed / 1e9:.2f}GB "
+        f"(alloc {alloc_before / 1e9:.2f}->{alloc_after / 1e9:.2f}GB)\n"
     )
     _sys2.stderr.flush()
 
@@ -1054,10 +1047,7 @@ def _construct_runtime(
             )
             scheduler.swap_pool = swap_pool
             for block in blocks:
-                if (
-                    getattr(block, "_protrain_wrapped_mode", None)
-                    is _BM_swap.SWAP
-                ):
+                if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
                     block.attach_runtime(swap_pool, scheduler.swap_stream)
             LOG.info(
                 "ProTrain: SWAP pool wired — %d slots × %d bytes = %.2f MB pinned",
@@ -1201,7 +1191,9 @@ def protrain_model_wrapper(
     # ProTrain, and the CKPT block wrapper depends on it.
     cfg_obj = getattr(model, "config", None)
     if cfg_obj is not None and getattr(cfg_obj, "use_cache", False):
-        LOG.info("ProTrain: forcing model.config.use_cache=False for CKPT compatibility")
+        LOG.info(
+            "ProTrain: forcing model.config.use_cache=False for CKPT compatibility"
+        )
         cfg_obj.use_cache = False
 
     # ---- 1. profile (cached) --------------------------------------------
@@ -1252,9 +1244,7 @@ def protrain_model_wrapper(
         _sys.stderr.flush()
         save_cached_trace(cache_key, trace)
     else:
-        LOG.info(
-            "ProTrain profiler cache hit for %s", cache_key.fingerprint()[:12]
-        )
+        LOG.info("ProTrain profiler cache hit for %s", cache_key.fingerprint()[:12])
 
     # ---- 2. layout ------------------------------------------------------
     import sys as _sys2
@@ -1278,8 +1268,7 @@ def protrain_model_wrapper(
         block_spans=block_spans,
     )
     _sys2.stderr.write(
-        f"[protrain] layout built: S_chunk={layout.S_chunk} "
-        f"N_chunk={layout.N_chunk}\n"
+        f"[protrain] layout built: S_chunk={layout.S_chunk} N_chunk={layout.N_chunk}\n"
     )
     _sys2.stderr.flush()
 
@@ -1382,13 +1371,13 @@ def protrain_model_wrapper(
     # value here as in trace.compute_rate_tflops, so the ratio is ~1.0.
     if hardware_profile.gpu_compute_tflops <= 0.0:
         try:
-            _live_tflops = measure_compute_rate(
-                int(getattr(device, "index", 0) or 0)
-            )
+            _live_tflops = measure_compute_rate(int(getattr(device, "index", 0) or 0))
             if _live_tflops > 0.0:
                 _hw_updates["gpu_compute_tflops"] = _live_tflops
         except Exception as _e:  # noqa: BLE001 - defensive
-            LOG.debug("measure_compute_rate live failed (%s); skipping SKU calibration", _e)
+            LOG.debug(
+                "measure_compute_rate live failed (%s); skipping SKU calibration", _e
+            )
     # PCIe rates: overwrite the caller's hardcoded prior (usually 13e9 =
     # Gen3) with the profiler's measured H2D/D2H. A 3090 on PCIe Gen4 x16
     # sits around 50-56 GB/s — 4× the conservative default — and the
@@ -1399,10 +1388,7 @@ def protrain_model_wrapper(
         and trace.pcie_h2d_bps > 13e9 + 1e6
     ):
         _hw_updates["pcie_h2d_bps"] = trace.pcie_h2d_bps
-    if (
-        hardware_profile.pcie_d2h_bps <= 13e9 + 1e6
-        and trace.pcie_d2h_bps > 13e9 + 1e6
-    ):
+    if hardware_profile.pcie_d2h_bps <= 13e9 + 1e6 and trace.pcie_d2h_bps > 13e9 + 1e6:
         _hw_updates["pcie_d2h_bps"] = trace.pcie_d2h_bps
     if _hw_updates:
         hardware_profile = _replace(hardware_profile, **_hw_updates)
@@ -1442,9 +1428,7 @@ def protrain_model_wrapper(
             n_swap=0,
             n_checkpoint=n_block,
         )
-        block_map = assign_modes(
-            n_swap=0, n_checkpoint=n_block, N_block=n_block
-        )
+        block_map = assign_modes(n_swap=0, n_checkpoint=n_block, N_block=n_block)
         result = SearchResult(
             cfg=synth_cfg,
             block_map=block_map,
@@ -1460,9 +1444,7 @@ def protrain_model_wrapper(
             synth_cfg.n_buffer,
             synth_cfg.n_checkpoint,
         )
-        _sys2.stderr.write(
-            f"[protrain] force_all_persistent: cfg={result.cfg}\n"
-        )
+        _sys2.stderr.write(f"[protrain] force_all_persistent: cfg={result.cfg}\n")
         _sys2.stderr.flush()
     elif all_overrides_set:
         # Explicit 4-tuple override path — still skip the searcher but
@@ -1480,17 +1462,12 @@ def protrain_model_wrapper(
 
         if not (0 <= n_persist <= layout.N_chunk):
             raise ValueError(
-                f"n_persist_override={n_persist} out of range "
-                f"[0, {layout.N_chunk}]"
+                f"n_persist_override={n_persist} out of range [0, {layout.N_chunk}]"
             )
         if n_buffer < 1:
-            raise ValueError(
-                f"n_buffer_override must be >= 1, got {n_buffer}"
-            )
+            raise ValueError(f"n_buffer_override must be >= 1, got {n_buffer}")
         if not (0 <= n_swap <= n_block):
-            raise ValueError(
-                f"n_swap_override={n_swap} out of range [0, {n_block}]"
-            )
+            raise ValueError(f"n_swap_override={n_swap} out of range [0, {n_block}]")
         if not (0 <= n_checkpoint <= n_block - n_swap):
             raise ValueError(
                 f"n_checkpoint_override={n_checkpoint} incompatible "
@@ -1547,9 +1524,7 @@ def protrain_model_wrapper(
             "ProTrain: explicit knob override path — bypassing searcher. cfg=%s",
             synth_cfg,
         )
-        _sys2.stderr.write(
-            f"[protrain] explicit override: cfg={result.cfg}\n"
-        )
+        _sys2.stderr.write(f"[protrain] explicit override: cfg={result.cfg}\n")
         _sys2.stderr.flush()
     else:
         _sys2.stderr.write(
@@ -1566,7 +1541,7 @@ def protrain_model_wrapper(
         )
         _sys2.stderr.write(
             f"[protrain] search done: cfg={result.cfg} "
-            f"peak={result.predicted_peak_bytes/1e9:.2f}GB "
+            f"peak={result.predicted_peak_bytes / 1e9:.2f}GB "
             f"iter={result.predicted_iter_s:.3f}s\n"
         )
         _sys2.stderr.flush()
@@ -1648,9 +1623,8 @@ def protrain_model_wrapper(
         # prior hw flip to False is already correct.)
         if zero3_shard != hardware_profile.zero3_shard:
             from dataclasses import replace as _replace
-            hardware_profile = _replace(
-                hardware_profile, zero3_shard=bool(zero3_shard)
-            )
+
+            hardware_profile = _replace(hardware_profile, zero3_shard=bool(zero3_shard))
 
     # ---- 4. construct runtime ------------------------------------------
     # When phase-2 is enabled (default on cache-miss profiles where the
@@ -1699,7 +1673,6 @@ def protrain_model_wrapper(
             zero3_shard=zero3_shard,
             device=device,
         )
-
         # Build a transient WrappedModel + optimizer for the measurement.
         boot_wrapped = WrappedModel(
             module=model,
@@ -1729,7 +1702,8 @@ def protrain_model_wrapper(
                 "Phase-2 chunked measurement raised %s; falling back to "
                 "the v8 cost-model path under the searcher's original "
                 "pick. Tighten or disable the phase-2 gate if the "
-                "failure is reproducible.", exc,
+                "failure is reproducible.",
+                exc,
             )
             measurement_failed = True
 
@@ -1746,8 +1720,8 @@ def protrain_model_wrapper(
                     h.remove()  # type: ignore[attr-defined]
                 except Exception as exc:  # noqa: BLE001 — best-effort
                     LOG.debug(
-                        "phase-2 fallback teardown: hook handle "
-                        "remove failed: %s", exc,
+                        "phase-2 fallback teardown: hook handle remove failed: %s",
+                        exc,
                     )
             block_parent_map_unwrap = _find_block_parent_map(model, blocks)
             for idx, block in enumerate(blocks):
@@ -1782,9 +1756,7 @@ def protrain_model_wrapper(
             # add) — so it stays consistent regardless of whether we
             # call it pre- or post-splice. We call it pre-splice to
             # mirror the v10 ordering and keep the splice block compact.
-            per_block_recompute_s = estimate_per_block_recompute_s(
-                trace, n_block
-            )
+            per_block_recompute_s = estimate_per_block_recompute_s(trace, n_block)
             from dataclasses import replace as _replace
 
             new_trace = _replace(
@@ -1803,7 +1775,8 @@ def protrain_model_wrapper(
             except OSError as exc:
                 LOG.warning(
                     "Phase-2: failed to persist updated trace (%s); the "
-                    "in-memory trace is still updated for this run.", exc,
+                    "in-memory trace is still updated for this run.",
+                    exc,
                 )
             trace = new_trace
 
@@ -1833,8 +1806,7 @@ def protrain_model_wrapper(
             # rebuild's effective post-pinning n_persist, collapsing
             # f_bm to 0 in the calibration arithmetic).
             cfg_changed = (
-                new_result.cfg != boot_cfg
-                or new_result.block_map != boot_block_map
+                new_result.cfg != boot_cfg or new_result.block_map != boot_block_map
             )
             if not cfg_changed:
                 calibrated_peak = _calibrate_peak_with_actual_chunk_bytes(
@@ -1890,8 +1862,8 @@ def protrain_model_wrapper(
                         h.remove()  # type: ignore[attr-defined]
                     except Exception as exc:  # noqa: BLE001 — best-effort
                         LOG.debug(
-                            "phase-2 teardown: hook handle remove "
-                            "failed: %s", exc,
+                            "phase-2 teardown: hook handle remove failed: %s",
+                            exc,
                         )
                 block_parent_map_unwrap = _find_block_parent_map(model, blocks)
                 for idx, block in enumerate(blocks):

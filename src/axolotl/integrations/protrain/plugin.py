@@ -146,7 +146,8 @@ def _early_init_dist_for_nccl(cfg) -> int:
     if not dist.is_available():
         LOG.warning(
             "ProTrain: torch.distributed unavailable but WORLD_SIZE=%d. "
-            "Skipping early dist init.", world_size,
+            "Skipping early dist init.",
+            world_size,
         )
         return 1
 
@@ -165,7 +166,8 @@ def _early_init_dist_for_nccl(cfg) -> int:
         # it.
         LOG.info(
             "ProTrain: CUDA unavailable; skipping early NCCL dist init "
-            "(WORLD_SIZE=%d).", world_size,
+            "(WORLD_SIZE=%d).",
+            world_size,
         )
         return 1
 
@@ -309,7 +311,8 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
 
     LOG.info(
         "ProTrain: re-measuring NCCL on world_size=%d (trace was profiled "
-        "with empty tables)", world_size,
+        "with empty tables)",
+        world_size,
     )
     try:
         gather_table, reduce_table = measure_nccl(world_size)
@@ -344,7 +347,8 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
     except OSError as exc:
         LOG.warning(
             "ProTrain: failed to persist updated trace to cache (%s); "
-            "the in-memory trace is still updated for this run.", exc,
+            "the in-memory trace is still updated for this run.",
+            exc,
         )
 
     # Re-run search with the populated tables. ``hw`` is reused as-is —
@@ -451,29 +455,27 @@ def _build_hardware_profile(cfg):
 
     # Prefer the live process group when one is up (set by our early
     # init in ``post_model_load`` for multi-rank torchrun runs). Fall
-    # back to ``WORLD_SIZE`` env (also accurate under torchrun) and
-    # finally to ``device_count()`` for raw single-host inference cases.
-    # ``device_count()`` is per-rank under torchrun (= 1 with
-    # CUDA_VISIBLE_DEVICES masking) so it under-reports the total world,
-    # which is the bug the early-init path repairs.
+    # back to ``WORLD_SIZE`` env (also accurate under torchrun, defaults
+    # to 1 for single-process runs). Do NOT use ``torch.cuda.device_count()``
+    # as a fallback: visible GPU count is not the distributed rank count,
+    # so on a single-process run on a multi-GPU host this would inflate
+    # ``world_size`` from 1 to N and skew the profiler cache key, the
+    # per-rank CPU-capacity budget, and the cost-model sharding divisor
+    # before the wrapper has a chance to correct it.
     try:
         import torch.distributed as _dist
+
         if _dist.is_available() and _dist.is_initialized():
             world_size = max(1, int(_dist.get_world_size()))
         else:
-            world_size = max(
-                _resolve_world_size_from_env(),
-                int(torch.cuda.device_count()),
-            )
+            world_size = _resolve_world_size_from_env()
     except ImportError:
-        world_size = max(1, int(torch.cuda.device_count()))
+        world_size = 1
 
     # Mirror protrain_model_wrapper's zero3_shard auto-detect so the
     # searcher's CPU-footprint accounting lines up with the runtime's
     # actual per-rank pinned-memory layout.
-    force_all_persistent = bool(
-        getattr(cfg, "protrain_force_all_persistent", False)
-    )
+    force_all_persistent = bool(getattr(cfg, "protrain_force_all_persistent", False))
     explicit = getattr(cfg, "protrain_zero3_shard", None)
     if explicit is None:
         zero3_shard = (world_size > 1) and (not force_all_persistent)
@@ -635,9 +637,7 @@ class ProTrainPlugin(BasePlugin):
         n_persist_override = getattr(cfg, "protrain_n_persist_override", None)
         n_buffer_override = getattr(cfg, "protrain_n_buffer_override", None)
         n_swap_override = getattr(cfg, "protrain_n_swap_override", None)
-        n_checkpoint_override = getattr(
-            cfg, "protrain_n_checkpoint_override", None
-        )
+        n_checkpoint_override = getattr(cfg, "protrain_n_checkpoint_override", None)
         zero3_shard = getattr(cfg, "protrain_zero3_shard", None)
 
         # auto_mode defaults to True (see ProTrainArgs). On the auto
@@ -683,9 +683,7 @@ class ProTrainPlugin(BasePlugin):
         chunk_manager = cast("ChunkManager", wrapped.chunk_manager)
         n_chunk_total = getattr(chunk_manager.layout, "N_chunk", -1)
         effective_force_persistent = int(picked.n_persist) >= int(n_chunk_total)
-        effective_zero3 = bool(
-            getattr(chunk_manager, "zero3_shard", False)
-        )
+        effective_zero3 = bool(getattr(chunk_manager, "zero3_shard", False))
         LOG.info(
             "ProTrain: %s config picked (n_persist=%d, n_buffer=%d, "
             "n_checkpoint=%d, force_all_persistent=%s, zero3_shard=%s, "
@@ -699,9 +697,7 @@ class ProTrainPlugin(BasePlugin):
             bool(auto_mode),
         )
 
-    def create_optimizer(
-        self, cfg, trainer: "Trainer"
-    ) -> "Optimizer | None":
+    def create_optimizer(self, cfg, trainer: "Trainer") -> "Optimizer | None":
         """Return the ProTrain optimizer facade, or ``None`` when inactive."""
         if not _is_plugin_active(cfg):
             return None
@@ -838,9 +834,7 @@ class ProTrainPlugin(BasePlugin):
             )
 
             cfg_max = getattr(cfg, "protrain_optim_save_max_bytes", None)
-            save_max = (
-                int(cfg_max) if cfg_max is not None else DEFAULT_SAVE_MAX_BYTES
-            )
+            save_max = int(cfg_max) if cfg_max is not None else DEFAULT_SAVE_MAX_BYTES
             verify_replicated = bool(
                 getattr(cfg, "protrain_save_optim_verify_replicated", False)
             )
@@ -853,9 +847,7 @@ class ProTrainPlugin(BasePlugin):
                     verify_replicated=verify_replicated,
                 )
             )
-            install_load_hook(
-                trainer, optim, allow_online_reshard=allow_online_reshard
-            )
+            install_load_hook(trainer, optim, allow_online_reshard=allow_online_reshard)
             LOG.info(
                 "ProTrain: optimizer-state checkpointing enabled "
                 "(save_max_bytes=%d ~= %.2f GiB, verify_replicated=%s, "

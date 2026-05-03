@@ -318,9 +318,7 @@ def reshard_mode_c_shards(
         through axolotl's logging setup.
     """
     if target_world_size < 1:
-        raise ValueError(
-            f"target_world_size must be >= 1 (got {target_world_size})"
-        )
+        raise ValueError(f"target_world_size must be >= 1 (got {target_world_size})")
 
     if log_fn is None:
         log_fn = lambda msg: print(msg, file=sys.stderr)  # noqa: E731
@@ -400,8 +398,7 @@ def reshard_mode_c_shards(
     for cid in sorted(chunk_paths.keys()):
         per_rank_paths = chunk_paths[cid]
         per_rank_state_dicts = [
-            torch.load(p, map_location="cpu", weights_only=True)
-            for p in per_rank_paths
+            torch.load(p, map_location="cpu", weights_only=True) for p in per_rank_paths
         ]
         regs = saved_regions[str(cid)]
 
@@ -434,8 +431,7 @@ def reshard_mode_c_shards(
 
             for state_key in ("exp_avg", "exp_avg_sq"):
                 per_rank_inputs = [
-                    sd["state"][region_idx][state_key]
-                    for sd in per_rank_state_dicts
+                    sd["state"][region_idx][state_key] for sd in per_rank_state_dicts
                 ]
                 # Defensive: ensure all are 1-D (they should be — the
                 # shard_param's flat storage view).
@@ -450,9 +446,9 @@ def reshard_mode_c_shards(
                     region_bytes_padded_new=int(new_padded),
                 )
                 for r2, slice_ in enumerate(new_slices):
-                    new_per_rank_states[r2].setdefault(region_idx, {})[
-                        state_key
-                    ] = slice_
+                    new_per_rank_states[r2].setdefault(region_idx, {})[state_key] = (
+                        slice_
+                    )
 
             # Replicate ``step`` and any other per-region scalars from
             # rank-0 (they're guaranteed identical across saving ranks

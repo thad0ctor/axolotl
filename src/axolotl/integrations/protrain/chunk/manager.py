@@ -358,9 +358,7 @@ class ChunkManager:
         self.buffer_pool = buffer_pool
         self.cpu_optim = cpu_optim
         self.gpu_optim = gpu_optim
-        self.device = torch.device(
-            device if device is not None else buffer_pool.device
-        )
+        self.device = torch.device(device if device is not None else buffer_pool.device)
 
         # ZeRO-3 sharding context. ``world_size`` and ``rank`` default
         # to the single-rank case; when either is > default AND
@@ -496,11 +494,20 @@ class ChunkManager:
         if self._cpu_slots:
             LOG.debug(
                 "ChunkManager.materialize_offload: already materialized "
-                "(%d chunks), no-op", len(self._cpu_slots)
+                "(%d chunks), no-op",
+                len(self._cpu_slots),
             )
             return 0
 
         import torch
+
+        # ``pin_memory=True`` requires an NVIDIA driver/runtime even when the
+        # tensor lives on host memory, so allocating pinned host buffers on a
+        # CPU-only box raises ``RuntimeError: Found no NVIDIA driver``. Gate
+        # every pinned-host allocation in this method on a single boolean
+        # so CPU-only test hosts (and other CUDA-less environments) can
+        # construct a ChunkManager without crashing.
+        use_pinned_host = self.device.type == "cuda" and torch.cuda.is_available()
 
         freed = 0
         for cid_int in sorted(self._non_persistent_ids):
@@ -571,7 +578,9 @@ class ChunkManager:
             # non-empty param is seen). Empty / missing params do not
             # split regions — they simply contribute nothing.
             chunk_is_shardable = self.zero3_shard
-            dtype_regions: list[tuple] = []  # list of (dtype, esize, start_off, end_off)
+            dtype_regions: list[
+                tuple
+            ] = []  # list of (dtype, esize, start_off, end_off)
             if chunk_is_shardable:
                 cur_dtype = None
                 cur_esize = 0
@@ -607,17 +616,13 @@ class ChunkManager:
                         if off < cur_start:
                             cur_start = off
                     else:
-                        dtype_regions.append(
-                            (cur_dtype, cur_esize, cur_start, cur_end)
-                        )
+                        dtype_regions.append((cur_dtype, cur_esize, cur_start, cur_end))
                         cur_dtype = dtype_here
                         cur_esize = esz
                         cur_start = off
                         cur_end = param_end
                 if cur_dtype is not None:
-                    dtype_regions.append(
-                        (cur_dtype, cur_esize, cur_start, cur_end)
-                    )
+                    dtype_regions.append((cur_dtype, cur_esize, cur_start, cur_end))
 
             # No chunk without any regions is shardable (empty chunk).
             if chunk_is_shardable and not dtype_regions:
@@ -654,6 +659,7 @@ class ChunkManager:
             total_shard_bytes = 0
             if chunk_is_shardable:
                 import math as _math
+
                 for dtype_r, esize_r, start_off, end_off in dtype_regions:
                     region_bytes = end_off - start_off
                     pad_unit = (esize_r * self.world_size) // _math.gcd(
@@ -663,14 +669,16 @@ class ChunkManager:
                         (region_bytes + pad_unit - 1) // pad_unit
                     ) * pad_unit
                     shard_bytes_r = region_bytes_padded // self.world_size
-                    region_plans.append({
-                        "dtype": dtype_r,
-                        "esize": esize_r,
-                        "chunk_offset": start_off,
-                        "region_bytes": region_bytes,
-                        "region_bytes_padded": region_bytes_padded,
-                        "shard_bytes": shard_bytes_r,
-                    })
+                    region_plans.append(
+                        {
+                            "dtype": dtype_r,
+                            "esize": esize_r,
+                            "chunk_offset": start_off,
+                            "region_bytes": region_bytes,
+                            "region_bytes_padded": region_bytes_padded,
+                            "shard_bytes": shard_bytes_r,
+                        }
+                    )
                     total_shard_bytes += shard_bytes_r
 
             # Full-chunk buffer. For the sharded path we keep this
@@ -679,7 +687,7 @@ class ChunkManager:
             # absorbed into the PER-REGION scratch buffer at
             # gather/reduce time, not into the pool-buffer layout.
             cpu_bytes = torch.empty(
-                chunk_bytes, dtype=torch.uint8, pin_memory=True
+                chunk_bytes, dtype=torch.uint8, pin_memory=use_pinned_host
             )
 
             # --- Step 3: copy + rebind param.data -----------------------
@@ -722,7 +730,7 @@ class ChunkManager:
                     trainable_count += 1
                     if not chunk_is_shardable:
                         cpu_grad = torch.zeros(
-                            shape, dtype=dtype, pin_memory=True
+                            shape, dtype=dtype, pin_memory=use_pinned_host
                         )
 
                 # For sharded chunks ``slot.cpu_data`` points into the
@@ -766,6 +774,7 @@ class ChunkManager:
             # layout.
             if chunk_is_shardable:
                 from torch import nn as _nn
+
                 regions: list[_DtypeRegion] = []
                 for plan in region_plans:
                     r_dtype = plan["dtype"]
@@ -798,25 +807,21 @@ class ChunkManager:
                     # This rank's shard of the region.
                     my_off = self.rank * r_shard_bytes
                     cpu_region_shard = torch.empty(
-                        r_shard_bytes, dtype=torch.uint8, pin_memory=True
+                        r_shard_bytes, dtype=torch.uint8, pin_memory=use_pinned_host
                     )
                     cpu_region_shard.copy_(
                         region_scratch.narrow(0, my_off, r_shard_bytes)
                     )
                     cpu_region_grad = torch.zeros(
-                        r_shard_bytes, dtype=torch.uint8, pin_memory=True
+                        r_shard_bytes, dtype=torch.uint8, pin_memory=use_pinned_host
                     )
 
                     # Shard-level nn.Parameter for this region — one
                     # flat Adam step per region.
                     shard_numel = r_shard_bytes // r_esize
-                    shard_view = cpu_region_shard.view(r_dtype).view(
-                        shard_numel
-                    )
+                    shard_view = cpu_region_shard.view(r_dtype).view(shard_numel)
                     shard_param = _nn.Parameter(shard_view, requires_grad=True)
-                    shard_grad_view = cpu_region_grad.view(r_dtype).view(
-                        shard_numel
-                    )
+                    shard_grad_view = cpu_region_grad.view(r_dtype).view(shard_numel)
                     shard_param.grad = shard_grad_view
 
                     regions.append(
@@ -935,8 +940,7 @@ class ChunkManager:
         # "default process group not initialized" deep in the call stack.
         if self.zero3_shard and self._chunk_shards:
             if not (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
+                torch.distributed.is_available() and torch.distributed.is_initialized()
             ):
                 raise RuntimeError(
                     "ChunkManager.restore_to_gpu: zero3_shard=True but "
@@ -1008,9 +1012,7 @@ class ChunkManager:
                         dtype=torch.uint8,
                         device=self.device,
                     )
-                    my_shard_gpu.copy_(
-                        region.cpu_shard_bytes, non_blocking=True
-                    )
+                    my_shard_gpu.copy_(region.cpu_shard_bytes, non_blocking=True)
 
                     # Padded gather output: region_bytes_padded ==
                     # shard_bytes * world_size, so this matches the
@@ -1029,9 +1031,9 @@ class ChunkManager:
                     # region_bytes) are never read by any slot's
                     # byte_offset slice, so leaving them
                     # uninitialized in chunk_buf is correct.
-                    chunk_buf.narrow(
-                        0, region.chunk_offset, region.region_bytes
-                    ).copy_(gather_scratch.narrow(0, 0, region.region_bytes))
+                    chunk_buf.narrow(0, region.chunk_offset, region.region_bytes).copy_(
+                        gather_scratch.narrow(0, 0, region.region_bytes)
+                    )
 
                 # All regions are in place: rebind each slot to a
                 # fresh standalone GPU tensor. Per-slot fresh
@@ -1051,9 +1053,7 @@ class ChunkManager:
                     nbytes = slot.numel * slot.element_size
                     if nbytes == 0:
                         continue
-                    byte_view = chunk_buf.narrow(
-                        0, slot.byte_offset, nbytes
-                    )
+                    byte_view = chunk_buf.narrow(0, slot.byte_offset, nbytes)
                     typed = byte_view.view(slot.dtype).view(slot.shape)
                     gpu_tensor = torch.empty(
                         slot.shape, dtype=slot.dtype, device=self.device
@@ -1183,6 +1183,7 @@ class ChunkManager:
             # sole grad-sync point.
             import torch as _torch
             import torch.distributed as _dist
+
             if (
                 _dist.is_available()
                 and _dist.is_initialized()
@@ -1252,9 +1253,7 @@ class ChunkManager:
                         post_step=cm._make_post_cpu_step_repoint(captured_cid),
                     )
                 # Reset the counter now so the next backward fires again.
-                cm._grad_remaining[captured_cid] = cm._grad_initial.get(
-                    captured_cid, 0
-                )
+                cm._grad_remaining[captured_cid] = cm._grad_initial.get(captured_cid, 0)
 
         return _hook
 
@@ -1612,9 +1611,7 @@ class ChunkManager:
         # the params are in a clean state for the next gather.
         self.offload(chunk_id)
 
-    def _coalesced_all_reduce_persistent_grads(
-        self, chunk_id: ChunkId
-    ) -> None:
+    def _coalesced_all_reduce_persistent_grads(self, chunk_id: ChunkId) -> None:
         """Bucket persistent-chunk grads by dtype and issue one all_reduce per bucket.
 
         Replaces the per-param ``dist.all_reduce`` loop that dominated
@@ -1768,9 +1765,7 @@ class ChunkManager:
             # region shard). Use the region's dtype.
             shard_numel_r = region.shard_bytes // region.element_size
             full_numel_r = region.region_bytes_padded // region.element_size
-            region_grad_typed = region_grad.view(region.dtype).view(
-                full_numel_r
-            )
+            region_grad_typed = region_grad.view(region.dtype).view(full_numel_r)
             my_shard_grad_gpu = torch.empty(
                 shard_numel_r, dtype=region.dtype, device=device
             )
@@ -1813,9 +1808,7 @@ class ChunkManager:
         # against every region's shard_param for this chunk, so one
         # step_async call updates every region's slice at once.
         if self.cpu_optim is not None:
-            self.cpu_optim.step_async(
-                chunk_id, d2h_event=d2h_event, post_step=None
-            )
+            self.cpu_optim.step_async(chunk_id, d2h_event=d2h_event, post_step=None)
 
     # ---- optimizer driver ---------------------------------------------
 
@@ -1897,5 +1890,6 @@ class ChunkManager:
         )
         self._persistent_buffers[chunk_id] = buf
         return buf
+
 
 __all__ = ["ChunkManager"]

@@ -249,9 +249,7 @@ def run_trace(
     import torch
 
     device = torch.device(cfg.device)
-    cuda_available_for_bench = (
-        device.type == "cuda" and torch.cuda.is_available()
-    )
+    cuda_available_for_bench = device.type == "cuda" and torch.cuda.is_available()
 
     # Run the Adam microbenchmarks BEFORE installing the memory-delta
     # tracker. The benchmarks allocate a ~100-200 MB synthetic param
@@ -305,7 +303,7 @@ def run_trace(
     # post-forward hook after recording the "post" event; resolved into
     # ``op_latencies`` (seconds) after ``torch.cuda.synchronize()`` so that
     # ``Event.elapsed_time`` reads never stall the hook path.
-    pending_events: list[tuple[OpId, object, object]] = []
+    pending_events: "list[tuple[OpId, CudaEvent | None, CudaEvent | None]]" = []
 
     # Stack of in-flight _OpFrames keyed by the calling module id. Submodules
     # fire pre-hooks before their parent's post-hook; a dict keyed on id()
@@ -361,7 +359,8 @@ def run_trace(
     except Exception as exc:  # pragma: no cover - defensive
         LOG.debug(
             "trace: block_id_path_map unavailable (%s); falling back "
-            "to single-tree path-fragment heuristic", exc
+            "to single-tree path-fragment heuristic",
+            exc,
         )
 
     def _resolve_block_id(path: str) -> BlockId | None:
@@ -485,9 +484,9 @@ def run_trace(
         # with when a block_id is inferrable.
         if frame.block_id is not None:
             out_bytes = _output_bytes(output)
-            activation_sizes[frame.block_id] = activation_sizes.get(
-                frame.block_id, 0
-            ) + out_bytes
+            activation_sizes[frame.block_id] = (
+                activation_sizes.get(frame.block_id, 0) + out_bytes
+            )
 
     def _output_bytes(output: Any) -> int:
         total = 0
@@ -512,9 +511,7 @@ def run_trace(
     engage_on_demand = False
     if cfg.on_demand and cuda_available:
         try:
-            gpu_total = int(
-                torch.cuda.get_device_properties(device).total_memory
-            )
+            gpu_total = int(torch.cuda.get_device_properties(device).total_memory)
             # State-aware footprint: params (all of them) + grads + fp32
             # master + two fp32 Adam momenta for trainable params. Using
             # param-bytes alone misses the optimizer state, which dominates
@@ -617,7 +614,8 @@ def run_trace(
         except Exception as exc:  # pragma: no cover - defensive
             LOG.debug(
                 "profiler: discover_blocks failed (%s); skipping per-block "
-                "peak capture, aggregate cap only", exc
+                "peak capture, aggregate cap only",
+                exc,
             )
             blocks = []
 
@@ -651,6 +649,7 @@ def run_trace(
                 # above; the whole-iter aggregate is recovered post-iter
                 # from the per-block peaks the post-hooks already record.
                 torch.cuda.reset_peak_memory_stats(_dev)
+
             return _pre
 
         def _make_post(bid, _dev):
@@ -660,16 +659,13 @@ def run_trace(
                     steady_fwd_block_peak_bytes.get(bid, 0), block_peak
                 )
                 iter_block_peaks.append(block_peak)
+
             return _post
 
         for idx, block in enumerate(blocks):
             bid = BlockId(idx)
-            block_handles.append(
-                block.register_forward_pre_hook(_make_pre(device))
-            )
-            block_handles.append(
-                block.register_forward_hook(_make_post(bid, device))
-            )
+            block_handles.append(block.register_forward_pre_hook(_make_pre(device)))
+            block_handles.append(block.register_forward_hook(_make_post(bid, device)))
 
         # Multi-iter hot-loop measurement. A single forward still carries
         # allocator-settle cost that a real steady-state training loop
@@ -708,9 +704,7 @@ def run_trace(
                 # ``max(iter_block_peaks)`` — the largest individual block
                 # peak from this iter — to recover the whole-iter peak
                 # without paying for an extra read inside each hot pre-hook.
-                whole_iter_peak = (
-                    max(iter_block_peaks) if iter_block_peaks else 0
-                )
+                whole_iter_peak = max(iter_block_peaks) if iter_block_peaks else 0
                 steady_fwd_peak_bytes = max(
                     steady_fwd_peak_bytes,
                     whole_iter_peak,
@@ -727,14 +721,14 @@ def run_trace(
                         steady_loss.backward()
                         post_sb.record()
                         torch.cuda.synchronize(device)
-                        bwd_iter_s.append(
-                            pre_sb.elapsed_time(post_sb) / 1000.0
-                        )
+                        bwd_iter_s.append(pre_sb.elapsed_time(post_sb) / 1000.0)
                         model.zero_grad(set_to_none=True)
                     except Exception as bwd_exc:  # pragma: no cover
                         LOG.debug(
                             "profiler steady backward iter %d failed (%s); "
-                            "cost model falls back to bwd_fwd ratio", i, bwd_exc
+                            "cost model falls back to bwd_fwd ratio",
+                            i,
+                            bwd_exc,
                         )
                         bwd_iter_s.clear()  # drop partial measurements
                         # Don't raise — continue forward timing
@@ -744,6 +738,7 @@ def run_trace(
             # Steady value = median of iters [N_STEADY_WARMUP:]. With
             # N=4 warmup=2 this is the median of the last 2.
             import statistics
+
             steady_slice = fwd_iter_s[N_STEADY_WARMUP:]
             if steady_slice:
                 steady_fwd_wall_s = statistics.median(steady_slice)
@@ -754,7 +749,8 @@ def run_trace(
         except Exception as exc:  # pragma: no cover - defensive
             LOG.debug(
                 "profiler hook-less steady-state measurement failed (%s); "
-                "cost model will fall back to identity scale", exc
+                "cost model will fall back to identity scale",
+                exc,
             )
             steady_fwd_wall_s = 0.0
             steady_bwd_wall_s = 0.0
@@ -867,6 +863,8 @@ def run_trace(
     op_latencies: dict[OpId, float] = {}
     if cuda_available:
         for op_id, pre_ev, post_ev in pending_events:
+            if pre_ev is None or post_ev is None:
+                continue
             try:
                 elapsed_ms = pre_ev.elapsed_time(post_ev)
             except Exception as exc:  # pragma: no cover - defensive
@@ -884,8 +882,7 @@ def run_trace(
         if hooked_fwd_pre_event is not None and hooked_fwd_post_event is not None:
             try:
                 hooked_fwd_wall_s = (
-                    hooked_fwd_pre_event.elapsed_time(hooked_fwd_post_event)
-                    / 1000.0
+                    hooked_fwd_pre_event.elapsed_time(hooked_fwd_post_event) / 1000.0
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 LOG.debug("hooked forward Event.elapsed_time failed: %s", exc)
@@ -910,13 +907,9 @@ def run_trace(
     # model uses this to pick a tighter bwd/fwd-ratio fallback (LoRA backward
     # is ~1× forward, vs the 2× canonical full-finetune ratio).
     try:
-        n_trainable = sum(
-            int(p.numel()) for p in model.parameters() if p.requires_grad
-        )
+        n_trainable = sum(int(p.numel()) for p in model.parameters() if p.requires_grad)
         n_total = sum(int(p.numel()) for p in model.parameters())
-        trainable_param_fraction = (
-            n_trainable / n_total if n_total > 0 else 0.0
-        )
+        trainable_param_fraction = n_trainable / n_total if n_total > 0 else 0.0
     except Exception as exc:  # pragma: no cover - defensive
         LOG.debug("trainable_param_fraction probe failed (%s)", exc)
         trainable_param_fraction = 0.0
@@ -932,7 +925,8 @@ def run_trace(
     except Exception as exc:  # pragma: no cover - defensive
         LOG.warning(
             "measure_compute_rate failed (%s); recording 0.0 — cost model "
-            "will skip SKU calibration", exc,
+            "will skip SKU calibration",
+            exc,
         )
         compute_rate_tflops = 0.0
 
@@ -942,9 +936,8 @@ def run_trace(
     if resolved_world is None:
         try:
             import torch.distributed as _dist
-            resolved_world = (
-                _dist.get_world_size() if _dist.is_initialized() else 1
-            )
+
+            resolved_world = _dist.get_world_size() if _dist.is_initialized() else 1
         except Exception:  # noqa: BLE001 - defensive
             resolved_world = 1
 
@@ -953,7 +946,8 @@ def run_trace(
     except Exception as exc:  # pragma: no cover - distributed-only paths
         LOG.warning(
             "measure_nccl failed (%s); recording empty collective tables. "
-            "Cost model's communication term will degrade to 0.", exc,
+            "Cost model's communication term will degrade to 0.",
+            exc,
         )
         gather_table, reduce_table = ({}, {})
 
@@ -1005,7 +999,9 @@ def _extract_loss(output: Any) -> "torch.Tensor":
         for item in output:
             if isinstance(item, torch.Tensor):
                 return item.sum()
-    raise TypeError(f"run_trace: unable to extract a loss from output of type {type(output)}")
+    raise TypeError(
+        f"run_trace: unable to extract a loss from output of type {type(output)}"
+    )
 
 
 __all__ = ["run_trace"]
