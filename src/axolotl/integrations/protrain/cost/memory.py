@@ -26,6 +26,7 @@ Design contract (see DESIGN.md §Design Decisions):
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 
 from axolotl.integrations.protrain.types import (
@@ -270,22 +271,25 @@ def estimate_cpu_footprint(
     chunk, so the per-rank footprint divides by ``gpu_count``.
 
     The activation-swap pool, when ``n_swap > 0`` and a trace is
-    provided, contributes an additional ``n_swap * SWAP_PREFETCH_DEPTH
-    * max_swap_band_activation_bytes`` of pinned CPU. This term is
-    **per-rank** and **NOT divided by gpu_count** — the swap pool is
-    a rank-local allocation; sharding does not split activations
-    across ranks. The aggregate per-block activation bytes is split
-    across ``SWAP_SLOTS_PER_BLOCK`` slots in the actual pool (M5+
-    ``saved_tensors_hooks`` integration), but the **total** pinned
-    bytes per block is unchanged from option-2A: K slots each sized
-    to ``aggregate / K`` ≡ one slot sized to ``aggregate``. The
-    factoring matters for slot-fit correctness (a too-small slot
-    rejects a single tensor that exceeds it), not for the CPU-bytes
-    gate the searcher consults. When ``trace`` is None we
-    conservatively use the average across all blocks as a proxy (used
-    by callers that want a pre-search ballpark; the searcher itself
+    provided, contributes an additional
+    ``n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH * slot_bytes``
+    of pinned CPU, where
+    ``slot_bytes = ceil(per_block_activation_bytes / SWAP_SLOTS_PER_BLOCK)``.
+    This mirrors the runtime allocation in
+    ``block.swap_pool.ActivationSwapPool``, which reserves
+    K slots (``SWAP_SLOTS_PER_BLOCK``) per block, each
+    ``SWAP_PREFETCH_DEPTH`` deep, with every slot sized to the same
+    width so any saved tensor fits. The term is **per-rank** and
+    **NOT divided by gpu_count** — the swap pool is a rank-local
+    allocation; sharding does not split activations across ranks.
+    Because slot width is the per-tensor ceiling rather than an exact
+    average, this formula is a slight overestimate of the bare
+    ``n_swap * SWAP_PREFETCH_DEPTH * aggregate`` lower bound, which
+    matches the conservative-upper-bound contract the searcher gate
+    expects. When ``trace`` is None we omit the swap term — used by
+    callers that want a pre-search ballpark; the searcher itself
     always passes ``trace`` so the gate matches the real wrap-time
-    pool size).
+    pool size.
 
     This accounting is **orthogonal to** :func:`estimate_peak`, which
     models GPU memory: the gather materializes the full chunk on GPU
@@ -331,19 +335,30 @@ def estimate_cpu_footprint(
     chunk_term = (total_bytes + per_rank_divisor - 1) // per_rank_divisor
 
     # Activation-swap pool term — rank-local; not sharded.
+    #
+    # The runtime pool (``block.swap_pool.ActivationSwapPool``) reserves
+    # ``n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH`` pinned CPU
+    # slots, each sized to the worst-case single-saved-tensor bytes.
+    # We approximate the per-saved-tensor width as
+    # ``ceil(per_block_aggregate_activation_bytes / SWAP_SLOTS_PER_BLOCK)``
+    # — i.e. the aggregate activation budget for a block, evenly split
+    # across its K saved-tensor slots. Picking the max aggregate across
+    # the swap band ensures every block's slots fit (the pool sizes all
+    # slots to the same width at wrap time).
     swap_term = 0
     if cfg.n_swap > 0 and trace is not None and trace.activation_sizes:
         # Swap-early rule: the first ``n_swap`` blocks (in BlockId order)
-        # use SWAP. We take the max activation bytes across that band as
-        # the slot size — the wrap-time pool sizes every slot to the
-        # same width so any SWAP block's activation fits any slot.
+        # use SWAP.
         sorted_bids = sorted(trace.activation_sizes.keys())
         swap_band = sorted_bids[: cfg.n_swap]
         if swap_band:
-            slot_bytes = max(
+            per_block_activation_bytes = max(
                 int(trace.activation_sizes.get(bid, 0)) for bid in swap_band
             )
-            swap_term = cfg.n_swap * SWAP_PREFETCH_DEPTH * slot_bytes
+            slot_bytes = math.ceil(per_block_activation_bytes / SWAP_SLOTS_PER_BLOCK)
+            swap_term = (
+                cfg.n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH * slot_bytes
+            )
 
     return chunk_term + swap_term
 

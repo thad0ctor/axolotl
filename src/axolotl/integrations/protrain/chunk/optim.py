@@ -261,6 +261,17 @@ class GpuFusedAdamAdapter:
         self.eps = float(eps)
         self.weight_decay = float(weight_decay)
 
+        # Empty persistent set is a valid Mode-C state (e.g. a config where
+        # all chunks are non-persistent / live on CPU). Both Apex FusedAdam
+        # and torch.optim.AdamW raise ValueError on an empty params list,
+        # so short-circuit to a no-op adapter: step()/zero_grad() do
+        # nothing and state_dict() returns the empty dict shape that
+        # torch optimizers use.
+        self._is_noop = len(param_list) == 0
+        if self._is_noop:
+            self._optim = None
+            return
+
         optim = self._build_optim(param_list)
         self._optim = optim
 
@@ -300,15 +311,34 @@ class GpuFusedAdamAdapter:
 
     def step(self) -> None:
         """Synchronous fused GPU Adam step over persistent-chunk params."""
+        if self._is_noop:
+            return
         self._optim.step()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Zero gradients on every persistent-chunk parameter."""
+        if self._is_noop:
+            return
         self._optim.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the wrapped optimizer's state dict (empty when no-op)."""
+        if self._is_noop:
+            return {"state": {}, "param_groups": []}
+        return self._optim.state_dict()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Load state into the wrapped optimizer (no-op when adapter is empty)."""
+        if self._is_noop:
+            return
+        self._optim.load_state_dict(state_dict)
 
     @property
     def underlying(self) -> Any:
-        """The wrapped optimizer instance (useful for LR schedulers)."""
+        """The wrapped optimizer instance (useful for LR schedulers).
+
+        ``None`` when the adapter wraps an empty persistent param set.
+        """
         return self._optim
 
 

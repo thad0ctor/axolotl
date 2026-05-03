@@ -688,11 +688,45 @@ def _construct_runtime(
     import torch
 
     n_persist = result.cfg.n_persist
-    n_buffer = max(1, result.cfg.n_buffer)
+    # The searcher's choice of ``n_buffer`` is what the cost model used to
+    # rank this config; the runtime, however, has a hard floor: the
+    # scheduler's lookahead prefetch needs the union of the current and
+    # next block's non-persistent chunks to fit in the pool
+    # simultaneously. ``min_n_buffer_for`` returns that floor for the
+    # given layout + n_persist (see search/exhaustive.py — promoted to
+    # public for exactly this reason). If the searcher's pick already
+    # satisfies it, we honour the pick verbatim. If it doesn't (e.g. a
+    # single-rank all-persistent config that searched with n_buffer=0),
+    # we bump to the floor and LOG.warning so the user knows the
+    # cost-model prediction may be slightly off.
+    required_n_buffer = min_n_buffer_for(layout, n_persist)
+    if result.cfg.n_buffer < required_n_buffer:
+        LOG.warning(
+            "ProTrain: searcher returned n_buffer=%d but runtime requires "
+            ">= %d for the scheduler's lookahead prefetch (n_persist=%d, "
+            "N_chunk=%d). Bumping n_buffer; cost-model prediction may be "
+            "slightly off.",
+            int(result.cfg.n_buffer),
+            int(required_n_buffer),
+            int(n_persist),
+            int(layout.N_chunk),
+        )
+        n_buffer = int(required_n_buffer)
+    else:
+        n_buffer = int(result.cfg.n_buffer)
 
-    pinned_host = PinnedHostMemory(n_buffer=n_buffer, S_chunk=layout.S_chunk)
+    # Pool needs at least 1 slot for the allocator API (PinnedHostMemory
+    # and BufferPool both reject n_buffer=0). When ``min_n_buffer_for``
+    # legitimately returns 0 (all-persistent layout — every chunk
+    # resident on GPU, nothing routes through the pool), reserve one
+    # dormant slot so the allocator constructs cleanly. R9's intent
+    # (no silent inflation of the searcher's choice) is preserved:
+    # the cost-model ranking already used n_buffer=0 to score this
+    # config; the dormant pool slot doesn't change that ranking.
+    pool_capacity = max(1, n_buffer)
+    pinned_host = PinnedHostMemory(n_buffer=pool_capacity, S_chunk=layout.S_chunk)
     buffer_pool = BufferPool(
-        n_buffer=n_buffer,
+        n_buffer=pool_capacity,
         S_chunk=layout.S_chunk,
         pinned_host=pinned_host,
         device=device,
@@ -1299,12 +1333,11 @@ def protrain_model_wrapper(
 
     # Stash the caller's raw intent before the auto-selector potentially
     # rewrites the effective flags. The selector is applied AFTER
-    # search() returns; until then we treat the run as a "best fit"
-    # search with zero3_shard=False in the hardware profile so the
-    # searcher's CPU accounting uses the replicated baseline (the GPU
-    # peak filter is sharding-agnostic anyway — see
-    # cost/memory.estimate_peak — so the searcher's pick of n_persist is
-    # not distorted by this choice).
+    # search() returns; the search itself runs against a hardware
+    # profile whose ``zero3_shard`` flag is resolved a few lines below
+    # to keep the CPU-capacity hard gate from preempting the auto-mode
+    # selector — see the block immediately following the auto-mode
+    # short-circuit for the full rationale.
     _user_force_all_persistent = bool(force_all_persistent)
     _user_zero3_shard = zero3_shard
 
@@ -1336,7 +1369,23 @@ def protrain_model_wrapper(
     # overrides otherwise. The ChunkManager additionally degrades to
     # False on single-rank hosts (so setting this True on ws=1 is a
     # no-op); we mirror that here for HW profile consistency.
-    if zero3_shard is None:
+    #
+    # On the auto-mode multi-rank path we deliberately overstate
+    # ``zero3_shard=True`` for the SEARCH-TIME hardware profile so the
+    # ``cpu_capacity_bytes`` hard gate inside ``search()`` uses the
+    # SHARDED (most-permissive) per-rank footprint. Otherwise the gate
+    # would reject configs that fit under sharding before
+    # ``_select_mode`` ever gets to enable Mode C. The post-search
+    # selector (``_select_mode``) then re-evaluates both replicated and
+    # sharded footprints against the actual per-rank RAM and either
+    # picks the right mode or raises a clear RuntimeError; here we just
+    # make sure the search itself doesn't preempt that decision. The
+    # GPU peak filter is sharding-agnostic (see
+    # ``cost/memory.estimate_peak``), so the searcher's pick of
+    # ``n_persist`` is not distorted by this choice.
+    if auto_mode and _ws_early > 1:
+        _zero3_for_hw = True
+    elif zero3_shard is None:
         _zero3_for_hw = (_ws_early > 1) and (not force_all_persistent)
     else:
         _zero3_for_hw = bool(zero3_shard) and (_ws_early > 1)
@@ -1616,11 +1665,15 @@ def protrain_model_wrapper(
 
         force_all_persistent = auto_force_persistent
         zero3_shard = auto_zero3
-        # If the selector picked Mode C (sharded), we need the downstream
-        # chunk manager to see zero3_shard=True. Propagate via the
-        # hardware_profile so the remaining pipeline picks it up exactly
-        # as the explicit path would. (If selector picked Mode B, the
-        # prior hw flip to False is already correct.)
+        # Sync the downstream hardware_profile to the selector's pick.
+        # The SEARCH ran with the most-permissive ``zero3_shard`` flag
+        # (True on auto + multi-rank, see the resolve block above) so
+        # the CPU gate didn't preempt Mode C. Now that the selector has
+        # made its call, re-stamp the profile so the chunk-manager,
+        # cost-model peak prediction, and any phase-2 rebuild see the
+        # ACTUAL mode the runtime will use (Mode B → False, Mode C →
+        # True; Mode A → False because force_all_persistent skips the
+        # sharded all_gather path).
         if zero3_shard != hardware_profile.zero3_shard:
             from dataclasses import replace as _replace
 

@@ -63,8 +63,15 @@ def measure_pcie(
     host = torch.empty(n_bytes, dtype=torch.uint8, pin_memory=True)
     gpu = torch.empty(n_bytes, dtype=torch.uint8, device=device)
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    # Bind the timing events to ``device_idx`` so they record on the
+    # right device under CUDA_VISIBLE_DEVICES masking / multi-GPU rigs.
+    # ``torch.cuda.Event`` infers its device from the current device at
+    # construction time; without this guard a stale ``current_device()``
+    # would attach the events to the wrong GPU and produce nonsensical
+    # ``elapsed_time`` readings (or a hard error on cross-device record).
+    with torch.cuda.device(device_idx):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
     def _time_copy(src, dst) -> float:
         torch.cuda.synchronize(device)

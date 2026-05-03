@@ -1235,14 +1235,28 @@ def _load_protrain_optim_dir(
         # behaviour silently tolerated extras (e.g. ``chunk_X_rank_8.pt``
         # left over from a higher-world_size save). Mirror Mode-B's
         # pattern: enumerate cpu_optim/ and reject anything that
-        # (a) doesn't match CHUNK_SHARD_FILE_RE, or
+        # (a) doesn't match CHUNK_SHARD_FILE_RE,
         # (b) carries a rank ordinal outside ``[0, current_world)`` —
         #     these match the filename grammar but are leftovers from a
         #     larger-world_size save and would silently slip past a
-        #     pure regex check.
+        #     pure regex check, or
+        # (c) carries a chunk ID that isn't in the current set of
+        #     non-persistent chunk IDs — a syntactically valid filename
+        #     for a chunk that the current run does not own (e.g.
+        #     leftover from a different partition / persistent_ids
+        #     override). Mode-B catches the equivalent case via the
+        #     ``saved_cpu_ids != current_cpu_ids`` set comparison; the
+        #     Mode-C per-rank loop only opens the files it expects, so
+        #     stray chunk IDs would otherwise sit unread on disk and
+        #     mask a real partition mismatch.
         # Done up-front (inside the try/except so the cross-rank failure
         # protocol applies) before any torch.load runs.
         cpu_dir = os.path.join(target, CPU_OPTIM_DIRNAME)
+        expected_cpu_ids = (
+            set(int(cid) for cid in optim._cpu_optim._optims)
+            if optim._cpu_optim is not None
+            else set()
+        )
         load_status = 0
         try:
             if os.path.isdir(cpu_dir):
@@ -1255,6 +1269,7 @@ def _load_protrain_optim_dir(
                             "must contain only chunk_<N>_rank_<R>.pt "
                             "shards. Refusing to load."
                         )
+                    file_chunk_id = int(m.group(1))
                     file_rank = int(m.group(2))
                     if file_rank < 0 or file_rank >= current_world:
                         raise RuntimeError(
@@ -1264,6 +1279,17 @@ def _load_protrain_optim_dir(
                             f"world_size range [0, {current_world}). "
                             "Likely a leftover shard from a higher-"
                             "world_size save. Refusing to load."
+                        )
+                    if file_chunk_id not in expected_cpu_ids:
+                        raise RuntimeError(
+                            "ProTrain optimizer load: unexpected file "
+                            f"{name!r} in {cpu_dir!r} — chunk ID "
+                            f"{file_chunk_id} is not in the current set "
+                            f"of non-persistent chunk IDs "
+                            f"{sorted(expected_cpu_ids)}. Likely a "
+                            "leftover shard from a different partition "
+                            "or persistent_ids configuration. Refusing "
+                            "to load."
                         )
             if optim._cpu_optim is not None and optim._cpu_optim._optims:
                 for cid, inner in optim._cpu_optim._optims.items():
@@ -1300,10 +1326,22 @@ def _load_protrain_optim_dir(
         finally:
             _allreduce_status_or_raise(load_status, op="load (per-rank shard read)")
 
-        # Hyperparam drift: warn but accept.
+        # Hyperparam drift: warn but accept. ``zip`` runs without
+        # ``strict=True`` because the count-mismatch case is handled by
+        # the explicit warning above (R8): aborting here with a
+        # ValueError would contradict the documented "warn and accept"
+        # contract.
         saved_hp = metadata.get("param_groups_meta", [])
         current_hp = _hyperparam_snapshot(optim)
-        for i, (s, c) in enumerate(zip(saved_hp, current_hp, strict=True)):
+        if len(saved_hp) != len(current_hp):
+            LOG.warning(
+                "ProTrain optimizer load: param-group count mismatch "
+                "(saved=%d, current=%d) — accepting partial restore; "
+                "groups beyond min(saved, current) won't be compared.",
+                len(saved_hp),
+                len(current_hp),
+            )
+        for i, (s, c) in enumerate(zip(saved_hp, current_hp, strict=False)):
             if _normalize_hp(s) != _normalize_hp(c):
                 LOG.warning(
                     "ProTrain optimizer load: param_groups[%d] "
@@ -1486,10 +1524,22 @@ def _load_protrain_optim_dir(
 
     # Hyperparam drift: warn but accept. JSON serialization turns
     # ``betas`` tuples into lists; normalize before comparing so
-    # round-tripped data doesn't trigger a spurious warning.
+    # round-tripped data doesn't trigger a spurious warning. ``zip``
+    # runs without ``strict=True`` because the count-mismatch case is
+    # handled by the explicit warning above (R8): aborting here with a
+    # ValueError would contradict the documented "warn and accept"
+    # contract.
     saved_hp = metadata.get("param_groups_meta", [])
     current_hp = _hyperparam_snapshot(optim)
-    for i, (s, c) in enumerate(zip(saved_hp, current_hp, strict=True)):
+    if len(saved_hp) != len(current_hp):
+        LOG.warning(
+            "ProTrain optimizer load: param-group count mismatch "
+            "(saved=%d, current=%d) — accepting partial restore; "
+            "groups beyond min(saved, current) won't be compared.",
+            len(saved_hp),
+            len(current_hp),
+        )
+    for i, (s, c) in enumerate(zip(saved_hp, current_hp, strict=False)):
         if _normalize_hp(s) != _normalize_hp(c):
             LOG.warning(
                 "ProTrain optimizer load: param_groups[%d] hyperparams drifted "

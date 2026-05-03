@@ -612,14 +612,27 @@ class ProTrainPlugin(BasePlugin):
             and _torch is not None
             and _torch.cuda.is_available()
         ):
-            target = f"cuda:{int(_os.environ.get('LOCAL_RANK', 0))}"
-            LOG.info(
-                "ProTrain: model is on %s; moving to %s before wrap "
-                "(post_model_load fired pre-Accelerate.prepare).",
-                current_device,
-                target,
-            )
-            model.to(target)
+            local_rank = int(_os.environ.get("LOCAL_RANK", 0))
+            visible = _torch.cuda.device_count()
+            if local_rank < visible:
+                target = f"cuda:{local_rank}"
+                LOG.info(
+                    "ProTrain: model is on %s; moving to %s before wrap "
+                    "(post_model_load fired pre-Accelerate.prepare).",
+                    current_device,
+                    target,
+                )
+                model.to(target)
+            else:
+                LOG.warning(
+                    "ProTrain: model is on %s and CUDA is available, but "
+                    "LOCAL_RANK=%d is out of range for visible device count "
+                    "%d (CUDA_VISIBLE_DEVICES masking?); skipping pre-wrap "
+                    "model.to() and deferring placement to Accelerate.prepare.",
+                    current_device,
+                    local_rank,
+                    visible,
+                )
 
         hw = _build_hardware_profile(cfg)
 

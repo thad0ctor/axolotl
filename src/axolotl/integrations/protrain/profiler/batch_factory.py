@@ -54,7 +54,7 @@ LOG = get_logger(__name__)
 
 TASK_CAUSAL_LM = "causal_lm"
 TASK_SEQ_CLASSIFICATION = "seq_classification"
-TASK_TOKEN_CLASSIFICATION = "token_classification"
+TASK_TOKEN_CLASSIFICATION = "token_classification"  # nosec B105 — task type label, not a password
 TASK_SEQ2SEQ_LM = "seq2seq_lm"
 
 KNOWN_TASKS: tuple[str, ...] = (
