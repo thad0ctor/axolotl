@@ -21,7 +21,7 @@ to ``protrain_model_wrapper`` / ``protrain_optimizer_wrapper``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from axolotl.integrations.base import BasePlugin
 from axolotl.utils.logging import get_logger
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from torch.optim import Optimizer
     from transformers import Trainer
 
-    from axolotl.utils.dict import DictDefault
+    from axolotl.integrations.protrain.chunk import ChunkManager
 
 LOG = get_logger(__name__)
 
@@ -263,7 +263,6 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
     import dataclasses
 
     try:
-        import torch
         import torch.distributed as dist
     except ImportError:
         return (False, False)
@@ -681,10 +680,11 @@ class ProTrainPlugin(BasePlugin):
         # ``auto_mode=True`` the selector may have overridden the
         # user's force_all_persistent / zero3_shard intent, and the
         # log should reflect what's actually installed.
-        n_chunk_total = getattr(wrapped.chunk_manager.layout, "N_chunk", -1)
+        chunk_manager = cast("ChunkManager", wrapped.chunk_manager)
+        n_chunk_total = getattr(chunk_manager.layout, "N_chunk", -1)
         effective_force_persistent = int(picked.n_persist) >= int(n_chunk_total)
         effective_zero3 = bool(
-            getattr(wrapped.chunk_manager, "zero3_shard", False)
+            getattr(chunk_manager, "zero3_shard", False)
         )
         LOG.info(
             "ProTrain: %s config picked (n_persist=%d, n_buffer=%d, "

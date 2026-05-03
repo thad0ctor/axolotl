@@ -20,7 +20,7 @@ single-tree causal-LM models return a single-element list.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 
 from torch import nn
@@ -171,6 +171,8 @@ _KNOWN_BLOCK_PATHS: tuple[str, ...] = (
     "base_model.model.transformer.h",  # PEFT + GPT-2
     "encoder.block",                   # T5 / FLAN-T5 encoder tree
     "decoder.block",                   # T5 / FLAN-T5 decoder tree
+    "encoder.layers",                  # BART / mBART encoder tree
+    "decoder.layers",                  # BART / mBART decoder tree
 )
 
 
@@ -181,7 +183,8 @@ _KNOWN_BLOCK_PATHS: tuple[str, ...] = (
 # the encoder (forward_order=0) runs first; the decoder (forward_order=1)
 # consumes the encoder's last-layer hidden state via cross-attention.
 _ENC_DEC_PATH_PAIRS: tuple[tuple[str, str], ...] = (
-    ("encoder.block", "decoder.block"),  # T5 / FLAN-T5
+    ("encoder.block", "decoder.block"),    # T5 / FLAN-T5
+    ("encoder.layers", "decoder.layers"),  # BART / mBART
 )
 
 

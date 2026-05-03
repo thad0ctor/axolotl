@@ -11,16 +11,6 @@ import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from axolotl.utils.logging import get_logger
-
-from axolotl.integrations.protrain.types import (
-    BlockId,
-    OpId,
-    OpRecord,
-    ProfilerConfig,
-    ProfilerTrace,
-)
-
 from axolotl.integrations.protrain.profiler.hw_bench import (
     measure_compute_rate,
     measure_cpu_adam,
@@ -34,10 +24,19 @@ from axolotl.integrations.protrain.profiler.memory_deltas import (
     intra_op_delta,
 )
 from axolotl.integrations.protrain.profiler.on_demand import OnDemandTensorMgr
+from axolotl.integrations.protrain.types import (
+    BlockId,
+    OpId,
+    OpRecord,
+    ProfilerConfig,
+    ProfilerTrace,
+)
+from axolotl.utils.logging import get_logger
 
 if TYPE_CHECKING:
     import torch
     from torch import nn
+    from torch.cuda import Event as CudaEvent
 
 LOG = get_logger(__name__)
 
@@ -108,10 +107,10 @@ class _OpFrame:
     # Pair of torch.cuda.Events recorded at pre-/post-forward. ``elapsed_time``
     # is read lazily after the final ``torch.cuda.synchronize`` at the end of
     # ``run_trace`` so the hook path does not stall on a per-op sync.
-    # Typed as ``object`` here to keep this module import-light (torch is a
-    # TYPE_CHECKING-only import at the top of the file).
-    pre_event: object = None
-    post_event: object = None
+    # ``CudaEvent`` is imported under ``TYPE_CHECKING`` so this annotation
+    # does not pull torch at module-import time.
+    pre_event: "CudaEvent | None" = None
+    post_event: "CudaEvent | None" = None
 
 
 def _infer_block_id(module_path: str) -> BlockId | None:
@@ -122,7 +121,7 @@ def _infer_block_id(module_path: str) -> BlockId | None:
     M2's ChunkLayout supplies the authoritative block->module map.
     """
     parts = module_path.split(".")
-    for prev, cur in zip(parts, parts[1:]):
+    for prev, cur in zip(parts, parts[1:], strict=False):
         if prev in {"h", "layers", "blocks", "block", "layer"} and cur.isdigit():
             return BlockId(int(cur))
     return None

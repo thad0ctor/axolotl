@@ -762,7 +762,7 @@ def test_swap_smoke_n_swap_override_runs_three_iters() -> None:
     # Force n_swap=2 (first 2 blocks SWAP) via the explicit override.
     # The other knobs are sized to keep all chunks persistent — SWAP
     # blocks need their parameter chunks to be persistent (see
-    # _block_map_runtime_admissible in exhaustive.py).
+    # block_map_runtime_admissible in exhaustive.py).
     try:
         wrapped = protrain_model_wrapper(
             model,

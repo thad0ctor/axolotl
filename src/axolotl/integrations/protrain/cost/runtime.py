@@ -609,7 +609,7 @@ def estimate_runtime(
         # in backward if not evicted, skipping reload" invariant. Without
         # this translation the chunked-wall override is FLAT in
         # ``n_buffer`` and the searcher's "argmin over n_buffer" would
-        # collapse to the minimum-feasible value (``_min_n_buffer_for``);
+        # collapse to the minimum-feasible value (``min_n_buffer_for``);
         # the searcher then picks ``n_buffer=2`` for a Mode-C workload
         # where ``n_buffer >= 6`` would let most non-persistent chunks
         # survive forward and skip the re-gather in backward.
@@ -677,19 +677,29 @@ def estimate_runtime(
     else:
         ms_per_chunk = 0.0
 
-    # Prefer the profiler-measured Adam rates on ``HardwareProfile``; fall
-    # back to the hardcoded priors when the microbenchmarks returned 0.0
-    # (e.g. DeepSpeedCPUAdam compile failure). Log at WARN exactly once
-    # per estimate_runtime call so repeated search invocations don't spam.
+    # ``cpu_adam_bytes_per_sec == 0`` is the sentinel ``measure_cpu_adam``
+    # emits when DeepSpeedCPUAdam can't be imported or constructed
+    # (e.g. CUDA-version mismatch on this rig). The runtime path mirrors
+    # this: ``protrain_optimizer_wrapper`` sets ``cpu_optim = None`` and
+    # **skips the CPU step entirely** for non-persistent chunks (they sit
+    # un-stepped — a "training-incorrect" state the wrapper LOG.errors
+    # about). Earlier this branch fell back to a hardcoded prior, which
+    # billed a fictional CPU-Adam wall and made the searcher pick configs
+    # that minimized a cost the runtime would never pay. Now we honour
+    # the absence: ``cpu_adam_bps = 0.0`` here is a sentinel that drops
+    # the ``t_cpu_optim`` term to 0 below.
     if hw.cpu_adam_bytes_per_sec > 0.0:
         cpu_adam_bps = hw.cpu_adam_bytes_per_sec
     else:
         LOG.warning(
-            "estimate_runtime: cpu_adam_bytes_per_sec unavailable; using "
-            "fallback %.2e (re-run profiler for a calibrated rate)",
-            _CPU_ADAM_FALLBACK,
+            "estimate_runtime: cpu_adam_bytes_per_sec=0 — treating CPU "
+            "Adam as unavailable (matches optim_wrapper's cpu_optim=None "
+            "path). Non-persistent chunks contribute 0 to t_cpu_optim. "
+            "Note that under this state non-persistent chunks are NOT "
+            "actually being stepped at runtime either; install/fix "
+            "DeepSpeed for full coverage."
         )
-        cpu_adam_bps = _CPU_ADAM_FALLBACK
+        cpu_adam_bps = 0.0  # sentinel — t_cpu_optim collapses to 0
 
     if hw.gpu_adam_bytes_per_sec > 0.0:
         gpu_adam_bps = hw.gpu_adam_bytes_per_sec
@@ -702,7 +712,38 @@ def estimate_runtime(
         gpu_adam_bps = _GPU_ADAM_FALLBACK
 
     t_gpu_optim = n_persist * ms_per_chunk / gpu_adam_bps
-    t_cpu_optim = n_nonpersist * ms_per_chunk / cpu_adam_bps
+    # In ZeRO-3/Mode-C, non-persistent chunks are sharded across ranks, so
+    # each rank only Adam-steps ``1/world_size`` of every chunk. Without
+    # this divide the CPU-optim cost was billed at ``world_size×`` actual
+    # — the searcher consequently under-rated configs with high
+    # ``n_nonpersist``. Mode-B (DDP-replicated, no sharding) leaves every
+    # rank stepping the full chunk, so the divide stays gated on
+    # ``zero3_shard``.
+    cpu_shard_divisor = (
+        max(1, hw.gpu_count) if hw.zero3_shard else 1
+    )
+    if cpu_adam_bps <= 0.0:
+        # CPU Adam unavailable — no step happens at runtime.
+        t_cpu_optim = 0.0
+    else:
+        t_cpu_optim = (
+            n_nonpersist * (ms_per_chunk / cpu_shard_divisor) / cpu_adam_bps
+        )
+
+    # TODO(coderabbit-pr10-7b-residual): the phase-2 chunked-wall
+    # measurements (``trace.steady_fwd_chunked_wall_s`` /
+    # ``steady_bwd_chunked_wall_s``, consumed at lines 545-546 / 590-647)
+    # are captured under the bootstrap config (``n_persist=0+pinned``)
+    # and consumed as flat baselines independent of candidate
+    # ``n_persist``. In single-rank mode the only ``n_persist``-related
+    # term (``gather_save_per_hit`` at ~line 636) is gated on
+    # ``nccl_gather`` and short-circuits to 0 when ``world_size==1``, so
+    # candidates with high ``n_persist`` get the same chunked-wall as the
+    # bootstrap's ``n_persist=0`` measurement. On 7B-LoRA this leaves a
+    # ~19% over-prediction residual after the cpu_adam_bps fix above.
+    # Real fix needs an analytical PCIe-roundtrip translation across
+    # ``n_persist`` (or a higher-``n_persist`` re-bootstrap) — multi-day
+    # refactor, deferred per the v1 paper-alignment scope policy.
 
     # Eq. 2: T_iter = T_fwd + max(T_bwd + T_gpu_optim, T_cpu_optim)
     t_iter = t_fwd + max(t_bwd + t_gpu_optim, t_cpu_optim)

@@ -824,12 +824,13 @@ def _save_protrain_optim_dir(
 
     os.makedirs(target, exist_ok=True)
 
+    persistent_ids = _effective_persistent_ids(chunk_manager)
     metadata = {
         "format_version": SCHEMA_FORMAT_VERSION,
         "protrain_layout_signature": _layout_signature(
             chunk_manager, world_size, zero3_shard
         ),
-        "protrain_persistent_ids": _effective_persistent_ids(chunk_manager),
+        "protrain_persistent_ids": persistent_ids,
         "protrain_n_buffer": int(getattr(chunk_manager, "n_buffer", 0)),
         "protrain_world_size": int(world_size),
         "protrain_zero3_shard": zero3_shard,
@@ -864,7 +865,7 @@ def _save_protrain_optim_dir(
         "world_size=%d, save_mode=%s)",
         target,
         estimate,
-        len(metadata["protrain_persistent_ids"]),
+        len(persistent_ids),
         len(optim._cpu_optim._optims) if optim._cpu_optim is not None else 0,
         step,
         world_size,
@@ -1213,7 +1214,7 @@ def _load_protrain_optim_dir(
                     "signature check."
                 )
             loaded = torch.load(
-                gpu_path, map_location="cpu", weights_only=False
+                gpu_path, map_location="cpu", weights_only=True
             )
             optim._gpu_optim._optim.load_state_dict(loaded)
         elif optim._gpu_optim is not None:
@@ -1297,7 +1298,7 @@ def _load_protrain_optim_dir(
                             "by a different world_size."
                         )
                     loaded = torch.load(
-                        shard_path, map_location="cpu", weights_only=False
+                        shard_path, map_location="cpu", weights_only=True
                     )
                     inner.load_state_dict(loaded)
                     # Defensive: torch.optim.Optimizer.load_state_dict
@@ -1423,7 +1424,7 @@ def _load_protrain_optim_dir(
                 "current optimizer has no persistent (GPU) inner — partition "
                 "mismatch slipped past the layout-signature check."
             )
-        loaded = torch.load(gpu_path, map_location="cpu", weights_only=False)
+        loaded = torch.load(gpu_path, map_location="cpu", weights_only=True)
         optim._gpu_optim._optim.load_state_dict(loaded)
     elif optim._gpu_optim is not None:
         raise RuntimeError(
@@ -1463,7 +1464,7 @@ def _load_protrain_optim_dir(
     if optim._cpu_optim is not None:
         for cid, inner in optim._cpu_optim._optims.items():
             loaded = torch.load(
-                saved_chunks[int(cid)], map_location="cpu", weights_only=False
+                saved_chunks[int(cid)], map_location="cpu", weights_only=True
             )
             inner.load_state_dict(loaded)
             # ``torch.optim.Optimizer.load_state_dict`` auto-casts every

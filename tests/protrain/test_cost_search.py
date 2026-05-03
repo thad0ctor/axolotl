@@ -1065,7 +1065,7 @@ def test_estimate_runtime_phase2_bwd_credits_n_buffer_cache_hits():
     backward time equalled the bootstrap measurement regardless of how
     many non-persistent chunks would survive forward into backward. That
     flatness made the searcher pick the smallest feasible ``n_buffer``
-    (the ``_min_n_buffer_for`` boundary) for any phase-2-calibrated
+    (the ``min_n_buffer_for`` boundary) for any phase-2-calibrated
     workload, undercounting the cache-hit savings the paper's reused-
     buffer scheme is supposed to model. See
     ``cost/runtime.py:estimate_runtime`` PHASE-2 BACKWARD OVERRIDE
@@ -1471,7 +1471,7 @@ def test_search_raises_cpu_pressure_specific_message_when_no_cfg_fits_both(
     capacity = 12 * GB  # roomy GPU — many configs clear the GPU gate
     # Tight CPU budget: 0 bytes means only the all-persistent
     # (n_persist=N_chunk → 0 non-persistent chunks on CPU) cfg could
-    # fit. But the toy layout's _min_n_buffer_for at n_persist=N_chunk
+    # fit. But the toy layout's min_n_buffer_for at n_persist=N_chunk
     # is 0, so n_persist=N_chunk is itself feasible only if the
     # GPU capacity admits the full model-state. We block that by
     # picking a CPU budget that's strictly less than ``S_chunk`` —
@@ -1518,7 +1518,7 @@ def test_search_picks_zero_swap_on_3090_like_hw(toy_trace, toy_layout):
 def test_search_picks_high_n_buffer_when_phase2_makes_savings_substantial():
     """When phase-2 is calibrated and cache-hit savings dominate, the
     searcher must pick a large ``n_buffer`` — not the
-    ``_min_n_buffer_for`` floor.
+    ``min_n_buffer_for`` floor.
 
     Synthetic invariant: if every additional cache hit subtracts
     ``nccl_gather`` from the predicted backward, and the GPU capacity
@@ -1527,7 +1527,7 @@ def test_search_picks_high_n_buffer_when_phase2_makes_savings_substantial():
     maximum-feasible ``n_buffer``. This is the proximate fix for the
     Item 5 B+C profiling finding: the original chunked-wall override
     was flat in ``n_buffer`` and the searcher collapsed to
-    ``_min_n_buffer_for`` (= 2 on the bench).
+    ``min_n_buffer_for`` (= 2 on the bench).
 
     This test is the synthetic version of the Mode-C regression
     further down — same fix, smaller fixture.
@@ -1572,7 +1572,7 @@ def test_search_picks_high_n_buffer_for_llama_3b_mode_c_4gpu_inputs():
     wall populated (``steady_bwd_chunked_wall_s`` ≈ 0.87s as the bench
     measured). Without the cache-hit translation in
     ``cost/runtime.py:estimate_runtime`` PHASE-2 BACKWARD OVERRIDE,
-    the searcher picks ``_min_n_buffer_for(layout, n_persist) = 2`` for
+    the searcher picks ``min_n_buffer_for(layout, n_persist) = 2`` for
     this layout. The fix translates each delta cache hit to a backward
     NCCL gather skip and the searcher lands on the maximum feasible
     ``n_buffer`` — which is far above 6 for this workload.
