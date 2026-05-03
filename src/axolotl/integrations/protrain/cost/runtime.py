@@ -347,9 +347,18 @@ def _bwd_compute_time_from_trace(trace: ProfilerTrace, t_fwd_total: float) -> fl
     backward timing.
     """
     # ---- Path 1: phase-2 chunked measurement ----
-    if (
-        trace.steady_bwd_chunked_wall_s > 0.0
-        and trace.phase2_per_block_recompute_s > 0.0
+    # Gate accepts phase-2 measurements when the chunked backward wall is
+    # populated AND we can correctly translate out the bootstrap's recompute:
+    #   - bootstrap with ``n_checkpoint > 0`` requires
+    #     ``per_block_recompute_s > 0`` to subtract the right amount, OR
+    #   - bootstrap with ``n_checkpoint == 0`` is also valid: there was no
+    #     recompute to subtract (``per_block_recompute_s`` is naturally 0
+    #     in that case), and the chunked wall IS the base backward time.
+    # Pre-fix this branch required ``per_block_recompute_s > 0`` and
+    # silently rejected ``n_checkpoint=0`` bootstraps even though their
+    # measurement is the cleanest possible base (no recompute baked in).
+    if trace.steady_bwd_chunked_wall_s > 0.0 and (
+        trace.phase2_n_checkpoint == 0 or trace.phase2_per_block_recompute_s > 0.0
     ):
         bootstrap_recompute = (
             trace.phase2_n_checkpoint * trace.phase2_per_block_recompute_s
@@ -589,9 +598,13 @@ def estimate_runtime(
                 t_bwd_swap_prefetch += act_sz / eff_h2d
 
     t_bwd_compute_total = t_bwd_compute_base + t_bwd_recompute
-    if (
-        trace.steady_bwd_chunked_wall_s > 0.0
-        and trace.phase2_per_block_recompute_s > 0.0
+    # Gate mirrors ``_bwd_compute_time_from_trace`` Path 1: accept the
+    # chunked measurement when the bootstrap had no CKPT
+    # (``per_block_recompute_s`` is naturally 0 there) OR when both fields
+    # are populated. Keeps the two consumers of ``steady_bwd_chunked_wall_s``
+    # in lock-step on which traces qualify.
+    if trace.steady_bwd_chunked_wall_s > 0.0 and (
+        trace.phase2_n_checkpoint == 0 or trace.phase2_per_block_recompute_s > 0.0
     ):
         # PHASE-2 BACKWARD OVERRIDE (TRACE_VERSION >= 10): the chunked
         # backward wall already includes the measured chunk runtime and its
@@ -718,7 +731,17 @@ def estimate_runtime(
     # ``zero3_shard``.
     cpu_shard_divisor = max(1, hw.gpu_count) if hw.zero3_shard else 1
     if cpu_adam_bps <= 0.0:
-        # CPU Adam unavailable — no step happens at runtime.
+        # CPU Adam unavailable — non-persistent chunks won't actually be
+        # stepped at runtime (``optim_wrapper`` sets ``cpu_optim = None``
+        # and skips the CPU step, leaving those chunks un-updated — a
+        # training-incorrect state the wrapper LOG.errors about).
+        # Mark configs that offload chunks as INFEASIBLE so the searcher's
+        # argmin doesn't pick them on a fictional ``t_cpu_optim=0`` ranking.
+        # Configs with ``n_nonpersist == 0`` (everything persistent on GPU,
+        # e.g. small LoRA fits) remain feasible because no CPU step is
+        # required at runtime.
+        if n_nonpersist > 0:
+            return float("inf")
         t_cpu_optim = 0.0
     else:
         t_cpu_optim = n_nonpersist * (ms_per_chunk / cpu_shard_divisor) / cpu_adam_bps

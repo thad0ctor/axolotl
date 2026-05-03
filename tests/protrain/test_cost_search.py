@@ -145,6 +145,20 @@ def _make_hw(
     pcie_h2d_bps: float = 12e9,
     pcie_d2h_bps: float = 12e9,
     zero3_shard: bool = False,
+    # Positive Adam-rate defaults so the synthetic HW exercises the
+    # FEASIBLE path of estimate_runtime. Per the round-3 R15 contract
+    # (cost/runtime.py), ``cpu_adam_bytes_per_sec <= 0`` now marks any
+    # config with ``n_nonpersist > 0`` as infeasible (returns
+    # ``float("inf")``) — that's the correct production behaviour
+    # (CPU Adam unavailable means non-persistent chunks would not be
+    # stepped at runtime), but it makes ALL offloaded configs in
+    # ``search()`` infeasible if the synthetic HW left these at the
+    # type-default 0.0. Tests that explicitly want the
+    # CPU-Adam-unavailable contract (e.g. the renamed
+    # ``test_estimate_runtime_returns_inf_when_offloaded_and_adam_bps_zero``
+    # below) override these to 0.0 via ``replace(...)``.
+    cpu_adam_bytes_per_sec: float = 2e9,
+    gpu_adam_bytes_per_sec: float = 4e11,
 ) -> HardwareProfile:
     return HardwareProfile(
         gpu_sku="NVIDIA GeForce RTX 3090 (synthetic)",
@@ -154,6 +168,8 @@ def _make_hw(
         pcie_d2h_bps=pcie_d2h_bps,
         has_nvlink=False,
         zero3_shard=zero3_shard,
+        cpu_adam_bytes_per_sec=cpu_adam_bytes_per_sec,
+        gpu_adam_bytes_per_sec=gpu_adam_bytes_per_sec,
     )
 
 
@@ -715,22 +731,60 @@ def test_estimate_runtime_ckpt_adds_recompute(toy_trace, toy_layout, toy_hw):
     )
 
 
-def test_estimate_runtime_falls_back_when_adam_bps_zero(toy_trace, toy_layout):
-    """HardwareProfile with ``cpu_adam_bytes_per_sec=0.0`` must trigger the
-    fallback path in ``estimate_runtime`` (and likewise for GPU Adam). The
-    output must be a finite positive number; the fallback constants live in
-    ``cost/runtime.py`` as ``_CPU_ADAM_FALLBACK`` / ``_GPU_ADAM_FALLBACK``.
+def test_estimate_runtime_returns_inf_when_offloaded_and_adam_bps_zero(
+    toy_trace, toy_layout
+):
+    """Round-3 R15 contract: ``cpu_adam_bytes_per_sec <= 0`` makes any
+    config with ``n_nonpersist > 0`` INFEASIBLE.
+
+    Previously this test asserted ``estimate_runtime`` fell back to a
+    hardcoded CPU-Adam prior and returned a finite number. That was
+    incorrect — when ``cpu_adam_bytes_per_sec`` is zero,
+    ``optim_wrapper`` sets ``cpu_optim = None`` and skips the CPU step
+    entirely, leaving non-persistent chunks un-updated at runtime. The
+    cost model now refuses to score those configs as feasible so the
+    searcher's argmin doesn't pick a config the runtime would silently
+    fail to step.
+
+    Two complementary invariants:
+
+    1. Offloaded config (``n_persist < N_chunk``) → ``inf``.
+    2. All-persistent config (``n_persist == N_chunk``) → still finite,
+       because no CPU step is required at runtime.
     """
-    hw_no_adam = _make_hw()  # defaults: cpu_adam=0.0, gpu_adam=0.0
-    cfg = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
-    block_map = assign_modes(0, 0, len(toy_trace.activation_sizes))
-
-    t = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_no_adam)
-
-    assert t > 0.0
     import math
+    from dataclasses import replace
 
-    assert math.isfinite(t)
+    # Override the positive defaults from ``_make_hw`` to exercise the
+    # cpu_adam=0 branch explicitly.
+    hw_no_adam = replace(
+        _make_hw(), cpu_adam_bytes_per_sec=0.0, gpu_adam_bytes_per_sec=0.0
+    )
+    n_block = len(toy_trace.activation_sizes)
+    n_chunk = toy_layout.N_chunk
+
+    # (1) Offloaded → infeasible.
+    cfg_offload = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+    t_offload = estimate_runtime(
+        cfg_offload, toy_trace, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isinf(t_offload), (
+        f"offloaded config under cpu_adam=0 should be infeasible (inf); "
+        f"got t={t_offload}"
+    )
+
+    # (2) All-persistent → still feasible (no CPU step at runtime).
+    cfg_all_persist = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    t_all_persist = estimate_runtime(
+        cfg_all_persist, toy_trace, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isfinite(t_all_persist) and t_all_persist > 0.0, (
+        f"all-persistent config under cpu_adam=0 should still be finite; "
+        f"got t={t_all_persist}"
+    )
 
 
 def test_estimate_runtime_uses_measured_adam_when_provided(toy_trace, toy_layout):

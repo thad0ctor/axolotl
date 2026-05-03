@@ -38,6 +38,7 @@ a block forward needs its own slot, so K cannot be 1 anymore.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
@@ -132,6 +133,14 @@ class ActivationSwapPool:
         # (typically <= 16).
         self._free: list[int] = list(range(self.n_slot))
         self._inflight: int = 0
+        # Bookkeeping lock. The SWAP wrapper's pack/unpack hooks fire
+        # from autograd's worker threads on the swap stream while the
+        # main stream calls ``acquire``/``release`` from the forward
+        # path; without a lock the ``_free`` list and ``_inflight``
+        # counter can race. A plain ``Lock`` (not ``RLock``) suffices
+        # because none of the locked sections call back into another
+        # locked method on this pool.
+        self._lock = threading.Lock()
 
         LOG.debug(
             "ActivationSwapPool: n_swap=%d slot_bytes=%d prefetch_depth=%d "
@@ -153,16 +162,19 @@ class ActivationSwapPool:
         their target dtype with ``.view(dtype).reshape(shape)`` after
         copying via ``.copy_(src, non_blocking=True)`` on the swap stream.
         """
-        if self._closed:
-            raise RuntimeError("ActivationSwapPool is closed")
-        if not self._free:
-            raise RuntimeError(
-                f"ActivationSwapPool exhausted (n_slot={self.n_slot}, "
-                f"in-flight={self._inflight}); increase prefetch_depth or "
-                "verify the SWAP wrapper releases slots after backward."
-            )
-        slot_id = self._free.pop()
-        self._inflight += 1
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("ActivationSwapPool is closed")
+            if not self._free:
+                raise RuntimeError(
+                    f"ActivationSwapPool exhausted (n_slot={self.n_slot}, "
+                    f"in-flight={self._inflight}); increase prefetch_depth or "
+                    "verify the SWAP wrapper releases slots after backward."
+                )
+            slot_id = self._free.pop()
+            self._inflight += 1
+        # ``buffer()`` is a pinned-region narrow view; no pool
+        # bookkeeping mutated, so we drop the lock before calling it.
         return slot_id, self._pinned.buffer(slot_id)
 
     def release(self, slot_id: int) -> None:
@@ -172,31 +184,34 @@ class ActivationSwapPool:
         operation references this slot before calling — the pool does
         NOT issue stream syncs.
         """
-        if self._closed:
-            return
-        if not 0 <= slot_id < self.n_slot:
-            LOG.warning(
-                "ActivationSwapPool.release: slot_id %d out of range [0, %d); ignored",
-                slot_id,
-                self.n_slot,
-            )
-            return
-        if slot_id in self._free:
-            # Defensive: double-release. Log loudly because this likely
-            # signals a swap-wrapper bug (e.g. backward executed twice
-            # because of a retain_graph=True replay).
-            LOG.warning(
-                "ActivationSwapPool.release: slot %d already free; double-release",
-                slot_id,
-            )
-            return
-        self._free.append(slot_id)
-        self._inflight -= 1
+        with self._lock:
+            if self._closed:
+                return
+            if not 0 <= slot_id < self.n_slot:
+                LOG.warning(
+                    "ActivationSwapPool.release: slot_id %d out of range [0, %d); ignored",
+                    slot_id,
+                    self.n_slot,
+                )
+                return
+            if slot_id in self._free:
+                # Defensive: double-release. Log loudly because this likely
+                # signals a swap-wrapper bug (e.g. backward executed twice
+                # because of a retain_graph=True replay).
+                LOG.warning(
+                    "ActivationSwapPool.release: slot %d already free; double-release",
+                    slot_id,
+                )
+                return
+            self._free.append(slot_id)
+            self._inflight -= 1
         # Return the borrow to the underlying pinned allocator so its
         # close() guard knows the slot view is no longer live. The view
         # itself is dropped by the caller; ``record_stream`` keeps the
         # bytes alive for the in-flight H2D, but the borrow accounting
-        # follows the pool slot lifetime.
+        # follows the pool slot lifetime. Done outside the lock — the
+        # pinned allocator has its own bookkeeping and is not part of
+        # this pool's free-list/inflight invariants.
         self._pinned.release_buffer(slot_id)
 
     @property
@@ -206,20 +221,27 @@ class ActivationSwapPool:
 
     @property
     def free_count(self) -> int:
-        return len(self._free)
+        with self._lock:
+            return len(self._free)
 
     @property
     def inflight_count(self) -> int:
-        return self._inflight
+        with self._lock:
+            return self._inflight
 
     def close(self) -> None:
         """Free the pinned region. Idempotent."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._free.clear()
+            self._inflight = 0
+        # ``_pinned.close()`` is the underlying allocator tear-down; it
+        # is idempotent and not part of this pool's bookkeeping, so we
+        # release the lock before calling it to avoid holding it across
+        # a (potentially slow) pinned-region free.
         self._pinned.close()
-        self._free.clear()
-        self._inflight = 0
 
     def __del__(self) -> None:  # noqa: D401
         try:
