@@ -75,6 +75,7 @@ class BufferPool:
         pinned_host: "PinnedHostMemory",
         device: "torch.device | str",
     ) -> None:
+        """Pre-allocate ``n_buffer`` flat ``S_chunk``-byte GPU buffers and the free list."""
         if n_buffer <= 0:
             raise ValueError(f"n_buffer must be positive, got {n_buffer}")
         if S_chunk <= 0:

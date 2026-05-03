@@ -27,7 +27,6 @@ import statistics
 from typing import TYPE_CHECKING
 
 from axolotl.integrations.protrain.types import (
-    BlockId,
     ChunkId,
     CostConfig,
     SearchResult,
@@ -300,20 +299,20 @@ def estimate_per_block_recompute_s(
 def _extract_loss(out) -> "torch.Tensor":
     """Pull a backwards-able scalar loss out of a HuggingFace forward output.
 
-    Handles both attribute-style (``CausalLMOutput.loss``) and
-    dict-style (``out["loss"]``) returns. Raises if neither is
-    present — phase-2 needs a ``.backward()``-able tensor.
+    Delegates to the shared ``trace._extract_loss`` so the supported
+    output shapes stay in sync: HF attribute-style (``CausalLMOutput.loss``),
+    dict-style (``out["loss"]``), raw scalar/non-scalar ``torch.Tensor``,
+    and tuple/list whose first scalar tensor is the loss. Raises
+    ``TypeError`` (from the shared helper) if none of those match —
+    phase-2 needs a ``.backward()``-able tensor.
     """
-    loss = getattr(out, "loss", None)
-    if loss is None and isinstance(out, dict):
-        loss = out.get("loss")
-    if loss is None:
-        raise RuntimeError(
-            "Phase-2 measurement: model forward returned no `loss` field. "
-            "The dummy batch must include `labels` for HuggingFace causal "
-            "LM heads to compute a backward-able loss."
-        )
-    return loss
+    # Local import keeps phase2 importable without forcing trace at module
+    # load time; trace.py does not import phase2 so there's no cycle.
+    from axolotl.integrations.protrain.profiler.trace import (
+        _extract_loss as _trace_extract_loss,
+    )
+
+    return _trace_extract_loss(out)
 
 
 __all__ = [

@@ -15,6 +15,7 @@ the chunk manager's gather/offload happens at call sites in M4
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 from axolotl.utils.logging import get_logger
@@ -62,23 +63,21 @@ class SingleStreamAllocator:
         else:
             self.stream = stream
 
-        self._ctx: object | None = None
+        self._ctx_stack: list[AbstractContextManager[object]] = []
 
     def __enter__(self) -> "SingleStreamAllocator":
         if self.stream is None:
             return self
-        self._ctx = self._torch.cuda.stream(self.stream)
-        # ``torch.cuda.stream(...)`` returns a context manager; we need to
-        # call its own ``__enter__`` to activate it.
-        self._ctx.__enter__()  # type: ignore[attr-defined]
+        ctx = self._torch.cuda.stream(self.stream)
+        ctx.__enter__()
+        self._ctx_stack.append(ctx)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._ctx is None:
+        if not self._ctx_stack:
             return
-        ctx = self._ctx
-        self._ctx = None
-        ctx.__exit__(exc_type, exc, tb)  # type: ignore[attr-defined]
+        ctx = self._ctx_stack.pop()
+        ctx.__exit__(exc_type, exc, tb)
 
     def sync(self) -> None:
         """Synchronize the managed stream.

@@ -35,9 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable
 
-from axolotl.utils.logging import get_logger
-
 from axolotl.integrations.protrain.types import OpRecord
+from axolotl.utils.logging import get_logger
 
 if TYPE_CHECKING:
     import torch
@@ -125,6 +124,7 @@ class OnDemandTensorMgr:
         disabled: bool = False,
         model: "nn.Module | None" = None,
     ) -> None:
+        """Configure target device and disabled-mode flag; defer spill until ``__enter__``."""
         self.device = device
         self.disabled = disabled
         self.model = model
@@ -137,6 +137,7 @@ class OnDemandTensorMgr:
     # ---- context-manager protocol --------------------------------------
 
     def __enter__(self) -> "OnDemandTensorMgr":
+        """Spill parameters to pinned CPU and install the gather/spill hooks."""
         self._entered = True
         if self.disabled:
             return self
@@ -148,6 +149,15 @@ class OnDemandTensorMgr:
             )
 
         import torch
+
+        # If no explicit device was provided, infer the active CUDA device
+        # so ``_unpack_hook`` has a real GPU target to copy spilled saved
+        # tensors back to. Without this the unpack hook hits its
+        # ``self.device is None`` early-return on the first saved
+        # activation and backward fails the moment it touches a CPU
+        # tensor on a CUDA grad path.
+        if self.device is None and torch.cuda.is_available():
+            self.device = torch.device("cuda", torch.cuda.current_device())
 
         target_device = (
             torch.device(self.device) if self.device is not None else None
@@ -281,6 +291,7 @@ class OnDemandTensorMgr:
         self._spills.clear()
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Remove hooks and restore parameters from their pinned-CPU spill copies."""
         self._entered = False
         if self.disabled:
             return

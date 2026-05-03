@@ -385,8 +385,14 @@ def test_pinned_alloc_precise_size():
         # Slot 0 and slot (n-1) should both be valid and exactly S_chunk bytes.
         for i in (0, n_buffer - 1):
             t = mem.buffer(i)
-            assert t.numel() == S_chunk
-            assert t.dtype == torch.uint8
+            try:
+                assert t.numel() == S_chunk
+                assert t.dtype == torch.uint8
+            finally:
+                # Release the borrow so close() doesn't raise the
+                # use-after-free guard.
+                del t
+                mem.release_buffer(i)
         # Total bytes exactly n_buffer * S_chunk (no pow-2 round-up).
         assert mem.total_bytes == n_buffer * S_chunk
         assert mem.total_bytes == 4 << 20  # 4 MB, NOT 8 MB

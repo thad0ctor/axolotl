@@ -58,6 +58,8 @@ class _RecomputePreHookHandle:
 
 
 def _make_forward_pre_hook(scheduler: "Scheduler", block_id: BlockId):
+    """Build a forward-pre hook bound to ``scheduler`` and ``block_id``."""
+
     def _hook(module: nn.Module, inputs):  # noqa: ARG001 — signature required
         scheduler.pre_block_forward(block_id)
         return None  # allow default arg flow
@@ -66,6 +68,8 @@ def _make_forward_pre_hook(scheduler: "Scheduler", block_id: BlockId):
 
 
 def _make_forward_post_hook(scheduler: "Scheduler", block_id: BlockId):
+    """Build a forward-post hook bound to ``scheduler`` and ``block_id``."""
+
     def _hook(module: nn.Module, inputs, output):  # noqa: ARG001
         scheduler.post_block_forward(block_id)
         return None
@@ -74,6 +78,8 @@ def _make_forward_post_hook(scheduler: "Scheduler", block_id: BlockId):
 
 
 def _make_backward_pre_hook(scheduler: "Scheduler", block_id: BlockId):
+    """Build a backward-pre hook bound to ``scheduler`` and ``block_id``."""
+
     def _hook(module: nn.Module, grad_output):  # noqa: ARG001
         scheduler.pre_block_backward(block_id)
         return None
@@ -82,6 +88,8 @@ def _make_backward_pre_hook(scheduler: "Scheduler", block_id: BlockId):
 
 
 def _make_backward_post_hook(scheduler: "Scheduler", block_id: BlockId):
+    """Build a backward-post hook bound to ``scheduler`` and ``block_id``."""
+
     def _hook(module: nn.Module, grad_input, grad_output):  # noqa: ARG001
         scheduler.post_block_backward(block_id)
         return None

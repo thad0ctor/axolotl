@@ -20,7 +20,7 @@ Semantics:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -33,6 +33,8 @@ from axolotl.utils.logging import get_logger
 
 if TYPE_CHECKING:
     from torch import nn
+
+    from axolotl.integrations.protrain.chunk import ChunkManager
 
 LOG = get_logger(__name__)
 
@@ -54,6 +56,7 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
         defaults: dict[str, Any],
         chunk_manager: Any,
     ) -> None:
+        """Wire the GPU/CPU adapter pair into a Trainer-compatible Optimizer facade."""
         # ``torch.optim.Optimizer.__init__`` requires at least one non-empty
         # parameter group. We pass the full param list so ``optim.param_groups``
         # reflects the real set — schedulers iterating over it still see
@@ -94,6 +97,7 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
         self._chunk_manager.wait_cpu_optim_all()
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
+        """Zero gradients on every adapter and any unrouted param-group entries."""
         if self._gpu_optim is not None:
             self._gpu_optim.zero_grad(set_to_none=set_to_none)
         if self._cpu_optim is not None:
@@ -114,12 +118,14 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
     # ---- checkpointing: deliberately unimplemented for M4 ---------------
 
     def state_dict(self) -> dict[str, Any]:  # type: ignore[override]
+        """Reject the call — checkpointing goes through the dedicated callback (M5/M6)."""
         raise NotImplementedError(
             "ProTrain optimizer checkpointing is M5/M6 work; "
             "disable optimizer-state saving for now."
         )
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:  # type: ignore[override]
+        """Reject the call — checkpointing goes through the dedicated load hook (M5/M6)."""
         raise NotImplementedError(
             "ProTrain optimizer checkpointing is M5/M6 work; "
             "disable optimizer-state loading for now."
@@ -144,10 +150,10 @@ def protrain_optimizer_wrapper(
     ``reduce_grads_and_offload`` path continues to pump the right
     optimizer.
     """
-    chunk_manager = wrapped.chunk_manager
-    layout = chunk_manager.layout  # type: ignore[union-attr]
+    chunk_manager = cast("ChunkManager", wrapped.chunk_manager)
+    layout = chunk_manager.layout
     persistent_ids = set(
-        chunk_manager._persistent_ids  # type: ignore[union-attr]
+        chunk_manager._persistent_ids
     )
 
     # Partition params the same way ``protrain_model_wrapper`` did —
@@ -198,7 +204,7 @@ def protrain_optimizer_wrapper(
     # one shard_param per region.
     cpu_params_per_chunk_for_optim: dict[ChunkId, list["nn.Parameter"]] = {}
     for cid, chunk_params in cpu_params_per_chunk.items():
-        shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
+        shard_state = chunk_manager._chunk_shards.get(cid)
         if shard_state is not None and shard_state.regions:
             cpu_params_per_chunk_for_optim[cid] = [
                 r.shard_param for r in shard_state.regions
@@ -221,6 +227,16 @@ def protrain_optimizer_wrapper(
             # ``ImportError``). Compare by class name to avoid a hard
             # import on a broken deepspeed install.
             is_cuda_mismatch = type(err).__name__ == "CUDAMismatchException"
+            # Render the exception to a string before logging — passing
+            # the live ``err`` object into LOG.error propagates
+            # ``err.__traceback__`` → frame locals (the persistent /
+            # cpu-resident param lists in this scope) into LogRecord.args.
+            # Test runners that retain log records would then leak one
+            # full model footprint per failed wrap. The ``raise ... from
+            # err`` below is fine — that hands ``err`` to the caller's
+            # except path, not the logger's record retention.
+            err_kind = type(err).__name__
+            err_str = str(err)
             base_msg = (
                 "protrain_optimizer_wrapper: CPU FusedAdam unavailable "
                 "(%s: %s). Non-persistent chunks will NOT receive "
@@ -237,24 +253,33 @@ def protrain_optimizer_wrapper(
                     "Workaround: set env DS_SKIP_CUDA_CHECK=1 (CPU Adam "
                     "JIT-compiles correctly despite the mismatch on "
                     "most rigs).",
-                    type(err).__name__,
-                    err,
+                    err_kind,
+                    err_str,
                 )
             else:
                 LOG.error(
                     base_msg
                     + " Install DeepSpeed (or fix its dependencies) to "
                     "enable async CPU Adam.",
-                    type(err).__name__,
-                    err,
+                    err_kind,
+                    err_str,
                 )
-            cpu_optim = None
+            raise RuntimeError(
+                "CpuFusedAdamAdapter is required whenever ProTrain has "
+                "non-persistent chunks (cpu_params_per_chunk_for_optim "
+                "is non-empty); without it those offloaded params receive "
+                "computed gradients but never an optimizer step, silently "
+                "corrupting training. Fix the DeepSpeed install (e.g., set "
+                "DS_SKIP_CUDA_CHECK=1 if this is a CUDA-toolkit / "
+                "torch-wheel mismatch) or switch to an all-persistent "
+                "config so no CPU optimizer is needed."
+            ) from err
 
     # Swap the freshly-built adapters into the chunk manager so the
     # scheduler's post_block_backward -> reduce_grads_and_offload ->
     # cpu_optim.step_async chain uses them.
-    chunk_manager.cpu_optim = cpu_optim  # type: ignore[union-attr]
-    chunk_manager.gpu_optim = gpu_optim  # type: ignore[union-attr]
+    chunk_manager.cpu_optim = cpu_optim
+    chunk_manager.gpu_optim = gpu_optim
 
     # Build the flat param list for the Optimizer base class.
     all_params: list["nn.Parameter"] = list(persistent_params)

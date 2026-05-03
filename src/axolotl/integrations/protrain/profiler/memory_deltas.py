@@ -54,13 +54,18 @@ class MemoryDeltaTracker:
     """
 
     def __init__(self, device: "torch.device | str | int | None" = None) -> None:
+        """Bind the tracker to ``device`` and seed the inter-op baseline as unset."""
         # Local import so this module can be parsed in environments without
         # torch installed (e.g. syntax check in CI prep).
         import torch
 
         self._torch = torch
         self._device = device
-        self._last_end_bytes: int = 0
+        # ``None`` sentinel so the first ``delta_since_last`` call establishes
+        # the baseline and returns 0, instead of treating "0 bytes" as the
+        # previous end and reporting the entire current allocation as the
+        # delta. ``mark_end`` (explicit baseline-set) is unchanged.
+        self._last_end_bytes: int | None = None
 
     # ---- allocator interface --------------------------------------------
 
@@ -86,6 +91,9 @@ class MemoryDeltaTracker:
         post-op hook observed.
         """
         current = self.snapshot().allocated_bytes
+        if self._last_end_bytes is None:
+            self._last_end_bytes = current
+            return 0
         delta = current - self._last_end_bytes
         self._last_end_bytes = current
         return delta
@@ -96,7 +104,7 @@ class MemoryDeltaTracker:
 
     @property
     def last_end_bytes(self) -> int:
-        return self._last_end_bytes
+        return 0 if self._last_end_bytes is None else self._last_end_bytes
 
 
 __all__ = [

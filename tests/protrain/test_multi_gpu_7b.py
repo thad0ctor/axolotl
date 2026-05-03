@@ -386,6 +386,13 @@ def _launch(
     # spurious warnings about ibv_open_device failures.
     env.setdefault("NCCL_IB_DISABLE", "1")
     env.setdefault("NCCL_P2P_DISABLE", "0")
+    # Allow DeepSpeed CPU-Adam JIT-compile to proceed when the system
+    # CUDA toolkit version disagrees with torch's compiled wheel — the
+    # CPU kernel doesn't actually depend on the matched toolkit and
+    # works fine across the mismatch in practice. Without this the
+    # adapter raises ``CUDAMismatchException`` and the wrapper now
+    # hard-errors (see C2 in the CodeRabbit review).
+    env.setdefault("DS_SKIP_CUDA_CHECK", "1")
 
     # Persist the script to a file under tmp_path so tracebacks point
     # at a real line number rather than ``<string>:1``.
@@ -783,6 +790,8 @@ def _launch_zero3(
     env["PROTRAIN_MASTER_PORT"] = str(_pick_free_port())
     env.setdefault("NCCL_IB_DISABLE", "1")
     env.setdefault("NCCL_P2P_DISABLE", "0")
+    # See _launch above for rationale on DS_SKIP_CUDA_CHECK.
+    env.setdefault("DS_SKIP_CUDA_CHECK", "1")
 
     tag = "replicate" if force_replicate else "shard"
     script_path = tmp_path / f"_zero3_worker_{tag}.py"
@@ -1368,6 +1377,8 @@ def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
     env["PROTRAIN_MASTER_PORT"] = str(_pick_free_port())
     env.setdefault("NCCL_IB_DISABLE", "1")
     env.setdefault("NCCL_P2P_DISABLE", "0")
+    # See _launch above for rationale on DS_SKIP_CUDA_CHECK.
+    env.setdefault("DS_SKIP_CUDA_CHECK", "1")
 
     script_path = tmp_path / "_mistral_modec_worker.py"
     script_path.write_text(_MISTRAL_MODEC_WORKER_SCRIPT)

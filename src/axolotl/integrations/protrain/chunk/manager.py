@@ -1503,6 +1503,24 @@ class ChunkManager:
         re-copy) — but the param-level bindings are severed here so
         nothing tries to read stale GPU bytes after the pool reassigns
         the slot to a different chunk.
+
+        BUG FIX: skip the ``param.data = empty_placeholder`` re-bind when
+        ``param.data`` is already on CPU. In the replicated non-sharded
+        path the per-param grad hook calls ``_ensure_cpu_grads_attached``
+        right before kicking the async CPU Adam step — that points
+        ``param.data`` at the pinned CPU shard so DeepSpeedCPUAdam can
+        read/write it. The block-granularity scheduler then calls
+        ``reduce_grads_and_offload`` → ``offload`` on the SAME main
+        thread that just enqueued the step. If we re-bind ``param.data``
+        back to a GPU placeholder here, the worker thread (which hasn't
+        called ``step()`` yet) sees ``p.device == cuda`` and trips
+        DeepSpeedCPUAdam's ``"CPUAdam param is on cuda:N and must be
+        'cpu'"`` assertion. The post_step callback registered by the
+        grad hook (``_make_post_cpu_step_repoint``) is the canonical
+        place that returns ``param.data`` to the empty GPU placeholder
+        AFTER the CPU step completes, so leaving it on CPU here is
+        correct: the next gather repoints it onto the GPU buffer view
+        before any compute runs against it.
         """
         if chunk_id in self._persistent_ids:
             return
@@ -1510,6 +1528,11 @@ class ChunkManager:
         for slot in slots:
             param = self._params_by_id.get(slot.param_id)
             if param is None:
+                continue
+            # Don't clobber a CPU-bound param.data: the grad hook just
+            # repointed it for the pending CPU Adam step and the
+            # post-step repoint will null it back to a GPU placeholder.
+            if param.data.device.type == "cpu":
                 continue
             param.data = self._empty_placeholder(slot.dtype)
         self.buffer_pool.release(chunk_id)
@@ -1869,31 +1892,5 @@ class ChunkManager:
         )
         self._persistent_buffers[chunk_id] = buf
         return buf
-
-    def _cpu_shard(self, chunk_id: ChunkId) -> "torch.Tensor":
-        """Legacy accessor — returns the first param's CPU shard for ``chunk_id``.
-
-        Only kept for backwards compatibility with M2-era tests. The M4.5
-        semantics are the per-param ``_CpuParamSlot`` list in
-        ``self._cpu_slots``; the M7 sharded semantics are the shard
-        state in ``self._chunk_shards``.
-        """
-        slots = self._cpu_slots.get(chunk_id)
-        if not slots:
-            # Fall back to the M2 pool-slot semantics for chunks that
-            # were never materialize_offload'd (e.g. bare unit tests).
-            slot = int(chunk_id) % self.buffer_pool.n_buffer
-            return self.buffer_pool.pinned_host.buffer(slot)
-        if slots[0].cpu_data is None:
-            # Sharded slot — return the first region's shard bytes
-            # reinterpreted as its dtype as a best-effort legacy
-            # answer. Callers interpreting this path are out-of-spec
-            # for the M7+ semantics; use ``_chunk_shards`` directly.
-            shard = self._chunk_shards.get(chunk_id)
-            if shard is not None and shard.regions:
-                r0 = shard.regions[0]
-                return r0.cpu_shard_bytes.view(r0.dtype)
-        return slots[0].cpu_data  # type: ignore[return-value]
-
 
 __all__ = ["ChunkManager"]

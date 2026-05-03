@@ -55,6 +55,7 @@ class CpuFusedAdamAdapter:
         eps: float = 1e-8,
         weight_decay: float = 0.0,
     ) -> None:
+        """Build one ``DeepSpeedCPUAdam`` instance per chunk and a single worker thread."""
         try:
             from deepspeed.ops.adam import DeepSpeedCPUAdam  # type: ignore[import-not-found]
         except ImportError as err:
@@ -249,6 +250,7 @@ class GpuFusedAdamAdapter:
         eps: float = 1e-8,
         weight_decay: float = 0.0,
     ) -> None:
+        """Build the underlying fused GPU optimizer over ``params``."""
         param_list = [p for p in params if p is not None]
 
         self.lr = float(lr)
@@ -260,6 +262,7 @@ class GpuFusedAdamAdapter:
         self._optim = optim
 
     def _build_optim(self, params: list["nn.Parameter"]) -> Any:
+        """Return Apex ``FusedAdam`` if importable, else ``torch.optim.AdamW``."""
         try:
             from apex.optimizers import FusedAdam  # type: ignore[import-not-found]
 
@@ -270,12 +273,15 @@ class GpuFusedAdamAdapter:
                 eps=self.eps,
                 weight_decay=self.weight_decay,
             )
-        except ImportError:
+        except Exception as exc:  # noqa: BLE001 — Apex may import but still be unusable
+            exc_repr = f"{type(exc).__name__}: {exc}"
             LOG.warning(
-                "apex.optimizers.FusedAdam unavailable; falling back to "
+                "apex.optimizers.FusedAdam unavailable (%s); falling back to "
                 "torch.optim.AdamW for the persistent-chunk optimizer. "
-                "Install Apex for the paper-configured fused kernel."
+                "Install Apex for the paper-configured fused kernel.",
+                exc_repr,
             )
+            del exc
 
         import torch
 
@@ -294,6 +300,7 @@ class GpuFusedAdamAdapter:
         self._optim.step()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        """Zero gradients on every persistent-chunk parameter."""
         self._optim.zero_grad(set_to_none=set_to_none)
 
     @property

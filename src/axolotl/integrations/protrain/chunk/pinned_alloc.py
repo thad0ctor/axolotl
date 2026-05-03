@@ -71,6 +71,21 @@ class PinnedHostMemory:
     Memory is allocated once in ``__init__`` and freed once in ``__del__``
     (or via :meth:`close`). Slots are contiguous and identically sized —
     ``buffer(i)`` hands out the ``i``-th slot as a pinned ``torch.Tensor``.
+
+    Lifetime hazard
+    ---------------
+    ``buffer(i)`` returns a ``narrow()`` view sharing storage with the
+    underlying pinned region. If ``close()`` is called while a caller
+    still holds such a view, the view becomes a dangling pointer —
+    subsequent reads/writes (including async H2D copies) will touch
+    freed memory. To guard against this, ``buffer(i)`` increments a
+    borrow counter that the caller must decrement via
+    :meth:`release_buffer` once the slot is no longer in use (the
+    canonical pattern is acquire-via-``buffer`` then
+    ``record_stream`` + ``release_buffer`` after enqueueing the H2D
+    copy). :meth:`close` raises ``RuntimeError`` if any borrow is
+    still outstanding so the lifetime violation is loud rather than
+    silent.
     """
 
     def __init__(self, n_buffer: int, S_chunk: int) -> None:
@@ -89,6 +104,10 @@ class PinnedHostMemory:
         self._fallback_tensor: "torch.Tensor | None" = None
         self._torch_tensor: "torch.Tensor | None" = None
         self._is_precise_size: bool = False
+        # Outstanding views handed out by ``buffer(i)`` that have not yet
+        # been returned via ``release_buffer(i)``. Used by ``close()`` to
+        # refuse free-while-borrowed (use-after-free guard).
+        self._live_borrows: int = 0
 
         cudart = _load_cudart()
         if cudart is None:
@@ -181,6 +200,11 @@ class PinnedHostMemory:
 
         The returned view shares storage with the pinned region; writes are
         immediately visible to CUDA transfers that use the same host pointer.
+
+        The slot is considered borrowed until the caller pairs this call
+        with :meth:`release_buffer`. ``close()`` will refuse to free the
+        underlying pinned region while any borrow is still outstanding
+        (see the class docstring for the use-after-free hazard).
         """
         if self._closed:
             raise RuntimeError("PinnedHostMemory is closed")
@@ -188,12 +212,59 @@ class PinnedHostMemory:
             raise IndexError(f"buffer index {i} out of range [0, {self.n_buffer})")
         assert self._torch_tensor is not None
         start = i * self.S_chunk
-        return self._torch_tensor.narrow(0, start, self.S_chunk)
+        view = self._torch_tensor.narrow(0, start, self.S_chunk)
+        self._live_borrows += 1
+        return view
+
+    def release_buffer(self, i: int) -> None:
+        """Decrement the borrow counter for slot ``i``.
+
+        Pairs with :meth:`buffer`. The counter is the only ownership
+        signal :meth:`close` consults; failing to release leaves
+        ``close()`` raising. Index validation is best-effort so this
+        is safe to call from cleanup paths even if the slot id was
+        never borrowed in this allocator (logged but not fatal — we
+        prefer not to derail destructor flows).
+        """
+        if not 0 <= i < self.n_buffer:
+            LOG.warning(
+                "PinnedHostMemory.release_buffer: index %d out of range "
+                "[0, %d); ignored",
+                i,
+                self.n_buffer,
+            )
+            return
+        if self._live_borrows <= 0:
+            LOG.warning(
+                "PinnedHostMemory.release_buffer(%d): no outstanding borrow; "
+                "double-release?",
+                i,
+            )
+            return
+        self._live_borrows -= 1
 
     def close(self) -> None:
-        """Free the pinned allocation. Idempotent."""
+        """Free the pinned allocation. Idempotent.
+
+        Raises ``RuntimeError`` if any slot view returned by
+        :meth:`buffer` has not been returned via :meth:`release_buffer`
+        — freeing the underlying pinned region while views are still
+        live can create dangling pointers and silently corrupt any
+        in-flight H2D copy or host write that targets the slot. The
+        explicit ``close()`` path is the user-controlled deterministic
+        teardown surface, so we want loud failure on lifetime
+        violations. Destructor-driven cleanup falls through
+        :meth:`__del__`, which logs and force-frees because destructors
+        must not raise.
+        """
         if self._closed:
             return
+        if self._live_borrows > 0:
+            raise RuntimeError(
+                f"PinnedHostMemory.close(): {self._live_borrows} slot view(s) "
+                "still borrowed; release them via release_buffer() before close() "
+                "to avoid use-after-free on the pinned region."
+            )
         self._closed = True
         # Drop torch views first so no tensor outlives the underlying memory.
         self._torch_tensor = None
@@ -206,7 +277,24 @@ class PinnedHostMemory:
             self._cudart = None
 
     def __del__(self) -> None:  # noqa: D401
+        # Destructors must not throw, so the borrow guard in ``close()``
+        # is bypassed here: if the user dropped the allocator with views
+        # outstanding it is too late to ask them to release. We log loudly
+        # and force the free so we don't leak pinned memory at process
+        # shutdown. The view-holders will fault if they touch the region
+        # after this — that is the original hazard, surfaced rather than
+        # hidden.
         try:
+            if self._closed:
+                return
+            if self._live_borrows > 0:
+                LOG.warning(
+                    "PinnedHostMemory.__del__: %d slot view(s) still borrowed "
+                    "at GC time; forcing free. Holders touching the region "
+                    "after this point will hit freed memory.",
+                    self._live_borrows,
+                )
+                self._live_borrows = 0
             self.close()
         except Exception:  # noqa: BLE001 — destructors must not throw
             pass

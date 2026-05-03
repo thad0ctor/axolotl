@@ -106,6 +106,7 @@ class ActivationSwapPool:
         prefetch_depth: int = 2,
         slots_per_block: int = DEFAULT_SLOTS_PER_BLOCK,
     ) -> None:
+        """Allocate the backing pinned region and the free-slot LIFO."""
         if n_swap < 1:
             raise ValueError(f"n_swap must be >= 1, got {n_swap}")
         if slot_bytes <= 0:
@@ -197,6 +198,12 @@ class ActivationSwapPool:
             return
         self._free.append(slot_id)
         self._inflight -= 1
+        # Return the borrow to the underlying pinned allocator so its
+        # close() guard knows the slot view is no longer live. The view
+        # itself is dropped by the caller; ``record_stream`` keeps the
+        # bytes alive for the in-flight H2D, but the borrow accounting
+        # follows the pool slot lifetime.
+        self._pinned.release_buffer(slot_id)
 
     @property
     def total_bytes(self) -> int:

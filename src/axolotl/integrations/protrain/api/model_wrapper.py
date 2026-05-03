@@ -47,8 +47,8 @@ from axolotl.integrations.protrain.profiler import (
     save_cached_trace,
 )
 from axolotl.integrations.protrain.profiler.cache import ProfilerCacheKey
-from axolotl.integrations.protrain.profiler.trace import _arch_hash
 from axolotl.integrations.protrain.profiler.hw_bench import measure_compute_rate
+from axolotl.integrations.protrain.profiler.trace import _arch_hash
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
 from axolotl.integrations.protrain.runtime.scheduler import Scheduler
 from axolotl.integrations.protrain.search import search
@@ -320,9 +320,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
 
     # Actual persistent bytes (≤ n_persist * S_chunk).
     actual_persistent = sum(cb.get(cid, 0) for cid in persistent_ids)
-    # Buffer pool is still n_buffer * S_chunk — those slots really are
-    # that size.
-    buffer_bytes = n_buffer * S
+    # Buffer pool occupancy is accounted via ``buffer_bytes_eff`` below.
 
     # Reverse out the cost-model's ``model_state_present`` term.
     n_persist = len(persistent_ids)
@@ -688,6 +686,7 @@ def _construct_runtime(
         removal; ``result`` is the (possibly calibrated) SearchResult.
     """
     import sys as _sys2
+
     import torch
 
     n_persist = result.cfg.n_persist
@@ -715,7 +714,7 @@ def _construct_runtime(
     param_is_in_block: dict[str, bool] = {
         str(pid): False for pid in layout.param_to_chunk
     }
-    for bid, pids in _build_block_spans(model)[1].items():
+    for _bid, pids in _build_block_spans(model)[1].items():
         for pid in pids:
             param_is_in_block[str(pid)] = True
     chunks_with_nonblock: set[int] = set()
@@ -946,12 +945,20 @@ def _construct_runtime(
             # chunks fall through to the in-line torch.optim path inside
             # the optimizer wrapper. The warning surfaces the root cause
             # so users know they're not getting the async overlap.
+            #
+            # IMPORTANT: render ``err`` to a string before logging — passing
+            # the live exception object propagates ``err.__traceback__`` →
+            # frame locals (which include large GPU param lists in this
+            # scope) into the LogRecord. pytest log-capture retains those
+            # records, leaking one full model footprint per failed attempt.
+            err_repr = f"{type(err).__name__}: {err}"
             LOG.warning(
                 "ProTrain: CPU FusedAdam unavailable (%s); non-persistent chunks "
                 "will not get async CPU Adam. Install DeepSpeed with a matching "
                 "CUDA toolkit (or set DS_SKIP_CUDA_CHECK=1) for full coverage.",
-                err,
+                err_repr,
             )
+            del err
             cpu_optim = None
     chunk_manager.cpu_optim = cpu_optim
 
@@ -1211,7 +1218,7 @@ def protrain_model_wrapper(
             seq_len,
         )
         _sys.stderr.write(
-            f"[protrain] profiler cache miss — running forward-only trace\n"
+            "[protrain] profiler cache miss — running forward-only trace\n"
         )
         _sys.stderr.flush()
         # Forward-only profile: the cost model's op-walk in
@@ -1456,33 +1463,43 @@ def protrain_model_wrapper(
         # Explicit 4-tuple override path — still skip the searcher but
         # honour the caller's exact knob selection. Bounds-check is
         # mandatory; the searcher normally enforces these.
-        if not (0 <= n_persist_override <= layout.N_chunk):
+        assert n_persist_override is not None
+        assert n_buffer_override is not None
+        assert n_swap_override is not None
+        assert n_checkpoint_override is not None
+
+        n_persist = int(n_persist_override)
+        n_buffer = int(n_buffer_override)
+        n_swap = int(n_swap_override)
+        n_checkpoint = int(n_checkpoint_override)
+
+        if not (0 <= n_persist <= layout.N_chunk):
             raise ValueError(
-                f"n_persist_override={n_persist_override} out of range "
+                f"n_persist_override={n_persist} out of range "
                 f"[0, {layout.N_chunk}]"
             )
-        if n_buffer_override < 1:
+        if n_buffer < 1:
             raise ValueError(
-                f"n_buffer_override must be >= 1, got {n_buffer_override}"
+                f"n_buffer_override must be >= 1, got {n_buffer}"
             )
-        if not (0 <= n_swap_override <= n_block):
+        if not (0 <= n_swap <= n_block):
             raise ValueError(
-                f"n_swap_override={n_swap_override} out of range [0, {n_block}]"
+                f"n_swap_override={n_swap} out of range [0, {n_block}]"
             )
-        if not (0 <= n_checkpoint_override <= n_block - n_swap_override):
+        if not (0 <= n_checkpoint <= n_block - n_swap):
             raise ValueError(
-                f"n_checkpoint_override={n_checkpoint_override} incompatible "
-                f"with n_swap_override={n_swap_override} (N_block={n_block})"
+                f"n_checkpoint_override={n_checkpoint} incompatible "
+                f"with n_swap_override={n_swap} (N_block={n_block})"
             )
         synth_cfg = CostConfig(
-            n_persist=n_persist_override,
-            n_buffer=n_buffer_override,
-            n_swap=n_swap_override,
-            n_checkpoint=n_checkpoint_override,
+            n_persist=n_persist,
+            n_buffer=n_buffer,
+            n_swap=n_swap,
+            n_checkpoint=n_checkpoint,
         )
         block_map = assign_modes(
-            n_swap=n_swap_override,
-            n_checkpoint=n_checkpoint_override,
+            n_swap=n_swap,
+            n_checkpoint=n_checkpoint,
             N_block=n_block,
         )
         result = SearchResult(

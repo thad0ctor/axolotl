@@ -31,9 +31,8 @@ of the space without the full op-walk.
 
 from __future__ import annotations
 
-from typing import Iterator
-
 from collections import defaultdict
+from typing import Iterable, Iterator
 
 from axolotl.integrations.protrain.block.layout_rules import assign_modes
 from axolotl.integrations.protrain.cost.memory import (  # noqa: F401 - re-exported for test back-compat
@@ -443,7 +442,22 @@ def search(
                 # evaluate n_buffer = min_buffer as the tie-break
                 # boundary so the picked config doesn't over-commit
                 # buffer capacity when the runtime is flat.
-                for n_buffer in {max_buffer, min_buffer}:
+                #
+                # When the CPU-RAM gate is active, the 2-point shortcut
+                # is unsound: ``max_buffer`` may fail the host-side
+                # ``estimate_cpu_footprint`` check (more buffered chunks
+                # = more pinned CPU staging) while an intermediate
+                # ``n_buffer`` is feasible AND faster than ``min_buffer``.
+                # Iterate the full feasible range in that case so we
+                # don't spuriously raise "no config fits" or pick a
+                # slower ``min_buffer`` config. Capacity bounds are
+                # unchanged — we still scan within ``[min_buffer,
+                # max_buffer]`` so the GPU gate stays enforced.
+                if cpu_capacity_bytes is None:
+                    n_buffer_candidates: Iterable[int] = {max_buffer, min_buffer}
+                else:
+                    n_buffer_candidates = range(min_buffer, max_buffer + 1)
+                for n_buffer in n_buffer_candidates:
                     n_total += 1
                     model_state_present = (n_persist + n_buffer) * s_chunk
                     raw_peak = model_state_present + f_bm

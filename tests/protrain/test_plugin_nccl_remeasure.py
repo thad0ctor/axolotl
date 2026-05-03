@@ -280,7 +280,7 @@ def test_remeasure_splices_nccl_and_keeps_search_result_when_unchanged(
         arch_hash="deadbeef", bs=1, seq=128, sku="MockGPU", world=2
     )
     expected_path = (
-        tmp_path / "protrain" / "profiler" / f"{new_key.fingerprint()}.pkl"
+        tmp_path / "protrain" / "profiler" / f"{new_key.fingerprint()}.json"
     )
     assert expected_path.exists(), (
         f"updated trace not persisted at expected path {expected_path}"
