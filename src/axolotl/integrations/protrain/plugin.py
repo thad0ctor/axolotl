@@ -956,7 +956,8 @@ class ProTrainPlugin(BasePlugin):
             # has already created per-rank shards, so we cannot cleanly
             # revert here — hard-raise so the operator fixes the
             # configuration before training starts.
-            if getattr(wrapped.chunk_manager, "zero3_shard", False):
+            chunk_manager = cast("ChunkManager", wrapped.chunk_manager)
+            if getattr(chunk_manager, "zero3_shard", False):
                 raise RuntimeError(
                     "ProTrain: DDP wrapping detected with active "
                     "zero3_shard=True. Non-persistent sharded chunks call "
@@ -973,7 +974,7 @@ class ProTrainPlugin(BasePlugin):
                     "removing DDP from the trainer config) and let "
                     "ProTrain own grad reduction."
                 )
-            wrapped.chunk_manager.skip_internal_grad_reduce = True
+            chunk_manager.skip_internal_grad_reduce = True
             LOG.info(
                 "ProTrain: detected DDP composition; set "
                 "skip_internal_grad_reduce=True (DDP owns the cross-rank grad "
