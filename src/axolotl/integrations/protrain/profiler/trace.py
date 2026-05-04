@@ -419,7 +419,7 @@ def run_trace(
         # Direct parent = top of stack BEFORE we push; when empty, this is
         # the root call and parent_id stays None.
         parent_id = live_frame_stack[-1] if live_frame_stack else None
-        live_frames[id(module)] = _OpFrame(
+        frame = _OpFrame(
             op_id=op_id,
             module_path=path,
             qualified_name=type(module).__name__,
@@ -431,7 +431,27 @@ def run_trace(
             parent_id=parent_id,
             pre_event=pre_event,
         )
+        live_frames[id(module)] = frame
         live_frame_stack.append(id(module))
+        # Record op_order in EXECUTION order (start-of-op), not post-hook
+        # order. The POST hook of an inner module fires BEFORE the POST
+        # hook of its enclosing parent, so appending to ``op_records`` in
+        # the post-hook produced post-completion order — wrong for the
+        # searcher's chunk schedule, which needs the order in which ops
+        # STARTED. Append here at PRE-time. All OpRecord fields below are
+        # already known at pre-hook entry (block_id, shape, qualified
+        # name) — they don't depend on the op's output, so PRE-time
+        # population is safe.
+        op_records.append(
+            OpRecord(
+                op_id=frame.op_id,
+                module_path=frame.module_path,
+                qualified_name=frame.qualified_name,
+                shape_signature=frame.shape_signature,
+                block_id=frame.block_id,
+                is_forward=True,
+            )
+        )
 
     def _post_forward(module: "nn.Module", inputs, output):
         frame = live_frames.pop(id(module), None)
@@ -476,16 +496,12 @@ def run_trace(
             post_event.record()
             pending_events.append((frame.op_id, frame.pre_event, post_event))
 
-        op_records.append(
-            OpRecord(
-                op_id=frame.op_id,
-                module_path=frame.module_path,
-                qualified_name=frame.qualified_name,
-                shape_signature=frame.shape_signature,
-                block_id=frame.block_id,
-                is_forward=True,
-            )
-        )
+        # NOTE: ``op_records`` is appended at PRE-time (see _pre_forward)
+        # so ``op_order`` reflects start-of-execution order. The intra /
+        # inter delta dicts are filled here at POST-time — they're keyed
+        # by ``op_id`` so the order in which they're populated is irrelevant
+        # to consumers (the searcher iterates op_records and looks up the
+        # delta by id).
         intra_deltas[frame.op_id] = intra
         inter_deltas[frame.op_id] = inter
 
