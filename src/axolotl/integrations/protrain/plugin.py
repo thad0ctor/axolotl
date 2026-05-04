@@ -409,11 +409,24 @@ def _is_plugin_active(cfg) -> bool:
     Matches the enable-gate documented on ``ProTrainArgs.protrain_auto_memory``
     and mirrors the ``LigerPlugin`` pattern of reading ``cfg.*`` attributes
     without touching Axolotl-internal state.
+
+    Activation is strictly opt-in: the ``plugins:`` config list must contain
+    one of the canonical ProTrain entry points (the ``module.ClassName`` form
+    consumed by :func:`axolotl.integrations.base.load_plugin`, or the bare
+    package/module path which Axolotl resolves to the same class). Substring
+    matches such as ``"my-protrain-extension"`` or ``"protrain_disabled"``
+    are intentionally rejected to prevent accidental activation.
     """
     if not getattr(cfg, "protrain_auto_memory", False):
         return False
     plugins = getattr(cfg, "plugins", None) or []
-    return any(isinstance(p, str) and "protrain" in p.lower() for p in plugins)
+    allowed = {
+        "axolotl.integrations.protrain.protrainplugin",
+        "axolotl.integrations.protrain.plugin.protrainplugin",
+        "axolotl.integrations.protrain",
+        "axolotl.integrations.protrain.plugin",
+    }
+    return any(isinstance(p, str) and p.strip().lower() in allowed for p in plugins)
 
 
 def _build_hardware_profile(cfg):
@@ -579,7 +592,7 @@ class ProTrainPlugin(BasePlugin):
         # ``measure_nccl`` internally) sees the live PG.
         _early_init_dist_for_nccl(cfg)
 
-        # ---- Move model to GPU if it isn't already ----------------------
+        # ---- Move model to cuda:LOCAL_RANK if needed --------------------
         # ``protrain_model_wrapper`` reads
         # ``next(model.parameters()).device`` to seed the profiler
         # tracker, which calls ``torch.cuda.memory_stats(device)`` —
@@ -596,7 +609,11 @@ class ProTrainPlugin(BasePlugin):
         # ``ACCELERATE_USE_*`` env vars are set, so ``device_map`` falls
         # to ``"auto"`` and the model is GPU-resident at load time.
         # We close the gap by moving the model ourselves; idempotent
-        # when already on the target device.
+        # when already on the target device. The gate also catches the
+        # case where the model is already on CUDA but on the *wrong*
+        # ordinal (e.g. left on ``cuda:0`` while ``LOCAL_RANK=2``) — we
+        # pin it to ``cuda:LOCAL_RANK`` so the profiler reads memory
+        # stats from the device this rank will actually train on.
         import os as _os
 
         try:
@@ -608,13 +625,22 @@ class ProTrainPlugin(BasePlugin):
             _torch = None  # type: ignore[assignment]
         if (
             current_device is not None
-            and current_device.type != "cuda"
             and _torch is not None
             and _torch.cuda.is_available()
         ):
             local_rank = int(_os.environ.get("LOCAL_RANK", 0))
             visible = _torch.cuda.device_count()
-            if local_rank < visible:
+            # ``current_device.index`` is ``None`` for a bare
+            # ``torch.device("cuda")`` without an explicit ordinal
+            # (resolves to the current device at runtime); treat that as
+            # "wrong ordinal" so we pin it to ``cuda:LOCAL_RANK``.
+            on_wrong_cuda = current_device.type == "cuda" and (
+                current_device.index is None or current_device.index != local_rank
+            )
+            needs_move = current_device.type != "cuda" or on_wrong_cuda
+            if not needs_move:
+                pass  # already on cuda:local_rank, no-op
+            elif local_rank < visible:
                 target = f"cuda:{local_rank}"
                 LOG.info(
                     "ProTrain: model is on %s; moving to %s before wrap "

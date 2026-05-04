@@ -26,7 +26,6 @@ Design contract (see DESIGN.md §Design Decisions):
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 
 from axolotl.integrations.protrain.types import (
@@ -273,20 +272,24 @@ def estimate_cpu_footprint(
     The activation-swap pool, when ``n_swap > 0`` and a trace is
     provided, contributes an additional
     ``n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH * slot_bytes``
-    of pinned CPU, where
-    ``slot_bytes = ceil(per_block_activation_bytes / SWAP_SLOTS_PER_BLOCK)``.
-    This mirrors the runtime allocation in
-    ``block.swap_pool.ActivationSwapPool``, which reserves
-    K slots (``SWAP_SLOTS_PER_BLOCK``) per block, each
-    ``SWAP_PREFETCH_DEPTH`` deep, with every slot sized to the same
-    width so any saved tensor fits. The term is **per-rank** and
-    **NOT divided by gpu_count** — the swap pool is a rank-local
-    allocation; sharding does not split activations across ranks.
-    Because slot width is the per-tensor ceiling rather than an exact
-    average, this formula is a slight overestimate of the bare
-    ``n_swap * SWAP_PREFETCH_DEPTH * aggregate`` lower bound, which
-    matches the conservative-upper-bound contract the searcher gate
-    expects. When ``trace`` is None we omit the swap term — used by
+    of pinned CPU, where ``slot_bytes`` is the per-block AGGREGATE
+    activation bytes (NOT divided by ``SWAP_SLOTS_PER_BLOCK``). The
+    trace records only the per-block aggregate — there is no per-saved-
+    tensor breakdown — and real transformer blocks have skewed tensor
+    size distributions where the residual stream alone can dominate
+    ~1/3-1/2 of the aggregate. Sizing slots to the average would let
+    the runtime ``ActivationSwapPool`` raise ``RuntimeError`` whenever
+    SWAP encountered a single saved tensor larger than the average.
+    Sizing every slot to the full aggregate over-provisions the pool
+    by up to K× but guarantees any saved tensor fits any slot — see
+    the matching slot-sizing comment in
+    ``api/model_wrapper.py::_construct_runtime`` for the runtime side.
+    The term is **per-rank** and **NOT divided by gpu_count** — the
+    swap pool is a rank-local allocation; sharding does not split
+    activations across ranks. The conservative-upper-bound contract
+    the searcher gate expects is preserved (this term is now strictly
+    larger than the previous average-derived estimate). When ``trace``
+    is None we omit the swap term — used by
     callers that want a pre-search ballpark; the searcher itself
     always passes ``trace`` so the gate matches the real wrap-time
     pool size.
@@ -339,12 +342,15 @@ def estimate_cpu_footprint(
     # The runtime pool (``block.swap_pool.ActivationSwapPool``) reserves
     # ``n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH`` pinned CPU
     # slots, each sized to the worst-case single-saved-tensor bytes.
-    # We approximate the per-saved-tensor width as
-    # ``ceil(per_block_aggregate_activation_bytes / SWAP_SLOTS_PER_BLOCK)``
-    # — i.e. the aggregate activation budget for a block, evenly split
-    # across its K saved-tensor slots. Picking the max aggregate across
-    # the swap band ensures every block's slots fit (the pool sizes all
-    # slots to the same width at wrap time).
+    # The trace exposes only the per-block AGGREGATE
+    # (``activation_sizes[bid]``); a single saved tensor inside that
+    # block can be a large fraction of the aggregate (residual stream)
+    # so dividing by ``SWAP_SLOTS_PER_BLOCK`` would underestimate the
+    # required slot width and let the runtime ``slot_view.copy_(tensor)``
+    # raise. Until per-saved-tensor profiling lands, size each slot to
+    # the full per-block aggregate — a strict upper bound that matches
+    # the matching slot-sizing branch in
+    # ``api/model_wrapper.py::_construct_runtime``.
     swap_term = 0
     if cfg.n_swap > 0 and trace is not None and trace.activation_sizes:
         # Swap-early rule: the first ``n_swap`` blocks (in BlockId order)
@@ -355,7 +361,7 @@ def estimate_cpu_footprint(
             per_block_activation_bytes = max(
                 int(trace.activation_sizes.get(bid, 0)) for bid in swap_band
             )
-            slot_bytes = math.ceil(per_block_activation_bytes / SWAP_SLOTS_PER_BLOCK)
+            slot_bytes = max(1, int(per_block_activation_bytes))
             swap_term = (
                 cfg.n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH * slot_bytes
             )

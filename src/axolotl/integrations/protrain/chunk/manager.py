@@ -302,6 +302,11 @@ class ChunkManager:
         offloaded / sharded.
     buffer_pool
         Pre-allocated GPU chunk buffers for the non-persistent path.
+        May be ``None`` in the all-persistent layout (every chunk
+        resident on GPU, ``n_persist == layout.N_chunk``); in that
+        case no method that needs the pool ever fires (gather/offload
+        early-return for persistent chunks, ``_ensure_persistent_buffer``
+        sources its device from ``self.device``).
     cpu_optim
         Optional CPU FusedAdam adapter for non-persistent chunks. If
         provided, :meth:`reduce_grads_and_offload` triggers its
@@ -311,7 +316,9 @@ class ChunkManager:
         invoked by :meth:`persistent_step`.
     device
         The CUDA device where non-persistent chunks land when gathered.
-        Defaults to ``buffer_pool.device``.
+        Defaults to ``buffer_pool.device`` when a pool is provided;
+        otherwise must be supplied explicitly (the all-persistent
+        wrapper passes the resolved device directly).
     world_size, rank
         Collective-comms context, defaulting to ``1`` / ``0`` for the
         single-rank unit-test path. When ``world_size > 1`` and
@@ -333,7 +340,7 @@ class ChunkManager:
         model: "nn.Module",
         layout: ChunkLayout,
         n_persist: int,
-        buffer_pool: "BufferPool",
+        buffer_pool: "BufferPool | None",
         cpu_optim: "CpuFusedAdamAdapter | None" = None,
         gpu_optim: "GpuFusedAdamAdapter | None" = None,
         device: "torch.device | str | None" = None,
@@ -345,10 +352,19 @@ class ChunkManager:
             raise ValueError(
                 f"n_persist={n_persist} out of range [0, {layout.N_chunk}]"
             )
-        if buffer_pool.S_chunk != layout.S_chunk:
+        if buffer_pool is not None and buffer_pool.S_chunk != layout.S_chunk:
             raise ValueError(
                 f"buffer_pool.S_chunk ({buffer_pool.S_chunk}) "
                 f"!= layout.S_chunk ({layout.S_chunk})"
+            )
+        # When the layout is all-persistent (n_persist == N_chunk) the
+        # caller may legitimately pass ``buffer_pool=None`` to skip the
+        # dormant pool allocation. In that case ``device`` MUST be
+        # supplied explicitly — there's no pool to source it from.
+        if buffer_pool is None and device is None:
+            raise ValueError(
+                "device must be provided when buffer_pool is None "
+                "(all-persistent layout has no pool to source it from)"
             )
 
         import torch
@@ -358,7 +374,9 @@ class ChunkManager:
         self.buffer_pool = buffer_pool
         self.cpu_optim = cpu_optim
         self.gpu_optim = gpu_optim
-        self.device = torch.device(device if device is not None else buffer_pool.device)
+        self.device = torch.device(
+            device if device is not None else buffer_pool.device  # type: ignore[union-attr]
+        )
 
         # ZeRO-3 sharding context. ``world_size`` and ``rank`` default
         # to the single-rank case; when either is > default AND
@@ -1348,6 +1366,16 @@ class ChunkManager:
             # params — nothing to do.
             return
 
+        # Past the persistent early-return: every code path below
+        # routes through ``self.buffer_pool``. The all-persistent
+        # construction path (``buffer_pool=None``) cannot reach here
+        # because every chunk would have hit the ``_persistent_ids``
+        # branch above. Assert for type narrowing + defense in depth.
+        assert self.buffer_pool is not None, (
+            "gather() reached the non-persistent path with no buffer_pool; "
+            "all-persistent layouts must early-return above"
+        )
+
         shard_state = self._chunk_shards.get(chunk_id)
 
         # Forward→backward reuse fast path (paper §3.1.1: "buffer-cached
@@ -1527,6 +1555,15 @@ class ChunkManager:
         """
         if chunk_id in self._persistent_ids:
             return
+        # Past the persistent early-return: ``buffer_pool`` is required
+        # for the release call below. The all-persistent construction
+        # path (``buffer_pool=None``) cannot reach here because every
+        # chunk hits the early-return above. Narrow for mypy + assert
+        # for defense in depth.
+        assert self.buffer_pool is not None, (
+            "offload() reached the non-persistent path with no buffer_pool; "
+            "all-persistent layouts must early-return above"
+        )
         slots = self._cpu_slots.get(chunk_id, [])
         for slot in slots:
             param = self._params_by_id.get(slot.param_id)
@@ -1883,10 +1920,15 @@ class ChunkManager:
             return existing
         import torch
 
+        # Source the device from ``self.device`` rather than
+        # ``self.buffer_pool.device`` so this works in the
+        # all-persistent layout where ``buffer_pool is None``.
+        # ``self.device`` is canonical (always set in __init__) and
+        # equal to ``buffer_pool.device`` when a pool exists.
         buf = torch.empty(
             self.layout.S_chunk,
             dtype=torch.uint8,
-            device=self.buffer_pool.device,
+            device=self.device,
         )
         self._persistent_buffers[chunk_id] = buf
         return buf

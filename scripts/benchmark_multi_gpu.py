@@ -389,8 +389,7 @@ def _launch_mode(
     if proc.returncode != 0:
         tail = log_path.read_text()[-6000:]
         raise RuntimeError(
-            f"mode={mode} worker failed (exit={proc.returncode}); "
-            f"log tail:\n{tail}"
+            f"mode={mode} worker failed (exit={proc.returncode}); log tail:\n{tail}"
         )
 
     # Collect per-rank stats.
@@ -398,9 +397,7 @@ def _launch_mode(
     for r in range(world_size):
         p = out_dir / f"rank{r}.json"
         if not p.exists():
-            raise RuntimeError(
-                f"mode={mode}: rank{r}.json missing; see {log_path}"
-            )
+            raise RuntimeError(f"mode={mode}: rank{r}.json missing; see {log_path}")
         with p.open() as f:
             stats.append(json.load(f))
     return stats

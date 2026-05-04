@@ -715,22 +715,29 @@ def _construct_runtime(
     else:
         n_buffer = int(result.cfg.n_buffer)
 
-    # Pool needs at least 1 slot for the allocator API (PinnedHostMemory
-    # and BufferPool both reject n_buffer=0). When ``min_n_buffer_for``
-    # legitimately returns 0 (all-persistent layout — every chunk
-    # resident on GPU, nothing routes through the pool), reserve one
-    # dormant slot so the allocator constructs cleanly. R9's intent
-    # (no silent inflation of the searcher's choice) is preserved:
-    # the cost-model ranking already used n_buffer=0 to score this
-    # config; the dormant pool slot doesn't change that ranking.
-    pool_capacity = max(1, n_buffer)
-    pinned_host = PinnedHostMemory(n_buffer=pool_capacity, S_chunk=layout.S_chunk)
-    buffer_pool = BufferPool(
-        n_buffer=pool_capacity,
-        S_chunk=layout.S_chunk,
-        pinned_host=pinned_host,
-        device=device,
-    )
+    # When ``min_n_buffer_for`` legitimately returns 0 (all-persistent
+    # layout — every chunk resident on GPU, no offload/gather routes
+    # through the pool), skip pool construction entirely. Allocating a
+    # dormant 1-slot pool would burn S_chunk bytes of pinned host AND
+    # S_chunk bytes of GPU memory outside the searched budget, which
+    # the cost model and CPU/GPU gates are supposed to prevent (on
+    # large models S_chunk can be 128 MiB+). The runtime's persistent
+    # path never touches ``self.buffer_pool`` so leaving it as ``None``
+    # is correctness-safe; ChunkManager's pool-touching methods all
+    # early-return for persistent chunks.
+    pinned_host: "PinnedHostMemory | None"
+    buffer_pool: "BufferPool | None"
+    if n_buffer == 0:
+        pinned_host = None
+        buffer_pool = None
+    else:
+        pinned_host = PinnedHostMemory(n_buffer=n_buffer, S_chunk=layout.S_chunk)
+        buffer_pool = BufferPool(
+            n_buffer=n_buffer,
+            S_chunk=layout.S_chunk,
+            pinned_host=pinned_host,
+            device=device,
+        )
 
     # Compute the effective persistent set FIRST so the param
     # partitioning + the ChunkManager construction agree on which
@@ -1063,16 +1070,26 @@ def _construct_runtime(
             )
 
             # Each slot must be large enough for the worst-case single
-            # saved tensor. We don't have per-tensor profiling, so use
-            # the per-block aggregate divided by ``slots_per_block`` as
-            # a proxy — for typical transformers this approximates
-            # "max single tensor" since the residual stream is the
-            # dominant contributor (~1/4 to 1/3 of the aggregate).
-            # Round up so an exact-fit residual still slots in.
+            # saved tensor inside any SWAP block. The trace records only
+            # the per-block AGGREGATE (sum across all saved tensors) —
+            # there is no per-tensor breakdown. The previous formula
+            # ``ceil(aggregate / slots_per_block)`` modelled a uniform
+            # split, but real transformer blocks have skewed tensor
+            # distributions (the residual stream alone can dominate
+            # ~1/3-1/2 of the aggregate while small Q/K projections
+            # share the remainder). When SWAP encounters a saved tensor
+            # larger than the AVERAGE-derived slot, ``slot_view.view(
+            # dtype).copy_(tensor)`` raises ``RuntimeError`` at runtime.
+            # Until per-tensor profiling lands, size every slot to the
+            # full per-block aggregate. The pool is over-provisioned
+            # (worst case ~K× larger than necessary) but cannot fail at
+            # runtime regardless of the saved-tensor size distribution.
+            # The cost model in ``cost/memory.estimate_cpu_footprint``
+            # uses the same formula so the searcher's CPU gate stays
+            # aligned with the actual runtime allocation.
             slots_per_block = DEFAULT_SLOTS_PER_BLOCK
-            per_slot = (max_act_bytes + slots_per_block - 1) // slots_per_block
             # Floor at 1 byte to satisfy the pool's positive-size invariant.
-            per_slot = max(1, per_slot)
+            per_slot = max(1, int(max_act_bytes))
             swap_pool = ActivationSwapPool(
                 n_swap=result.cfg.n_swap,
                 slot_bytes=per_slot,
@@ -1442,6 +1459,15 @@ def protrain_model_wrapper(
     if _hw_updates:
         hardware_profile = _replace(hardware_profile, **_hw_updates)
 
+    # Snapshot the SEARCH-time hardware profile. The auto-mode path
+    # below may re-stamp ``hardware_profile.zero3_shard`` after
+    # ``_select_mode`` returns to reflect the RUNTIME mode, but the
+    # phase-2 re-search must keep using the permissive (search-time)
+    # profile to avoid filtering Mode-C-only candidates whose CPU
+    # footprint only fits under sharding. On the non-auto-mode path
+    # this snapshot is identical to ``hardware_profile`` end-to-end.
+    search_hw_profile = hardware_profile
+
     n_block = max(1, len(trace.activation_sizes))
     # Max chunks seen in any one transformer block — used for the
     # force_all_persistent buffer-pool sizing (we need enough buffers to
@@ -1669,11 +1695,22 @@ def protrain_model_wrapper(
         # The SEARCH ran with the most-permissive ``zero3_shard`` flag
         # (True on auto + multi-rank, see the resolve block above) so
         # the CPU gate didn't preempt Mode C. Now that the selector has
-        # made its call, re-stamp the profile so the chunk-manager,
-        # cost-model peak prediction, and any phase-2 rebuild see the
-        # ACTUAL mode the runtime will use (Mode B → False, Mode C →
-        # True; Mode A → False because force_all_persistent skips the
-        # sharded all_gather path).
+        # made its call, re-stamp the RUNTIME profile so the
+        # chunk-manager, cost-model peak prediction, and any phase-2
+        # rebuild see the ACTUAL mode the runtime will use (Mode B →
+        # False, Mode C → True; Mode A → False because
+        # force_all_persistent skips the sharded all_gather path).
+        #
+        # IMPORTANT: ``search_hw_profile`` (snapshot taken above
+        # before this block) stays un-restamped — the phase-2
+        # re-search MUST use that permissive profile. Otherwise the
+        # stricter ``zero3_shard=False`` (e.g. when the selector
+        # picked Mode A or Mode B) would re-engage the CPU
+        # feasibility gate against the replicated footprint and
+        # could filter out Mode-C-only candidates whose pinned CPU
+        # only fits under sharding. The post-re-search
+        # ``_select_mode`` call re-evaluates the runtime mode for
+        # the post-measurement cfg.
         if zero3_shard != hardware_profile.zero3_shard:
             from dataclasses import replace as _replace
 
@@ -1837,13 +1874,70 @@ def protrain_model_wrapper(
             # same CPU feasibility budget — phase-2 only refines runtime
             # estimates, not memory accounting, so the CPU envelope
             # binding doesn't change.
+            #
+            # Pass ``search_hw_profile`` (the permissive snapshot taken
+            # before ``_select_mode`` re-stamped ``hardware_profile``).
+            # If we passed the runtime-stamped profile, then on auto-
+            # mode runs where the original selector picked Mode A or
+            # Mode B (zero3_shard=False) the search's CPU feasibility
+            # gate would re-engage against the replicated footprint
+            # and could drop Mode-C-only candidates whose pinned CPU
+            # only fits under sharding. The post-search ``_select_mode``
+            # call below picks the actual runtime mode for the new cfg.
             new_result = search(
                 trace,
                 layout,
                 capacity_bytes,
-                hardware_profile,
+                search_hw_profile,
                 cpu_capacity_bytes=cpu_capacity_bytes,
             )
+
+            # Re-pick runtime mode for the post-measurement cfg. The
+            # original ``_select_mode`` decision was made against
+            # ``boot_cfg``; ``new_result.cfg`` may push more chunks to
+            # CPU (offload mode B/C) or fewer (Mode A), changing the
+            # required per-rank CPU footprint and therefore the
+            # replicated-vs-sharded-vs-A decision. Skip on the non-
+            # auto path — explicit user flags don't get re-evaluated.
+            if auto_mode:
+                cpu_ram_re = _cpu_ram_per_rank_bytes(_ws_early)
+                new_force_persistent, new_zero3 = _select_mode(
+                    search_result=new_result,
+                    layout=layout,
+                    hw=search_hw_profile,
+                    world_size=_ws_early,
+                    cpu_ram_per_rank_bytes=cpu_ram_re,
+                    auto_mode=True,
+                    user_force_all_persistent=_user_force_all_persistent,
+                    user_zero3_shard=_user_zero3_shard,
+                )
+                # Re-stamp the runtime ``hardware_profile`` to reflect
+                # the post-measurement mode pick. The chunk-manager
+                # rebuild path below (the ``cfg_changed`` branch) reads
+                # this when calling ``_construct_runtime``; the
+                # no-rebuild branch keeps the bootstrap runtime, which
+                # was constructed under the original mode pick — log
+                # only if the mode actually changed so future reruns
+                # land on the new pick from cache directly.
+                if (
+                    new_force_persistent != force_all_persistent
+                    or new_zero3 != zero3_shard
+                ):
+                    LOG.info(
+                        "Phase-2: post-measurement _select_mode changed "
+                        "the runtime mode (force_all_persistent %s -> %s, "
+                        "zero3_shard %s -> %s).",
+                        force_all_persistent,
+                        new_force_persistent,
+                        zero3_shard,
+                        new_zero3,
+                    )
+                force_all_persistent = new_force_persistent
+                zero3_shard = new_zero3
+                if zero3_shard != hardware_profile.zero3_shard:
+                    hardware_profile = _replace(
+                        hardware_profile, zero3_shard=bool(zero3_shard)
+                    )
             # Compare the SEARCH's raw pick (boot_cfg) against the
             # search's raw new pick (new_result.cfg) — NOT the
             # calibrated boot_result.cfg. _construct_runtime's

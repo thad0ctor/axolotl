@@ -173,9 +173,13 @@ class ActivationSwapPool:
                 )
             slot_id = self._free.pop()
             self._inflight += 1
-        # ``buffer()`` is a pinned-region narrow view; no pool
-        # bookkeeping mutated, so we drop the lock before calling it.
-        return slot_id, self._pinned.buffer(slot_id)
+            # ``PinnedHostMemory.buffer()`` mutates ``_live_borrows`` and
+            # explicitly requires caller synchronization. Hold ``self._lock``
+            # across it so concurrent acquire/release/close() callers cannot
+            # race on the borrow accounting (which would either drift the
+            # count or free the pinned region while a slot view is still live).
+            view = self._pinned.buffer(slot_id)
+        return slot_id, view
 
     def release(self, slot_id: int) -> None:
         """Return ``slot_id`` to the free list. Idempotent on bad ids.
@@ -205,14 +209,15 @@ class ActivationSwapPool:
                 return
             self._free.append(slot_id)
             self._inflight -= 1
-        # Return the borrow to the underlying pinned allocator so its
-        # close() guard knows the slot view is no longer live. The view
-        # itself is dropped by the caller; ``record_stream`` keeps the
-        # bytes alive for the in-flight H2D, but the borrow accounting
-        # follows the pool slot lifetime. Done outside the lock — the
-        # pinned allocator has its own bookkeeping and is not part of
-        # this pool's free-list/inflight invariants.
-        self._pinned.release_buffer(slot_id)
+            # Return the borrow to the underlying pinned allocator so its
+            # close() guard knows the slot view is no longer live. The view
+            # itself is dropped by the caller; ``record_stream`` keeps the
+            # bytes alive for the in-flight H2D, but the borrow accounting
+            # is mutated by ``release_buffer`` and per ``PinnedHostMemory``'s
+            # contract requires caller synchronization — so we hold
+            # ``self._lock`` across it to keep ``_live_borrows`` consistent
+            # with our slot lifetime under concurrent acquire/release/close().
+            self._pinned.release_buffer(slot_id)
 
     @property
     def total_bytes(self) -> int:
@@ -230,18 +235,32 @@ class ActivationSwapPool:
             return self._inflight
 
     def close(self) -> None:
-        """Free the pinned region. Idempotent."""
+        """Free the pinned region. Idempotent.
+
+        Ordering note: ``_pinned.close()`` raises if any slot view is
+        still borrowed (its lifetime guard). If we marked ``_closed``
+        BEFORE calling it, a raise would leave the pool permanently
+        half-closed — ``release()`` short-circuits on ``_closed`` and
+        the outstanding borrow could never be returned. So we tear the
+        pinned allocator down FIRST, and only flip our own ``_closed``
+        flag once that succeeds. On a raise the pool stays usable: the
+        caller can return the leaked slot via ``release()`` and retry
+        ``close()``.
+        """
         with self._lock:
             if self._closed:
                 return
+        # ``_pinned.close()`` is the underlying allocator tear-down; it
+        # is on a separate lock-domain (its own bookkeeping, not part of
+        # this pool's free-list/inflight invariants) so it is safe — and
+        # preferable — to call without holding ``self._lock``: it may be
+        # slow, and dropping the lock keeps concurrent ``free_count`` /
+        # ``inflight_count`` reads responsive during teardown.
+        self._pinned.close()
+        with self._lock:
             self._closed = True
             self._free.clear()
             self._inflight = 0
-        # ``_pinned.close()`` is the underlying allocator tear-down; it
-        # is idempotent and not part of this pool's bookkeeping, so we
-        # release the lock before calling it to avoid holding it across
-        # a (potentially slow) pinned-region free.
-        self._pinned.close()
 
     def __del__(self) -> None:  # noqa: D401
         try:

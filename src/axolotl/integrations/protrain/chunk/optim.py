@@ -267,13 +267,11 @@ class GpuFusedAdamAdapter:
         # so short-circuit to a no-op adapter: step()/zero_grad() do
         # nothing and state_dict() returns the empty dict shape that
         # torch optimizers use.
-        self._is_noop = len(param_list) == 0
-        if self._is_noop:
+        if len(param_list) == 0:
             self._optim = None
             return
 
-        optim = self._build_optim(param_list)
-        self._optim = optim
+        self._optim = self._build_optim(param_list)
 
     def _build_optim(self, params: list["nn.Parameter"]) -> Any:
         """Return Apex ``FusedAdam`` if importable, else ``torch.optim.AdamW``."""
@@ -311,27 +309,31 @@ class GpuFusedAdamAdapter:
 
     def step(self) -> None:
         """Synchronous fused GPU Adam step over persistent-chunk params."""
-        if self._is_noop:
+        optim = self._optim
+        if optim is None:
             return
-        self._optim.step()
+        optim.step()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Zero gradients on every persistent-chunk parameter."""
-        if self._is_noop:
+        optim = self._optim
+        if optim is None:
             return
-        self._optim.zero_grad(set_to_none=set_to_none)
+        optim.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self) -> dict[str, Any]:
         """Return the wrapped optimizer's state dict (empty when no-op)."""
-        if self._is_noop:
+        optim = self._optim
+        if optim is None:
             return {"state": {}, "param_groups": []}
-        return self._optim.state_dict()
+        return optim.state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load state into the wrapped optimizer (no-op when adapter is empty)."""
-        if self._is_noop:
+        optim = self._optim
+        if optim is None:
             return
-        self._optim.load_state_dict(state_dict)
+        optim.load_state_dict(state_dict)
 
     @property
     def underlying(self) -> Any:

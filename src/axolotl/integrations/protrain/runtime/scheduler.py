@@ -327,6 +327,14 @@ class Scheduler:
         if not chunk_ids:
             return
 
+        # All-persistent layouts (n_buffer=0) skip pool construction
+        # entirely — every chunk is GPU-resident throughout forward AND
+        # backward, no gather/prefetch is needed here. The pool-cache
+        # fast-path below would NPE on the missing pool; bail out
+        # cleanly instead.
+        if self.chunk_manager.buffer_pool is None:
+            return
+
         # Consult the pool first — gathers that hit the resident tag are
         # essentially free; gathers that miss trigger a fresh H2D copy
         # onto the prefetch stream.
