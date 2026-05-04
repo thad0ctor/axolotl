@@ -450,11 +450,16 @@ def _build_hardware_profile(cfg):
             "ProTrain plugin requires a CUDA device; torch.cuda.is_available() is False."
         )
 
-    # Honour CUDA_VISIBLE_DEVICES — the ordinal here is logical (0), which
-    # resolves to whatever the user masked in via the env var. The
-    # searcher consumes total GPU memory; the M5 plan scopes ProTrain to
-    # single-3090 runs so we read device 0 without enumerating the rest.
-    device = 0
+    # Honour CUDA_VISIBLE_DEVICES — the ordinal here is logical, which
+    # resolves to whatever the user masked in via the env var. Read this
+    # rank's device (set by ``torch.cuda.set_device(LOCAL_RANK)`` in
+    # ``post_model_load``) so heterogeneous-memory multi-GPU rigs report
+    # the correct ``capacity_bytes`` / SKU per rank instead of always
+    # reading device 0.
+    import os
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = local_rank
     props = torch.cuda.get_device_properties(device)
     gpu_memory_bytes = int(props.total_memory)
     gpu_sku = torch.cuda.get_device_name(device)

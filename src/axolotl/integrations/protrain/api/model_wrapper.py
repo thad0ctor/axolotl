@@ -1469,15 +1469,6 @@ def protrain_model_wrapper(
     search_hw_profile = hardware_profile
 
     n_block = max(1, len(trace.activation_sizes))
-    # Max chunks seen in any one transformer block — used for the
-    # force_all_persistent buffer-pool sizing (we need enough buffers to
-    # hold every chunk a single block touches during its forward, times
-    # 2 for the rolling forward→backward reuse the BufferPool assumes).
-    max_chunks_per_block = 1
-    if layout.block_to_chunks:
-        max_chunks_per_block = max(
-            (len(cids) for cids in layout.block_to_chunks.values()), default=1
-        )
 
     all_overrides_set = all(
         v is not None
@@ -1499,7 +1490,7 @@ def protrain_model_wrapper(
         # misread them as real predictions.
         synth_cfg = CostConfig(
             n_persist=layout.N_chunk,
-            n_buffer=max(1, 2 * max_chunks_per_block),
+            n_buffer=min_n_buffer_for(layout, layout.N_chunk),
             n_swap=0,
             n_checkpoint=n_block,
         )
@@ -1788,13 +1779,15 @@ def protrain_model_wrapper(
                 model=model, batch=boot_batch, optimizer=boot_optim
             )
         except Exception as exc:  # noqa: BLE001 — measurement is best-effort
+            exc_repr = f"{type(exc).__name__}: {exc}"
             LOG.warning(
                 "Phase-2 chunked measurement raised %s; falling back to "
                 "the v8 cost-model path under the searcher's original "
                 "pick. Tighten or disable the phase-2 gate if the "
                 "failure is reproducible.",
-                exc,
+                exc_repr,
             )
+            del exc
             measurement_failed = True
 
         if measurement_failed:
