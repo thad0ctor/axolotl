@@ -458,8 +458,29 @@ def _build_hardware_profile(cfg):
     # reading device 0.
     import os
 
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    device = local_rank
+    raw_local_rank = os.environ.get("LOCAL_RANK", "0")
+    try:
+        local_rank = int(raw_local_rank)
+    except ValueError:
+        LOG.warning(
+            "ProTrain: invalid LOCAL_RANK=%r; falling back to current CUDA device.",
+            raw_local_rank,
+        )
+        local_rank = torch.cuda.current_device()
+
+    visible = int(torch.cuda.device_count())
+    if visible <= 0:
+        raise RuntimeError("ProTrain plugin requires at least one visible CUDA device.")
+    if not (0 <= local_rank < visible):
+        LOG.warning(
+            "ProTrain: LOCAL_RANK=%d out of visible CUDA range [0, %d); "
+            "falling back to current CUDA device.",
+            local_rank,
+            visible,
+        )
+        device = torch.cuda.current_device()
+    else:
+        device = local_rank
     props = torch.cuda.get_device_properties(device)
     gpu_memory_bytes = int(props.total_memory)
     gpu_sku = torch.cuda.get_device_name(device)

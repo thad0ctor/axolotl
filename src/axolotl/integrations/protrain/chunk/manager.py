@@ -1914,12 +1914,20 @@ class ChunkManager:
     def per_rank_cpu_bytes(self) -> int:
         """Total pinned CPU bytes this rank holds across every sharded chunk.
 
-        Equals the sum of ``shard_bytes_for`` over every sharded chunk
-        id. Convenience accessor for the 4-GPU sharding test which
-        asserts per-rank CPU footprint roughly equals
-        ``total_non_persistent_bytes / world_size``.
+        Sums BOTH the per-region shard buffer (``cpu_shard_bytes``) and
+        the per-region grad buffer (``cpu_shard_grad_bytes``) — both are
+        allocated by ``materialize_offload`` for every sharded region.
+        Convenience accessor for the 4-GPU sharding test which asserts
+        per-rank CPU footprint roughly equals
+        ``total_non_persistent_bytes / world_size`` and for benchmark
+        scripts reporting Mode-C host RAM.
         """
-        return sum(s.shard_bytes for s in self._chunk_shards.values())
+        total = 0
+        for shard_state in self._chunk_shards.values():
+            for region in shard_state.regions:
+                total += int(region.cpu_shard_bytes.numel())
+                total += int(region.cpu_shard_grad_bytes.numel())
+        return total
 
     # ---- internals -----------------------------------------------------
 

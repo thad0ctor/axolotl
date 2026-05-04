@@ -464,18 +464,23 @@ def test_save_skipped_when_estimate_exceeds_threshold(tmp_path, caplog):
     )
     fake_optim._chunk_manager._persistent_ids = {0}
 
-    # ``MultiProcessAdapter.log`` consults ``is_main_process`` BEFORE handing
-    # the record to the underlying logger. In pytest-xdist CI workers a prior
-    # test can leak ``LOCAL_RANK`` or distributed state and turn this off,
-    # silently dropping the WARN we want to assert on. Force the gate True so
-    # caplog deterministically sees the WARN.
-    with (
-        mock.patch("axolotl.utils.logging.is_main_process", return_value=True),
-        caplog.at_level(logging.WARNING),
-    ):
-        wrote = _save_protrain_optim_dir(
-            fake_optim, str(tmp_path), step=1, save_max_bytes=1024
-        )
+    # ``axolotl.logging_config.configure_logging()`` (run at axolotl.cli
+    # import time, which CI hits) sets ``propagate=False`` on the
+    # ``axolotl`` logger. Pytest's ``caplog`` installs its handler at the
+    # root, so non-propagating records never reach it and the assertion
+    # below sees an empty ``caplog.records``. Force propagation for the
+    # duration of the test (and restore on exit) so caplog deterministically
+    # sees the production WARN.
+    ax_logger = logging.getLogger("axolotl")
+    prev_propagate = ax_logger.propagate
+    ax_logger.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING):
+            wrote = _save_protrain_optim_dir(
+                fake_optim, str(tmp_path), step=1, save_max_bytes=1024
+            )
+    finally:
+        ax_logger.propagate = prev_propagate
     assert wrote is False
     assert any(
         "skipping save" in rec.message and "exceeds" in rec.message

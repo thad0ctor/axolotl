@@ -601,10 +601,15 @@ def _select_mode(
             bool(user_zero3_shard) if user_zero3_shard is not None else False,
         )
 
-    # Single-rank auto path: no multi-GPU mode to pick — Mode A is
-    # always the right answer (no CPU offload to replicate/shard).
+    # Single-rank auto path: no multi-GPU mode to pick. Honour the
+    # searcher's persistent-vs-offload decision rather than forcing
+    # Mode A unconditionally — if the model only fits with non-
+    # persistent chunks (n_persist < N_chunk) we'd OOM otherwise.
     if world_size <= 1:
-        return (True, False)
+        return (
+            int(search_result.cfg.n_persist) >= int(layout.N_chunk),
+            False,
+        )
 
     # Mode A: searcher says everything fits on GPU. Best throughput.
     if int(search_result.cfg.n_persist) >= int(layout.N_chunk):

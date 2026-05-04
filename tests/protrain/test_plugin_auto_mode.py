@@ -234,29 +234,48 @@ def test_explicit_flag_overrides_auto() -> None:
     assert zero3 is False
 
 
-def test_auto_single_rank_picks_mode_a() -> None:
-    """world_size=1 → always Mode A (no multi-GPU mode to pick).
+def test_auto_single_rank_honours_searcher_n_persist() -> None:
+    """world_size=1 → honour the searcher's offload decision.
 
-    Extra coverage for the single-rank short-circuit — the selector
-    must not try to reason about sharding when there's only one rank.
+    Single-rank has no multi-GPU mode to pick (zero3 is meaningless),
+    but the selector must still respect ``n_persist < N_chunk`` from
+    the searcher — forcing Mode A on a model that only fits with
+    non-persistent chunks would OOM. Mode A is selected only when the
+    searcher itself picked an all-persistent layout.
     """
-    # Even with n_persist < N_chunk (which would normally drive the
-    # selector toward offload), single-rank always picks Mode A.
     layout = _mk_layout(s_chunk=128 * (1 << 20), n_chunk=10)
     hw = _mk_hw(gpu_count=1)
-    search = _mk_search(n_persist=1)
 
+    # Searcher wants offload (n_persist=1 < N_chunk=10): selector must
+    # NOT force Mode A.
+    search_offload = _mk_search(n_persist=1)
     force_persistent, zero3 = _select_mode(
-        search_result=search,
+        search_result=search_offload,
         layout=layout,
         hw=hw,
         world_size=1,
-        cpu_ram_per_rank_bytes=0,  # irrelevant when ws=1
+        cpu_ram_per_rank_bytes=0,
         auto_mode=True,
         user_force_all_persistent=False,
         user_zero3_shard=None,
     )
+    assert force_persistent is False, (
+        "single-rank with searcher n_persist < N_chunk must NOT force Mode A"
+    )
+    assert zero3 is False
 
+    # Searcher wants all-persistent (n_persist=N_chunk): selector picks Mode A.
+    search_all = _mk_search(n_persist=10)
+    force_persistent, zero3 = _select_mode(
+        search_result=search_all,
+        layout=layout,
+        hw=hw,
+        world_size=1,
+        cpu_ram_per_rank_bytes=0,
+        auto_mode=True,
+        user_force_all_persistent=False,
+        user_zero3_shard=None,
+    )
     assert force_persistent is True
     assert zero3 is False
 
