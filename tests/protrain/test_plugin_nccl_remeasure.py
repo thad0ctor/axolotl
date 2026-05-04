@@ -381,18 +381,23 @@ def test_remeasure_skips_when_wrapped_missing_stashed_state(caplog):
     # Deliberately do NOT set _trace / _layout / _hardware_profile / _capacity_bytes.
 
     patches = _patch_dist(initialized=True, world_size=2)
-    # ``MultiProcessAdapter.log`` consults ``is_main_process`` BEFORE handing
-    # the record to the underlying logger. In pytest-xdist CI workers a prior
-    # test can leak ``LOCAL_RANK`` or distributed state and turn this off,
-    # silently dropping the WARN we want to assert on. Force the gate True so
-    # caplog deterministically sees the WARN.
-    patches.append(patch("axolotl.utils.logging.is_main_process", return_value=True))
     for p in patches:
         p.start()
+    # ``axolotl.logging_config.configure_logging()`` (run at axolotl.cli
+    # import time, which CI hits) sets ``propagate=False`` on the
+    # ``axolotl`` logger. Pytest's ``caplog`` installs its handler at the
+    # root, so non-propagating records never reach it and the assertion
+    # below sees an empty ``caplog.records``. Force propagation for the
+    # duration of the test (and restore on exit) so caplog deterministically
+    # sees the production WARN.
+    ax_logger = logging.getLogger("axolotl")
+    prev_propagate = ax_logger.propagate
+    ax_logger.propagate = True
     try:
         with caplog.at_level(logging.WARNING):
             updated, changed = _remeasure_nccl_and_research(bare)
     finally:
+        ax_logger.propagate = prev_propagate
         for p in patches:
             p.stop()
 

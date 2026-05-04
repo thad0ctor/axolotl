@@ -279,6 +279,8 @@ _WORKER_SCRIPT = textwrap.dedent(
                 for s in slots:
                     if s.cpu_data is not None:
                         total += s.numel * s.element_size
+                    if s.cpu_grad is not None:
+                        total += s.numel * s.element_size
             cpu_pinned = total
         else:
             cpu_pinned = 0
