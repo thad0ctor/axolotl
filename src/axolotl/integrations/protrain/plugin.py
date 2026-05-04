@@ -654,7 +654,20 @@ class ProTrainPlugin(BasePlugin):
             and _torch is not None
             and _torch.cuda.is_available()
         ):
-            local_rank = int(_os.environ.get("LOCAL_RANK", 0))
+            # Defensive parse: a non-numeric LOCAL_RANK would raise here
+            # and abort plugin init before the safer fallback in
+            # _build_hardware_profile() runs; a negative would slip
+            # through as cuda:-1. Mirror the same try/except + range
+            # guard used at _build_hardware_profile().
+            raw_local_rank = _os.environ.get("LOCAL_RANK", "0")
+            try:
+                local_rank = int(raw_local_rank)
+            except ValueError:
+                LOG.warning(
+                    "ProTrain: invalid LOCAL_RANK=%r; falling back to current CUDA device.",
+                    raw_local_rank,
+                )
+                local_rank = _torch.cuda.current_device()
             visible = _torch.cuda.device_count()
             # ``current_device.index`` is ``None`` for a bare
             # ``torch.device("cuda")`` without an explicit ordinal
@@ -666,7 +679,7 @@ class ProTrainPlugin(BasePlugin):
             needs_move = current_device.type != "cuda" or on_wrong_cuda
             if not needs_move:
                 pass  # already on cuda:local_rank, no-op
-            elif local_rank < visible:
+            elif 0 <= local_rank < visible:
                 target = f"cuda:{local_rank}"
                 LOG.info(
                     "ProTrain: model is on %s; moving to %s before wrap "
