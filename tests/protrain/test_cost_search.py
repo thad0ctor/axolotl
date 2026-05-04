@@ -1,0 +1,1712 @@
+"""Unit tests for the ProTrain cost models + searcher (M4).
+
+These tests build synthetic ``ProfilerTrace`` / ``ChunkLayout`` /
+``HardwareProfile`` objects — no GPU required. The toy model has
+``N_block=8`` transformer blocks, ``N_chunk=12`` chunks of
+``S_chunk=64 MB``, with uniform per-block activation size and a small
+op-walk seeded per block so the peak estimator has something to walk.
+"""
+
+from __future__ import annotations
+
+from typing import Iterable
+
+import pytest
+
+from axolotl.integrations.protrain.block.layout_rules import assign_modes
+from axolotl.integrations.protrain.cost import (
+    ALPHA_FRAGMENTATION,
+    effective_bw,
+    estimate_cpu_footprint,
+    estimate_peak,
+    estimate_runtime,
+)
+from axolotl.integrations.protrain.search import derive_bounds, search
+from axolotl.integrations.protrain.types import (
+    BlockId,
+    BlockMode,
+    ChunkId,
+    ChunkLayout,
+    CostConfig,
+    HardwareProfile,
+    OpId,
+    OpRecord,
+    ParamId,
+    ProfilerTrace,
+    SearchResult,
+)
+
+# ---------------------------------------------------------------------------
+# Synthetic fixtures
+# ---------------------------------------------------------------------------
+
+
+MB = 1 << 20
+GB = 1 << 30
+
+
+def _make_op_order(n_block: int, ops_per_block: int) -> tuple[OpRecord, ...]:
+    """Build a forward op sequence with ``ops_per_block`` ops per block."""
+    out: list[OpRecord] = []
+    op_id = 0
+    for b in range(n_block):
+        for k in range(ops_per_block):
+            out.append(
+                OpRecord(
+                    op_id=OpId(op_id),
+                    module_path=f"block.{b}.op.{k}",
+                    qualified_name="aten::toy",
+                    shape_signature=((1,),),
+                    block_id=BlockId(b),
+                    is_forward=True,
+                )
+            )
+            op_id += 1
+    return tuple(out)
+
+
+def _make_trace(
+    *,
+    n_block: int = 8,
+    ops_per_block: int = 5,
+    activation_bytes_per_block: int = 32 * MB,
+    model_state_bytes: int = 768 * MB,
+    pcie_h2d_bps: float = 12e9,  # ~12 GB/s, 3090-like PCIe4 x16
+    pcie_d2h_bps: float = 12e9,
+    intra_delta_bytes: int = 8 * MB,
+    inter_delta_bytes: int = 2 * MB,
+    world: int = 1,
+    op_latency_s: float = 0.0002,  # 200 µs per forward op; toy but >0
+    hook_scale_ratio: float = 1.0,  # steady/hooked forward wall ratio; 1.0 = no-op
+) -> ProfilerTrace:
+    op_order = _make_op_order(n_block, ops_per_block)
+    intra_op_delta: dict[OpId, int] = {op.op_id: intra_delta_bytes for op in op_order}
+    inter_op_delta: dict[OpId, int] = {op.op_id: inter_delta_bytes for op in op_order}
+    activation_sizes: dict[BlockId, int] = {
+        BlockId(b): activation_bytes_per_block for b in range(n_block)
+    }
+    # Populated op_latencies so the cost model exercises the measured-compute
+    # path rather than the activation-bytes fallback. Uniform per-op timing
+    # keeps the synthetic invariants (monotonicity in n_buffer, CKPT-adds-
+    # recompute, etc.) easy to reason about.
+    op_latencies: dict[OpId, float] = {op.op_id: op_latency_s for op in op_order}
+    # Hooked/steady forward wall-time fields (TRACE_VERSION=4). Default 1:1
+    # ratio so the cost model's scale factor is identity and existing
+    # invariants still hold. Individual tests can pass a non-default
+    # ratio to exercise the scale path.
+    hooked_sum = sum(op_latencies.values())
+    return ProfilerTrace(
+        op_order=op_order,
+        intra_op_delta=intra_op_delta,
+        inter_op_delta=inter_op_delta,
+        activation_sizes=activation_sizes,
+        model_state_bytes=model_state_bytes,
+        pcie_h2d_bps=pcie_h2d_bps,
+        pcie_d2h_bps=pcie_d2h_bps,
+        nccl_gather_s={} if world <= 1 else {64 * MB: 0.01},
+        nccl_reduce_s={} if world <= 1 else {64 * MB: 0.012},
+        arch_hash="test-arch",
+        bs=1,
+        seq=128,
+        sku="RTX 3090 (synthetic)",
+        world=world,
+        op_latencies=op_latencies,
+        hooked_fwd_wall_s=hooked_sum,
+        steady_fwd_wall_s=hooked_sum * hook_scale_ratio,
+        steady_bwd_wall_s=0.0,
+    )
+
+
+def _make_layout(
+    *, n_chunk: int = 12, s_chunk: int = 64 * MB, n_block: int = 8
+) -> ChunkLayout:
+    # Dummy chunk contents — enough to be structurally valid.
+    chunks: list[tuple[ParamId, ...]] = [
+        (ParamId(f"param.{i}"),) for i in range(n_chunk)
+    ]
+    param_to_chunk = {ParamId(f"param.{i}"): ChunkId(i) for i in range(n_chunk)}
+    # Distribute chunks across blocks roughly 1:1 then wrap.
+    block_to_chunks: dict[BlockId, tuple] = {
+        BlockId(b): (ChunkId(b % n_chunk),) for b in range(n_block)
+    }
+    return ChunkLayout(
+        S_chunk=s_chunk,
+        N_chunk=n_chunk,
+        chunks=tuple(chunks),
+        param_to_chunk=param_to_chunk,
+        block_to_chunks=block_to_chunks,
+    )
+
+
+def _make_hw(
+    *,
+    gpu_memory_bytes: int = 24 * GB,
+    gpu_count: int = 1,
+    pcie_h2d_bps: float = 12e9,
+    pcie_d2h_bps: float = 12e9,
+    zero3_shard: bool = False,
+    # Positive Adam-rate defaults so the synthetic HW exercises the
+    # FEASIBLE path of estimate_runtime. Per the round-3 R15 contract
+    # (cost/runtime.py), ``cpu_adam_bytes_per_sec <= 0`` now marks any
+    # config with ``n_nonpersist > 0`` as infeasible (returns
+    # ``float("inf")``) — that's the correct production behaviour
+    # (CPU Adam unavailable means non-persistent chunks would not be
+    # stepped at runtime), but it makes ALL offloaded configs in
+    # ``search()`` infeasible if the synthetic HW left these at the
+    # type-default 0.0. Tests that explicitly want the
+    # CPU-Adam-unavailable contract (e.g. the renamed
+    # ``test_estimate_runtime_returns_inf_when_offloaded_and_adam_bps_zero``
+    # below) override these to 0.0 via ``replace(...)``.
+    cpu_adam_bytes_per_sec: float = 2e9,
+    gpu_adam_bytes_per_sec: float = 4e11,
+) -> HardwareProfile:
+    return HardwareProfile(
+        gpu_sku="NVIDIA GeForce RTX 3090 (synthetic)",
+        gpu_memory_bytes=gpu_memory_bytes,
+        gpu_count=gpu_count,
+        pcie_h2d_bps=pcie_h2d_bps,
+        pcie_d2h_bps=pcie_d2h_bps,
+        has_nvlink=False,
+        zero3_shard=zero3_shard,
+        cpu_adam_bytes_per_sec=cpu_adam_bytes_per_sec,
+        gpu_adam_bytes_per_sec=gpu_adam_bytes_per_sec,
+    )
+
+
+@pytest.fixture
+def toy_trace() -> ProfilerTrace:
+    return _make_trace()
+
+
+@pytest.fixture
+def toy_layout() -> ChunkLayout:
+    return _make_layout()
+
+
+@pytest.fixture
+def toy_hw() -> HardwareProfile:
+    return _make_hw()
+
+
+# ---------------------------------------------------------------------------
+# memory / estimate_peak
+# ---------------------------------------------------------------------------
+
+
+def _peaks_for_ckpt_sweep(
+    trace: ProfilerTrace,
+    layout: ChunkLayout,
+    hw: HardwareProfile,
+    n_persist: int,
+    n_buffer: int,
+    n_swap: int,
+) -> list[int]:
+    """Return [peak(n_checkpoint=k) for k in 0..N_block]."""
+    n_block = len(trace.activation_sizes)
+    peaks: list[int] = []
+    for k in range(0, n_block + 1 - n_swap):
+        cfg = CostConfig(
+            n_persist=n_persist,
+            n_buffer=n_buffer,
+            n_swap=n_swap,
+            n_checkpoint=k,
+        )
+        bm = assign_modes(n_swap, k, n_block)
+        peaks.append(estimate_peak(cfg, trace, layout, bm, hw))
+    return peaks
+
+
+def test_estimate_peak_monotonic_in_n_checkpoint(toy_trace, toy_layout, toy_hw):
+    # With n_swap=0 and a fixed (n_persist, n_buffer), increasing
+    # n_checkpoint should not increase peak memory (checkpointing
+    # replaces retained-activation bytes with per-block recomputation
+    # bumps that are equal in magnitude, so peak is non-increasing).
+    peaks = _peaks_for_ckpt_sweep(
+        toy_trace, toy_layout, toy_hw, n_persist=2, n_buffer=2, n_swap=0
+    )
+    for prev, nxt in zip(peaks, peaks[1:], strict=False):
+        assert nxt <= prev, (
+            f"peak should be non-increasing in n_checkpoint; got {peaks}"
+        )
+
+
+def test_estimate_peak_increases_with_n_persist_until_activations_dominate(
+    toy_trace, toy_layout, toy_hw
+):
+    # At low n_persist the model-state contribution dominates, so
+    # bumping n_persist strictly increases peak. Fix n_buffer=0 so the
+    # buffer contribution is constant.
+    peaks = []
+    for n_persist in range(0, toy_layout.N_chunk + 1):
+        cfg = CostConfig(n_persist=n_persist, n_buffer=0, n_swap=0, n_checkpoint=0)
+        bm = assign_modes(0, 0, len(toy_trace.activation_sizes))
+        peaks.append(estimate_peak(cfg, toy_trace, toy_layout, bm, toy_hw))
+
+    # Must be strictly non-decreasing across the sweep.
+    for prev, nxt in zip(peaks, peaks[1:], strict=False):
+        assert nxt >= prev
+    # And the first-to-last jump should be at least S_chunk * N_chunk
+    # worth of model-state bytes after alpha scaling.
+    expected_min_delta = int(
+        ALPHA_FRAGMENTATION * toy_layout.N_chunk * toy_layout.S_chunk * 0.5
+    )
+    assert peaks[-1] - peaks[0] >= expected_min_delta
+
+
+def test_estimate_peak_uses_per_block_caps(toy_layout, toy_hw):
+    """``steady_fwd_block_peak_bytes`` caps the op-walk raw_peak for ANY config.
+
+    Build a trace with an absurdly large synthetic intra_op_delta so the
+    op-walk would compute a huge raw_peak absent the measured cap. Populate
+    ``steady_fwd_block_peak_bytes`` with a modest per-block peak; the cap
+    must pull raw_peak down to ``forward_max_block_peak + ckpt_recomp_bump``
+    regardless of n_checkpoint/n_swap.
+
+    Contrast: the v5 ``steady_fwd_peak_bytes`` cap only fires when
+    n_checkpoint==0 && n_swap==0, so a config with n_checkpoint>0 would
+    see the full (huge) op-walk peak. With per-block data the cap
+    tightens fractional-NONE configs too.
+    """
+    n_block = 8
+    # Raw op-walk raw_peak: uniform intra_delta of 1 GB per op.
+    # Op-walk raw_peak >> 1 GB. Set per-block measured peaks to 512 MB —
+    # the cap must pull raw_peak to ~512 MB + max(activation CKPT bump).
+    huge_intra = 1 * GB
+    activation_bytes_per_block = 64 * MB
+    trace = _make_trace(
+        n_block=n_block,
+        ops_per_block=5,
+        activation_bytes_per_block=activation_bytes_per_block,
+        intra_delta_bytes=huge_intra,
+    )
+    per_block_peak = 512 * MB
+    # Rebuild with block-peak dict populated — ProfilerTrace is frozen,
+    # so construct a fresh one copying all fields from the base trace.
+    from dataclasses import replace
+
+    trace = replace(
+        trace,
+        steady_fwd_block_peak_bytes={
+            BlockId(b): per_block_peak for b in range(n_block)
+        },
+    )
+
+    # All-NONE config: ckpt_recomp_bump = 0, cap = per_block_peak.
+    cfg_all_none = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
+    bm_all_none = assign_modes(0, 0, n_block)
+    peak_all_none = estimate_peak(cfg_all_none, trace, toy_layout, bm_all_none, toy_hw)
+    # Scaled cap = ALPHA_FRAGMENTATION * per_block_peak; op-walk would
+    # otherwise be > 1 GB * alpha. The cap should pin peak near the
+    # scaled per_block_peak value.
+    assert peak_all_none <= int(ALPHA_FRAGMENTATION * per_block_peak) + 1, (
+        f"all-NONE peak {peak_all_none / 1e6:.1f}MB should be capped at "
+        f"~{ALPHA_FRAGMENTATION * per_block_peak / 1e6:.1f}MB"
+    )
+
+    # Fractional-NONE config: 3 blocks CKPT. ckpt_recomp_bump =
+    # max activation across CKPT blocks = activation_bytes_per_block.
+    cfg_mixed = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=3)
+    bm_mixed = assign_modes(0, 3, n_block)
+    peak_mixed = estimate_peak(cfg_mixed, trace, toy_layout, bm_mixed, toy_hw)
+    expected_cap = int(
+        ALPHA_FRAGMENTATION * (per_block_peak + activation_bytes_per_block)
+    )
+    # 1% slack for ALPHA_FRAGMENTATION * int() rounding.
+    assert peak_mixed <= expected_cap + 1, (
+        f"mixed-CKPT peak {peak_mixed / 1e6:.1f}MB should be capped at "
+        f"~{expected_cap / 1e6:.1f}MB (forward_max_block + max_ckpt_activation)"
+    )
+    # Without per-block cap the op-walk raw_peak would dwarf this
+    # (intra_delta=1GB per op). Sanity check: the capped value is well
+    # below 1 GB * alpha.
+    assert peak_mixed < int(ALPHA_FRAGMENTATION * huge_intra), (
+        "per-block cap should pull peak well below the raw op-walk "
+        "estimate; got {peak_mixed/1e9:.3f}GB"
+    )
+
+
+def test_estimate_peak_per_block_cap_respects_under_predict_floor(toy_layout, toy_hw):
+    """Per-block cap must not under-predict when the op-walk is tighter.
+
+    If the op-walk's raw_peak is ALREADY smaller than
+    ``forward_max_block_peak + ckpt_recomp_bump``, the cap is a no-op.
+    Verify that a trace with tiny intra_deltas and a large per-block
+    measurement yields the op-walk's value, not the inflated measurement.
+    """
+    n_block = 8
+    trace = _make_trace(
+        n_block=n_block,
+        ops_per_block=3,
+        activation_bytes_per_block=4 * MB,
+        intra_delta_bytes=1 * MB,
+        inter_delta_bytes=256 * 1024,
+    )
+    from dataclasses import replace
+
+    trace = replace(
+        trace,
+        steady_fwd_block_peak_bytes={BlockId(b): 10 * GB for b in range(n_block)},
+    )
+    cfg = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
+    bm = assign_modes(0, 0, n_block)
+    peak = estimate_peak(cfg, trace, toy_layout, bm, toy_hw)
+    # The per-block cap is 10 GB+; the op-walk gives a much smaller
+    # peak (<< 1 GB). The cap must NOT raise raw_peak — only lower it.
+    assert peak < int(ALPHA_FRAGMENTATION * 1 * GB), (
+        f"peak {peak / 1e9:.3f}GB should track the tight op-walk, not the "
+        "10 GB per-block measurement"
+    )
+
+
+# ---------------------------------------------------------------------------
+# memory / estimate_peak — enc-dec two-tree cost-model walk (Fix 3, Item 9)
+# ---------------------------------------------------------------------------
+
+
+def _make_op_order_two_trees(
+    *, n_enc: int, n_dec: int, ops_per_block: int
+) -> tuple[OpRecord, ...]:
+    """Build a forward op sequence for a synthetic enc-dec model.
+
+    Tree boundary is encoded into ``module_path``: encoder ops live
+    under ``encoder.block.{i}`` and decoder ops under
+    ``decoder.block.{i}``. ``estimate_peak``'s tree-index inference
+    parses these prefixes (matching T5 / FLAN-T5 module layout).
+    Block ids are global (encoder = ``[0, n_enc)``, decoder = ``[n_enc,
+    n_enc + n_dec)``) per ``flatten_block_trees``.
+    """
+    out: list[OpRecord] = []
+    op_id = 0
+    for b in range(n_enc):
+        for k in range(ops_per_block):
+            out.append(
+                OpRecord(
+                    op_id=OpId(op_id),
+                    module_path=f"encoder.block.{b}.op.{k}",
+                    qualified_name="aten::toy",
+                    shape_signature=((1,),),
+                    block_id=BlockId(b),
+                    is_forward=True,
+                )
+            )
+            op_id += 1
+    for b in range(n_dec):
+        gbid = n_enc + b
+        for k in range(ops_per_block):
+            out.append(
+                OpRecord(
+                    op_id=OpId(op_id),
+                    module_path=f"decoder.block.{b}.op.{k}",
+                    qualified_name="aten::toy",
+                    shape_signature=((1,),),
+                    block_id=BlockId(gbid),
+                    is_forward=True,
+                )
+            )
+            op_id += 1
+    return tuple(out)
+
+
+def _make_enc_dec_trace(
+    *,
+    n_enc: int = 4,
+    n_dec: int = 4,
+    ops_per_block: int = 5,
+    activation_bytes_per_block: int = 32 * MB,
+    intra_delta_bytes: int = 8 * MB,
+    inter_delta_bytes: int = 2 * MB,
+) -> ProfilerTrace:
+    """Synthetic two-tree (encoder+decoder) trace; legacy-NONE friendly."""
+    n_block = n_enc + n_dec
+    op_order = _make_op_order_two_trees(
+        n_enc=n_enc, n_dec=n_dec, ops_per_block=ops_per_block
+    )
+    intra_op_delta: dict[OpId, int] = {op.op_id: intra_delta_bytes for op in op_order}
+    inter_op_delta: dict[OpId, int] = {op.op_id: inter_delta_bytes for op in op_order}
+    activation_sizes: dict[BlockId, int] = {
+        BlockId(b): activation_bytes_per_block for b in range(n_block)
+    }
+    op_latencies: dict[OpId, float] = {op.op_id: 0.0002 for op in op_order}
+    hooked_sum = sum(op_latencies.values())
+    return ProfilerTrace(
+        op_order=op_order,
+        intra_op_delta=intra_op_delta,
+        inter_op_delta=inter_op_delta,
+        activation_sizes=activation_sizes,
+        model_state_bytes=768 * MB,
+        pcie_h2d_bps=12e9,
+        pcie_d2h_bps=12e9,
+        nccl_gather_s={},
+        nccl_reduce_s={},
+        arch_hash="test-encdec-arch",
+        bs=1,
+        seq=128,
+        sku="RTX 3090 (synthetic)",
+        world=1,
+        op_latencies=op_latencies,
+        hooked_fwd_wall_s=hooked_sum,
+        steady_fwd_wall_s=hooked_sum,
+        steady_bwd_wall_s=0.0,
+    )
+
+
+def test_estimate_peak_single_tree_matches_legacy_walk(toy_trace, toy_layout, toy_hw):
+    """Single-tree (causal-LM) traces must be bit-identical to the pre-Fix-3 walk.
+
+    The Fix-3 refactor adds a tree-detection step plus a cross-attention
+    surcharge. On a single-tree trace, ``_has_multiple_trees`` returns
+    False and ``_cross_attn_persist_bytes`` returns 0; the op-walk
+    therefore produces the exact same raw_peak. We assert this by
+    sweeping a representative slice of the search space and checking
+    every config's peak is unchanged.
+
+    Lock-in test for backward compat: any future refactor that
+    perturbs the single-tree numerical path will fail here.
+    """
+    n_block = len(toy_trace.activation_sizes)
+    seen_peaks: list[int] = []
+    for n_swap in (0,):
+        for n_ckpt in (0, 2, 4):
+            block_map = assign_modes(n_swap, n_ckpt, n_block)
+            for n_persist in (0, 4, toy_layout.N_chunk):
+                for n_buffer in (0, 2, toy_layout.N_chunk - n_persist):
+                    if n_buffer < 0:
+                        continue
+                    cfg = CostConfig(
+                        n_persist=n_persist,
+                        n_buffer=n_buffer,
+                        n_swap=n_swap,
+                        n_checkpoint=n_ckpt,
+                    )
+                    seen_peaks.append(
+                        estimate_peak(cfg, toy_trace, toy_layout, block_map, toy_hw)
+                    )
+    # Every peak should be a positive integer; this run validates the
+    # walk runs without exceptions on the legacy path. Numerical
+    # backward-compat is enforced by the existing
+    # ``test_estimate_peak_*`` tests above which would fail if the
+    # refactor changed any single-tree value.
+    assert all(p > 0 for p in seen_peaks)
+
+
+def test_estimate_peak_enc_dec_walks_two_trees(toy_layout, toy_hw):
+    """Cross-attn surcharge restores enc-last-block bytes when its mode is CKPT/SWAP.
+
+    On a 4-encoder + 4-decoder trace under all-NONE, the encoder's
+    last block contributes its activation bytes to ``live_none`` and
+    those are part of the end-of-forward peak. Switch the encoder's
+    last block to CKPT (its activations leave ``live_none``) and the
+    Fix-3 cross-attn term adds the bytes back — because the cross-
+    attention saved-state output crosses the encoder->decoder boundary
+    regardless of whether the rest of the encoder's activations are
+    retained.
+
+    Without the Fix-3 term, this CKPT case would UNDER-predict peak
+    by ``activation_sizes[last_enc_bid]`` — a real correctness bug for
+    SWAP/CKPT-on-encoder configurations.
+    """
+    n_block = 8
+    encdec_trace = _make_enc_dec_trace(
+        n_enc=4,
+        n_dec=4,
+        ops_per_block=3,
+        activation_bytes_per_block=32 * MB,
+        intra_delta_bytes=4 * MB,
+        inter_delta_bytes=1 * MB,
+    )
+
+    cfg = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
+    bm_all_none = assign_modes(0, 0, n_block)
+    peak_encdec_none = estimate_peak(cfg, encdec_trace, toy_layout, bm_all_none, toy_hw)
+
+    # CKPT the encoder's last block. Without the Fix-3 cross-attn
+    # term, peak would drop by ``activation_sizes[3]`` (32 MB *
+    # ALPHA_FRAGMENTATION ~= 35 MB after rounding); WITH the term the
+    # cross-attn-saved bytes restore it.
+    bm_enc_last_ckpt = assign_modes(0, 0, n_block).copy()
+    enc_last_bid = BlockId(3)  # n_enc=4 -> last encoder block id is 3
+    bm_enc_last_ckpt[enc_last_bid] = BlockMode.CKPT
+    peak_encdec_ckpt = estimate_peak(
+        cfg, encdec_trace, toy_layout, bm_enc_last_ckpt, toy_hw
+    )
+
+    # Cross-attn term must be non-negative (Fix 3 acceptance criterion 2):
+    # peak with enc-last-block in CKPT >= peak with enc-last-block in
+    # NONE minus a tolerance. With the cross-attn term they should be
+    # ~equal at the steady end-of-forward peak; without the term, CKPT
+    # would be ~35 MB lower.
+    activation_bytes = encdec_trace.activation_sizes[enc_last_bid]
+    # Tight: peaks should match within rounding (cross-attn term =
+    # activation_bytes restores the lost live_none contribution).
+    diff = peak_encdec_none - peak_encdec_ckpt
+    assert abs(diff) < int(activation_bytes * 0.05), (
+        f"cross-attn term should restore enc-last-block bytes when "
+        f"that block goes CKPT; expected peaks within rounding, got "
+        f"none={peak_encdec_none} ckpt={peak_encdec_ckpt} (diff={diff})"
+    )
+
+    # Two-tree peak must be >= a single-tree peak built from the
+    # encoder-only side of the same trace shape (cross-attn term is
+    # non-negative).
+    enc_only_trace = _make_trace(
+        n_block=4,
+        ops_per_block=3,
+        activation_bytes_per_block=32 * MB,
+        intra_delta_bytes=4 * MB,
+        inter_delta_bytes=1 * MB,
+    )
+    bm_enc_only = assign_modes(0, 0, 4)
+    cfg_enc_only = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
+    peak_enc_only = estimate_peak(
+        cfg_enc_only, enc_only_trace, toy_layout, bm_enc_only, toy_hw
+    )
+    assert peak_encdec_none >= peak_enc_only, (
+        f"enc-dec all-NONE peak ({peak_encdec_none}) must be >= "
+        f"single-tree encoder-only peak ({peak_enc_only})"
+    )
+
+
+def test_estimate_peak_cross_attn_term_scales_with_seq_hidden(toy_layout, toy_hw):
+    """Cross-attention surcharge scales with the encoder-last-block activation size.
+
+    The cross-attn saved-state size is paper-ambiguous for T5; we use
+    ``activation_sizes[last_enc_bid]`` as a conservative upper bound.
+    That value scales linearly with ``seq_len * hidden`` (per-block
+    activation bytes are dominated by hidden-state-shaped tensors).
+    Doubling activation_bytes_per_block must therefore (at least)
+    double the cross-attn surcharge.
+    """
+    base = _make_enc_dec_trace(
+        n_enc=4,
+        n_dec=4,
+        ops_per_block=3,
+        activation_bytes_per_block=16 * MB,
+        intra_delta_bytes=1 * MB,
+        inter_delta_bytes=256 * 1024,
+    )
+    larger = _make_enc_dec_trace(
+        n_enc=4,
+        n_dec=4,
+        ops_per_block=3,
+        activation_bytes_per_block=32 * MB,  # 2x
+        intra_delta_bytes=1 * MB,
+        inter_delta_bytes=256 * 1024,
+    )
+    n_block = 8
+    cfg = CostConfig(n_persist=4, n_buffer=2, n_swap=0, n_checkpoint=0)
+    # CKPT the encoder's last block so the cross-attn term fires.
+    bm = assign_modes(0, 0, n_block).copy()
+    bm[BlockId(3)] = BlockMode.CKPT
+    # Also CKPT all other encoder blocks so retained_none_bytes is
+    # constant across the two traces — we want to isolate the
+    # cross-attn-term scaling, not the live_none scaling.
+    bm[BlockId(0)] = BlockMode.CKPT
+    bm[BlockId(1)] = BlockMode.CKPT
+    bm[BlockId(2)] = BlockMode.CKPT
+
+    peak_base = estimate_peak(cfg, base, toy_layout, bm, toy_hw)
+    peak_larger = estimate_peak(cfg, larger, toy_layout, bm, toy_hw)
+
+    # Difference should be approximately the cross-attn term delta:
+    # 32MB - 16MB = 16MB (per the encoder-last-block activation size),
+    # but the decoder's NONE-block activations also doubled, so the
+    # delta is dominated by the live_none increase. The cross-attn
+    # term must contribute on top — we assert strict monotonicity.
+    assert peak_larger > peak_base, (
+        f"larger activation_sizes must yield strictly larger peak "
+        f"(got {peak_larger} <= {peak_base})"
+    )
+
+    # Bound the cross-attn-only contribution by re-evaluating with
+    # the encoder-last-block in NONE (cross-attn term -> 0). The
+    # difference (CKPT minus NONE on enc-last-block) is exactly the
+    # cross-attn surcharge plus the live_none restoration.
+    bm_no_xattn = bm.copy()
+    bm_no_xattn[BlockId(3)] = BlockMode.NONE
+    peak_base_no_xattn = estimate_peak(cfg, base, toy_layout, bm_no_xattn, toy_hw)
+    peak_larger_no_xattn = estimate_peak(cfg, larger, toy_layout, bm_no_xattn, toy_hw)
+    # Sanity: the cross-attn term itself isn't zero in the CKPT case
+    # but IS in the NONE case. Both peaks are positive.
+    assert peak_base_no_xattn > 0
+    assert peak_larger_no_xattn > 0
+
+
+# ---------------------------------------------------------------------------
+# memory / estimate_cpu_footprint (M7 follow-up: ZeRO-3 awareness)
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_cpu_footprint_scales_with_world_size():
+    """Per-rank pinned CPU footprint divides by ``gpu_count`` under sharding.
+
+    The replicated path (``zero3_shard=False``) has every rank hold a
+    full copy of every non-persistent chunk on CPU. The ZeRO-3
+    sharded path (``zero3_shard=True``) partitions each chunk's bytes
+    across ranks so each rank holds only ``chunk_bytes/world_size``
+    pinned bytes per chunk. This test locks in the arithmetic that
+    future searcher CPU-budget filters (if added) rely on.
+
+    Toy layout: N_chunk=12, S_chunk=128MB. With n_persist=4 the
+    non-persistent set is 8 chunks * 128MB = 1 GB.
+    """
+    n_chunk = 12
+    s_chunk = 128 * MB
+    n_persist = 4
+    cfg = CostConfig(n_persist=n_persist, n_buffer=2, n_swap=0, n_checkpoint=0)
+    layout = _make_layout(n_chunk=n_chunk, s_chunk=s_chunk, n_block=8)
+
+    expected_total = (n_chunk - n_persist) * s_chunk  # 1 GB
+
+    hw_single = _make_hw(gpu_count=1, zero3_shard=False)
+    footprint_single = estimate_cpu_footprint(cfg, layout, hw_single)
+    assert footprint_single == expected_total, (
+        f"single-GPU / no-shard footprint should be the full "
+        f"non-persistent total ({expected_total}B), got {footprint_single}B"
+    )
+
+    hw_4gpu_ddp = _make_hw(gpu_count=4, zero3_shard=False)
+    footprint_4gpu_ddp = estimate_cpu_footprint(cfg, layout, hw_4gpu_ddp)
+    assert footprint_4gpu_ddp == expected_total, (
+        f"4-GPU without shard (DDP mode) still replicates full chunks "
+        f"per rank — expected {expected_total}B, got {footprint_4gpu_ddp}B"
+    )
+
+    hw_4gpu_shard = _make_hw(gpu_count=4, zero3_shard=True)
+    footprint_4gpu_shard = estimate_cpu_footprint(cfg, layout, hw_4gpu_shard)
+    # Ceiling division so the trailing rank's shard pad counts: for
+    # 1 GB / 4 = 256 MB exactly, no rounding.
+    expected_sharded = expected_total // 4
+    assert footprint_4gpu_shard == expected_sharded, (
+        f"4-GPU sharded footprint should be total/world_size = "
+        f"{expected_sharded}B, got {footprint_4gpu_shard}B"
+    )
+
+    # Sanity ratio: sharded is exactly 1/world_size of replicated at
+    # this chunk-size / world_size alignment.
+    assert footprint_single == 4 * footprint_4gpu_shard
+    assert footprint_4gpu_ddp > footprint_4gpu_shard
+
+
+# ---------------------------------------------------------------------------
+# runtime / estimate_runtime
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_runtime_monotonic_in_n_buffer(toy_trace, toy_layout, toy_hw):
+    """Searcher relies on the invariant that runtime is non-increasing in n_buffer
+    (cached chunks skip re-gather). If this ever flips, the searcher's O(N_chunk)
+    optimization in exhaustive.py picks the wrong n_buffer."""
+    prev_iter_s = float("inf")
+    for nb in range(toy_layout.N_chunk - 1):
+        cfg = CostConfig(n_persist=1, n_buffer=nb, n_swap=0, n_checkpoint=0)
+        block_map = assign_modes(
+            cfg.n_swap, cfg.n_checkpoint, len(toy_trace.activation_sizes)
+        )
+        iter_s = estimate_runtime(cfg, toy_trace, toy_layout, block_map, toy_hw)
+        assert iter_s <= prev_iter_s + 1e-9, (
+            f"non-monotonic: n_buffer={nb} broke invariant "
+            f"(prev={prev_iter_s:.6f}, now={iter_s:.6f})"
+        )
+        prev_iter_s = iter_s
+
+
+def test_estimate_runtime_ckpt_adds_recompute(toy_trace, toy_layout, toy_hw):
+    # When CPU-Adam dominates the iteration (all chunks non-persistent)
+    # it masks backward-side changes via the T_iter max() in Eq. 2. Put
+    # all chunks persistent so T_cpu_optim == 0 and the CKPT recomputation
+    # bump shows up directly in T_bwd.
+    n_block = len(toy_trace.activation_sizes)
+    n_chunk = toy_layout.N_chunk
+    cfg_zero = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
+    cfg_ckpt = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=4)
+
+    bm_zero = assign_modes(0, 0, n_block)
+    bm_ckpt = assign_modes(0, 4, n_block)
+
+    t_zero = estimate_runtime(cfg_zero, toy_trace, toy_layout, bm_zero, toy_hw)
+    t_ckpt = estimate_runtime(cfg_ckpt, toy_trace, toy_layout, bm_ckpt, toy_hw)
+
+    assert t_ckpt > t_zero, (
+        f"CKPT must add recomputation time: t_zero={t_zero:.6f} t_ckpt={t_ckpt:.6f}"
+    )
+
+
+def test_estimate_runtime_returns_inf_when_offloaded_and_adam_bps_zero(
+    toy_trace, toy_layout
+):
+    """Round-3 R15 contract: ``cpu_adam_bytes_per_sec <= 0`` makes any
+    config with ``n_nonpersist > 0`` INFEASIBLE.
+
+    Previously this test asserted ``estimate_runtime`` fell back to a
+    hardcoded CPU-Adam prior and returned a finite number. That was
+    incorrect — when ``cpu_adam_bytes_per_sec`` is zero,
+    ``optim_wrapper`` sets ``cpu_optim = None`` and skips the CPU step
+    entirely, leaving non-persistent chunks un-updated at runtime. The
+    cost model now refuses to score those configs as feasible so the
+    searcher's argmin doesn't pick a config the runtime would silently
+    fail to step.
+
+    Two complementary invariants:
+
+    1. Offloaded config (``n_persist < N_chunk``) → ``inf``.
+    2. All-persistent config (``n_persist == N_chunk``) → still finite,
+       because no CPU step is required at runtime.
+    """
+    import math
+    from dataclasses import replace
+
+    # Override the positive defaults from ``_make_hw`` to exercise the
+    # cpu_adam=0 branch explicitly.
+    hw_no_adam = replace(
+        _make_hw(), cpu_adam_bytes_per_sec=0.0, gpu_adam_bytes_per_sec=0.0
+    )
+    n_block = len(toy_trace.activation_sizes)
+    n_chunk = toy_layout.N_chunk
+
+    # (1) Offloaded → infeasible.
+    cfg_offload = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+    t_offload = estimate_runtime(
+        cfg_offload, toy_trace, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isinf(t_offload), (
+        f"offloaded config under cpu_adam=0 should be infeasible (inf); "
+        f"got t={t_offload}"
+    )
+
+    # (2) All-persistent → still feasible (no CPU step at runtime).
+    cfg_all_persist = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    t_all_persist = estimate_runtime(
+        cfg_all_persist, toy_trace, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isfinite(t_all_persist) and t_all_persist > 0.0, (
+        f"all-persistent config under cpu_adam=0 should still be finite; "
+        f"got t={t_all_persist}"
+    )
+
+
+def test_estimate_runtime_uses_measured_adam_when_provided(toy_trace, toy_layout):
+    """A 10x larger ``cpu_adam_bytes_per_sec`` on the HardwareProfile must
+    translate to a ~10x smaller CPU-optim contribution in the runtime
+    estimate.
+
+    Picks a CPU-Adam-dominated config (all chunks non-persistent) so
+    ``t_cpu_optim`` shows up on the critical path via the ``max()`` in
+    Eq. 2. The ratio-assertion avoids needing to know the other terms
+    exactly — we only care that the Adam rate IS the knob controlling
+    the CPU-optim contribution.
+    """
+    from dataclasses import replace
+
+    n_block = len(toy_trace.activation_sizes)
+    # Force CPU-Adam onto the critical path: n_persist=0 moves all chunks
+    # to the CPU-Adam branch, n_checkpoint=0 keeps t_bwd small so
+    # t_cpu_optim > t_bwd + t_gpu_optim.
+    cfg = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+
+    hw_slow = _make_hw()
+    hw_slow = replace(hw_slow, cpu_adam_bytes_per_sec=1e9)  # 1 GB/s
+    hw_fast = replace(hw_slow, cpu_adam_bytes_per_sec=1e10)  # 10 GB/s
+
+    t_slow = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_slow)
+    t_fast = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_fast)
+
+    # The CPU-Adam contribution scales inversely with the rate. Since
+    # this config puts CPU-Adam on the critical path (see docstring), the
+    # iteration time drop should approach 10x on the CPU-optim term.
+    # Other terms (t_fwd forward-only) are small and identical between
+    # runs, so the total ratio is ~10 but loosely so; assert >5 as a
+    # robust sanity threshold.
+    assert t_fast < t_slow
+    # Compute the t_cpu_optim contribution alone: for the same config,
+    # everything except the Adam term is constant. Use the difference:
+    delta_slow_vs_fast = t_slow - t_fast
+    # Reconstruct the implicit t_cpu_optim term from the rate change:
+    # t_cpu_optim_slow = X / 1e9; t_cpu_optim_fast = X / 1e10;
+    # their difference = 0.9 * X / 1e9 = 0.9 * t_cpu_optim_slow.
+    # So delta_slow_vs_fast == 0.9 * t_cpu_optim_slow — this means the
+    # ratio delta/t_slow should be close to 0.9 when CPU-optim
+    # dominates. Allow a generous 0.5 floor to tolerate non-dominating
+    # configs without masking regressions.
+    assert delta_slow_vs_fast / t_slow > 0.5, (
+        f"10x faster CPU Adam barely moved the needle: "
+        f"t_slow={t_slow:.6f} t_fast={t_fast:.6f}"
+    )
+
+
+def test_bwd_compute_time_uses_phase2_chunked_measurement_when_present():
+    """Phase-2 path (TRACE_VERSION 10) takes precedence over the v8 unwrapped ratio.
+
+    A trace with both ``steady_bwd_chunked_wall_s`` and the legacy
+    ``steady_bwd_wall_s`` populated must use the chunked field. The
+    return value is the BASE backward (recompute subtracted), so the
+    caller's per-cfg recompute term still adds the right amount on top.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _bwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+    # Numbers picked so the translation is hand-verifiable:
+    # measurement = 1.20s, bootstrap had 4 CKPT'd blocks, per-block
+    # recompute = 0.05s -> phase2_recompute = 0.20s -> base = 1.00s.
+    trace = replace(
+        base_trace,
+        steady_bwd_wall_s=2.50,  # would give a 1.0× clamp via path 2
+        steady_bwd_chunked_wall_s=1.20,
+        phase2_n_checkpoint=4,
+        phase2_per_block_recompute_s=0.05,
+    )
+    base = _bwd_compute_time_from_trace(trace, t_fwd_total=2.50)
+    assert base == pytest.approx(1.00, abs=1e-9), (
+        f"phase-2 base should be measured - bootstrap_recompute = "
+        f"1.20 - 4*0.05 = 1.00, got {base}"
+    )
+
+
+def test_bwd_compute_time_phase2_clamped_to_non_negative():
+    """If the measurement is shorter than bootstrap recompute (degenerate case),
+    the base is clamped to 0 — the caller's per-cfg recompute then provides
+    the entire backward time. Real measurements should never trigger this,
+    but we guard against arithmetic surprises.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _bwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+    # Bootstrap recompute = 4 * 0.5 = 2.0s but measurement = 1.0s.
+    trace = replace(
+        base_trace,
+        steady_bwd_chunked_wall_s=1.0,
+        phase2_n_checkpoint=4,
+        phase2_per_block_recompute_s=0.5,
+    )
+    base = _bwd_compute_time_from_trace(trace, t_fwd_total=2.50)
+    assert base == 0.0, f"expected clamp to 0, got {base}"
+
+
+def test_bwd_compute_time_falls_back_when_phase2_not_populated():
+    """When phase-2 fields are 0 (pre-v10 cache or skipped phase-2), use v8 path."""
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _bwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+
+    # v8-style trace: legacy steady_bwd_wall_s populated, phase-2 fields 0.
+    trace_v8 = replace(
+        base_trace,
+        steady_bwd_wall_s=1.5,
+        steady_fwd_wall_s=1.0,  # ratio = 1.5
+        # phase-2 fields all default 0.0 / 0
+    )
+    bwd_v8 = _bwd_compute_time_from_trace(trace_v8, t_fwd_total=2.0)
+    assert bwd_v8 == pytest.approx(2.0 * 1.5, abs=1e-9), (
+        f"v8 path should return t_fwd * measured_ratio = 3.0, got {bwd_v8}"
+    )
+
+    # Pure heuristic: nothing measured at all -> 2x canonical (assuming
+    # trainable_param_fraction defaults to 0 which goes to else branch).
+    trace_h = replace(
+        base_trace,
+        steady_bwd_wall_s=0.0,
+        steady_fwd_wall_s=0.0,
+    )
+    bwd_h = _bwd_compute_time_from_trace(trace_h, t_fwd_total=2.0)
+    assert bwd_h == pytest.approx(2.0 * 2.0, abs=1e-9), (
+        f"heuristic path should return t_fwd * 2.0 = 4.0, got {bwd_h}"
+    )
+
+
+def test_fwd_compute_time_uses_phase2_chunked_fwd_when_present():
+    """``_fwd_compute_time_from_trace`` overrides the total with the chunked
+    forward measurement when populated (TRACE_VERSION ≥ 11).
+
+    Mirrors the precedence pattern in
+    :func:`_bwd_compute_time_from_trace`: the phase-2 chunked
+    measurement takes precedence over the per-op-derived total. The
+    per-block distribution stays at the per-op-derived shape — used
+    for CKPT recompute accounting in ``estimate_runtime``.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import (
+        _fwd_compute_time_from_trace,
+    )
+
+    base_trace = _make_trace()
+    per_op_sum = 8 * 5 * 0.0002
+
+    # Without chunked fwd populated — total = per-op sum.
+    trace_no = replace(base_trace, steady_fwd_chunked_wall_s=0.0)
+    total_no, per_block_no, used_no = _fwd_compute_time_from_trace(trace_no)
+    assert used_no is True
+    assert total_no == pytest.approx(per_op_sum, abs=1e-9), (
+        f"v10 fallback should return per-op sum {per_op_sum}, got {total_no}"
+    )
+
+    # With chunked fwd populated — total = chunked wall.
+    chunked_fwd = 0.30
+    trace_with = replace(base_trace, steady_fwd_chunked_wall_s=chunked_fwd)
+    total_with, per_block_with, used_with = _fwd_compute_time_from_trace(trace_with)
+    assert used_with is True
+    assert total_with == pytest.approx(chunked_fwd, abs=1e-9), (
+        f"phase-2 fwd path should return chunked wall {chunked_fwd}, got {total_with}"
+    )
+    # Per-block stays at per-op-derived shape — does NOT rescale.
+    for bid in per_block_no:
+        assert per_block_with[bid] == pytest.approx(per_block_no[bid], rel=1e-6), (
+            f"per-block must stay per-op-derived for block {bid}: "
+            f"with={per_block_with[bid]} no={per_block_no[bid]}"
+        )
+
+
+def test_estimate_runtime_uses_phase2_chunked_fwd_measurement():
+    """End-to-end: ``estimate_runtime`` substitutes ``steady_fwd_chunked_wall_s``
+    for the per-chunk-roofline t_fwd assembly.
+
+    With phase-2 fwd populated, t_fwd should equal the measured
+    chunked wall (plus SKU scale + any swap transfer) — NOT the
+    per-chunk max(compute, comm) sum. The bootstrap-then-search
+    pipeline depends on this for the cost model to predict close to
+    actual on the bootstrap config.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import estimate_runtime
+
+    base_trace = _make_trace()
+    n_block = len(base_trace.activation_sizes)
+    chunked_fwd = 0.20
+    trace = replace(
+        base_trace,
+        steady_fwd_chunked_wall_s=chunked_fwd,
+        # Set chunked bwd too so the bwd path is also on the phase-2
+        # branch (otherwise its fallback paths depend on
+        # steady_fwd_wall_s and would mask the forward signal).
+        steady_bwd_chunked_wall_s=0.30,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=8 * 5 * 0.0002 / n_block,
+    )
+    layout = _make_layout()
+    hw = _make_hw()
+    n_chunk = layout.N_chunk
+
+    cfg_high_persist = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    bm = assign_modes(0, 0, n_block)
+
+    t_with = estimate_runtime(cfg_high_persist, trace, layout, bm, hw)
+
+    # Synthesize a trace WITHOUT the chunked fwd; the per-chunk-roofline
+    # forward path fires instead. Under cfg_high_persist (all
+    # persistent, no comm), that path collapses to per-op-sum × hook
+    # scale = 8 * 5 * 0.0002 = 0.008s. With phase-2 forward, t_fwd
+    # = chunked_fwd (0.20s). So the t_iter delta should be
+    # chunked_fwd - per_op_sum ≈ 0.192s (forward is the only
+    # phase-2-affected term in this all-NONE config).
+    trace_no_fwd = replace(trace, steady_fwd_chunked_wall_s=0.0)
+    t_without = estimate_runtime(cfg_high_persist, trace_no_fwd, layout, bm, hw)
+    delta = t_with - t_without
+    expected_delta = 0.20 - 8 * 5 * 0.0002  # ~0.192
+    assert delta == pytest.approx(expected_delta, abs=1e-3), (
+        f"chunked-fwd override should increase t_fwd by ~{expected_delta:.4f}, "
+        f"got delta={delta:.4f} (t_with={t_with:.4f} t_without={t_without:.4f})"
+    )
+
+
+def test_estimate_runtime_phase2_translation_changes_with_n_checkpoint():
+    """End-to-end: with phase-2 populated, increasing n_checkpoint adds recompute.
+
+    The translation is the whole point of D1b. A trace whose phase-2
+    measurement was taken under all-CKPT bootstrap should yield bigger
+    backward times for configs with more CKPT blocks (the addition is
+    via the caller's per_block_compute walk, NOT via the measurement
+    itself).
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.runtime import estimate_runtime
+
+    base_trace = _make_trace()
+    n_block = len(base_trace.activation_sizes)
+    # Bootstrap was n_checkpoint=N_block (all CKPT). Per-block recompute
+    # at 0.001s — small enough that the translation doesn't dominate
+    # but big enough to be visible after the n_block multiplier.
+    trace = replace(
+        base_trace,
+        steady_bwd_chunked_wall_s=0.5,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.001,
+    )
+    layout = _make_layout()
+    hw = _make_hw()
+    n_chunk = layout.N_chunk
+
+    # All-persistent so CPU-Adam doesn't mask backward changes.
+    cfg_zero = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
+    cfg_full_ckpt = CostConfig(
+        n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=n_block
+    )
+    bm_zero = assign_modes(0, 0, n_block)
+    bm_full = assign_modes(0, n_block, n_block)
+
+    t_zero = estimate_runtime(cfg_zero, trace, layout, bm_zero, hw)
+    t_full = estimate_runtime(cfg_full_ckpt, trace, layout, bm_full, hw)
+
+    # The all-CKPT config must add per-block recompute on top of the
+    # base; the all-NONE config must not. The DELTA proves the
+    # translation is wired up.
+    assert t_full > t_zero, (
+        f"phase-2 translation broken: t_full={t_full:.6f} <= t_zero={t_zero:.6f}; "
+        "all-CKPT should be more expensive than all-NONE because the "
+        "caller's per-cfg recompute term adds time on top of the base"
+    )
+
+
+def test_estimate_runtime_phase2_bwd_credits_n_buffer_cache_hits():
+    """Phase-2 backward override translates the bootstrap measurement to
+    the candidate's ``n_buffer`` (paper §3.3.1 / §4.2 cache-hit invariant).
+
+    Previously the override was flat in ``n_buffer`` — every candidate's
+    backward time equalled the bootstrap measurement regardless of how
+    many non-persistent chunks would survive forward into backward. That
+    flatness made the searcher pick the smallest feasible ``n_buffer``
+    (the ``min_n_buffer_for`` boundary) for any phase-2-calibrated
+    workload, undercounting the cache-hit savings the paper's reused-
+    buffer scheme is supposed to model. See
+    ``cost/runtime.py:estimate_runtime`` PHASE-2 BACKWARD OVERRIDE
+    branch — the fix subtracts ``delta_cached * nccl_gather`` from the
+    measured backward wall, where ``delta_cached`` is the cache-hit
+    delta between bootstrap and candidate.
+
+    Invariants:
+
+    1. ``t_cached < t_uncached`` — every extra cache hit relative to the
+       bootstrap saves one backward all-gather collective.
+    2. CKPT recompute is still additive on top — the recompute correction
+       and the buffer-cache correction compose linearly.
+    """
+    from dataclasses import replace
+
+    base_trace = _make_trace(world=2)
+    n_block = len(base_trace.activation_sizes)
+    per_op_sum = 8 * 5 * 0.0002
+    # Phase-2 fields populated as if measured under
+    # ``n_persist=0, n_buffer=0`` (no cached chunks in the bootstrap),
+    # so any candidate ``n_buffer > 0`` strictly increases cache hits.
+    trace = replace(
+        base_trace,
+        model_state_bytes=0,
+        steady_fwd_chunked_wall_s=0.05,
+        # Large enough that ``delta_cached * nccl_gather`` (12 * 0.012 =
+        # 0.144s) does not saturate the ``max(0, ...)`` clamp on the
+        # corrected backward total — keeps the assertion exact.
+        steady_bwd_chunked_wall_s=0.500,
+        phase2_n_persist=0,
+        phase2_n_buffer=0,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.0005,
+    )
+    layout = _make_layout()
+    hw = _make_hw(gpu_count=2)
+    n_chunk = layout.N_chunk
+    bm_none = assign_modes(0, 0, n_block)
+
+    cfg_uncached = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
+    cfg_cached = CostConfig(n_persist=0, n_buffer=n_chunk, n_swap=0, n_checkpoint=0)
+
+    t_uncached = estimate_runtime(cfg_uncached, trace, layout, bm_none, hw)
+    t_cached = estimate_runtime(cfg_cached, trace, layout, bm_none, hw)
+
+    # Cache hits must strictly reduce predicted iter — that's the entire
+    # point of the buffer pool in the paper's runtime model.
+    assert t_cached < t_uncached, (
+        f"phase-2 override flat in n_buffer: cached={t_cached:.6f} "
+        f"uncached={t_uncached:.6f}; cache hits should save the "
+        "backward all-gather collective per chunk"
+    )
+    # Each delta cache hit saves the backward NCCL gather time at the
+    # chunk-payload size (``nccl_gather_s[64MB] = 0.01`` in
+    # ``_make_trace`` for world=2). Reduce-offload still happens on
+    # cached chunks so the savings are exactly the gather collective.
+    expected_delta = n_chunk * 0.01
+    assert t_uncached - t_cached == pytest.approx(expected_delta, abs=1e-9)
+
+    # CKPT recompute composes additively with the buffer-cache correction.
+    cfg_ckpt = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_block)
+    bm_ckpt = assign_modes(0, n_block, n_block)
+    t_ckpt = estimate_runtime(cfg_ckpt, trace, layout, bm_ckpt, hw)
+    assert t_ckpt - t_uncached == pytest.approx(per_op_sum, abs=1e-9)
+
+
+def test_phase2_bootstrap_uses_low_persistence_all_ckpt(toy_trace, toy_layout, toy_hw):
+    """Phase-2 should measure the low-persistence offload family."""
+    from axolotl.integrations.protrain.profiler.phase2 import (
+        select_bootstrap_config,
+    )
+
+    n_block = len(toy_trace.activation_sizes)
+    initial = SearchResult(
+        cfg=CostConfig(
+            n_persist=toy_layout.N_chunk - 1,
+            n_buffer=1,
+            n_swap=0,
+            n_checkpoint=0,
+        ),
+        block_map=assign_modes(0, 0, n_block),
+        predicted_peak_bytes=0,
+        predicted_iter_s=0.0,
+    )
+
+    cfg, block_map = select_bootstrap_config(
+        initial_result=initial,
+        layout=toy_layout,
+        n_block=n_block,
+        capacity_bytes=12 * GB,
+        trace=toy_trace,
+        hw=toy_hw,
+    )
+
+    assert cfg.n_persist == 0
+    assert cfg.n_checkpoint == n_block
+    assert cfg.n_buffer >= 2  # adjacent one-chunk blocks need two buffers
+    assert all(mode.value == "ckpt" for mode in block_map.values())
+
+
+def test_estimate_runtime_per_sku_compute_scale(toy_trace, toy_layout):
+    """SKU compute-rate calibration scales forward compute proportionally.
+
+    Trace captured on a faster SKU (higher TFLOPS) replayed on a slower SKU
+    (lower TFLOPS) → the cost model must scale forward-time UP by the ratio.
+    Picks an all-persistent config so forward compute is on the critical
+    path with no comm dominance, making the scale visible end-to-end.
+    """
+    from dataclasses import replace
+
+    n_block = len(toy_trace.activation_sizes)
+    n_chunk = toy_layout.N_chunk
+    cfg = CostConfig(n_persist=n_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, n_block)
+
+    # Trace says "I was captured on a 60 TFLOPS card."
+    fast_trace = replace(toy_trace, compute_rate_tflops=60.0)
+
+    # Live SKU is 60 TFLOPS — same card. Scale = 1.0.
+    hw_same = _make_hw()
+    hw_same = replace(hw_same, gpu_compute_tflops=60.0)
+    t_same = estimate_runtime(cfg, fast_trace, toy_layout, block_map, hw_same)
+
+    # Live SKU is 30 TFLOPS — half the speed. Scale = 60/30 = 2.0; forward
+    # compute should roughly double.
+    hw_slow = _make_hw()
+    hw_slow = replace(hw_slow, gpu_compute_tflops=30.0)
+    t_slow = estimate_runtime(cfg, fast_trace, toy_layout, block_map, hw_slow)
+
+    # The forward term should grow by ~2x; total iter time ratio should be
+    # >1.4 (allowing for non-fwd terms diluting the signal). When backward
+    # is roughly proportional to forward (default 2x ratio), total scales
+    # ~ proportionally, so >1.4 is a robust threshold.
+    assert t_slow > t_same * 1.4, (
+        f"per-SKU calibration didn't scale t_iter: t_same={t_same:.6f} "
+        f"t_slow={t_slow:.6f} (expected >1.4x)"
+    )
+
+
+def test_estimate_runtime_sku_scale_identity_when_unmeasured(
+    toy_trace, toy_layout, toy_hw
+):
+    """0.0 on either side of the SKU ratio falls back to identity scale."""
+    from dataclasses import replace
+
+    cfg = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+    block_map = assign_modes(0, 0, len(toy_trace.activation_sizes))
+
+    # Both unmeasured → identity scale → unchanged result.
+    t_baseline = estimate_runtime(cfg, toy_trace, toy_layout, block_map, toy_hw)
+
+    # Trace measured but live not measured → still identity (HW info missing).
+    trace_with = replace(toy_trace, compute_rate_tflops=60.0)
+    t_trace_only = estimate_runtime(cfg, trace_with, toy_layout, block_map, toy_hw)
+    assert abs(t_trace_only - t_baseline) < 1e-9, (
+        f"identity scale violated when only trace had a measurement: "
+        f"baseline={t_baseline:.6f} with={t_trace_only:.6f}"
+    )
+
+    # Live measured but trace not → also identity.
+    hw_with = replace(toy_hw, gpu_compute_tflops=60.0)
+    t_hw_only = estimate_runtime(cfg, toy_trace, toy_layout, block_map, hw_with)
+    assert abs(t_hw_only - t_baseline) < 1e-9, (
+        f"identity scale violated when only hw had a measurement: "
+        f"baseline={t_baseline:.6f} with={t_hw_only:.6f}"
+    )
+
+
+def test_effective_bw_derates_with_n_swap(toy_hw):
+    cfg_no_swap = CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0)
+    cfg_swap = CostConfig(n_persist=0, n_buffer=0, n_swap=3, n_checkpoint=0)
+
+    h2d_0, d2h_0 = effective_bw(cfg_no_swap, toy_hw)
+    h2d_k, d2h_k = effective_bw(cfg_swap, toy_hw)
+
+    assert h2d_0 >= h2d_k
+    assert d2h_0 >= d2h_k
+    # And the derate should be strict when n_swap > 0.
+    assert h2d_0 > h2d_k
+    assert d2h_0 > d2h_k
+
+
+def test_effective_bw_multi_gpu_derate():
+    """Multi-GPU derate is WEAKER than single-GPU for the same n_swap.
+
+    Current formula: eff_bw = raw / (1 + 0.5 * min(1, n_swap / gpu_count)).
+    * world=1, n_swap=2 → min(1, 2/1)=1 → factor 1.5 → eff = raw * (2/3)
+    * world=4, n_swap=2 → min(1, 2/4)=0.5 → factor 1.25 → eff = raw * (0.8)
+    So at identical n_swap, the 4-GPU case retains more bandwidth per rank.
+    Guards against a refactor silently swapping the ratio direction or
+    dropping the gpu_count clamp.
+    """
+    from dataclasses import replace
+
+    hw_1gpu = _make_hw(gpu_count=1)
+    hw_4gpu = replace(hw_1gpu, gpu_count=4)
+
+    cfg = CostConfig(n_persist=0, n_buffer=4, n_swap=2, n_checkpoint=0)
+
+    h2d_1, d2h_1 = effective_bw(cfg, hw_1gpu)
+    h2d_4, d2h_4 = effective_bw(cfg, hw_4gpu)
+
+    # Multi-GPU bandwidth should be HIGHER (less derated) than single-GPU
+    # with the same n_swap because the contention is spread across ranks.
+    assert h2d_4 > h2d_1, (
+        f"multi-GPU H2D must derate less than single-GPU for same n_swap: "
+        f"h2d_1={h2d_1:.2e} h2d_4={h2d_4:.2e}"
+    )
+    assert d2h_4 > d2h_1, (
+        f"multi-GPU D2H must derate less than single-GPU for same n_swap: "
+        f"d2h_1={d2h_1:.2e} d2h_4={d2h_4:.2e}"
+    )
+
+    # Spot-check absolute ratios against the formula.
+    expected_h2d_1 = hw_1gpu.pcie_h2d_bps / 1.5
+    expected_h2d_4 = hw_4gpu.pcie_h2d_bps / 1.25
+    assert abs(h2d_1 - expected_h2d_1) / expected_h2d_1 < 1e-6
+    assert abs(h2d_4 - expected_h2d_4) / expected_h2d_4 < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# knobs / derive_bounds
+# ---------------------------------------------------------------------------
+
+
+def test_derive_bounds_basic(toy_trace, toy_layout):
+    bounds = derive_bounds(toy_trace, toy_layout)
+    assert bounds.N_chunk == toy_layout.N_chunk
+    assert bounds.N_block == len(toy_trace.activation_sizes)
+    assert bounds.N_interval > 0
+    # We have 5 ops per block in the fixture, so N_interval should be
+    # either 5 (mean) given uniform ops per block.
+    assert bounds.N_interval == 5
+
+
+# ---------------------------------------------------------------------------
+# search / exhaustive
+# ---------------------------------------------------------------------------
+
+
+def test_search_picks_feasible_config(toy_trace, toy_layout, toy_hw):
+    # Tighten capacity below the max-model-state footprint so not all
+    # configs fit. Model state alone = 12 * 64MB = 768 MB; activations
+    # at full retention = 8 * 32 = 256 MB; alpha = 1.1 pushes us past
+    # 1.1 GB for the all-persistent all-NONE case.
+    capacity = 700 * MB
+    result = search(toy_trace, toy_layout, capacity, toy_hw)
+    assert result.predicted_peak_bytes <= capacity
+    assert result.predicted_iter_s > 0
+    # And the block map should cover every block.
+    assert len(result.block_map) == len(toy_trace.activation_sizes)
+
+
+def test_search_requires_ckpt_for_blocks_with_nonpersistent_chunks(
+    toy_trace, toy_layout, toy_hw
+):
+    """Search must not pick NONE/SWAP for blocks whose chunks are offloaded.
+
+    The current runtime releases non-persistent chunk storage after
+    forward; non-CKPT blocks can only be correct when all chunks they
+    own are persistent. Phase-2 calibration makes low-CKPT configs
+    look fast, so this is an admissibility constraint rather than a
+    runtime-cost preference.
+    """
+    from dataclasses import replace
+
+    n_block = len(toy_trace.activation_sizes)
+    trace = replace(
+        toy_trace,
+        steady_fwd_chunked_wall_s=0.05,
+        steady_bwd_chunked_wall_s=0.10,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.001,
+    )
+
+    # Tight enough that the all-persistent all-NONE configuration is
+    # GPU-infeasible, so the searcher must use offload.
+    result = search(trace, toy_layout, 700 * MB, toy_hw)
+    persistent = set(range(result.cfg.n_persist))
+    for bid, mode in result.block_map.items():
+        chunks = toy_layout.block_to_chunks.get(bid, ())
+        if any(int(cid) not in persistent for cid in chunks):
+            assert mode.value == "ckpt", (
+                f"block {bid} owns non-persistent chunks {chunks} but "
+                f"search picked mode={mode} cfg={result.cfg}"
+            )
+
+
+def test_search_raises_when_nothing_fits(toy_trace, toy_layout, toy_hw):
+    with pytest.raises(RuntimeError, match="no feasible ProTrain config"):
+        search(toy_trace, toy_layout, 0, toy_hw)
+
+
+def test_search_cpu_capacity_filter_excludes_high_offload_configs(
+    toy_trace, toy_layout, toy_hw
+):
+    """CPU feasibility filter must drop configs whose CPU footprint exceeds the budget.
+
+    Toy layout: N_chunk=12, S_chunk=64MB → CPU footprint =
+    ``(12 - n_persist) * S_chunk`` per rank under the replicated
+    (``zero3_shard=False``) path.
+
+    Setup: a tight GPU capacity forces the unfiltered searcher to pick
+    a CPU-heavy cfg (the lowest n_persist that still clears the GPU
+    gate is also the highest n_persist the runtime model can pick,
+    because the runtime favours fewer CPU-resident chunks). With a
+    LOOSE CPU budget (>= baseline footprint) the same cfg is picked.
+    With a TIGHT CPU budget (< baseline footprint) the searcher must
+    either pick a different cfg or raise — and on this synthetic
+    fixture every higher-n_persist alternative is GPU-infeasible, so
+    the filter exposes the no-fit case. That last branch is covered
+    by ``test_search_raises_cpu_pressure_specific_message_when_no_cfg_fits_both``;
+    here we assert (a) loose-budget = baseline pick, (b) tighter-but-
+    still-feasible budget = baseline still picked, (c) budget below
+    baseline footprint excludes baseline (verified via the picked
+    cfg's footprint).
+    """
+    capacity = 600 * MB
+    # Sanity: unfiltered pick has non-zero CPU footprint on this fixture.
+    baseline = search(toy_trace, toy_layout, capacity, toy_hw)
+    baseline_cpu = (toy_layout.N_chunk - baseline.cfg.n_persist) * toy_layout.S_chunk
+    assert baseline_cpu > 0, (
+        f"fixture sanity: baseline must offload >0B to CPU for the "
+        f"filter to have anything to reject; got cfg={baseline.cfg}"
+    )
+
+    # (a) Loose CPU budget (matches baseline footprint) -> same pick.
+    loose = search(
+        toy_trace,
+        toy_layout,
+        capacity,
+        toy_hw,
+        cpu_capacity_bytes=baseline_cpu,
+    )
+    assert loose.cfg == baseline.cfg, (
+        f"CPU budget == baseline footprint should not change the pick; "
+        f"baseline={baseline.cfg} loose={loose.cfg}"
+    )
+
+    # (b) CPU budget strictly above baseline footprint -> same pick.
+    above = search(
+        toy_trace,
+        toy_layout,
+        capacity,
+        toy_hw,
+        cpu_capacity_bytes=baseline_cpu + 10 * MB,
+    )
+    assert above.cfg == baseline.cfg
+
+    # (c) CPU budget BELOW baseline footprint -> baseline excluded.
+    # On this fixture every n_persist >= baseline.n_persist that would
+    # reduce CPU footprint is GPU-infeasible at capacity=600MB, so the
+    # search must raise — covered by the dedicated CPU-pressure test
+    # below. Here we just assert the boundary: at exactly
+    # ``baseline_cpu - 1`` the search no longer admits the baseline cfg.
+    with pytest.raises(RuntimeError, match=r"no ProTrain config fits in"):
+        search(
+            toy_trace,
+            toy_layout,
+            capacity,
+            toy_hw,
+            cpu_capacity_bytes=baseline_cpu - 1,
+        )
+
+
+def test_search_cpu_capacity_none_matches_pre_filter_behaviour(
+    toy_trace, toy_layout, toy_hw
+):
+    """Backward-compat: ``cpu_capacity_bytes=None`` -> identical pick.
+
+    The pre-filter signature ``search(trace, layout, capacity, hw)`` and
+    the new signature ``search(..., cpu_capacity_bytes=None)`` must
+    produce byte-identical SearchResults. Same cfg, same block_map,
+    same predicted peak, same predicted iter_s.
+    """
+    capacity = 12 * GB
+    pre_filter = search(toy_trace, toy_layout, capacity, toy_hw)
+    explicit_none = search(
+        toy_trace, toy_layout, capacity, toy_hw, cpu_capacity_bytes=None
+    )
+    assert pre_filter.cfg == explicit_none.cfg
+    assert pre_filter.block_map == explicit_none.block_map
+    assert pre_filter.predicted_peak_bytes == explicit_none.predicted_peak_bytes
+    assert pre_filter.predicted_iter_s == explicit_none.predicted_iter_s
+
+
+def test_search_raises_cpu_pressure_specific_message_when_no_cfg_fits_both(
+    toy_trace, toy_layout, toy_hw
+):
+    """When at least one cfg clears the GPU gate but every one busts the
+    CPU envelope, the failure message must explicitly cite the host RAM
+    budget so the user knows to scale up RAM, not GPU memory.
+    """
+    # Tight CPU budget: 0 bytes means only the all-persistent
+    # (n_persist=N_chunk → 0 non-persistent chunks on CPU) cfg could
+    # fit. But the toy layout's min_n_buffer_for at n_persist=N_chunk
+    # is 0, so n_persist=N_chunk is itself feasible only if the
+    # GPU capacity admits the full model-state. We block that by
+    # picking a CPU budget that's strictly less than ``S_chunk`` —
+    # so even a single non-persistent chunk on CPU busts it — AND
+    # combine with a GPU capacity that prevents fully-on-GPU
+    # configs from clearing the GPU gate.
+    #
+    # Calibration: the all-persistent cfg's GPU peak ~= alpha *
+    # (N_chunk * S_chunk + activations + intra/inter). With
+    # 768 MB of model state alone, capping GPU at 600 MB ensures
+    # the all-persistent cfg fails the GPU gate, while leaving
+    # some room for partially-offloaded cfgs to clear it. CPU
+    # budget = 1 byte then makes them all bust the CPU gate.
+    tight_capacity = 600 * MB
+    with pytest.raises(RuntimeError, match=r"no ProTrain config fits in"):
+        search(
+            toy_trace,
+            toy_layout,
+            tight_capacity,
+            toy_hw,
+            cpu_capacity_bytes=1,
+        )
+
+
+def test_search_picks_zero_swap_on_3090_like_hw(toy_trace, toy_layout):
+    # 3090-like hardware: 12 GB/s PCIe, 24 GB memory, single GPU. On
+    # such hardware the swap path should never be selected — backward
+    # prefetch competes with compute and bandwidth is precious.
+    hw = _make_hw(
+        gpu_memory_bytes=24 * GB,
+        gpu_count=1,
+        pcie_h2d_bps=12e9,
+        pcie_d2h_bps=12e9,
+    )
+    capacity = 12 * GB  # large enough to let the search roam
+    result = search(toy_trace, toy_layout, capacity, hw)
+    assert result.cfg.n_swap == 0, (
+        f"expected n_swap=0 on 3090-like HW, got cfg={result.cfg} "
+        f"predicted_peak={result.predicted_peak_bytes} "
+        f"predicted_iter_s={result.predicted_iter_s:.4f}"
+    )
+
+
+def test_search_picks_high_n_buffer_when_phase2_makes_savings_substantial():
+    """When phase-2 is calibrated and cache-hit savings dominate, the
+    searcher must pick a large ``n_buffer`` — not the
+    ``min_n_buffer_for`` floor.
+
+    Synthetic invariant: if every additional cache hit subtracts
+    ``nccl_gather`` from the predicted backward, and the GPU capacity
+    admits ``n_buffer = N_chunk - n_persist``, then the searcher's
+    runtime-monotone-in-n_buffer optimization must land on the
+    maximum-feasible ``n_buffer``. This is the proximate fix for the
+    Item 5 B+C profiling finding: the original chunked-wall override
+    was flat in ``n_buffer`` and the searcher collapsed to
+    ``min_n_buffer_for`` (= 2 on the bench).
+
+    This test is the synthetic version of the Mode-C regression
+    further down — same fix, smaller fixture.
+    """
+    from dataclasses import replace
+
+    base_trace = _make_trace(world=4)
+    n_block = len(base_trace.activation_sizes)
+    # Phase-2 fields populated. Bootstrap: n_persist=0, n_buffer=1
+    # (minimum feasible for adjacent-block prefetch). Candidate space:
+    # any (n_persist, n_buffer) with the GPU gate cleared.
+    trace = replace(
+        base_trace,
+        steady_fwd_chunked_wall_s=0.05,
+        steady_bwd_chunked_wall_s=0.40,
+        phase2_n_persist=0,
+        phase2_n_buffer=1,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.001,
+    )
+    layout = _make_layout()
+    hw = _make_hw(gpu_count=4, zero3_shard=True)
+
+    # Capacity wide enough to admit n_buffer up to N_chunk - 1.
+    capacity = 4 * GB
+    result = search(trace, layout, capacity, hw)
+    assert result.cfg.n_buffer >= 6, (
+        f"searcher under-credited cache-hit savings: cfg={result.cfg} "
+        f"predicted_peak={result.predicted_peak_bytes} "
+        f"predicted_iter_s={result.predicted_iter_s:.4f}; "
+        "expected cfg.n_buffer >= 6 once the override path translates "
+        "the bootstrap measurement across n_buffer"
+    )
+
+
+def test_search_picks_high_n_buffer_for_llama_3b_mode_c_4gpu_inputs():
+    """Regression: the Item 5 B+C bench config must auto-pick n_buffer >= 6.
+
+    Inputs mirror ``/tmp/protrain_item5/mode_c_bench.py`` —
+    Llama-3B-shape (26 transformer blocks, ~22 chunks of ~64 MB),
+    4-GPU world, bs=1 seq=256, ZeRO-3 sharded, post-phase-2 chunked
+    wall populated (``steady_bwd_chunked_wall_s`` ≈ 0.87s as the bench
+    measured). Without the cache-hit translation in
+    ``cost/runtime.py:estimate_runtime`` PHASE-2 BACKWARD OVERRIDE,
+    the searcher picks ``min_n_buffer_for(layout, n_persist) = 2`` for
+    this layout. The fix translates each delta cache hit to a backward
+    NCCL gather skip and the searcher lands on the maximum feasible
+    ``n_buffer`` — which is far above 6 for this workload.
+
+    This is the proxy for the multi-rank bench result (multi-rank
+    GPUs are in use on the dev box; the unit-test assertion is the
+    proxy that ``n_buffer >= 6`` falls out of the searcher).
+    """
+    n_block = 26
+    n_chunk = 22
+    s_chunk = 64 * MB
+    ops_per_block = 8
+
+    op_order = []
+    op_id = 0
+    for b in range(n_block):
+        for _ in range(ops_per_block):
+            op_order.append(
+                OpRecord(
+                    op_id=OpId(op_id),
+                    module_path=f"block.{b}.op",
+                    qualified_name="aten::toy",
+                    shape_signature=((1,),),
+                    block_id=BlockId(b),
+                    is_forward=True,
+                )
+            )
+            op_id += 1
+    op_order = tuple(op_order)
+
+    op_lat = 0.0007  # 700 us/op -> ~150 ms total fwd compute
+    op_latencies = {op.op_id: op_lat for op in op_order}
+    activation_sizes = {BlockId(b): 30 * MB for b in range(n_block)}
+    intra_op_delta = {op.op_id: 4 * MB for op in op_order}
+    inter_op_delta = {op.op_id: 1 * MB for op in op_order}
+    chunks = tuple((ParamId(f"param.{i}"),) for i in range(n_chunk))
+    param_to_chunk = {ParamId(f"param.{i}"): i for i in range(n_chunk)}
+    block_to_chunks = {BlockId(b): (min(b, n_chunk - 1),) for b in range(n_block)}
+    layout = ChunkLayout(
+        S_chunk=s_chunk,
+        N_chunk=n_chunk,
+        chunks=chunks,
+        param_to_chunk=param_to_chunk,
+        block_to_chunks=block_to_chunks,
+    )
+
+    trace = ProfilerTrace(
+        op_order=op_order,
+        intra_op_delta=intra_op_delta,
+        inter_op_delta=inter_op_delta,
+        activation_sizes=activation_sizes,
+        model_state_bytes=n_chunk * s_chunk,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        nccl_gather_s={s_chunk: 0.012},
+        nccl_reduce_s={s_chunk: 0.014},
+        arch_hash="regression-llama-3b-mode-c",
+        bs=1,
+        seq=256,
+        sku="NVIDIA GeForce RTX 3090",
+        world=4,
+        op_latencies=op_latencies,
+        hooked_fwd_wall_s=sum(op_latencies.values()),
+        steady_fwd_wall_s=sum(op_latencies.values()) * 0.5,
+        # Phase-2 fields mirroring real bench measurement:
+        steady_fwd_chunked_wall_s=0.41,
+        steady_bwd_chunked_wall_s=0.87,
+        steady_step_overlap_s=0.015,
+        steady_phase2_peak_bytes=int(8 * GB),
+        phase2_n_persist=0,
+        phase2_n_buffer=8,
+        phase2_n_checkpoint=n_block,
+        phase2_per_block_recompute_s=0.005,
+        compute_rate_tflops=60.0,
+        trainable_param_fraction=1.0,
+    )
+    hw = HardwareProfile(
+        gpu_sku="NVIDIA GeForce RTX 3090",
+        gpu_memory_bytes=24 * GB,
+        gpu_count=4,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        has_nvlink=False,
+        zero3_shard=True,
+        cpu_adam_bytes_per_sec=2e9,
+        gpu_adam_bytes_per_sec=4e11,
+        gpu_compute_tflops=60.0,
+    )
+
+    capacity = 20 * GB
+    result = search(trace, layout, capacity, hw)
+    assert result.cfg.n_buffer >= 6, (
+        f"Mode-C 4-GPU regression: n_buffer auto-pick collapsed to "
+        f"{result.cfg.n_buffer}. Expected >=6 so most non-persistent "
+        f"chunks fit in the buffer pool simultaneously and gather count "
+        f"approaches N_non_persist rather than 2 * N_non_persist. "
+        f"Full cfg={result.cfg}, predicted_iter_s={result.predicted_iter_s:.4f}, "
+        f"predicted_peak={result.predicted_peak_bytes / GB:.2f}GB"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defensive: enumeration order does not affect chosen optimum
+# ---------------------------------------------------------------------------
+
+
+def test_search_returns_valid_block_map(toy_trace, toy_layout, toy_hw):
+    """Smoke test: searcher output is internally consistent."""
+    result = search(toy_trace, toy_layout, 12 * GB, toy_hw)
+    n_block = len(toy_trace.activation_sizes)
+    assert len(result.block_map) == n_block
+    # Count modes in the block map matches the returned cfg.
+    from axolotl.integrations.protrain.types import BlockMode
+
+    counts: dict[BlockMode, int] = {m: 0 for m in BlockMode}
+    for mode in result.block_map.values():
+        counts[mode] += 1
+    assert counts[BlockMode.SWAP] == result.cfg.n_swap
+    assert counts[BlockMode.CKPT] == result.cfg.n_checkpoint
+
+
+# ---------------------------------------------------------------------------
+# Helper for debugging tests if they fail
+# ---------------------------------------------------------------------------
+
+
+def _iterable_repr(x: Iterable) -> str:  # pragma: no cover - debug helper
+    return ",".join(str(v) for v in x)

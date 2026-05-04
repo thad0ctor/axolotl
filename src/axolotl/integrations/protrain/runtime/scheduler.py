@@ -1,0 +1,420 @@
+"""Block-granularity runtime scheduler (§5, §6).
+
+The :class:`Scheduler` sits between the transformer-block hooks (see
+:mod:`axolotl.integrations.protrain.runtime.hooks`) and the chunk
+manager. Its four entry points mirror the four lifecycle edges of a
+transformer block:
+
+* :meth:`pre_block_forward` — prefetch the **next** block's chunks so
+  they are resident by the time compute reaches them.
+* :meth:`post_block_forward` — release buffers whose last forward use
+  was this block (keeping the next block's buffers resident for reuse).
+* :meth:`pre_block_backward` — ensure this block's chunks are resident
+  (re-gathering only if the forward-cached buffer was evicted).
+* :meth:`post_block_backward` — reduce-offload this block's chunk
+  gradients; this kicks off the CPU FusedAdam step asynchronously.
+
+Stream policy
+-------------
+Prefetch and gather traffic runs on a dedicated *prefetch stream*
+distinct from the default compute stream. Correctness is guaranteed at
+block boundaries by synchronising the prefetch stream onto the current
+(compute) stream before control returns to the caller — perfect overlap
+is a pleasant side-effect when the kernels happen to run long enough,
+but the scheduler never *relies* on it (the cost model did).
+
+Activation swap is gated by the block wrapper (see
+:class:`~axolotl.integrations.protrain.block.swap.SwappedBlock`); for
+SWAP blocks the scheduler only has to keep the chunk-state path
+consistent — the SWAP wrapper handles the activation copy itself.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Iterable
+
+from axolotl.integrations.protrain.types import (
+    BlockId,
+    BlockMode,
+    BlockStrategyMap,
+    ChunkId,
+    ChunkLayout,
+)
+from axolotl.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    import torch
+
+    from axolotl.integrations.protrain.chunk import ChunkManager
+
+LOG = get_logger(__name__)
+
+
+class Scheduler:
+    """Drives prefetch / release / reduce-offload at block granularity.
+
+    Parameters
+    ----------
+    chunk_manager:
+        Runtime chunk driver; the scheduler never allocates buffers
+        directly — it only calls ``gather`` / ``offload`` /
+        ``reduce_grads_and_offload`` on the manager.
+    block_map:
+        Per-block activation mode (NONE / CKPT / SWAP) chosen by the
+        searcher. Scheduler consults this to decide whether SWAP-specific
+        prefetch paths need to be poked for backward.
+    layout:
+        The :class:`ChunkLayout` whose ``block_to_chunks`` dict tells
+        the scheduler which chunks belong to which block.
+    effective_h2d_bps / effective_d2h_bps:
+        Post-contention effective bandwidths. Not consumed by M4b itself
+        (the plan checks overlap at block boundaries, not per-transfer)
+        but stored for the telemetry path in M5 and to surface the
+        scheduler's current budget to callers.
+    """
+
+    def __init__(
+        self,
+        chunk_manager: "ChunkManager",
+        block_map: BlockStrategyMap,
+        layout: ChunkLayout,
+        effective_h2d_bps: float,
+        effective_d2h_bps: float,
+    ) -> None:
+        self.chunk_manager = chunk_manager
+        self.block_map = block_map
+        self.layout = layout
+        self.effective_h2d_bps = float(effective_h2d_bps)
+        self.effective_d2h_bps = float(effective_d2h_bps)
+
+        # Ordered list of block ids — matches forward traversal order
+        # by construction (``flatten_block_trees(discover_blocks(...))``
+        # emits encoder ids before decoder ids; sorted(block_map.keys())
+        # therefore reproduces the forward traversal order on both
+        # single-tree and encoder-decoder models). Used to resolve
+        # "next block" for the prefetch rule.
+        self._block_order: list[BlockId] = sorted(block_map.keys())
+
+        self._prefetch_stream: "torch.cuda.Stream | None" = None
+        self._swap_stream: "torch.cuda.Stream | None" = None
+        # ActivationSwapPool reference, attached lazily by the model
+        # wrapper when ``n_swap > 0``. Type-erased to ``object`` here so
+        # the scheduler module does not depend on ``block.swap_pool``.
+        self.swap_pool: object | None = None
+        self._init_streams()
+
+    @property
+    def swap_stream(self) -> "torch.cuda.Stream | None":
+        """Public accessor for the dedicated activation-swap stream.
+
+        Returned for the model wrapper to thread into each
+        :class:`SwappedBlock` via :meth:`SwappedBlock.attach_runtime`.
+        ``None`` on CPU-only paths.
+        """
+        return self._swap_stream
+
+    def _init_streams(self) -> None:
+        """Create dedicated CUDA streams for prefetch + activation swap.
+
+        Two independent non-default streams: one for chunk prefetch
+        (parameters), one for activation D2H/H2D under SWAP. Keeping
+        them separate lets the chunk gather for block N+1 overlap with
+        the activation H2D for block N during backward — the same
+        single-block lookahead pattern the chunk prefetch already uses.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover — torch is required at runtime
+            return
+
+        if not torch.cuda.is_available():
+            LOG.debug(
+                "Scheduler: CUDA unavailable; prefetch/swap streams are None "
+                "(scheduler degrades to synchronous transfers)."
+            )
+            self._prefetch_stream = None
+            self._swap_stream = None
+            return
+
+        # A non-default stream lets the allocator / kernel launches on
+        # the compute stream continue while PCIe copies are in flight.
+        self._prefetch_stream = torch.cuda.Stream()
+        # Activation SWAP runs on its own stream so D2H/H2D from the
+        # block wrapper does not contend with chunk prefetch traffic.
+        # Even on PCIe-bound 3090s where overlap with compute is
+        # limited, isolating the streams keeps the cost model honest
+        # (it already assumes the swap stream is independent).
+        self._swap_stream = torch.cuda.Stream()
+
+    # ---- helpers -------------------------------------------------------
+
+    def _chunks_for(self, block_id: BlockId) -> tuple[ChunkId, ...]:
+        """Return the chunks owned by ``block_id`` under the current layout."""
+        return self.layout.block_to_chunks.get(block_id, ())
+
+    def _next_block_of(self, block_id: BlockId) -> BlockId | None:
+        """Return the block id scheduled *after* ``block_id`` in forward order."""
+        try:
+            idx = self._block_order.index(block_id)
+        except ValueError:
+            return None
+        nxt = idx + 1
+        if nxt >= len(self._block_order):
+            return None
+        return self._block_order[nxt]
+
+    def _prev_block_of(self, block_id: BlockId) -> BlockId | None:
+        """Return the block id scheduled *after* ``block_id`` in backward order.
+
+        Backward walks the block list in reverse, so the "next" block in
+        backward is the one with index ``idx - 1`` in forward order.
+        """
+        try:
+            idx = self._block_order.index(block_id)
+        except ValueError:
+            return None
+        if idx <= 0:
+            return None
+        return self._block_order[idx - 1]
+
+    def _gather_on_prefetch_stream(self, chunk_ids: Iterable[ChunkId]) -> None:
+        """Async-gather ``chunk_ids`` on the prefetch stream.
+
+        No-op if the prefetch stream is unavailable (CPU-only test
+        lanes) — the chunk manager's synchronous ``gather`` is still
+        correct; it is simply serialised against compute.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover
+            return
+
+        if self._prefetch_stream is None or not torch.cuda.is_available():
+            # Synchronous fallback.
+            for cid in chunk_ids:
+                self.chunk_manager.gather(cid)
+            return
+
+        with torch.cuda.stream(self._prefetch_stream):
+            for cid in chunk_ids:
+                # gather issues its own H2D copy with non_blocking=True; it
+                # lands on the current stream (our prefetch stream).
+                self.chunk_manager.gather(cid)
+
+    def _sync_prefetch_with_compute(self) -> None:
+        """Make the default compute stream wait on the prefetch stream."""
+        try:
+            import torch
+        except ImportError:  # pragma: no cover
+            return
+        if self._prefetch_stream is None or not torch.cuda.is_available():
+            return
+        compute = torch.cuda.current_stream()
+        compute.wait_stream(self._prefetch_stream)
+
+    def ensure_block_resident(self, block_id: BlockId) -> None:
+        """Synchronously ensure ``block_id``'s parameter chunks are resident.
+
+        Used by checkpoint recompute. ``torch.utils.checkpoint`` replays
+        the inner block forward directly during backward, bypassing the
+        wrapper module's forward-pre hook. The replay therefore needs a
+        direct, idempotent gather hook before it touches the inner
+        block's parameters.
+        """
+        chunk_ids = self._chunks_for(block_id)
+        if not chunk_ids:
+            return
+        self._gather_on_prefetch_stream(chunk_ids)
+        self._sync_prefetch_with_compute()
+
+    # ---- forward -------------------------------------------------------
+
+    def pre_block_forward(self, block_id: BlockId) -> None:
+        """Prefetch the *next* block's chunks so they are resident by then.
+
+        The **current** block's chunks are assumed to already be resident
+        — they were either (a) kicked off by the previous block's
+        ``pre_block_forward`` prefetch, or (b) persistent. On the very
+        first block we also have to gather its own chunks, which we
+        handle synchronously here to keep correctness.
+        """
+        # First-block warm-up: make sure the current block's chunks are in.
+        # ``gather`` is idempotent on persistent chunks and fast on
+        # already-resident non-persistent ones (it's just a tag lookup
+        # through the pool). So calling unconditionally costs nothing in
+        # steady state.
+        self.ensure_block_resident(block_id)
+
+        # Kick off async prefetch for the *next* block.
+        nxt = self._next_block_of(block_id)
+        if nxt is None:
+            return
+        next_chunks = self._chunks_for(nxt)
+        if not next_chunks:
+            return
+        self._gather_on_prefetch_stream(next_chunks)
+        # Do NOT sync here — the point of the prefetch stream is that
+        # the copy can run overlapped with this block's forward compute.
+        LOG.debug(
+            "Scheduler.pre_block_forward: block=%d prefetched %d chunks for next block %d",
+            block_id,
+            len(next_chunks),
+            nxt,
+        )
+
+    def post_block_forward(self, block_id: BlockId) -> None:
+        """Release buffers whose last forward use was this block.
+
+        Heuristic: release every non-persistent chunk owned by
+        ``block_id`` *except* any that also appear in the next block's
+        chunk set — keeping them resident lets the next block skip a
+        re-gather on its pre-hook.
+
+        The buffer pool preserves the chunk's tag after ``release`` so
+        ``lookup_resident`` in backward still works (forward→backward
+        reuse window, §3.1.1 + §5).
+        """
+        nxt = self._next_block_of(block_id)
+        next_chunks: set[ChunkId] = (
+            set(self._chunks_for(nxt)) if nxt is not None else set()
+        )
+
+        for cid in self._chunks_for(block_id):
+            if cid in next_chunks:
+                continue
+            # ``offload`` short-circuits for persistent chunks — see
+            # ChunkManager.offload docstring.
+            self.chunk_manager.offload(cid)
+
+    # ---- backward ------------------------------------------------------
+
+    def pre_block_backward(self, block_id: BlockId) -> None:
+        """Ensure the chunks for ``block_id`` are resident before its backward runs.
+
+        Backward walks blocks in reverse order. The SWAP wrapper takes
+        care of activation prefetch itself (`SwappedBlock`'s autograd
+        Function schedules the H2D on the scheduler's ``_swap_stream``
+        and synchronises the compute stream against it). We only need
+        to cover the chunk-state path here.
+
+        Fast path: if the chunk is still tagged in the buffer pool
+        (``lookup_resident`` returns non-None) the gather call is a
+        cheap re-tag + no-copy return. Otherwise the chunk manager
+        re-gathers from the CPU shard with a fresh H2D copy.
+
+        Lookahead: the chunk-prefetch lookahead at the bottom of this
+        method already covers parameter chunks for block N-1 (the next
+        backward block). For activation H2D the lookahead is implicit
+        in the autograd graph — when block N's backward runs its
+        ``_SwapOffloadFunction.backward``, the H2D for block N's
+        activation lands on ``_swap_stream`` and the compute stream
+        wait happens before block N's gradient kernels run. Block
+        N-1's activation H2D will fire when *its* backward Function
+        executes; the swap pool's ``prefetch_depth=2`` slots ensure
+        block N's slot can be in-flight while block N-1's is being
+        scheduled, mirroring the chunk-prefetch single-block
+        lookahead pattern.
+        """
+        mode = self.block_map.get(block_id, BlockMode.NONE)
+        if mode is BlockMode.SWAP:
+            LOG.debug(
+                "Scheduler.pre_block_backward: block=%d is SWAP; "
+                "activation H2D scheduled by SwappedBlock on swap_stream",
+                block_id,
+            )
+
+        chunk_ids = self._chunks_for(block_id)
+        if not chunk_ids:
+            return
+
+        # All-persistent layouts (n_buffer=0) skip pool construction
+        # entirely — every chunk is GPU-resident throughout forward AND
+        # backward, no gather/prefetch is needed here. The pool-cache
+        # fast-path below would NPE on the missing pool; bail out
+        # cleanly instead.
+        if self.chunk_manager.buffer_pool is None:
+            return
+
+        # Consult the pool first — gathers that hit the resident tag are
+        # essentially free; gathers that miss trigger a fresh H2D copy
+        # onto the prefetch stream.
+        misses: list[ChunkId] = []
+        for cid in chunk_ids:
+            if self.chunk_manager.buffer_pool.lookup_resident(cid) is None:
+                misses.append(cid)
+            else:
+                # Re-claim the slot (removes from free list if present).
+                self.chunk_manager.gather(cid)
+        if misses:
+            self._gather_on_prefetch_stream(misses)
+            self._sync_prefetch_with_compute()
+
+        # Also kick off an async prefetch for the block that is about to
+        # be visited in the *next* backward step (i.e. the previous
+        # block in forward order), mirroring the forward look-ahead.
+        nxt_bwd = self._prev_block_of(block_id)
+        if nxt_bwd is None:
+            return
+        nxt_chunks = self._chunks_for(nxt_bwd)
+        if not nxt_chunks:
+            return
+        # Only gather what's not already resident to avoid needless work.
+        need = [
+            cid
+            for cid in nxt_chunks
+            if self.chunk_manager.buffer_pool.lookup_resident(cid) is None
+        ]
+        if need:
+            self._gather_on_prefetch_stream(need)
+
+    def post_block_backward(self, block_id: BlockId) -> None:
+        """Finalize this block's backward: release buffers + maybe kick CPU Adam.
+
+        Behavior after the M4.5 runtime-primitives landing:
+
+        * **Non-persistent chunks** — grads for their params were already
+          drained to the pinned-CPU grad shards by the per-parameter
+          post-accumulate-grad hooks installed by
+          :meth:`ChunkManager.materialize_offload` (the block-level hook
+          used to own this, but could only fire after PyTorch's autograd
+          had already accumulated grads for the whole block — too late
+          for the memory-pressure path). The CPU FusedAdam step is
+          kicked off inside those per-param hooks as soon as the last
+          grad for a chunk lands. Here we merely release the GPU buffer
+          and null ``param.data`` so the slot can be recycled.
+        * **Persistent chunks** — their grads live on GPU (no drain);
+          the call is a no-op in single-rank mode, and in multi-rank
+          mode issues the distributed all-reduce per param.
+        """
+        for cid in self._chunks_for(block_id):
+            self.chunk_manager.reduce_grads_and_offload(cid)
+
+    # ---- end-of-iteration cleanup -------------------------------------
+
+    def drain(self) -> None:
+        """Block until every in-flight CPU Adam step has finished.
+
+        Called at the end of ``backward`` (or at the start of the next
+        ``optimizer.step``) so the non-persistent optimizer updates are
+        committed before the next forward observes stale params.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover
+            self.chunk_manager.wait_cpu_optim()
+            return
+
+        # Make sure any prefetch / swap traffic that's still inflight
+        # completes before we declare the iteration done — callers
+        # inspecting peak memory stats right after drain expect a stable
+        # picture.
+        if torch.cuda.is_available():
+            if self._prefetch_stream is not None:
+                self._prefetch_stream.synchronize()
+            if self._swap_stream is not None:
+                self._swap_stream.synchronize()
+
+        self.chunk_manager.wait_cpu_optim()
+
+
+__all__ = ["Scheduler"]
