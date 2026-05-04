@@ -39,7 +39,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
-import sys
 import types
 
 
@@ -71,9 +70,7 @@ def _load_reshard_module() -> types.ModuleType:
             f"reshard CLI: cannot locate core reshard module at {target!r}. "
             "The repository layout has changed; update _load_reshard_module."
         )
-    spec = importlib.util.spec_from_file_location(
-        "_protrain_reshard_core", target
-    )
+    spec = importlib.util.spec_from_file_location("_protrain_reshard_core", target)
     if spec is None or spec.loader is None:
         raise RuntimeError(
             f"reshard CLI: importlib failed to build spec for {target!r}"
@@ -87,8 +84,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reshard_optim",
         description=(
-            "Offline cross-world-size reshard tool for ProTrain Mode-C "
-            "optimizer state."
+            "Offline cross-world-size reshard tool for ProTrain Mode-C optimizer state."
         ),
     )
     p.add_argument(

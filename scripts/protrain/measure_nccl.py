@@ -35,7 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
+import subprocess  # nosec B404 — script self-spawns under torchrun by design
 import sys
 from pathlib import Path
 
@@ -112,8 +112,8 @@ def _run_as_rank() -> None:
         )
         for size in sorted(gather_table.keys()):
             print(
-                f"  {size >> 20:>13}  {gather_table[size]*1000:>10.3f}  "
-                f"{reduce_table[size]*1000:>10.3f}"
+                f"  {size >> 20:>13}  {gather_table[size] * 1000:>10.3f}  "
+                f"{reduce_table[size] * 1000:>10.3f}"
             )
 
     dist.destroy_process_group()
@@ -131,7 +131,7 @@ def _self_spawn(world_size: int, extra_args: list[str]) -> int:
         *extra_args,
     ]
     print("[self-spawn]", " ".join(cmd), file=sys.stderr)
-    return subprocess.call(cmd)
+    return subprocess.call(cmd)  # nosec B603 — argv built from sys.executable + this script's own __file__
 
 
 def main() -> None:

@@ -66,34 +66,37 @@ def measure_pcie(
     # Bind the timing events to ``device_idx`` so they record on the
     # right device under CUDA_VISIBLE_DEVICES masking / multi-GPU rigs.
     # ``torch.cuda.Event`` infers its device from the current device at
-    # construction time; without this guard a stale ``current_device()``
-    # would attach the events to the wrong GPU and produce nonsensical
-    # ``elapsed_time`` readings (or a hard error on cross-device record).
+    # construction time AND ``event.record()`` / ``torch.cuda.synchronize``
+    # are device-bound operations — if any of these run with a different
+    # default device than the events were created on, the events bind to
+    # the wrong stream/device and we get nonsensical ``elapsed_time``
+    # readings (or a hard error on cross-device record). Wrap event
+    # creation, record, and synchronize in a single device guard.
+    h2d_times: list[float] = []
+    d2h_times: list[float] = []
     with torch.cuda.device(device_idx):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-    def _time_copy(src, dst) -> float:
-        torch.cuda.synchronize(device)
-        start.record()
-        dst.copy_(src, non_blocking=True)
-        end.record()
-        torch.cuda.synchronize(device)
-        # elapsed_time is in ms
-        return start.elapsed_time(end) / 1000.0
+        def _time_copy(src, dst) -> float:
+            torch.cuda.synchronize(device)
+            start.record()
+            dst.copy_(src, non_blocking=True)
+            end.record()
+            torch.cuda.synchronize(device)
+            # elapsed_time is in ms
+            return start.elapsed_time(end) / 1000.0
 
-    # Warmup + measured iters, H2D
-    h2d_times: list[float] = []
-    for i in range(n_iters + 1):
-        t = _time_copy(host, gpu)
-        if i > 0:
-            h2d_times.append(t)
+        # Warmup + measured iters, H2D
+        for i in range(n_iters + 1):
+            t = _time_copy(host, gpu)
+            if i > 0:
+                h2d_times.append(t)
 
-    d2h_times: list[float] = []
-    for i in range(n_iters + 1):
-        t = _time_copy(gpu, host)
-        if i > 0:
-            d2h_times.append(t)
+        for i in range(n_iters + 1):
+            t = _time_copy(gpu, host)
+            if i > 0:
+                d2h_times.append(t)
 
     h2d_bps = n_bytes / (sum(h2d_times) / len(h2d_times))
     d2h_bps = n_bytes / (sum(d2h_times) / len(d2h_times))
@@ -310,18 +313,21 @@ def measure_gpu_adam(
         return 0.0
 
     iter_s: list[float] = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    for _ in range(n_iters):
-        # Re-issue a fresh grad each iter. Keep it simple — copy in place
-        # so we don't thrash the allocator.
-        param.grad.copy_(torch.randn_like(param.grad))
-        torch.cuda.synchronize(device)
-        start.record()
-        optim.step()
-        end.record()
-        torch.cuda.synchronize(device)
-        iter_s.append(start.elapsed_time(end) / 1000.0)
+    # Bind events + record + synchronize to ``device_idx`` so they don't
+    # latch onto a stale ``current_device()`` under multi-GPU / masking.
+    with torch.cuda.device(device_idx):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(n_iters):
+            # Re-issue a fresh grad each iter. Keep it simple — copy in place
+            # so we don't thrash the allocator.
+            param.grad.copy_(torch.randn_like(param.grad))
+            torch.cuda.synchronize(device)
+            start.record()
+            optim.step()
+            end.record()
+            torch.cuda.synchronize(device)
+            iter_s.append(start.elapsed_time(end) / 1000.0)
 
     median_iter = statistics.median(iter_s)
     bytes_processed = n_params * _ADAM_BYTES_PER_PARAM
@@ -453,6 +459,10 @@ def measure_nccl(
     device = torch.device(
         f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     )
+    # Extract the integer ordinal so ``torch.cuda.device(device_idx)`` can
+    # guard event construction + record + synchronize against a stale
+    # ``current_device()`` under multi-GPU / CUDA_VISIBLE_DEVICES masking.
+    device_idx = device.index if device.index is not None else 0
 
     gather_table: dict[int, float] = {}
     reduce_table: dict[int, float] = {}
@@ -481,16 +491,18 @@ def measure_nccl(
             dist.all_gather_into_tensor(gathered, shard)
         torch.cuda.synchronize(device)
 
-        # Timed
+        # Timed — wrap event construction + record + synchronize in one
+        # device guard (cheaper than entering on each iter, equally correct).
         gather_times: list[float] = []
-        for _ in range(n_iters):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            dist.all_gather_into_tensor(gathered, shard)
-            end.record()
-            torch.cuda.synchronize(device)
-            gather_times.append(start.elapsed_time(end) / 1000.0)
+        with torch.cuda.device(device_idx):
+            for _ in range(n_iters):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                dist.all_gather_into_tensor(gathered, shard)
+                end.record()
+                torch.cuda.synchronize(device)
+                gather_times.append(start.elapsed_time(end) / 1000.0)
         gather_table[payload_bytes] = statistics.median(gather_times)
 
         # reduce_scatter_tensor: input is full payload on every rank,
@@ -508,16 +520,18 @@ def measure_nccl(
             dist.reduce_scatter_tensor(reduced, full_payload)
         torch.cuda.synchronize(device)
 
-        # Timed
+        # Timed — wrap event construction + record + synchronize in one
+        # device guard (cheaper than entering on each iter, equally correct).
         reduce_times: list[float] = []
-        for _ in range(n_iters):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            dist.reduce_scatter_tensor(reduced, full_payload)
-            end.record()
-            torch.cuda.synchronize(device)
-            reduce_times.append(start.elapsed_time(end) / 1000.0)
+        with torch.cuda.device(device_idx):
+            for _ in range(n_iters):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                dist.reduce_scatter_tensor(reduced, full_payload)
+                end.record()
+                torch.cuda.synchronize(device)
+                reduce_times.append(start.elapsed_time(end) / 1000.0)
         reduce_table[payload_bytes] = statistics.median(reduce_times)
 
         del shard, gathered, full_payload, reduced
@@ -601,16 +615,18 @@ def measure_compute_rate(
     torch.cuda.synchronize(device)
     del c
 
-    # Timed
+    # Timed — bind events + record + synchronize to ``device_idx`` so they
+    # don't latch onto a stale ``current_device()`` under multi-GPU / masking.
     iter_s: list[float] = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    for _ in range(n_iters):
-        start.record()
-        c = a @ b
-        end.record()
-        torch.cuda.synchronize(device)
-        iter_s.append(start.elapsed_time(end) / 1000.0)
+    with torch.cuda.device(device_idx):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(n_iters):
+            start.record()
+            c = a @ b
+            end.record()
+            torch.cuda.synchronize(device)
+            iter_s.append(start.elapsed_time(end) / 1000.0)
     median_iter = statistics.median(iter_s)
 
     # FLOP count for a square matmul: 2 * N^3 (one multiply + one add per
