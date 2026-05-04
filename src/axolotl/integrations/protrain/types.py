@@ -47,6 +47,7 @@ class BlockMode(str, Enum):
     NONE = "none"  # keep activations on GPU, no checkpoint, no swap
     CKPT = "ckpt"  # drop + recompute in backward
     SWAP = "swap"  # offload to CPU in forward, prefetch in backward (feature-flagged)
+    OFFLOAD = "offload"  # param-offload-aware NONE-equivalent for non-persistent chunks
 
 
 # Per-block mode selection, output of `block.layout_rules.assign_modes`.

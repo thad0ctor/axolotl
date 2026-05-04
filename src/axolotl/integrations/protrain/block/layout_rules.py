@@ -37,47 +37,85 @@ LOG = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def assign_modes(n_swap: int, n_checkpoint: int, N_block: int) -> BlockStrategyMap:
-    """Return the per-block mode map under the three placement rules.
+def assign_modes(
+    n_swap: int,
+    n_checkpoint: int,
+    N_block: int,
+    *,
+    n_offload: int = 0,
+) -> BlockStrategyMap:
+    """Return the per-block mode map under the four placement rules.
+
+    Placement order, applied in sequence (later rules fill positions left
+    free by earlier rules):
+
+    1. **Swap-early** — the first ``n_swap`` block ids are SWAP. Earlier
+       blocks have more forward compute after them to hide the CPU->GPU
+       prefetch.
+    2. **Interleave CKPT among the remaining blocks** — picks
+       ``n_checkpoint`` positions from ``[n_swap, N_block)`` via the
+       math-based even distribution, flattening peak memory by preventing
+       activation accumulation in a contiguous run.
+    3. **OFFLOAD in the unopt-late tail, before NONE** — the next
+       ``n_offload`` free positions (in index order, after SWAP/CKPT
+       removal) become OFFLOAD. OFFLOAD blocks share NONE's "unopt-late"
+       placement intent — they free their PCIe budget on the forward side
+       and their backward gather competes with reduce-offload in the same
+       backward window CKPT recompute would have. Placed before NONE so
+       that with mixed configs the tail-most positions stay NONE.
+    4. **NONE fills the remainder** — any positions not assigned by
+       rules 1-3 are NONE.
 
     Parameters
     ----------
     n_swap:
         Number of blocks that should use ``BlockMode.SWAP``. Must be
-        non-negative and ``n_swap + n_checkpoint <= N_block``.
+        non-negative and ``n_swap + n_checkpoint + n_offload <= N_block``.
     n_checkpoint:
         Number of blocks that should use ``BlockMode.CKPT``.
     N_block:
         Total number of transformer blocks in the model.
+    n_offload:
+        Number of blocks that should use ``BlockMode.OFFLOAD`` (the
+        param-offload-aware NONE-equivalent for non-persistent chunks;
+        see ``BLOCK_MODE_OFFLOAD_DESIGN.md`` §3.6). Defaults to 0 for
+        backward compatibility — the legacy 3-knob (SWAP/CKPT/NONE)
+        signature ``assign_modes(n_swap, n_checkpoint, N_block)``
+        continues to produce identical maps.
 
     Returns
     -------
     BlockStrategyMap
-        ``dict`` keyed ``0 .. N_block-1`` mapping to exactly
-        ``n_swap`` SWAP entries, ``n_checkpoint`` CKPT entries, and
-        ``N_block - n_swap - n_checkpoint`` NONE entries.
+        ``dict`` keyed ``0 .. N_block-1`` mapping to exactly ``n_swap``
+        SWAP entries, ``n_checkpoint`` CKPT entries, ``n_offload``
+        OFFLOAD entries, and ``N_block - n_swap - n_checkpoint -
+        n_offload`` NONE entries.
 
     Raises
     ------
     ValueError
-        If any input is negative or ``n_swap + n_checkpoint > N_block``.
+        If any input is negative or
+        ``n_swap + n_checkpoint + n_offload > N_block``.
     """
     if N_block < 0:
         raise ValueError(f"N_block must be non-negative, got {N_block}")
-    if n_swap < 0 or n_checkpoint < 0:
+    if n_swap < 0 or n_checkpoint < 0 or n_offload < 0:
         raise ValueError(
-            f"n_swap and n_checkpoint must be non-negative, got "
-            f"n_swap={n_swap}, n_checkpoint={n_checkpoint}"
+            f"n_swap, n_checkpoint, n_offload must be non-negative, got "
+            f"n_swap={n_swap}, n_checkpoint={n_checkpoint}, "
+            f"n_offload={n_offload}"
         )
-    if n_swap + n_checkpoint > N_block:
+    if n_swap + n_checkpoint + n_offload > N_block:
         raise ValueError(
-            f"n_swap + n_checkpoint ({n_swap} + {n_checkpoint} = "
-            f"{n_swap + n_checkpoint}) exceeds N_block ({N_block})"
+            f"n_swap + n_checkpoint + n_offload "
+            f"({n_swap} + {n_checkpoint} + {n_offload} = "
+            f"{n_swap + n_checkpoint + n_offload}) exceeds N_block "
+            f"({N_block})"
         )
 
     # Initialise everything to NONE (unopt-late default — positions that
-    # do not receive SWAP/CKPT just stay NONE, and by construction those
-    # positions land in the tail).
+    # do not receive SWAP/CKPT/OFFLOAD just stay NONE, and by construction
+    # those positions land in the tail).
     modes: BlockStrategyMap = {BlockId(i): BlockMode.NONE for i in range(N_block)}
 
     # Rule 1: swap-early. First n_swap block ids are SWAP.
@@ -105,27 +143,59 @@ def assign_modes(n_swap: int, n_checkpoint: int, N_block: int) -> BlockStrategyM
             idx = n_swap + (k * remaining) // n_checkpoint
             modes[BlockId(idx)] = BlockMode.CKPT
 
+    # Rule 3: OFFLOAD fills the next n_offload positions still bearing
+    # NONE, in ascending index order. This places OFFLOAD "before NONE"
+    # in the unopt-late tail — see §3.6 of ``BLOCK_MODE_OFFLOAD_DESIGN.md``.
+    # When n_offload=0 (default / legacy callers), this loop is a no-op
+    # and the map is identical to the pre-Option-B output.
+    if n_offload > 0:
+        placed = 0
+        for i in range(N_block):
+            if placed >= n_offload:
+                break
+            if modes[BlockId(i)] is BlockMode.NONE:
+                modes[BlockId(i)] = BlockMode.OFFLOAD
+                placed += 1
+
     # Post-condition: counts match the request.
-    _assert_counts(modes, n_swap=n_swap, n_checkpoint=n_checkpoint, N_block=N_block)
+    _assert_counts(
+        modes,
+        n_swap=n_swap,
+        n_checkpoint=n_checkpoint,
+        n_offload=n_offload,
+        N_block=N_block,
+    )
     return modes
 
 
 def _assert_counts(
-    modes: BlockStrategyMap, *, n_swap: int, n_checkpoint: int, N_block: int
+    modes: BlockStrategyMap,
+    *,
+    n_swap: int,
+    n_checkpoint: int,
+    n_offload: int,
+    N_block: int,
 ) -> None:
     """Invariant check. Raises ``ValueError`` if counts diverge."""
-    counts = {BlockMode.NONE: 0, BlockMode.CKPT: 0, BlockMode.SWAP: 0}
+    counts = {
+        BlockMode.NONE: 0,
+        BlockMode.CKPT: 0,
+        BlockMode.SWAP: 0,
+        BlockMode.OFFLOAD: 0,
+    }
     for m in modes.values():
         counts[m] = counts[m] + 1
-    expected_none = N_block - n_swap - n_checkpoint
+    expected_none = N_block - n_swap - n_checkpoint - n_offload
     if (
         counts[BlockMode.SWAP] != n_swap
         or counts[BlockMode.CKPT] != n_checkpoint
+        or counts[BlockMode.OFFLOAD] != n_offload
         or counts[BlockMode.NONE] != expected_none
     ):
         raise ValueError(
             f"assign_modes invariant violation: got counts={counts}, "
-            f"expected SWAP={n_swap}, CKPT={n_checkpoint}, NONE={expected_none}"
+            f"expected SWAP={n_swap}, CKPT={n_checkpoint}, "
+            f"OFFLOAD={n_offload}, NONE={expected_none}"
         )
 
 

@@ -304,6 +304,73 @@ class _ChunkShardState:
         return bool(self.regions)
 
 
+class BackwardHandle:
+    """RAII refcount handle for a chunk pinned across a backward window.
+
+    Returned by :meth:`ChunkManager.gather_for_backward` and consumed
+    by :class:`OffloadedBlock` (M2 of the Option B rollout). Each
+    handle represents one outstanding reference to ``chunk_id``'s
+    GPU pool slot. When the last live handle for a chunk is dropped:
+
+    1. The manager's per-chunk refcount hits zero.
+    2. If ``reduce_grads_and_offload`` ran while the count was non-zero
+       (the slot couldn't be safely released because saved tensors
+       still aliased it), the deferred offload runs now.
+
+    Lifetime is driven by the autograd engine: ``OffloadedBlock._unpack``
+    attaches the handle to the unpack-returned view as a private
+    attribute, autograd holds the view until the consuming Node's
+    ``apply()`` completes, then drops it; Python ref-counting cascades
+    the drop to the handle's ``__del__``.
+
+    ``release()`` is the explicit-drop path (idempotent). Tests use
+    it to deterministically simulate handle drops without relying on
+    GC timing. ``__del__`` is the safety net for the GC-driven path.
+    """
+
+    __slots__ = ("_chunk_id", "_manager", "_released")
+
+    def __init__(self, chunk_id: ChunkId, manager: "ChunkManager") -> None:
+        """Bind the handle to ``chunk_id`` on ``manager``; refcount already bumped."""
+        self._chunk_id = chunk_id
+        self._manager = manager
+        self._released = False
+
+    def release(self) -> None:
+        """Drop this handle, decrementing the manager's refcount.
+
+        Idempotent. Safe to call multiple times; subsequent calls are
+        no-ops. The manager handles the deferred-offload drain when
+        the count hits zero.
+        """
+        if self._released:
+            return
+        self._released = True
+        # ``_release_backward_handle`` performs the decrement +
+        # deferred-drain. We hold a hard reference to the manager so
+        # __del__ during interpreter shutdown still works (the
+        # manager is reachable via this handle's __slots__ until we
+        # explicitly clear it below).
+        try:
+            self._manager._release_backward_handle(self._chunk_id)  # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001 — best-effort during shutdown
+            LOG.debug(
+                "BackwardHandle.release: drain failed for chunk %d: %s",
+                int(self._chunk_id),
+                exc,
+            )
+
+    def __del__(self) -> None:  # noqa: D401
+        """Safety-net release on GC — RAII guarantee for the autograd path."""
+        # __del__ must not raise. ``release`` is itself defensively
+        # try/except'd; the only remaining risk is the manager weakref
+        # being collected before us during interpreter shutdown.
+        try:
+            self.release()
+        except Exception:  # noqa: BLE001 — destructors must not throw
+            pass
+
+
 class ChunkManager:
     """Runtime driver for a :class:`ChunkLayout`.
 
@@ -469,6 +536,27 @@ class ChunkManager:
         # Hook handles stored so ``uninstall`` / ``__del__`` can remove
         # them deterministically and we don't leak closures over ``self``.
         self._grad_hook_handles: list[object] = []
+
+        # M2 / Option B state: storage-pointer -> chunk_id reverse
+        # lookup populated at gather time and cleared at offload time.
+        # ``OffloadedBlock._pack`` queries this to detect "is this
+        # saved tensor a view of a chunk-managed param?". Using
+        # storage identity matches what autograd actually saved
+        # (storages survive view ops); using param-id would force a
+        # weakref-from-tensor path that PyTorch doesn't offer.
+        self._storage_ptr_to_chunk: dict[int, ChunkId] = {}
+
+        # Per-chunk refcount of outstanding ``BackwardHandle``s. When
+        # non-zero, ``reduce_grads_and_offload(cid)`` defers the
+        # actual offload into ``_deferred_offloads``; when the last
+        # handle is dropped, the deferred offload drains. This is
+        # the §3.4 backward-window pin counter.
+        self._backward_refcount: dict[ChunkId, int] = {}
+
+        # Set of chunks whose offload was deferred because their
+        # backward refcount was non-zero at reduce time. Drained by
+        # ``_release_backward_handle`` once the last handle drops.
+        self._deferred_offloads: set[ChunkId] = set()
 
         self.mark_persistent(n_persist)
 
@@ -1653,6 +1741,18 @@ class ChunkManager:
             typed = byte_view.view(slot.dtype).view(slot.shape)
             param.data = typed
 
+        # M2: register the chunk's flat buffer storage in the reverse
+        # lookup so OffloadedBlock._pack can identify saved tensors
+        # that view this chunk. Every per-param view rebound above
+        # shares ``buf``'s storage (``narrow`` + ``view`` keep
+        # storage identity), so a single entry per chunk suffices.
+        try:
+            ptr = buf.untyped_storage().data_ptr()
+        except Exception:  # noqa: BLE001 — defensive on unusual backends
+            ptr = 0
+        if ptr:
+            self._storage_ptr_to_chunk[ptr] = chunk_id
+
     def offload(self, chunk_id: ChunkId) -> None:
         """Release ``chunk_id``'s GPU storage (non-persistent only).
 
@@ -1692,7 +1792,40 @@ class ChunkManager:
             "offload() reached the non-persistent path with no buffer_pool; "
             "all-persistent layouts must early-return above"
         )
+
+        # M2 / Option B: defer the offload if any BackwardHandle is
+        # still outstanding for this chunk. The unpack hook returned a
+        # view into the pool buffer that autograd is still consuming;
+        # releasing the slot now would let an intervening
+        # ``acquire(other)`` evict the bytes mid-backward (see §3.4
+        # point 2). The drain runs in ``_release_backward_handle``
+        # when the last handle drops to zero.
+        if self._backward_refcount.get(chunk_id, 0) > 0:
+            self._deferred_offloads.add(chunk_id)
+            return
+
+        # M2: deregister the storage-ptr reverse lookup BEFORE we
+        # null param.data and release the buffer. The pool may keep
+        # the slot tagged for forward→backward reuse, but the
+        # OFFLOAD pack hook should only resolve a chunk_id from a
+        # storage_ptr while the chunk's params are actively bound to
+        # a buffer view; clearing here matches that invariant. (The
+        # next gather will re-register.)
         slots = self._cpu_slots.get(chunk_id, [])
+        for slot in slots:
+            param = self._params_by_id.get(slot.param_id)
+            if param is None:
+                continue
+            try:
+                ptr = param.data.untyped_storage().data_ptr()
+            except Exception:  # noqa: BLE001
+                ptr = 0
+            if ptr and self._storage_ptr_to_chunk.get(ptr) == chunk_id:
+                self._storage_ptr_to_chunk.pop(ptr, None)
+                # One ptr-per-chunk by construction (every param view
+                # shares the same buffer storage); break early.
+                break
+
         for slot in slots:
             param = self._params_by_id.get(slot.param_id)
             if param is None:
@@ -2053,6 +2186,75 @@ class ChunkManager:
         except Exception:  # noqa: BLE001 — destructors must not throw
             pass
 
+    # ---- M2 / Option B: backward-window pinning -----------------------
+
+    def chunk_id_for_storage_ptr(self, ptr: int) -> "ChunkId | None":
+        """Look up the chunk whose pool buffer storage starts at ``ptr``.
+
+        ``OffloadedBlock._pack`` calls this to detect whether a saved
+        tensor aliases a chunk-managed param view. The reverse lookup
+        is populated by ``_rebind_params_to_buffer`` at gather time
+        and cleared by ``offload`` (modulo the deferred path).
+
+        Returns ``None`` if no chunk is currently registered at the
+        given pointer — either the saved tensor is a pure activation
+        (SWAP's domain) or the chunk has already been offloaded.
+        """
+        return self._storage_ptr_to_chunk.get(ptr)
+
+    def gather_for_backward(self, chunk_id: ChunkId) -> "BackwardHandle":
+        """Re-gather a chunk for the backward pass and pin it via refcount.
+
+        Used by ``OffloadedBlock._unpack`` to re-materialize a chunk
+        whose forward-side gather buffer was offloaded in
+        ``post_block_forward``. The semantics:
+
+        1. ``gather(chunk_id)`` — idempotent if the chunk is already
+           resident; takes the H2D / all_gather path otherwise.
+        2. Increment the per-chunk ``_backward_refcount``.
+        3. Return a :class:`BackwardHandle` whose ``__del__`` /
+           ``release`` decrements the count and drains any deferred
+           offload queued for the chunk.
+
+        The refcount is what keeps the pool slot from being evicted
+        by an unrelated ``acquire`` call mid-backward (see §3.4 point
+        2 of BLOCK_MODE_OFFLOAD_DESIGN). Multiple unpack calls for the
+        same chunk in the same backward pass each get their own handle
+        and refcount stays at the high-water mark until they all drop.
+        """
+        self.gather(chunk_id)
+        self._backward_refcount[chunk_id] = self._backward_refcount.get(chunk_id, 0) + 1
+        return BackwardHandle(chunk_id, self)
+
+    def _release_backward_handle(self, chunk_id: ChunkId) -> None:
+        """Decrement ``chunk_id``'s refcount and drain any deferred offload.
+
+        Called by :meth:`BackwardHandle.release` (and indirectly by
+        ``BackwardHandle.__del__``). When the count hits zero AND a
+        prior ``offload(cid)`` / ``reduce_grads_and_offload(cid)`` was
+        deferred (because the count was non-zero when it ran), the
+        actual offload runs now — closing the §3.4 deferred-offload
+        loop without scheduler involvement.
+        """
+        cur = self._backward_refcount.get(chunk_id, 0)
+        if cur <= 1:
+            # Refcount hits zero: drop the entry to keep the dict tidy
+            # and run any deferred offload before we release.
+            self._backward_refcount.pop(chunk_id, None)
+            if chunk_id in self._deferred_offloads:
+                self._deferred_offloads.discard(chunk_id)
+                # The deferred offload was queued from offload() OR
+                # reduce_grads_and_offload(). Either way, the
+                # block-level reduce already ran (or didn't apply);
+                # the only thing left is the buffer release + param
+                # data nulling that ``offload`` does. Re-entering
+                # offload() here is safe because the refcount is now
+                # zero (we just popped it) and the ``> 0`` guard
+                # won't redirect us back into deferral.
+                self.offload(chunk_id)
+        else:
+            self._backward_refcount[chunk_id] = cur - 1
+
     # ---- introspection for tests --------------------------------------
 
     def sharded_chunk_ids(self) -> list[ChunkId]:
@@ -2118,4 +2320,4 @@ class ChunkManager:
         return buf
 
 
-__all__ = ["ChunkManager"]
+__all__ = ["BackwardHandle", "ChunkManager"]

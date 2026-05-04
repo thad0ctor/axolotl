@@ -15,6 +15,7 @@ from __future__ import annotations
 from torch import nn
 
 from axolotl.integrations.protrain.block.checkpoint import CheckpointedBlock
+from axolotl.integrations.protrain.block.offload import OffloadedBlock
 from axolotl.integrations.protrain.block.strategy import BlockMode, StrategyError
 from axolotl.integrations.protrain.block.swap import SwappedBlock
 from axolotl.utils.logging import get_logger
@@ -71,6 +72,8 @@ def wrap_block(block: nn.Module, mode: BlockMode) -> nn.Module:
         return CheckpointedBlock(block)
     if mode is BlockMode.SWAP:
         return SwappedBlock(block)
+    if mode is BlockMode.OFFLOAD:
+        return OffloadedBlock(block)
     raise StrategyError(f"unknown BlockMode: {mode!r}")
 
 
