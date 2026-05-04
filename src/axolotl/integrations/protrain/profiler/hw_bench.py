@@ -456,9 +456,7 @@ def measure_nccl(
         raise RuntimeError(
             "measure_nccl requires CUDA — NCCL collectives need GPU tensors."
         )
-    device = torch.device(
-        f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     # Extract the integer ordinal so ``torch.cuda.device(device_idx)`` can
     # guard event construction + record + synchronize against a stale
     # ``current_device()`` under multi-GPU / CUDA_VISIBLE_DEVICES masking.

@@ -113,7 +113,10 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_argparser().parse_args(argv)
+    parser = _build_argparser()
+    args = parser.parse_args(argv)
+    if args.target_world < 1:
+        parser.error("--target-world must be >= 1")
     reshard_mod = _load_reshard_module()
     reshard_mod.reshard_mode_c_shards(args.src, args.dst, args.target_world)
     return 0

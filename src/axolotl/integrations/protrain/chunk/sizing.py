@@ -62,6 +62,22 @@ def pick_S_chunk(
     # simulation, they should pass an exec-ordered dict.
     sizes_in_order = list(model_state_bytes_per_param.values())
 
+    # Filter out candidates smaller than the largest single param tensor:
+    # _simulate_waste counts ``max(0, S_chunk - b)`` per non-tail chunk, so
+    # any chunk whose sole occupant overflows ``S_chunk`` contributes *zero*
+    # waste and would let a too-small candidate win on a tie. Worse, splitting
+    # a single tensor across chunks isn't supported by build_layout. Drop
+    # those candidates up front so the search runs only over feasible sizes.
+    max_param_bytes = max(sizes_in_order, default=0)
+    feasible = tuple(S for S in candidates if S >= max_param_bytes)
+    if not feasible:
+        raise ValueError(
+            f"No candidate S_chunk >= max param tensor size "
+            f"({max_param_bytes} bytes); grid {candidates} is incompatible "
+            f"with this model — caller bug."
+        )
+    candidates = feasible
+
     best_S = candidates[0]
     best_waste = _simulate_waste(sizes_in_order, best_S)
     for S in candidates[1:]:

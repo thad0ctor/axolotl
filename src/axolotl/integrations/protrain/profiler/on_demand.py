@@ -363,9 +363,12 @@ class OnDemandTensorMgr:
 
         if original_device.type == "cpu":
             # CPU-resident: cpu_storage IS the original tensor. Pin it for
-            # async H2D copies in pre-gather, best-effort.
+            # async H2D copies in pre-gather, best-effort. Pin into a
+            # separate variable and only swap on success, so a partial
+            # failure inside pin_memory() cannot drop the original tensor.
             try:
-                cpu_storage = param.data.pin_memory()
+                pinned = param.data.pin_memory()
+                cpu_storage = pinned
             except Exception:  # noqa: BLE001 - pinning is best-effort
                 cpu_storage = param.data
                 self._n_pin_failures += 1
@@ -509,11 +512,12 @@ class OnDemandTensorMgr:
         backward and fails deep in autograd C++.
         """
         try:
-            # Non-tensor or already on GPU: nothing to do.
-            is_cpu = getattr(packed, "is_cpu", None)
-            if is_cpu is False:
+            # Non-tensor or already on GPU: nothing to do. ``torch.Tensor``
+            # exposes ``is_cuda`` but not ``is_cpu``; check device.type instead.
+            device = getattr(packed, "device", None)
+            if device is None:
                 return packed
-            if is_cpu is None:
+            if getattr(device, "type", None) != "cpu":
                 return packed
             if self.device is None:
                 # No target device known — autograd will surface the CPU/CUDA

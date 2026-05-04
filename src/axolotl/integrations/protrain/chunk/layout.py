@@ -92,6 +92,22 @@ def build_layout(
                 "not present in model.named_parameters()"
             )
 
+    # Validate block_spans entries up front: every ParamId referenced by any
+    # block must exist in the model. Without this check, an unknown ParamId
+    # would be silently skipped on the per-iteration ``param_sizes[pid]``
+    # lookup path (or worse, raise deep inside the placement loop with a
+    # confusing traceback). Fail fast at the API boundary instead.
+    block_referenced: set[ParamId] = set()
+    for params in block_spans.values():
+        block_referenced.update(params)
+    missing_block_pids = block_referenced - param_sizes.keys()
+    if missing_block_pids:
+        missing_sorted = sorted(repr(p) for p in missing_block_pids)
+        raise KeyError(
+            f"block_spans references unknown param(s) {', '.join(missing_sorted)}; "
+            "not present in model.named_parameters()"
+        )
+
     chunks: list[list[ParamId]] = [[]]
     chunk_bytes: list[int] = [0]
     param_to_chunk: dict[ParamId, ChunkId] = {}

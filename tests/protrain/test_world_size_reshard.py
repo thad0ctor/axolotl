@@ -121,17 +121,21 @@ def _save_worker(rank: int, world_size: int, tmpdir: str) -> None:
             os.makedirs(save_dir, exist_ok=True)
         dist.barrier()
 
-        if rank == 0:
-            wrote = _save_protrain_optim_dir(
-                optim,
-                save_dir,
-                step=1,
-                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
-                rank=0,
-                world_size=world_size,
-            )
-            if not wrote:
-                raise RuntimeError("rank-0 save returned False")
+        # _save_protrain_optim_dir is collective (lockstep broadcast in its
+        # finally — see api/checkpoint.py:_broadcast_status_or_raise); every
+        # rank must call it. Only rank-0 actually writes (gated internally),
+        # but every rank must reach the broadcast so a rank-0 write failure
+        # raises in lockstep instead of deadlocking the trailing barrier.
+        wrote = _save_protrain_optim_dir(
+            optim,
+            save_dir,
+            step=1,
+            save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+            rank=rank,
+            world_size=world_size,
+        )
+        if not wrote:
+            raise RuntimeError(f"rank {rank}: save returned False")
         dist.barrier()
 
         with open(os.path.join(tmpdir, f"save_rank{rank}.done"), "w") as f:

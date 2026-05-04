@@ -335,6 +335,19 @@ class Scheduler:
         if self.chunk_manager.buffer_pool is None:
             return
 
+        # CRITICAL: a resident tag only proves a slot is *assigned* to
+        # this chunk; the H2D copy that fills it may still be in flight
+        # on ``_prefetch_stream`` (kicked off by the previous backward
+        # step's lookahead at the bottom of this method, which
+        # intentionally does NOT sync — see below). Compute reads on the
+        # current stream must wait on that prefetch before trusting any
+        # resident-tag hit, otherwise a "skip prefetch" decision races
+        # the in-flight bytes and the gradient kernels see partially
+        # populated memory. ``_sync_prefetch_with_compute`` is a
+        # ``compute.wait_stream(prefetch_stream)`` — cheap when the
+        # prefetch is already done, correct when it isn't.
+        self._sync_prefetch_with_compute()
+
         # Consult the pool first — gathers that hit the resident tag are
         # essentially free; gathers that miss trigger a fresh H2D copy
         # onto the prefetch stream.

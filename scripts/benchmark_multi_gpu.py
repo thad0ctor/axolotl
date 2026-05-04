@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import statistics
 import subprocess  # nosec B404
 import sys
@@ -103,7 +104,7 @@ _WORKER_SCRIPT = textwrap.dedent(
         try:
             _run(rank, world_size, out_dir, mode, bs, seq, n_iters, n_warmup)
         finally:
-            if world_size > 1:
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
                 try:
                     dist.barrier()
                 except Exception:
@@ -373,6 +374,10 @@ def _launch_mode(
 ) -> list[dict]:
     """Run one mode in a subprocess, return the per-rank stats list."""
     out_dir = work_dir / f"stats_{mode}"
+    # Clear stale per-rank stats from any prior failed/partial run so we
+    # don't pick up rank*.json files that were never overwritten.
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()

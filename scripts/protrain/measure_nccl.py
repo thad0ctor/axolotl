@@ -147,6 +147,8 @@ def main() -> None:
         default=None,
         help="World size to spawn. Required when not invoked under torchrun.",
     )
+    parser.add_argument("--n-iters", type=int, default=8)
+    parser.add_argument("--n-warmup", type=int, default=2)
     args, extra = parser.parse_known_args()
     if args.world_size is None or args.world_size < 1:
         parser.error(
@@ -157,12 +159,18 @@ def main() -> None:
         # Single-rank just returns empty tables; emit them directly.
         from axolotl.integrations.protrain.profiler.hw_bench import measure_nccl
 
-        gather_table, reduce_table = measure_nccl(world_size=1)
+        gather_table, reduce_table = measure_nccl(
+            world_size=1,
+            n_iters=args.n_iters,
+            n_warmup=args.n_warmup,
+        )
         out = {
             "world_size": 1,
             "backend": "single-rank",
             "gather": {str(k): v for k, v in gather_table.items()},
             "reduce": {str(k): v for k, v in reduce_table.items()},
+            "n_iters": args.n_iters,
+            "n_warmup": args.n_warmup,
         }
         # When --output is in extra args we honour it; otherwise default name.
         out_path = Path("scripts/nccl_results_world1.json")
@@ -175,7 +183,16 @@ def main() -> None:
         print(f"wrote {out_path} (empty tables — single-rank)", file=sys.stderr)
         return
 
-    rc = _self_spawn(args.world_size, extra)
+    # Forward calibration knobs to the spawned ranks so multi-rank runs
+    # honour the same --n-iters / --n-warmup values parsed here.
+    forwarded = [
+        "--n-iters",
+        str(args.n_iters),
+        "--n-warmup",
+        str(args.n_warmup),
+        *extra,
+    ]
+    rc = _self_spawn(args.world_size, forwarded)
     sys.exit(rc)
 
 

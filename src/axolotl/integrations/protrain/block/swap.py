@@ -239,11 +239,20 @@ def _make_pack_unpack(
             return handle
 
         # H2D from pinned slot to a fresh GPU buffer.
-        # ``record_stream`` keeps the slot alive across streams; the
-        # compute stream waits on the H2D event before any kernel reads
-        # ``gpu_buf``.
+        # ``record_stream`` keeps the GPU-side ``gpu_buf`` storage alive
+        # across the swap stream, but pinned **host** memory is NOT
+        # managed by the CUDA caching allocator, so ``record_stream``
+        # gives us nothing on the source side — the only thing that
+        # protects the pinned slot from a concurrent ``pool.close()``
+        # (which frees the pinned region as soon as ``_live_borrows``
+        # hits zero, see ``PinnedHostMemory.close``) is keeping the
+        # borrow alive until the DMA has actually completed. Stream
+        # ordering on swap_stream itself guards reuse-via-acquire
+        # within the same stream, but ``close()`` consults the borrow
+        # counter on the host with no awareness of swap_stream events.
         gpu_buf = torch.empty(handle.shape, dtype=handle.dtype, device=handle.device)
         _swap_stream_wait_compute(handle.swap_stream)
+        h2d_done: "torch.cuda.Event | None" = None
         with torch.cuda.stream(handle.swap_stream):
             slot_view = handle.pool._pinned.buffer(handle.slot_id)  # noqa: SLF001
             slot_src = (
@@ -251,25 +260,51 @@ def _make_pack_unpack(
             )
             gpu_buf.copy_(slot_src, non_blocking=True)
             gpu_buf.record_stream(handle.swap_stream)
-            # Release the borrow taken on the line above (the matching
-            # acquire-time borrow is released by pool.release below).
-            # ``record_stream`` keeps the underlying bytes alive across
-            # streams for the in-flight H2D, so dropping the borrow
-            # here is safe; we must drop it before the slot view
-            # leaves scope or the allocator's close()-guard would see
-            # a phantom outstanding borrow.
+            # Record an event on swap_stream that fires when the H2D
+            # copy above has completed. We use this below to gate the
+            # borrow release so the pinned slot stays "live" (from the
+            # allocator's perspective) until the DMA is actually done.
+            h2d_done = torch.cuda.Event()
+            h2d_done.record(handle.swap_stream)
+            # Drop our local references to the slot view BEFORE
+            # releasing the borrow that backs them. ``release_buffer``
+            # only decrements the borrow counter; the underlying
+            # storage stays alive while the DMA is in flight thanks to
+            # the event-gated release sequencing below.
             del slot_view, slot_src
-            handle.pool._pinned.release_buffer(handle.slot_id)  # noqa: SLF001
         _compute_stream_wait_swap(handle.swap_stream)
 
-        # Return the slot to the pool. The H2D copy reads from the
-        # pinned slot on swap_stream; record_stream above keeps the
-        # slot's lifetime past the H2D's consumption. Subsequent
-        # ``acquire()`` callers must still respect the swap stream's
-        # completion before writing — the pool itself does no syncing,
-        # so callers MUST wait on ``swap_stream`` before re-using the
-        # slot for a new D2H. Inside the same step backward is purely
-        # consumer-side, so this is safe.
+        # Block the host until the H2D copy has actually retired on
+        # the device. Only after the event has fired is it safe to
+        # decrement the pinned-allocator borrow counter, because that
+        # counter is the sole signal ``PinnedHostMemory.close()`` uses
+        # to decide whether ``cudaFreeHost`` is safe — releasing
+        # before the DMA finishes opens a window where a concurrent
+        # ``close()`` would free the pinned region mid-transfer and
+        # the H2D DMA would read freed memory (silent data corruption
+        # in the activation that backward then consumes).
+        #
+        # The host-side wait is acceptable here: backward is the
+        # consumer of the unpacked tensor and will already wait on
+        # swap_stream before the kernel that reads ``gpu_buf`` runs;
+        # this synchronize() simply pulls that wait to the host so
+        # the borrow accounting is honest. Pipelined throughput is
+        # unaffected as long as backward kernels keep the compute
+        # stream busy while the next unpack's H2D enqueues.
+        if h2d_done is not None:
+            h2d_done.synchronize()
+
+        # Now safe to release the borrow taken on the second
+        # ``buffer()`` call inside the swap-stream block above (the
+        # acquire-time borrow is released through ``pool.release``).
+        handle.pool._pinned.release_buffer(handle.slot_id)  # noqa: SLF001
+
+        # Return the slot to the pool. Same-stream ordering guards
+        # reuse: any future D2H against this slot will be enqueued
+        # on swap_stream and is therefore serialized after the
+        # just-completed H2D. The host-side synchronize above
+        # additionally ensures the borrow accounting reflects the
+        # true in-flight state for any concurrent ``close()``.
         handle.pool.release(handle.slot_id)
 
         # Restore requires_grad flag if the original tensor had one.

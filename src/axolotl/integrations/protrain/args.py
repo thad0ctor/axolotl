@@ -28,6 +28,34 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 
+# Canonical plugin identifier strings that activate the ProTrain validators.
+# `axolotl.integrations.protrain.ProTrainPlugin` is the form used by tests,
+# the example config (examples/protrain/3090-7b-lora.yml), and the docstrings
+# in this file — it's the only form that actually loads (the integration
+# loader rsplits on '.' for module/class). The bare module form
+# `axolotl.integrations.protrain` is included so that a user-typo'd
+# truncation still trips the validator (giving a clean ValueError) instead
+# of being silently treated as a non-ProTrain plugin and skipping the mutex
+# checks.
+_PROTRAIN_PLUGIN_KEYS = frozenset(
+    {
+        "axolotl.integrations.protrain",
+        "axolotl.integrations.protrain.ProTrainPlugin",
+    }
+)
+
+
+def _has_protrain_plugin(plugins) -> bool:
+    """Return True iff the iterable contains an explicit ProTrain plugin id.
+
+    Uses exact-match against ``_PROTRAIN_PLUGIN_KEYS`` rather than a
+    substring check so that unrelated plugin names containing the
+    substring ``"protrain"`` (or future plugins under a different module
+    path) cannot accidentally activate the ProTrain validators.
+    """
+    return any(isinstance(p, str) and p in _PROTRAIN_PLUGIN_KEYS for p in plugins)
+
+
 class ProTrainArgs(BaseModel):
     """Input args for the ProTrain plugin.
 
@@ -294,10 +322,7 @@ class ProTrainArgs(BaseModel):
         if not data.get("protrain_auto_memory"):
             return data
         plugins = data.get("plugins") or []
-        has_protrain = any(
-            isinstance(p, str) and "protrain" in p.lower() for p in plugins
-        )
-        if not has_protrain:
+        if not _has_protrain_plugin(plugins):
             raise ValueError(
                 "`protrain_auto_memory: true` requires the ProTrain plugin to be "
                 "listed in `plugins:`. Add "
@@ -339,7 +364,7 @@ class ProTrainArgs(BaseModel):
         if not data.get("protrain_auto_memory"):
             return data
         plugins = data.get("plugins") or []
-        if not any(isinstance(p, str) and "protrain" in p.lower() for p in plugins):
+        if not _has_protrain_plugin(plugins):
             return data
         if data.get("deepspeed"):
             raise ValueError(
@@ -408,7 +433,7 @@ class ProTrainArgs(BaseModel):
         if not data.get("protrain_auto_memory"):
             return data
         plugins = data.get("plugins") or []
-        if not any(isinstance(p, str) and "protrain" in p.lower() for p in plugins):
+        if not _has_protrain_plugin(plugins):
             return data
         if not (data.get("base_model") or data.get("model_name_or_path")):
             raise ValueError(

@@ -104,10 +104,17 @@ class PinnedHostMemory:
         self._fallback_tensor: "torch.Tensor | None" = None
         self._torch_tensor: "torch.Tensor | None" = None
         self._is_precise_size: bool = False
-        # Outstanding views handed out by ``buffer(i)`` that have not yet
-        # been returned via ``release_buffer(i)``. Used by ``close()`` to
-        # refuse free-while-borrowed (use-after-free guard).
-        self._live_borrows: int = 0
+        # Per-slot borrow counts: ``{slot_idx: outstanding_borrows}``.
+        # ``buffer(i)`` increments ``_live_borrows[i]``; ``release_buffer(i)``
+        # decrements it (and prunes the key when it hits zero so ``close()``'s
+        # check is "is this dict non-empty"). A per-slot map (rather than a
+        # single global counter) lets the pool answer *which* slot is still
+        # live, which the swap pipeline needs to gate event-based release of
+        # individual slots without conflating concurrent borrows on others.
+        # Reentrant / multi-borrow semantics on the same slot are supported
+        # (count-per-slot, not set-of-live-slots) because callers may stage
+        # overlapping H2D copies on the same slot during pipelined refill.
+        self._live_borrows: dict[int, int] = {}
 
         cudart = _load_cudart()
         if cudart is None:
@@ -218,13 +225,13 @@ class PinnedHostMemory:
         assert self._torch_tensor is not None
         start = i * self.S_chunk
         view = self._torch_tensor.narrow(0, start, self.S_chunk)
-        self._live_borrows += 1
+        self._live_borrows[i] = self._live_borrows.get(i, 0) + 1
         return view
 
     def release_buffer(self, i: int) -> None:
-        """Decrement the borrow counter for slot ``i``.
+        """Decrement the borrow count for slot ``i``.
 
-        Pairs with :meth:`buffer`. The counter is the only ownership
+        Pairs with :meth:`buffer`. The per-slot count is the ownership
         signal :meth:`close` consults; failing to release leaves
         ``close()`` raising. Index validation is best-effort so this
         is safe to call from cleanup paths even if the slot id was
@@ -239,14 +246,52 @@ class PinnedHostMemory:
                 self.n_buffer,
             )
             return
-        if self._live_borrows <= 0:
+        count = self._live_borrows.get(i, 0)
+        if count <= 0:
             LOG.warning(
-                "PinnedHostMemory.release_buffer(%d): no outstanding borrow; "
-                "double-release?",
+                "PinnedHostMemory.release_buffer(%d): no outstanding borrow "
+                "for that slot; double-release?",
                 i,
             )
             return
-        self._live_borrows -= 1
+        if count == 1:
+            # Prune so ``_live_borrows`` is empty iff every slot is released —
+            # makes ``close()``'s check a simple truthiness test on the dict.
+            del self._live_borrows[i]
+        else:
+            self._live_borrows[i] = count - 1
+
+    # ---- introspection helpers (additive; backwards compatible) -----------
+
+    def borrow_count(self, i: int) -> int:
+        """Return the number of outstanding borrows on slot ``i`` (0 if none).
+
+        Additive helper for callers (e.g. the swap pipeline) that need to
+        reason about per-slot lifetime — the previous global counter could
+        not distinguish which slot was live.
+        """
+        if not 0 <= i < self.n_buffer:
+            return 0
+        return self._live_borrows.get(i, 0)
+
+    def live_slots(self) -> list[int]:
+        """Return slot indices with at least one outstanding borrow.
+
+        Order is unspecified. Useful for diagnostics and for the swap
+        pipeline's event-based release flow, which needs to enumerate which
+        slots are still in flight.
+        """
+        return list(self._live_borrows.keys())
+
+    @property
+    def total_live_borrows(self) -> int:
+        """Aggregate borrow count across all slots.
+
+        Preserves the semantics of the prior ``_live_borrows`` integer for
+        any external caller that only cared about "is anything still
+        borrowed" — though :meth:`live_slots` is preferred for new code.
+        """
+        return sum(self._live_borrows.values())
 
     def close(self) -> None:
         """Free the pinned allocation. Idempotent.
@@ -264,11 +309,14 @@ class PinnedHostMemory:
         """
         if self._closed:
             return
-        if self._live_borrows > 0:
+        if self._live_borrows:
+            outstanding = sum(self._live_borrows.values())
+            slots = sorted(self._live_borrows.keys())
             raise RuntimeError(
-                f"PinnedHostMemory.close(): {self._live_borrows} slot view(s) "
-                "still borrowed; release them via release_buffer() before close() "
-                "to avoid use-after-free on the pinned region."
+                f"PinnedHostMemory.close(): {outstanding} slot view(s) "
+                f"still borrowed across slots {slots}; release them via "
+                "release_buffer() before close() to avoid use-after-free "
+                "on the pinned region."
             )
         self._closed = True
         # Drop torch views first so no tensor outlives the underlying memory.
@@ -292,14 +340,16 @@ class PinnedHostMemory:
         try:
             if self._closed:
                 return
-            if self._live_borrows > 0:
+            if self._live_borrows:
                 LOG.warning(
                     "PinnedHostMemory.__del__: %d slot view(s) still borrowed "
-                    "at GC time; forcing free. Holders touching the region "
-                    "after this point will hit freed memory.",
-                    self._live_borrows,
+                    "across slots %s at GC time; forcing free. Holders "
+                    "touching the region after this point will hit freed "
+                    "memory.",
+                    sum(self._live_borrows.values()),
+                    sorted(self._live_borrows.keys()),
                 )
-                self._live_borrows = 0
+                self._live_borrows.clear()
             self.close()
         except Exception:  # noqa: BLE001 — destructors must not throw
             LOG.exception("Error during PinnedHostMemory.__del__ cleanup")
