@@ -487,10 +487,30 @@ class ChunkManager:
             raise ValueError(
                 f"first_n={first_n} out of range [0, {self.layout.N_chunk}]"
             )
-        self._persistent_ids = {cast(ChunkId, i) for i in range(first_n)}
-        self._non_persistent_ids = {
+        new_persistent_ids = {cast(ChunkId, i) for i in range(first_n)}
+        new_non_persistent_ids = {
             cast(ChunkId, i) for i in range(first_n, self.layout.N_chunk)
         }
+        # CodeRabbit R2-04 fix: once chunks have been materialized into
+        # CPU placeholder slots or persistent GPU buffers, the residency
+        # split is baked into the runtime state — a previously offloaded
+        # chunk newly tagged persistent would early-return in ``gather``
+        # while its params still point at empty GPU placeholders, and a
+        # previously persistent chunk newly tagged non-persistent would
+        # have no ``_cpu_slots`` to drain grads into. Reject the change
+        # so the failure surfaces immediately rather than as silent
+        # weight corruption many steps later.
+        if (self._cpu_slots or self._persistent_buffers) and (
+            new_persistent_ids != self._persistent_ids
+            or new_non_persistent_ids != self._non_persistent_ids
+        ):
+            raise RuntimeError(
+                "ChunkManager.mark_persistent() cannot change the residency "
+                "split after chunks have been materialized; rebuild the "
+                "manager first."
+            )
+        self._persistent_ids = new_persistent_ids
+        self._non_persistent_ids = new_non_persistent_ids
         LOG.debug(
             "ChunkManager.mark_persistent: %d / %d chunks resident on GPU",
             first_n,
@@ -1332,44 +1352,52 @@ class ChunkManager:
             remaining = cm._grad_remaining.get(captured_cid, 0) - 1
             cm._grad_remaining[captured_cid] = remaining
             if remaining == 0:
-                # All of the chunk's trainable params are drained. If a
-                # CPU FusedAdam adapter is attached, install the CPU
-                # shards onto the param objects and kick off the async
-                # step — the adapter was built against the GPU param
-                # refs but consumes grads from our CPU shards, so we
-                # temporarily repoint ``.data`` and ``.grad`` for it.
+                # All of the chunk's trainable params are drained. The
+                # CPU FusedAdam adapter is responsible for actually
+                # updating the offloaded weights — without it, the CPU
+                # master shards never advance and every offloaded chunk
+                # silently retains its iter-0 weights forever.
                 #
-                # When ``cpu_optim is None`` (no DeepSpeedCPUAdam — e.g.
-                # the system toolchain's CUDA version mismatches torch's
-                # build), we deliberately skip the repoint: leaving
-                # ``param.grad`` as None and ``param.data`` as the empty
-                # GPU placeholder keeps every ``nn.Parameter`` device-
-                # consistent across iterations. Without this guard,
-                # iter 0's hook would leave 56 trainable LoRA params
-                # pointing at CPU storage and iter 1's backward would
-                # trip the "expected same device" check when autograd
-                # accumulates the new GPU grad onto the stale CPU grad.
-                if cm.cpu_optim is not None:
-                    cm._ensure_cpu_grads_attached(captured_cid)
-                    # BUG 4 FIX: after the worker thread runs
-                    # ``optim.step()`` the CPU shards hold the updated
-                    # weights, but ``param.data`` still points at the
-                    # CPU tensor (we repointed it in
-                    # _ensure_cpu_grads_attached). Install a post_step
-                    # callback that repoints ``param.data`` back to the
-                    # GPU empty placeholder so any intermediate code
-                    # reading ``.data`` between iters (clip_grad_norm_,
-                    # checkpoint save, Trainer metric hooks) sees a
-                    # zero-element GPU tensor — matching the invariant
-                    # the rest of the runtime relies on. The CPU master
-                    # weights are still held by ``slot.cpu_data`` so
-                    # the next gather() flows the updated values back
-                    # to GPU via its H2D copy.
-                    cm.cpu_optim.step_async(
-                        captured_cid,
-                        d2h_event=d2h_event,
-                        post_step=cm._make_post_cpu_step_repoint(captured_cid),
+                # CodeRabbit R2-05 fix: fail fast the FIRST time an
+                # offloaded chunk reaches its CPU-step path with no
+                # ``cpu_optim`` attached. Prior code skipped the
+                # ``step_async`` and just reset ``_grad_remaining`` so
+                # the next backward could fire again — which masked the
+                # missing optimizer behind silently stale weights.
+                if cm.cpu_optim is None:
+                    raise RuntimeError(
+                        "ChunkManager: missing CPU optimizer for offloaded "
+                        f"chunk {int(captured_cid)} — DeepSpeedCPUAdam was "
+                        "not attached, so the offload step path cannot "
+                        "update the CPU master weights. Install "
+                        "deepspeed (with a matching CUDA toolchain) or "
+                        "configure n_persist == N_chunk so no chunks are "
+                        "offloaded."
                     )
+                # Install the CPU shards onto the param objects and kick
+                # off the async step — the adapter was built against the
+                # GPU param refs but consumes grads from our CPU shards,
+                # so we temporarily repoint ``.data`` and ``.grad`` for it.
+                cm._ensure_cpu_grads_attached(captured_cid)
+                # BUG 4 FIX: after the worker thread runs
+                # ``optim.step()`` the CPU shards hold the updated
+                # weights, but ``param.data`` still points at the
+                # CPU tensor (we repointed it in
+                # _ensure_cpu_grads_attached). Install a post_step
+                # callback that repoints ``param.data`` back to the
+                # GPU empty placeholder so any intermediate code
+                # reading ``.data`` between iters (clip_grad_norm_,
+                # checkpoint save, Trainer metric hooks) sees a
+                # zero-element GPU tensor — matching the invariant
+                # the rest of the runtime relies on. The CPU master
+                # weights are still held by ``slot.cpu_data`` so
+                # the next gather() flows the updated values back
+                # to GPU via its H2D copy.
+                cm.cpu_optim.step_async(
+                    captured_cid,
+                    d2h_event=d2h_event,
+                    post_step=cm._make_post_cpu_step_repoint(captured_cid),
+                )
                 # Reset the counter now so the next backward fires again.
                 cm._grad_remaining[captured_cid] = cm._grad_initial.get(captured_cid, 0)
 
@@ -1868,6 +1896,7 @@ class ChunkManager:
         # input order), so a linear scan per region is fine.
 
         d2h_event = None
+        any_trainable_region = False
         for region in shard_state.regions:
             # CodeRabbit R07 fix: skip frozen-only regions outright.
             # Their ``shard_param`` was constructed with
@@ -1883,6 +1912,7 @@ class ChunkManager:
             # guaranteed itself frozen and will never produce a grad.
             if not region.is_trainable:
                 continue
+            any_trainable_region = True
 
             r_start = region.chunk_offset
             r_end = r_start + region.region_bytes
@@ -1957,6 +1987,27 @@ class ChunkManager:
                 # all previous region copies.
             else:
                 region.shard_param.grad.copy_(my_shard_grad_gpu)  # type: ignore[union-attr]
+
+        # CodeRabbit R2-05 fix: if we just reduce_scatter'd / D2H'd grads
+        # for at least one trainable region but no CPU optimizer is
+        # attached, the offloaded master weights would silently never
+        # advance. Raise BEFORE resetting ``_grad_remaining`` so the
+        # next backward fires the same condition again rather than
+        # silently masking the bad state. Distinct from the R07
+        # frozen-region guard above (which is about ``is_trainable``
+        # per region — purely a routing concern within this loop):
+        # this check fires when at least one trainable region exists
+        # and the chunk-level ``cpu_optim`` hook is missing entirely.
+        if any_trainable_region and self.cpu_optim is None:
+            raise RuntimeError(
+                "ChunkManager: missing CPU optimizer for offloaded "
+                f"chunk {int(chunk_id)} — DeepSpeedCPUAdam was not "
+                "attached, so the sharded reduce_scatter/offload path "
+                "cannot update the CPU master weights. Install "
+                "deepspeed (with a matching CUDA toolchain) or "
+                "configure n_persist == N_chunk so no chunks are "
+                "offloaded."
+            )
 
         # Reset the hook counter so the next backward's per-param
         # decrements land correctly.

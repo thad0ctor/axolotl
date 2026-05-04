@@ -390,4 +390,4 @@ class SwappedBlock(nn.Module):
         return f"mode={self._protrain_wrapped_mode.value}"
 
 
-__all__ = ["SwappedBlock", "SIZE_THRESHOLD_BYTES"]
+__all__ = ["SIZE_THRESHOLD_BYTES", "SwappedBlock"]

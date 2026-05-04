@@ -52,7 +52,17 @@ def _has_protrain_plugin(plugins) -> bool:
     substring check so that unrelated plugin names containing the
     substring ``"protrain"`` (or future plugins under a different module
     path) cannot accidentally activate the ProTrain validators.
+
+    Tolerates malformed ``plugins`` values: a non-iterable scalar (None,
+    int, bool, dict, etc.) returns False rather than raising
+    ``TypeError`` from ``any(... for p in plugins)``, and non-string
+    entries inside the iterable are skipped via the ``isinstance(p, str)``
+    guard. This keeps config-validation failures actionable — the user
+    sees the schema-level type error on ``plugins`` itself rather than
+    a confusing crash from this helper.
     """
+    if not isinstance(plugins, (list, tuple, set, frozenset)):
+        return False
     return any(isinstance(p, str) and p in _PROTRAIN_PLUGIN_KEYS for p in plugins)
 
 
@@ -326,7 +336,8 @@ class ProTrainArgs(BaseModel):
             raise ValueError(
                 "`protrain_auto_memory: true` requires the ProTrain plugin to be "
                 "listed in `plugins:`. Add "
-                "`- axolotl.integrations.protrain` to the `plugins` list."
+                "`- axolotl.integrations.protrain.ProTrainPlugin` to the "
+                "`plugins` list."
             )
         return data
 

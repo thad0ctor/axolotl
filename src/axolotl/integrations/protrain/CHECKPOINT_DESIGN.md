@@ -1,6 +1,6 @@
 # ProTrain Optimizer Checkpoint/Resume — Design Note (v2)
 
-**Status:** design-only, no implementation yet
+**Status:** historical design note; Phase 1 implementation has landed (see `api/checkpoint.py` and plugin wiring). Phase 2 (DDP + ZeRO-3) is documented in `CHECKPOINT_DESIGN_PHASE2.md` and has also shipped.
 **Scope:** Item 3 from the paper-fidelity follow-up plan
 **Branch base:** `myfork/protrain-paper-fidelity` @ `99afc31c`
 
@@ -641,6 +641,7 @@ new set is:
 
 ---
 
-*This design note is the prerequisite to a feature branch off
-`protrain-paper-fidelity` named e.g. `protrain-optim-checkpoint`. No
-implementation should start until §8 is answered.*
+*Historical note: this document captures the pre-implementation design
+decisions for Phase 1 (single-rank, non-ZeRO). Phase 1 has shipped;
+Phase 2 (DDP + ZeRO-3) is covered in `CHECKPOINT_DESIGN_PHASE2.md`.
+Retained for context on why the current code looks the way it does.*

@@ -638,10 +638,12 @@ allocator issue from Phase 1. Use pytest-forked or subprocess.
 
 ---
 
-## 8. Open questions for the user
+## 8. Open questions (resolved during implementation)
 
-These are the remaining design choices that need direction before
-implementation begins.
+These were the design choices that needed direction before
+implementation. They are recorded here for historical context; the
+recommendations below are what shipped on
+`protrain-optim-checkpoint-phase2-mode-c`.
 
 1. **World-size mismatch policy (§4.1).** Recommend Option B (allow
    for replicated, error for sharded). Confirm.

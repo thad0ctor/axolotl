@@ -52,6 +52,9 @@ def measure_pcie(
             on a 3090 (~26 GB/s peak) without blowing up small-device budgets.
         n_iters: repetitions — the first is a warmup and is discarded.
     """
+    if n_iters < 1:
+        raise ValueError(f"measure_pcie: n_iters must be >= 1, got {n_iters}")
+
     import torch
 
     if not torch.cuda.is_available():
@@ -139,6 +142,9 @@ def measure_cpu_adam(n_params: int = 10_000_000, n_iters: int = 10) -> float:
         20 (see ``_ADAM_BYTES_PER_PARAM`` for the accounting breakdown).
         ``0.0`` on compile / import failure.
     """
+    if n_iters < 1:
+        raise ValueError(f"measure_cpu_adam: n_iters must be >= 1, got {n_iters}")
+
     try:
         from deepspeed.ops.adam import (
             DeepSpeedCPUAdam,  # type: ignore[import-not-found]
@@ -267,6 +273,9 @@ def measure_gpu_adam(
         Throughput in bytes/sec (n_params * 20 / median_iter_s). 0.0 if
         no Adam implementation is constructible.
     """
+    if n_iters < 1:
+        raise ValueError(f"measure_gpu_adam: n_iters must be >= 1, got {n_iters}")
+
     import torch
     from torch import nn
 
@@ -425,6 +434,11 @@ def measure_nccl(
     tuple[dict[int, float], dict[int, float]]
         ``(gather_seconds_by_size, reduce_seconds_by_size)``.
     """
+    if n_iters < 1:
+        raise ValueError(f"measure_nccl: n_iters must be >= 1, got {n_iters}")
+    if n_warmup < 0:
+        raise ValueError(f"measure_nccl: n_warmup must be >= 0, got {n_warmup}")
+
     if world_size == 1:
         return ({}, {})
 
@@ -597,6 +611,11 @@ def measure_compute_rate(
         Warmup iterations (discarded). The first iter typically pays
         cuBLAS handle init + JIT cost.
     """
+    if n_iters < 1:
+        raise ValueError(f"measure_compute_rate: n_iters must be >= 1, got {n_iters}")
+    if n_warmup < 0:
+        raise ValueError(f"measure_compute_rate: n_warmup must be >= 0, got {n_warmup}")
+
     import torch
 
     if not torch.cuda.is_available():

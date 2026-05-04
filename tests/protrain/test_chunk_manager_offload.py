@@ -502,6 +502,24 @@ def test_grad_offload_hook_fires() -> None:
     mgr, layout, pool, host = _build_chunk_manager(
         model, n_persist=1, S_chunk=S_chunk, n_buffer=n_non_persist
     )
+    # The grad-offload hook routes to ``cm.cpu_optim.step_async`` once a
+    # chunk's last param drains; ChunkManager raises RuntimeError when
+    # ``cpu_optim is None`` on that path (CodeRabbit R2-05 — silent skip
+    # would mask stale offloaded weights). This test only validates the
+    # grad-offload portion of the hook, not the optimizer step, so a
+    # no-op stub satisfies the contract without depending on
+    # DeepSpeedCPUAdam being available on the rig.
+
+    class _NoOpCpuOptim:
+        """Minimal CpuFusedAdamAdapter surface used by the chunk-step path."""
+
+        def step_async(self, chunk_id, *, d2h_event=None, post_step=None):  # noqa: ARG002
+            return None
+
+        def wait_all(self) -> None:
+            return None
+
+    mgr.cpu_optim = _NoOpCpuOptim()  # type: ignore[assignment]
     mgr.materialize_offload()
 
     # Gather all non-persistent chunks so the forward has GPU-resident

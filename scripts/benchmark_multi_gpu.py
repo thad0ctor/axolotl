@@ -103,12 +103,19 @@ _WORKER_SCRIPT = textwrap.dedent(
             )
         try:
             _run(rank, world_size, out_dir, mode, bs, seq, n_iters, n_warmup)
-        finally:
+            # Barrier ONLY on the success path. CodeRabbit R2-01: a
+            # teardown barrier in ``finally`` blocks remaining workers
+            # when one peer has already raised, turning a single-rank
+            # failure into a full ``_launch_mode`` 30-min timeout. On
+            # the failure path we skip the barrier and rely on
+            # ``destroy_process_group`` alone.
             if world_size > 1 and dist.is_available() and dist.is_initialized():
                 try:
                     dist.barrier()
                 except Exception:
                     pass
+        finally:
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
                 dist.destroy_process_group()
 
 

@@ -79,44 +79,50 @@ def _run_as_rank() -> None:
             file=sys.stderr,
         )
 
-    gather_table, reduce_table = measure_nccl(
-        world_size=world_size,
-        n_iters=args.n_iters,
-        n_warmup=args.n_warmup,
-    )
-
-    dist.barrier()
-
-    if rank == 0:
-        out_path = Path(
-            args.output
-            if args.output is not None
-            else f"scripts/nccl_results_world{world_size}.json"
+    success = False
+    try:
+        gather_table, reduce_table = measure_nccl(
+            world_size=world_size,
+            n_iters=args.n_iters,
+            n_warmup=args.n_warmup,
         )
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "world_size": world_size,
-            "backend": backend,
-            "gather": {str(k): v for k, v in gather_table.items()},
-            "reduce": {str(k): v for k, v in reduce_table.items()},
-            "n_iters": args.n_iters,
-            "n_warmup": args.n_warmup,
-        }
-        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        print(f"[rank 0] wrote {out_path}", file=sys.stderr)
-        # Pretty summary
-        print(
-            "\nNCCL results (world={}):\n  payload (MiB)  gather (ms)  reduce (ms)".format(
-                world_size
+        success = True
+
+        if rank == 0:
+            out_path = Path(
+                args.output
+                if args.output is not None
+                else f"scripts/nccl_results_world{world_size}.json"
             )
-        )
-        for size in sorted(gather_table.keys()):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "world_size": world_size,
+                "backend": backend,
+                "gather": {str(k): v for k, v in gather_table.items()},
+                "reduce": {str(k): v for k, v in reduce_table.items()},
+                "n_iters": args.n_iters,
+                "n_warmup": args.n_warmup,
+            }
+            out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            print(f"[rank 0] wrote {out_path}", file=sys.stderr)
+            # Pretty summary
             print(
-                f"  {size >> 20:>13}  {gather_table[size] * 1000:>10.3f}  "
-                f"{reduce_table[size] * 1000:>10.3f}"
+                "\nNCCL results (world={}):\n  payload (MiB)  gather (ms)  reduce (ms)".format(
+                    world_size
+                )
             )
-
-    dist.destroy_process_group()
+            for size in sorted(gather_table.keys()):
+                print(
+                    f"  {size >> 20:>13}  {gather_table[size] * 1000:>10.3f}  "
+                    f"{reduce_table[size] * 1000:>10.3f}"
+                )
+    finally:
+        # Barrier only on the success path: if any rank raised before reaching
+        # this point, peers must not block here waiting for the failed rank.
+        # destroy_process_group() always runs to release NCCL state.
+        if success:
+            dist.barrier()
+        dist.destroy_process_group()
 
 
 def _self_spawn(world_size: int, extra_args: list[str]) -> int:
