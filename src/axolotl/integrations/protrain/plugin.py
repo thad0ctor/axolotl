@@ -944,22 +944,36 @@ class ProTrainPlugin(BasePlugin):
             )
         )
         if is_ddp:
-            wrapped.chunk_manager.skip_internal_grad_reduce = True
             # DDP composition is incompatible with ZeRO-3 sharding —
-            # the sharded path's reduce_scatter would overlap with
-            # DDP's bucketed all_reduce. If sharding was auto-enabled
-            # in post_model_load (before the DDP wrap), warn loudly:
-            # at this point materialize_offload has already created
-            # per-rank shards, so we can't cleanly revert. The
-            # operator should have set ``protrain_zero3_shard: false``
-            # in the YAML when composing with DDP.
+            # ``skip_internal_grad_reduce=True`` only suppresses the
+            # PERSISTENT-chunk all-reduce path; non-persistent sharded
+            # chunks still route through
+            # ``ChunkManager._reduce_scatter_and_offload_shard``
+            # unconditionally whenever ``_chunk_shards`` has entries.
+            # With DDP's bucketed all-reduce ALSO firing on every
+            # parameter, gradients double-synchronize and the effective
+            # update is corrupted. At this point materialize_offload
+            # has already created per-rank shards, so we cannot cleanly
+            # revert here — hard-raise so the operator fixes the
+            # configuration before training starts.
             if getattr(wrapped.chunk_manager, "zero3_shard", False):
-                LOG.warning(
-                    "ProTrain: DDP composition detected but ZeRO-3 sharding "
-                    "is active on the chunk manager. The two paths are not "
-                    "composable (DDP + reduce_scatter would double-reduce). "
-                    "Set ``protrain_zero3_shard: false`` in YAML to silence."
+                raise RuntimeError(
+                    "ProTrain: DDP wrapping detected with active "
+                    "zero3_shard=True. Non-persistent sharded chunks call "
+                    "reduce_scatter via "
+                    "ChunkManager._reduce_scatter_and_offload_shard while "
+                    "DDP also issues bucketed all-reduce on every parameter "
+                    "— gradients double-synchronize and the effective "
+                    "update is corrupted (skip_internal_grad_reduce only "
+                    "silences the persistent-chunk path, not the sharded "
+                    "reduce_scatter). Either (a) rebuild the runtime in "
+                    "replicated mode by setting "
+                    "``protrain_zero3_shard: false`` in YAML before "
+                    "training, or (b) disable DDP wrapping (e.g. by "
+                    "removing DDP from the trainer config) and let "
+                    "ProTrain own grad reduction."
                 )
+            wrapped.chunk_manager.skip_internal_grad_reduce = True
             LOG.info(
                 "ProTrain: detected DDP composition; set "
                 "skip_internal_grad_reduce=True (DDP owns the cross-rank grad "

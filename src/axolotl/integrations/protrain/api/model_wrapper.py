@@ -1535,8 +1535,8 @@ def protrain_model_wrapper(
             raise ValueError(
                 f"n_persist_override={n_persist} out of range [0, {layout.N_chunk}]"
             )
-        if n_buffer < 1:
-            raise ValueError(f"n_buffer_override must be >= 1, got {n_buffer}")
+        if n_buffer < 0:
+            raise ValueError(f"n_buffer_override must be >= 0, got {n_buffer}")
         if not (0 <= n_swap <= n_block):
             raise ValueError(f"n_swap_override={n_swap} out of range [0, {n_block}]")
         if not (0 <= n_checkpoint <= n_block - n_swap):
@@ -1897,6 +1897,7 @@ def protrain_model_wrapper(
             # required per-rank CPU footprint and therefore the
             # replicated-vs-sharded-vs-A decision. Skip on the non-
             # auto path — explicit user flags don't get re-evaluated.
+            mode_changed = False
             if auto_mode:
                 cpu_ram_re = _cpu_ram_per_rank_bytes(_ws_early)
                 new_force_persistent, new_zero3 = _select_mode(
@@ -1910,21 +1911,24 @@ def protrain_model_wrapper(
                     user_zero3_shard=_user_zero3_shard,
                 )
                 # Re-stamp the runtime ``hardware_profile`` to reflect
-                # the post-measurement mode pick. The chunk-manager
-                # rebuild path below (the ``cfg_changed`` branch) reads
-                # this when calling ``_construct_runtime``; the
-                # no-rebuild branch keeps the bootstrap runtime, which
-                # was constructed under the original mode pick — log
-                # only if the mode actually changed so future reruns
-                # land on the new pick from cache directly.
-                if (
+                # the post-measurement mode pick. A mode flip MUST
+                # trigger the ``cfg_changed`` rebuild path below — even
+                # when ``new_result.cfg`` and ``block_map`` match the
+                # bootstrap pick, because the live ChunkManager was
+                # constructed under the OLD mode and silently keeps
+                # running under it (e.g. replicated CPU offload when
+                # only sharded fits). Track ``mode_changed`` here and
+                # fold it into ``cfg_changed`` so the no-rebuild
+                # short-circuit can't strand us on the wrong runtime.
+                mode_changed = (
                     new_force_persistent != force_all_persistent
                     or new_zero3 != zero3_shard
-                ):
+                )
+                if mode_changed:
                     LOG.info(
                         "Phase-2: post-measurement _select_mode changed "
                         "the runtime mode (force_all_persistent %s -> %s, "
-                        "zero3_shard %s -> %s).",
+                        "zero3_shard %s -> %s); rebuilding the runtime.",
                         force_all_persistent,
                         new_force_persistent,
                         zero3_shard,
@@ -1950,8 +1954,14 @@ def protrain_model_wrapper(
             # the search's RAW n_persist, which is smaller than the
             # rebuild's effective post-pinning n_persist, collapsing
             # f_bm to 0 in the calibration arithmetic).
+            #
+            # ``mode_changed`` (set above on the auto path) also forces
+            # a rebuild even when the cfg/block_map match — see the
+            # ``mode_changed`` block above for rationale.
             cfg_changed = (
-                new_result.cfg != boot_cfg or new_result.block_map != boot_block_map
+                new_result.cfg != boot_cfg
+                or new_result.block_map != boot_block_map
+                or mode_changed
             )
             if not cfg_changed:
                 calibrated_peak = _calibrate_peak_with_actual_chunk_bytes(
