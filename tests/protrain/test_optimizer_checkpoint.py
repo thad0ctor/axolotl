@@ -1681,16 +1681,21 @@ def _worker_replicated_load_succeeds_on_all_ranks(
 
             pre_save = _snap()
 
-            if rank == 0:
-                wrote = _save_protrain_optim_dir(
-                    optim,
-                    save_dir,
-                    step=1,
-                    save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
-                    rank=0,
-                    world_size=world_size,
-                )
-                assert wrote is True, "rank-0 save returned False"
+            # _save_protrain_optim_dir is collective (lockstep broadcast in
+            # its finally — see api/checkpoint.py:_broadcast_status_or_raise);
+            # every rank must call it. Only rank-0 actually writes (gated
+            # internally), but every rank must reach the broadcast so a rank-0
+            # write failure raises in lockstep instead of deadlocking the
+            # trailing barrier.
+            wrote = _save_protrain_optim_dir(
+                optim,
+                save_dir,
+                step=1,
+                save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+                rank=rank,
+                world_size=world_size,
+            )
+            assert wrote is True, f"rank {rank}: save returned False"
             dist.barrier()
 
             # Mutate every state tensor on every rank so a no-op load

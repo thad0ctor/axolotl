@@ -295,56 +295,56 @@ def test_param_exec_order_dedups_weight_tied_params():
 def test_sizing_picks_min_waste():
     """Grid-search chooses the minimum-waste candidate, tie-breaking to the larger S.
 
-    The algorithm (Appendix B.1) simulates greedy-fit chunking for each
-    candidate in {32, 64, 128, 256} MB and picks the S_chunk that minimizes
-    the sum of ``S_chunk - bytes_used`` across every *non-tail* chunk.
-    Overfilled chunks (a single param larger than S) contribute zero waste
-    because the clamp ``max(0, S - bytes)`` floors negatives to zero. Ties
-    are broken by picking the *larger* candidate — fewer chunks ⇒ fewer
+    The algorithm (Appendix B.1) first filters the candidate grid to sizes
+    that can hold the largest single parameter — chunks smaller than the
+    largest tensor are infeasible because ``build_layout`` cannot split a
+    tensor across chunks. Among the surviving candidates it simulates
+    greedy-fit chunking and picks the S_chunk minimizing the sum of
+    ``S_chunk - bytes_used`` across every *non-tail* chunk. Ties are
+    broken by picking the *larger* candidate — fewer chunks ⇒ fewer
     scheduler iterations.
     """
     from axolotl.integrations.protrain.chunk.sizing import pick_S_chunk
 
     MB = 1 << 20
 
-    # Case A — oversized-param regime. 8 × 63 MB params: at S=32 every param
-    # overflows its chunk (63 > 32) so waste clamps to 0, which becomes the
-    # global minimum. At S=64 each 63 MB param sits alone in a chunk leaving
-    # 1 MB of trailing slack × 7 preceding chunks = 7 MB of waste. At S=128
-    # pairs fit (2*63=126 ≤ 128) → 4 chunks, 3 preceding × 2 MB = 6 MB
-    # waste. At S=256 quadruples fit → 2 chunks, 1 preceding × 4 MB = 4 MB.
-    # So S=32 (waste 0) strictly wins; S=256 is the runner-up.
+    # Case A — feasibility filter eliminates undersized candidates.
+    # 8 × 63 MB params: S=32 is infeasible (32 < 63 max param) and is
+    # filtered out. Among feasible {64, 128, 256}: S=64 → each 63 MB
+    # param sits alone, 7 preceding × 1 MB = 7 MB waste. S=128 → pairs
+    # fit (2×63=126 ≤ 128), 4 chunks, 3 preceding × 2 MB = 6 MB. S=256
+    # → quadruples fit, 2 chunks, 1 preceding × 4 MB = 4 MB. So S=256
+    # strictly wins on the lowest-waste criterion.
     sizes_a: dict[ParamId, int] = {cast(ParamId, f"p{i}"): 63 * MB for i in range(8)}
     picked_a = pick_S_chunk(sizes_a)
-    assert picked_a == 32 * MB, (
-        f"overflow-clamp scenario: expected S=32 MB (waste=0); got {picked_a}"
+    assert picked_a == 256 * MB, (
+        f"feasibility-filter scenario: expected S=256 MB (waste=4 MB, "
+        f"lowest among feasible candidates); got {picked_a}"
     )
 
     # Case B — exact-fit regime with an all-tied waste profile. 4 × 64 MB
-    # params: at S=32 each overflows (waste=0); at S=64 each fills a chunk
-    # exactly (all preceding chunks have waste=0); at S=128 pairs fit
-    # exactly (waste=0); at S=256 all four fit in a single chunk (waste=0
-    # since tail slack is excluded). Every candidate ties at 0 waste, so
-    # the tie-break rule ("prefer larger S_chunk") selects 256 MB.
+    # params: S=32 is infeasible (filtered). Among {64, 128, 256}: S=64
+    # fills each chunk exactly (preceding waste=0); S=128 fits pairs
+    # exactly (waste=0); S=256 fits all four in one chunk (waste=0,
+    # tail-only). All three feasible candidates tie at 0 waste, so the
+    # tie-break rule ("prefer larger S_chunk") selects 256 MB.
     sizes_b: dict[ParamId, int] = {cast(ParamId, f"q{i}"): 64 * MB for i in range(4)}
     picked_b = pick_S_chunk(sizes_b)
     assert picked_b == 256 * MB, (
         f"tie-at-zero-waste scenario: expected S=256 MB via tie-break; got {picked_b}"
     )
 
-    # Case C — mid-grid winner. Construct a layout where S=128 MB is
-    # strictly minimum-waste. Use 3 × 100 MB params: at S=32 each overflows
-    # (waste=0 via clamp); at S=64 each overflows (100 > 64, waste=0); at
-    # S=128 each fills one chunk leaving 28 MB preceding-slack × 2 chunks =
-    # 56 MB; at S=256 pairs fit (200 ≤ 256) so [200][100] — waste =
-    # 256-200 = 56 MB preceding. Ties between 32/64 at 0 and between 128/
-    # 256 at 56; the zero-waste bucket wins, and within it S=64 beats S=32
-    # by tie-break. So the *overall* pick is S=64 MB.
+    # Case C — mid-grid waste tie resolved by tie-break. 3 × 100 MB
+    # params: S=32 and S=64 are both infeasible (<100, filtered). Among
+    # feasible {128, 256}: S=128 → each param sits alone, 3 chunks,
+    # 2 preceding × 28 MB = 56 MB. S=256 → greedy packs [200][100],
+    # 2 chunks, 1 preceding × 56 MB = 56 MB. Both tie at 56 MB; tie-break
+    # selects the larger (256 MB).
     sizes_c: dict[ParamId, int] = {cast(ParamId, f"r{i}"): 100 * MB for i in range(3)}
     picked_c = pick_S_chunk(sizes_c)
-    assert picked_c == 64 * MB, (
-        f"mixed-waste scenario: expected S=64 MB (waste=0, larger of the "
-        f"two zero-waste candidates); got {picked_c}"
+    assert picked_c == 256 * MB, (
+        f"mixed-waste scenario: expected S=256 MB (tie-break at 56 MB "
+        f"waste, larger of two feasible candidates); got {picked_c}"
     )
 
     # Sanity — every pick is drawn from the documented grid.

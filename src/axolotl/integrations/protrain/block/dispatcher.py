@@ -74,4 +74,4 @@ def wrap_block(block: nn.Module, mode: BlockMode) -> nn.Module:
     raise StrategyError(f"unknown BlockMode: {mode!r}")
 
 
-__all__ = ["wrap_block", "unwrap_block"]
+__all__ = ["unwrap_block", "wrap_block"]

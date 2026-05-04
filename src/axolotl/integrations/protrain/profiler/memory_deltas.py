@@ -94,7 +94,7 @@ class MemoryDeltaTracker:
         if self._last_end_bytes is None:
             self._last_end_bytes = current
             return 0
-        delta = current - self._last_end_bytes
+        delta = max(0, current - self._last_end_bytes)
         self._last_end_bytes = current
         return delta
 

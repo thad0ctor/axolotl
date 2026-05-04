@@ -87,45 +87,23 @@ def assign_modes(n_swap: int, n_checkpoint: int, N_block: int) -> BlockStrategyM
     # Rule 2: interleave CKPT evenly among the remaining (N_block - n_swap)
     # positions so checkpoint and non-checkpoint blocks alternate, flattening
     # peak memory. Strategy: pick n_checkpoint positions from [n_swap, N_block)
-    # at an even stride.
+    # using a math-based even distribution.
     remaining = N_block - n_swap
     if n_checkpoint > 0 and remaining > 0:
-        # Floor stride; n_checkpoint <= remaining guaranteed by validation.
-        # Using stride = remaining // n_checkpoint puts a CKPT block at
-        # position n_swap + k * stride for k in 0..n_checkpoint-1, which
-        # distributes CKPT blocks evenly and leaves the last tail slots NONE
-        # (satisfying rule 3: unopt-late).
-        stride = remaining // n_checkpoint
-        # Guard against stride==0 when remaining == n_checkpoint: every
-        # remaining slot becomes CKPT, which is the correct behaviour.
-        if stride == 0:
-            stride = 1
-        placed = 0
-        k = 0
-        while placed < n_checkpoint:
-            idx = n_swap + k * stride
-            if idx >= N_block:
-                # Past the end — fill from the first available NONE slot
-                # onward. This branch is only hit at the degenerate
-                # boundary where stride * n_checkpoint overshoots.
-                break
-            if modes[BlockId(idx)] is BlockMode.NONE:
-                modes[BlockId(idx)] = BlockMode.CKPT
-                placed += 1
-            k += 1
-            # Safety: if k runs away, walk remaining NONE positions.
-            if k > N_block:
-                break
-        # If we still haven't placed all CKPT blocks (only possible at the
-        # ragged boundary), fill from the first available NONE position
-        # after the swap band.
-        if placed < n_checkpoint:
-            for i in range(n_swap, N_block):
-                if placed >= n_checkpoint:
-                    break
-                if modes[BlockId(i)] is BlockMode.NONE:
-                    modes[BlockId(i)] = BlockMode.CKPT
-                    placed += 1
+        # Math-based placement: for k in 0..n_checkpoint-1, place at
+        # position n_swap + (k * remaining) // n_checkpoint. The
+        # integer-division sequence is strictly non-decreasing and produces
+        # unique indices whenever remaining >= n_checkpoint (guaranteed by
+        # input validation: n_swap + n_checkpoint <= N_block). This spreads
+        # CKPT blocks evenly across the tail without clustering — e.g. with
+        # remaining=5, n_checkpoint=3 it yields {0, 1, 3} (offset by n_swap)
+        # rather than the dense cluster {0, 1, 2} a stride-then-fallback
+        # scheme would emit. The unopt-late tail (rule 3) is preserved
+        # because the last index is at most n_swap + ((n_checkpoint-1) *
+        # remaining) // n_checkpoint < N_block.
+        for k in range(n_checkpoint):
+            idx = n_swap + (k * remaining) // n_checkpoint
+            modes[BlockId(idx)] = BlockMode.CKPT
 
     # Post-condition: counts match the request.
     _assert_counts(modes, n_swap=n_swap, n_checkpoint=n_checkpoint, N_block=N_block)
@@ -471,7 +449,7 @@ def block_id_path_map(model: nn.Module, trees: list[BlockTree]) -> dict[str, Blo
     for global_idx, block in enumerate(flat):
         path = path_by_id.get(id(block))
         if path is None or path == "":
-            continue
+            return {}
         out[path] = BlockId(global_idx)
     return out
 

@@ -196,10 +196,24 @@ class _DtypeRegion:
     cpu_shard_bytes / cpu_shard_grad_bytes:
         Pinned ``uint8`` tensors holding THIS RANK's slice of the
         region's data / grad. Both are ``shard_bytes`` long.
+        ``cpu_shard_grad_bytes`` is ``None`` for fully-frozen regions —
+        we never reduce/copy grads into them, so allocating the buffer
+        would only waste CPU memory.
     shard_param:
         An ``nn.Parameter`` whose ``.data`` views ``cpu_shard_bytes``
         as ``dtype``. The CPU FusedAdam adapter is built against this
-        param — one flat Adam step per region.
+        param — one flat Adam step per region. Constructed with
+        ``requires_grad`` matching the region's trainable state, and
+        with ``.grad`` left ``None`` for fully-frozen regions so the
+        optimizer's standard ``param.grad is None`` skip-clause keeps
+        weight decay / moment updates from touching frozen bytes
+        (PEFT/LoRA + base-weight freezing correctness).
+    is_trainable:
+        ``True`` iff at least one param contributing bytes to this
+        region has ``requires_grad=True``. Region segmentation in
+        :meth:`ChunkManager.materialize_offload` splits on this
+        boundary in addition to dtype, so every region is uniformly
+        trainable or uniformly frozen.
     """
 
     __slots__ = (
@@ -212,6 +226,7 @@ class _DtypeRegion:
         "cpu_shard_bytes",
         "cpu_shard_grad_bytes",
         "shard_param",
+        "is_trainable",
     )
 
     def __init__(
@@ -223,8 +238,9 @@ class _DtypeRegion:
         dtype: "torch.dtype",
         element_size: int,
         cpu_shard_bytes: "torch.Tensor",
-        cpu_shard_grad_bytes: "torch.Tensor",
+        cpu_shard_grad_bytes: "torch.Tensor | None",
         shard_param: "torch.Tensor",
+        is_trainable: bool,
     ) -> None:
         self.chunk_offset = chunk_offset
         self.region_bytes = region_bytes
@@ -235,6 +251,7 @@ class _DtypeRegion:
         self.cpu_shard_bytes = cpu_shard_bytes
         self.cpu_shard_grad_bytes = cpu_shard_grad_bytes
         self.shard_param = shard_param
+        self.is_trainable = is_trainable
 
 
 class _ChunkShardState:
@@ -596,14 +613,14 @@ class ChunkManager:
             # non-empty param is seen). Empty / missing params do not
             # split regions — they simply contribute nothing.
             chunk_is_shardable = self.zero3_shard
-            dtype_regions: list[
-                tuple
-            ] = []  # list of (dtype, esize, start_off, end_off)
+            # list of (dtype, esize, start_off, end_off, is_trainable)
+            dtype_regions: list[tuple] = []
             if chunk_is_shardable:
                 cur_dtype = None
                 cur_esize = 0
                 cur_start = 0
                 cur_end = 0
+                cur_trainable: bool | None = None
                 for pid, nbytes, off, esz in zip(
                     param_ids,
                     per_param_bytes,
@@ -617,13 +634,26 @@ class ChunkManager:
                     if param is None:
                         continue
                     dtype_here = param.data.dtype
+                    # CodeRabbit R07 fix: split regions on requires_grad
+                    # in addition to dtype so each region is uniformly
+                    # trainable or uniformly frozen. Without this, a
+                    # mixed-trainability region's flat shard_param sees
+                    # frozen subranges as zero-grad data — Adam's
+                    # weight-decay / moment updates would still mutate
+                    # bytes the user wanted frozen (PEFT/LoRA, base-
+                    # weight freezing). Splitting here guarantees
+                    # ``shard_param.requires_grad`` is honest at the
+                    # region granularity that the CPU FusedAdam adapter
+                    # actually steps over.
+                    trainable_here = bool(param.requires_grad)
                     param_end = off + nbytes
                     if cur_dtype is None:
                         cur_dtype = dtype_here
                         cur_esize = esz
                         cur_start = off
                         cur_end = param_end
-                    elif dtype_here == cur_dtype:
+                        cur_trainable = trainable_here
+                    elif dtype_here == cur_dtype and trainable_here == cur_trainable:
                         # Extend the current region. If the per-param
                         # aligned offset left a gap (can happen on
                         # weird dtype sequences) the gap bytes remain
@@ -634,13 +664,30 @@ class ChunkManager:
                         if off < cur_start:
                             cur_start = off
                     else:
-                        dtype_regions.append((cur_dtype, cur_esize, cur_start, cur_end))
+                        dtype_regions.append(
+                            (
+                                cur_dtype,
+                                cur_esize,
+                                cur_start,
+                                cur_end,
+                                bool(cur_trainable),
+                            )
+                        )
                         cur_dtype = dtype_here
                         cur_esize = esz
                         cur_start = off
                         cur_end = param_end
+                        cur_trainable = trainable_here
                 if cur_dtype is not None:
-                    dtype_regions.append((cur_dtype, cur_esize, cur_start, cur_end))
+                    dtype_regions.append(
+                        (
+                            cur_dtype,
+                            cur_esize,
+                            cur_start,
+                            cur_end,
+                            bool(cur_trainable),
+                        )
+                    )
 
             # No chunk without any regions is shardable (empty chunk).
             if chunk_is_shardable and not dtype_regions:
@@ -678,7 +725,13 @@ class ChunkManager:
             if chunk_is_shardable:
                 import math as _math
 
-                for dtype_r, esize_r, start_off, end_off in dtype_regions:
+                for (
+                    dtype_r,
+                    esize_r,
+                    start_off,
+                    end_off,
+                    trainable_r,
+                ) in dtype_regions:
                     region_bytes = end_off - start_off
                     pad_unit = (esize_r * self.world_size) // _math.gcd(
                         esize_r, self.world_size
@@ -695,6 +748,7 @@ class ChunkManager:
                             "region_bytes": region_bytes,
                             "region_bytes_padded": region_bytes_padded,
                             "shard_bytes": shard_bytes_r,
+                            "is_trainable": bool(trainable_r),
                         }
                     )
                     total_shard_bytes += shard_bytes_r
@@ -801,6 +855,7 @@ class ChunkManager:
                     r_bytes = plan["region_bytes"]
                     r_bytes_padded = plan["region_bytes_padded"]
                     r_shard_bytes = plan["shard_bytes"]
+                    r_is_trainable = plan["is_trainable"]
 
                     # Build the padded region image in a transient
                     # scratch buffer: copy the valid region_bytes from
@@ -830,17 +885,51 @@ class ChunkManager:
                     cpu_region_shard.copy_(
                         region_scratch.narrow(0, my_off, r_shard_bytes)
                     )
-                    cpu_region_grad = torch.zeros(
-                        r_shard_bytes, dtype=torch.uint8, pin_memory=use_pinned_host
-                    )
+                    # CodeRabbit R07 fix: only allocate the pinned grad
+                    # shard for trainable regions. Frozen-only regions
+                    # never receive a reduce/copy in
+                    # :meth:`reduce_grads_and_offload` (the trainability
+                    # gate there short-circuits before any grad work),
+                    # so the buffer would just waste pinned host memory
+                    # — and, worse, would be silently fed to Adam as
+                    # zero-grad data, letting weight-decay rewrite
+                    # frozen bytes. ``None`` here is the canonical
+                    # frozen-region marker.
+                    cpu_region_grad: "torch.Tensor | None" = None
+                    if r_is_trainable:
+                        cpu_region_grad = torch.zeros(
+                            r_shard_bytes,
+                            dtype=torch.uint8,
+                            pin_memory=use_pinned_host,
+                        )
 
                     # Shard-level nn.Parameter for this region — one
                     # flat Adam step per region.
+                    #
+                    # CodeRabbit R07 fix: ``requires_grad`` is set from
+                    # the region's trainability (region segmentation
+                    # already split on this boundary, so every param
+                    # contributing bytes here shares one trainability
+                    # state). For frozen regions we leave
+                    # ``shard_param.grad = None`` so PyTorch's
+                    # ``Optimizer.step`` skip-clause (and DeepSpeed
+                    # CPUAdam's matching skip) keeps weight decay /
+                    # moment updates from touching the bytes — the
+                    # whole point of freezing is to avoid optimizer
+                    # state on those params, and the previous code
+                    # quietly broke that invariant by binding a
+                    # zero-grad view as ``shard_param.grad``. Trainable
+                    # regions retain the original behaviour.
                     shard_numel = r_shard_bytes // r_esize
                     shard_view = cpu_region_shard.view(r_dtype).view(shard_numel)
-                    shard_param = _nn.Parameter(shard_view, requires_grad=True)
-                    shard_grad_view = cpu_region_grad.view(r_dtype).view(shard_numel)
-                    shard_param.grad = shard_grad_view
+                    shard_param = _nn.Parameter(
+                        shard_view, requires_grad=r_is_trainable
+                    )
+                    if r_is_trainable and cpu_region_grad is not None:
+                        shard_grad_view = cpu_region_grad.view(r_dtype).view(
+                            shard_numel
+                        )
+                        shard_param.grad = shard_grad_view
 
                     regions.append(
                         _DtypeRegion(
@@ -853,6 +942,7 @@ class ChunkManager:
                             cpu_shard_bytes=cpu_region_shard,
                             cpu_shard_grad_bytes=cpu_region_grad,
                             shard_param=shard_param,
+                            is_trainable=r_is_trainable,
                         )
                     )
 
@@ -1779,6 +1869,21 @@ class ChunkManager:
 
         d2h_event = None
         for region in shard_state.regions:
+            # CodeRabbit R07 fix: skip frozen-only regions outright.
+            # Their ``shard_param`` was constructed with
+            # ``requires_grad=False`` and ``cpu_shard_grad_bytes=None``;
+            # there is nothing to reduce or D2H here. Running the
+            # collective + binding a zero-grad view as
+            # ``shard_param.grad`` would re-introduce the original
+            # bug — Adam's weight-decay path would mutate frozen
+            # bytes against a silently-zero grad. The trainability
+            # flag is authoritative because region segmentation in
+            # :meth:`materialize_offload` splits on ``requires_grad``,
+            # so any param contributing bytes to a frozen region is
+            # guaranteed itself frozen and will never produce a grad.
+            if not region.is_trainable:
+                continue
+
             r_start = region.chunk_offset
             r_end = r_start + region.region_bytes
 
@@ -1828,6 +1933,12 @@ class ChunkManager:
             # adapter operates on the persistent ``cpu_shard_grad_bytes``
             # pinned buffer; we just need ``.grad`` to point at it again
             # so ``.copy_()`` lands in the right place.
+            #
+            # ``cpu_shard_grad_bytes`` is non-None here because the
+            # ``region.is_trainable`` guard above filtered out the
+            # frozen-region case where it stays None. The cast below
+            # is purely for the type-checker.
+            assert region.cpu_shard_grad_bytes is not None
             if region.shard_param.grad is None:
                 region.shard_param.grad = region.cpu_shard_grad_bytes.view(
                     region.dtype
@@ -1915,8 +2026,11 @@ class ChunkManager:
         """Total pinned CPU bytes this rank holds across every sharded chunk.
 
         Sums BOTH the per-region shard buffer (``cpu_shard_bytes``) and
-        the per-region grad buffer (``cpu_shard_grad_bytes``) — both are
-        allocated by ``materialize_offload`` for every sharded region.
+        the per-region grad buffer (``cpu_shard_grad_bytes``) when
+        present. ``cpu_shard_bytes`` is allocated for every sharded
+        region; ``cpu_shard_grad_bytes`` is allocated only for trainable
+        regions (frozen-only regions skip it as part of the CodeRabbit
+        R07 fix — no Adam step, no need for the pinned grad shard).
         Convenience accessor for the 4-GPU sharding test which asserts
         per-rank CPU footprint roughly equals
         ``total_non_persistent_bytes / world_size`` and for benchmark
@@ -1926,7 +2040,8 @@ class ChunkManager:
         for shard_state in self._chunk_shards.values():
             for region in shard_state.regions:
                 total += int(region.cpu_shard_bytes.numel())
-                total += int(region.cpu_shard_grad_bytes.numel())
+                if region.cpu_shard_grad_bytes is not None:
+                    total += int(region.cpu_shard_grad_bytes.numel())
         return total
 
     # ---- internals -----------------------------------------------------

@@ -376,11 +376,22 @@ def run_trace(
             return None
         return _infer_block_id(path)
 
+    # Precompute the id(module) -> dotted-path map ONCE up-front. The
+    # per-op pre-hook fires for every nn.Module on every traced step;
+    # resolving each module's path by re-walking ``model.named_modules()``
+    # inside the hook is O(N_modules) per fire, so the trace pays
+    # O(N_modules^2) just to label ops (~1M lookups for a 1000-leaf
+    # transformer). One pass here gives the hook an O(1) dict lookup —
+    # same pattern as ``block_id_path_map`` in layout_rules.py.
+    path_by_id: dict[int, str] = {}
+    for name, candidate in model.named_modules():
+        path_by_id[id(candidate)] = name or type(candidate).__name__
+
     def _module_path(m: "nn.Module") -> str:
         """Dotted path of ``m`` inside ``model`` (root -> '')."""
-        for name, candidate in model.named_modules():
-            if candidate is m:
-                return name or type(m).__name__
+        cached = path_by_id.get(id(m))
+        if cached is not None:
+            return cached
         return type(m).__name__  # unreachable in practice
 
     def _pre_forward(module: "nn.Module", inputs):

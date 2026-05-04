@@ -1,9 +1,8 @@
 # ProTrain Optimizer Checkpoint/Resume — Phase 2 Design Note
 
-**Status:** design-only, no implementation yet
+**Status:** implemented (M5 + Mode-C Phase 2 shipped on branch `protrain-optim-checkpoint-phase2-mode-c`)
 **Scope:** multi-rank replicated (DDP) AND ZeRO-3 sharded checkpoint/resume
-**Builds on:** `CHECKPOINT_DESIGN.md` Phase 1 (single-rank, non-ZeRO; merged on `protrain-optim-checkpoint`)
-**Branch base for impl:** new feature branch off Phase 1 once merged
+**Builds on:** Phase 1 single-rank, non-ZeRO checkpoint/resume documented in `CHECKPOINT_DESIGN.md` (callback wiring, atomic save, manifest schema)
 
 Phase 1 is single-rank by hard-coded guard. Phase 2 lifts that guard
 in two distinct configurations that need different handling:

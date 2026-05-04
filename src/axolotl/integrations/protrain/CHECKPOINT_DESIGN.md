@@ -594,13 +594,13 @@ new set is:
    more conservative; larger (e.g., 16 GiB) would let some small full-FT
    models through.
 
-2. **Callback hook vs. trainer override.** §1.8 picks
+2. **Callback hook vs. trainer override.** ~~Use
    `TrainerCallback.on_save` / `on_load_checkpoint` as the integration
-   point. Verify that HF's callback contract gives us enough
-   information at load time (we need the checkpoint dir; current
-   `TrainerCallback` API in modern HF transformers should expose this
-   via `state.best_model_checkpoint` or equivalent — confirm before
-   committing).
+   point.~~ **REJECTED.** HF exposes
+   `state.best_model_checkpoint` but does not provide a reliable
+   `on_load_checkpoint` hook → patch
+   `Trainer._load_optimizer_and_scheduler` instead (see §1.8). Save
+   side still uses `TrainerCallback.on_save`.
 
 3. **Phase 1's `save_only_model` flip.** §2.5 keeps `save_only_model =
    True` by default and only flips to `False` when
