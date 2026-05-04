@@ -99,13 +99,23 @@ def block_map_runtime_admissible(
 ) -> bool:
     """Return True iff the block strategy is safe for current chunk offload.
 
-    Current runtime correctness constraint: if a block owns any
-    non-persistent parameter chunk, that block must be CKPT. The forward
-    scheduler releases non-persistent chunk storage after the block runs,
-    and PyTorch's saved tensors for a normal NONE/SWAP block are not a
-    safe persistence mechanism once ``param.data`` is rebound to the
-    empty sentinel. CKPT blocks recompute their forward during backward,
-    so the scheduler can re-gather chunks immediately before recompute.
+    Four-mode admissibility (post-Option B; see
+    ``BLOCK_MODE_OFFLOAD_DESIGN.md`` §3.5):
+
+    * ``CKPT`` — always admissible. The recompute path re-binds storage by
+      replaying the wrapped forward inside ``torch.utils.checkpoint``; the
+      scheduler re-gathers the block's chunks immediately before recompute.
+    * ``OFFLOAD`` — always admissible. The wrapper installs a
+      saved-tensors-hook that records metadata only at pack time and
+      re-gathers the chunk at unpack time, so post-forward chunk release is
+      safe even with non-persistent params.
+    * ``NONE`` and ``SWAP`` — admissible iff every chunk owned by the
+      block is in the persistent set. The forward scheduler releases
+      non-persistent chunk storage after the block runs, and PyTorch's
+      saved tensors for a normal NONE/SWAP block are not a safe
+      persistence mechanism once ``param.data`` is rebound to the empty
+      sentinel. NONE/SWAP on a block with any non-persistent chunk
+      remains inadmissible.
 
     Fully persistent blocks may use NONE/SWAP because their parameter
     storage is never nulled or recycled.
@@ -113,7 +123,9 @@ def block_map_runtime_admissible(
     persistent = {ChunkId(i) for i in range(max(0, int(n_persist)))}
     for bid, chunks in layout.block_to_chunks.items():
         mode = block_map.get(bid, BlockMode.NONE)
-        if mode is BlockMode.CKPT:
+        if mode is BlockMode.CKPT or mode is BlockMode.OFFLOAD:
+            # CKPT recomputes; OFFLOAD's saved-tensors-hook re-binds
+            # storage at backward — both safe regardless of persistence.
             continue
         if any(ChunkId(int(cid)) not in persistent for cid in chunks):
             return False
