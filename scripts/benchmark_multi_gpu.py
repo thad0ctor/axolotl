@@ -171,27 +171,44 @@ _WORKER_SCRIPT = textwrap.dedent(
         else:
             zero3_shard = None  # auto; ends up False for DDP / single
 
+        # For replicated / zero3 modes we MUST drive the searcher away
+        # from picking ``n_persist = N_chunk`` — otherwise the CPU pool
+        # stays empty and the "offloaded replicated" mode is
+        # indistinguishable from DDP.
+        #
+        # Round-3 R9 tightened the explicit-override path to reject
+        # configs whose offloaded chunks land on non-CKPT blocks
+        # (``block_map_runtime_admissible``). The previous hardcoded
+        # tuple ``n_persist=2, n_checkpoint=0, n_swap=0`` is invalid for
+        # any model whose chunks beyond the first 2 don't all map to
+        # CKPT blocks — i.e. most realistic models. Computing
+        # admissible overrides up front would require N_chunk / N_block,
+        # which aren't known here (the layout is built inside
+        # ``protrain_model_wrapper``). Instead we drive the searcher
+        # via the capacity inputs: a tight ``capacity_bytes`` forces
+        # ``n_persist < N_chunk`` so the searcher selects a feasible
+        # offload config (with a CKPT-admissible block_map). DDP /
+        # single keep the loose 20 GiB so the searcher lands at
+        # ``n_persist = N_chunk`` (Mode A) naturally.
+        if mode in ("replicated", "zero3"):
+            # 4 GiB per rank — well below the Llama-3B fp16 param
+            # footprint (~6 GB), guaranteeing the searcher CANNOT pick
+            # a fully-persistent layout and must offload some chunks
+            # to host RAM. The searcher picks n_buffer / n_checkpoint /
+            # n_swap consistent with the resulting block_map.
+            capacity = 4 * (1 << 30)
+        else:
+            capacity = 20 * (1 << 30)
+
         wrapper_kwargs = dict(
             model_config=cfg,
             hardware_profile=hw,
             batch_size=bs,
             seq_len=seq,
-            capacity_bytes=20 * (1 << 30),
+            capacity_bytes=capacity,
             force_all_persistent=force_all_persistent,
             zero3_shard=zero3_shard,
         )
-        # For replicated / zero3 modes we MUST drive the searcher away
-        # from picking ``n_persist = N_chunk`` — otherwise the CPU pool
-        # stays empty and the "offloaded replicated" mode is
-        # indistinguishable from DDP. Same override pattern as the M7
-        # zero3 test.
-        if mode in ("replicated", "zero3"):
-            wrapper_kwargs.update(
-                n_persist_override=2,
-                n_buffer_override=2,
-                n_swap_override=0,
-                n_checkpoint_override=0,
-            )
 
         wrapped = protrain_model_wrapper(model, **wrapper_kwargs)
         optim = protrain_optimizer_wrapper(wrapped, lr=1e-4)

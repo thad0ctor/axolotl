@@ -943,6 +943,16 @@ class ChunkManager:
 
         Idempotent: a second call with no offload materialized is a no-op.
         """
+        # Wait for any in-flight async CPU Adam steps to finish so we
+        # snapshot a consistent post-step state, not a half-applied one.
+        # Without this barrier, a CpuFusedAdamAdapter.step_async() worker
+        # could be mid-write to the same shard tensors restore_to_gpu
+        # reads, producing corrupted weights — or restore could clear
+        # shard state out from under the still-running worker.
+        # ``wait_cpu_optim`` is a no-op when ``self.cpu_optim is None``
+        # (no DeepSpeedCPUAdam — replicated path or unavailable).
+        self.wait_cpu_optim()
+
         if not self._cpu_slots and not self._persistent_buffers:
             LOG.debug(
                 "ChunkManager.restore_to_gpu: nothing offloaded "

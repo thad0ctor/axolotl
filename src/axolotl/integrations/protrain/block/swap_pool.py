@@ -126,6 +126,13 @@ class ActivationSwapPool:
         # Backing pinned-host region (split into ``n_slot`` equal slots).
         self._pinned = PinnedHostMemory(n_buffer=self.n_slot, S_chunk=self.slot_bytes)
         self._closed = False
+        # Set as soon as ``close()`` begins teardown so concurrent
+        # ``acquire``/``release`` callers stop racing the (lock-free)
+        # ``_pinned.close()`` window. Without this, a caller could pop
+        # a slot, increment ``_inflight``, then fail in ``buffer()``
+        # with "PinnedHostMemory is closed" while the pool's free-list
+        # accounting is left corrupted.
+        self._closing = False
         # Free-list of available slot indices. We use a plain list as a
         # LIFO stack — locality of reuse is irrelevant for pinned host
         # memory (no allocator state to amortize), and a list is
@@ -163,7 +170,7 @@ class ActivationSwapPool:
         copying via ``.copy_(src, non_blocking=True)`` on the swap stream.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("ActivationSwapPool is closed")
             if not self._free:
                 raise RuntimeError(
@@ -189,7 +196,7 @@ class ActivationSwapPool:
         NOT issue stream syncs.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 return
             if not 0 <= slot_id < self.n_slot:
                 LOG.warning(
@@ -237,25 +244,38 @@ class ActivationSwapPool:
     def close(self) -> None:
         """Free the pinned region. Idempotent.
 
-        Ordering note: ``_pinned.close()`` raises if any slot view is
-        still borrowed (its lifetime guard). If we marked ``_closed``
-        BEFORE calling it, a raise would leave the pool permanently
-        half-closed — ``release()`` short-circuits on ``_closed`` and
-        the outstanding borrow could never be returned. So we tear the
-        pinned allocator down FIRST, and only flip our own ``_closed``
-        flag once that succeeds. On a raise the pool stays usable: the
-        caller can return the leaked slot via ``release()`` and retry
-        ``close()``.
+        Two-phase teardown to close a corruption race that the original
+        single-flag design exposed:
+
+        1. Under ``_lock``, flip ``_closing = True`` and drop the lock.
+           From this point, ``acquire()`` raises and ``release()`` is a
+           no-op, so no new borrow can sneak into the unlocked window.
+        2. Call ``_pinned.close()`` WITHOUT holding ``self._lock`` — it
+           is on a separate lock-domain (its own bookkeeping, not part
+           of this pool's free-list/inflight invariants), it may be
+           slow, and dropping the lock keeps concurrent ``free_count`` /
+           ``inflight_count`` reads responsive during teardown.
+        3. Re-acquire ``_lock`` and flip ``_closed = True``, clearing
+           the free-list / inflight counter.
+
+        ``_pinned.close()`` raises if any slot view is still borrowed
+        (its lifetime guard). With ``_closing = True`` already set,
+        ``release()`` is a no-op so the leaked borrows cannot be
+        returned and the pool is permanently dead — but we deliberately
+        let the exception propagate as a diagnostic. The caller's only
+        recovery is a fresh process; there is no retry path.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 return
-        # ``_pinned.close()`` is the underlying allocator tear-down; it
-        # is on a separate lock-domain (its own bookkeeping, not part of
-        # this pool's free-list/inflight invariants) so it is safe — and
-        # preferable — to call without holding ``self._lock``: it may be
-        # slow, and dropping the lock keeps concurrent ``free_count`` /
-        # ``inflight_count`` reads responsive during teardown.
+            # Block new acquires and short-circuit pending releases
+            # BEFORE we drop the lock for the (potentially slow)
+            # ``_pinned.close()`` call.
+            self._closing = True
+        # ``_pinned.close()`` may raise if outstanding borrows remain.
+        # With ``_closing`` set above, ``release()`` is now a no-op so
+        # those borrows can never be returned. The propagated exception
+        # is informational; the pool is permanently dead either way.
         self._pinned.close()
         with self._lock:
             self._closed = True

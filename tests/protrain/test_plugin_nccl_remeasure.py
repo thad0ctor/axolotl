@@ -381,6 +381,12 @@ def test_remeasure_skips_when_wrapped_missing_stashed_state(caplog):
     # Deliberately do NOT set _trace / _layout / _hardware_profile / _capacity_bytes.
 
     patches = _patch_dist(initialized=True, world_size=2)
+    # ``MultiProcessAdapter.log`` consults ``is_main_process`` BEFORE handing
+    # the record to the underlying logger. In pytest-xdist CI workers a prior
+    # test can leak ``LOCAL_RANK`` or distributed state and turn this off,
+    # silently dropping the WARN we want to assert on. Force the gate True so
+    # caplog deterministically sees the WARN.
+    patches.append(patch("axolotl.utils.logging.is_main_process", return_value=True))
     for p in patches:
         p.start()
     try:
