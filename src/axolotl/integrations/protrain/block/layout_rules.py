@@ -128,19 +128,24 @@ def assign_modes(
     # using a math-based even distribution.
     remaining = N_block - n_swap
     if n_checkpoint > 0 and remaining > 0:
-        # Math-based placement: for k in 0..n_checkpoint-1, place at
-        # position n_swap + (k * remaining) // n_checkpoint. The
-        # integer-division sequence is strictly non-decreasing and produces
-        # unique indices whenever remaining >= n_checkpoint (guaranteed by
-        # input validation: n_swap + n_checkpoint <= N_block). This spreads
-        # CKPT blocks evenly across the tail without clustering — e.g. with
-        # remaining=5, n_checkpoint=3 it yields {0, 1, 3} (offset by n_swap)
-        # rather than the dense cluster {0, 1, 2} a stride-then-fallback
-        # scheme would emit. The unopt-late tail (rule 3) is preserved
-        # because the last index is at most n_swap + ((n_checkpoint-1) *
-        # remaining) // n_checkpoint < N_block.
-        for k in range(n_checkpoint):
-            idx = n_swap + (k * remaining) // n_checkpoint
+        # Centered math-based placement: for k in 0..n_checkpoint-1, place at
+        # position n_swap + ((2k + 1) * remaining) // (2 * n_checkpoint). The
+        # half-step offset (2k + 1)/(2 * n_checkpoint) targets the midpoint
+        # of each of n_checkpoint equal-width sub-intervals across the tail,
+        # rather than its left edge — so CKPT slots are centered rather than
+        # front-loaded. Concretely: with remaining=5, n_checkpoint=3 this
+        # yields {0, 2, 4} (offset by n_swap) instead of the front-loaded
+        # {0, 1, 3} the left-edge formula `(k * remaining) // n_checkpoint`
+        # produced. Indices are unique whenever remaining >= n_checkpoint
+        # (guaranteed by input validation: n_swap + n_checkpoint <= N_block),
+        # and the maximum index is bounded by n_swap + ((2 * n_checkpoint - 1)
+        # * remaining) // (2 * n_checkpoint) < N_block, preserving the
+        # unopt-late tail for rule 3.
+        ckpt_positions = {
+            n_swap + ((2 * k + 1) * remaining) // (2 * n_checkpoint)
+            for k in range(n_checkpoint)
+        }
+        for idx in sorted(ckpt_positions):
             modes[BlockId(idx)] = BlockMode.CKPT
 
     # Rule 3: OFFLOAD fills the next n_offload positions still bearing

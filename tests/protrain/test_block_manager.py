@@ -43,13 +43,15 @@ from axolotl.integrations.protrain.block.swap import SwappedBlock  # noqa: E402
 def test_assign_modes_basic() -> None:
     """N_block=12, n_swap=0, n_checkpoint=4 → 4 evenly-spaced CKPT.
 
-    With stride = 12 // 4 = 3 and no swap band, CKPT should land at
-    block indices 0, 3, 6, 9 and every other block be NONE.
+    With remaining=12, n_checkpoint=4 and the centered formula
+    ``((2k + 1) * remaining) // (2 * n_checkpoint)``, CKPT lands at
+    block indices 1, 4, 7, 10 (round-3 R3-I — centered, not front-loaded).
     """
     N_block = 12
     modes = assign_modes(n_swap=0, n_checkpoint=4, N_block=N_block)
 
-    expected_ckpt = {0, 3, 6, 9}
+    # round-3 R3-I: centered placement shifts pinned positions {0,3,6,9} → {1,4,7,10}.
+    expected_ckpt = {1, 4, 7, 10}
     actual_ckpt = {i for i, m in modes.items() if m is BlockMode.CKPT}
     actual_swap = {i for i, m in modes.items() if m is BlockMode.SWAP}
     actual_none = {i for i, m in modes.items() if m is BlockMode.NONE}
@@ -65,8 +67,10 @@ def test_assign_modes_swap_early() -> None:
 
     SWAP positions must be exactly [0, 1] (swap-early rule). CKPT count
     must be exactly 3 and CKPT must not overlap SWAP. The three CKPT
-    slots come from the [2, 10) tail with stride 8//3 = 2, so land at
-    {2, 4, 6}.
+    slots come from the [2, 10) tail under the centered formula
+    ``n_swap + ((2k + 1) * remaining) // (2 * n_checkpoint)`` with
+    remaining=8, n_checkpoint=3, so land at {3, 6, 8} (round-3 R3-I —
+    centered, not front-loaded).
     """
     N_block = 10
     modes = assign_modes(n_swap=2, n_checkpoint=3, N_block=N_block)

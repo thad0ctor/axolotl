@@ -642,44 +642,38 @@ allocator issue from Phase 1. Use pytest-forked or subprocess.
 
 These were the design choices that needed direction before
 implementation. They are recorded here for historical context; the
-recommendations below are what shipped on
+decisions below are what shipped on
 `protrain-optim-checkpoint-phase2-mode-c`.
 
-1. **World-size mismatch policy (§4.1).** Recommend Option B (allow
-   for replicated, error for sharded). Confirm.
+1. **World-size mismatch policy (§4.1).** Chose Option B (allowed
+   for replicated, hard error for sharded).
 
-2. **Forward compat for v1 saves (§5).** Recommend YES — ~10 lines for
-   v2 loader to accept v1 saves as `replicated`/`world_size=1`. If you
-   want a clean break instead, say so.
+2. **Forward compat for v1 saves (§5).** Chose YES — the v2 loader
+   accepts v1 saves as `replicated`/`world_size=1` in ~10 lines.
 
-3. **Cross-rank state-equality check in Mode-B (§2.4).** Should the
-   opt-in flag exist at all? Three sub-options:
-   - Don't add the flag; trust DDP determinism. Simplest.
-   - Add the flag, default OFF (the recommendation in §2.4).
-   - Add the flag, default ON for the first save of each run only,
-     skipped on subsequent saves. Defensive but adds complexity.
+3. **Cross-rank state-equality check in Mode-B (§2.4).** Added the
+   opt-in flag, default OFF (matching the recommendation in §2.4). The
+   alternatives (no flag; default ON for first save) were rejected.
 
-4. **Estimate-gate broadcast (§4.4).** Recommend rank-0-decides +
-   broadcast. Confirm — alternative is per-rank-decides + cross-rank
-   assert, which is more permissive but logs noisier.
+4. **Estimate-gate broadcast (§4.4).** Chose rank-0-decides +
+   broadcast. The per-rank-decides + cross-rank assert alternative was
+   rejected as logs-noisier without enough upside.
 
-5. **Functional-equivalence test infra.** The slow correctness tests
-   need separate-process invocations. Do you want pytest-forked added
-   as a test dep, or should we drive subprocess.run from inside a
-   single test function? Pytest-forked is cleaner; subprocess is
-   dependency-free.
+5. **Functional-equivalence test infra.** Drove the slow correctness
+   tests via `subprocess.run` from inside a single test function (the
+   dependency-free option) rather than adding pytest-forked as a test
+   dep.
 
 6. **`save_only_model` flip in multi-rank.** Phase 1 sets
    `save_only_model=False` so HF saves scheduler.pt + rng_state.pth.
    In Mode-C with HF Trainer's standard distributed checkpoint path,
-   does HF write per-rank rng_state files? Verify before
-   implementation — if HF's rng_state save is rank-0-only, that's
-   fine; if it's per-rank, our path needs to coexist.
+   verified that HF's rng_state save coexists with our per-rank shard
+   path without collision.
 
 7. **Should Phase 2 land as a single PR, or split into Mode-B and
-   Mode-C?** Mode-B is mostly Phase 1 with the world_size guard
-   relaxed and a small dispatcher. Mode-C is the meaty part. Splitting
-   gives a faster Mode-B win.
+   Mode-C?** Landed as a single branch
+   (`protrain-optim-checkpoint-phase2-mode-c`) covering both Mode-B
+   and Mode-C rather than splitting for a faster Mode-B win.
 
 ---
 
@@ -750,7 +744,7 @@ gates — they need separate-process infra and run on the slow lane.
 
 ---
 
-*This design note is the prerequisite to a feature branch off
-`protrain-optim-checkpoint` (Phase 1 must land first) named e.g.
-`protrain-optim-checkpoint-phase2`. No implementation should start
-until §8 is answered.*
+*This design note was the prerequisite to the feature branch off
+`protrain-optim-checkpoint` (Phase 1 landed first), shipped as
+`protrain-optim-checkpoint-phase2-mode-c`. The §8 questions were
+answered during implementation and the answers are recorded above.*

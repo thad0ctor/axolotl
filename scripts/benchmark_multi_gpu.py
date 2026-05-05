@@ -214,6 +214,7 @@ _WORKER_SCRIPT = textwrap.dedent(
             batch_size=bs,
             seq_len=seq,
             capacity_bytes=capacity,
+            auto_mode=False,
             force_all_persistent=force_all_persistent,
             zero3_shard=zero3_shard,
         )

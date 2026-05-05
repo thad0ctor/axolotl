@@ -509,11 +509,38 @@ def run_trace(
         # The authoritative per-block activation footprint is reconstructed
         # in M4; this gives the M1 peak estimator something non-zero to work
         # with when a block_id is inferrable.
+        #
+        # Only record at the block-root module — every nested submodule
+        # inside a transformer block shares the same ``block_id`` (it's
+        # propagated down from the root via ``_resolve_block_id``), so
+        # summing each child's output would double-count intermediate
+        # activations and inflate the per-block footprint. Downstream
+        # ``_block_map_peak_contribution`` consumes this as the retained
+        # activation size, so over-counting causes the search to reject
+        # otherwise-feasible configs.
+        #
+        # When ``path_to_global_bid`` is populated (typical transformer
+        # layouts where ``block_id_path_map`` succeeded), we identify
+        # the canonical block-root path and record only there. When the
+        # map is empty (rare fallback for non-recognizable layouts —
+        # e.g. on-demand traces using the path-fragment heuristic),
+        # there's no canonical root path; we still need to populate
+        # ``activation_sizes`` so the M1 peak estimator has non-zero
+        # input. Use ``max`` over every block-id frame in that case —
+        # better than the old per-frame ``+`` (which "wildly inflated"
+        # totals) while still ensuring on-demand traces produce
+        # non-zero ``activation_sizes``. M4 reconstructs the
+        # authoritative footprint regardless of which path fires.
         if frame.block_id is not None:
-            out_bytes = _output_bytes(output)
-            activation_sizes[frame.block_id] = (
-                activation_sizes.get(frame.block_id, 0) + out_bytes
+            is_block_root = (
+                not path_to_global_bid
+                or path_to_global_bid.get(frame.module_path) == frame.block_id
             )
+            if is_block_root:
+                out_bytes = _output_bytes(output)
+                activation_sizes[frame.block_id] = max(
+                    activation_sizes.get(frame.block_id, 0), out_bytes
+                )
 
     def _output_bytes(output: Any) -> int:
         total = 0

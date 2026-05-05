@@ -534,9 +534,10 @@ Phase 1:
 2. `_ProTrainOptimizer` constructed (empty inner states).
 3. Trainer attaches optimizer, no-op patches stay active for the
    Accelerate `prepare` round-trip.
-4. ProTrain callback's `on_load_checkpoint` runs: read metadata, validate
-   single-rank + non-ZeRO + persistent_ids match, then load each shard
-   with `map_location='cpu'` and call inner `load_state_dict`.
+4. ProTrain's `trainer._load_optimizer_and_scheduler` monkey-patch runs:
+   read metadata, validate single-rank + non-ZeRO + persistent_ids match,
+   then load each shard with `map_location='cpu'` and call inner
+   `load_state_dict`.
 5. First step proceeds with restored momentums.
 
 ---
