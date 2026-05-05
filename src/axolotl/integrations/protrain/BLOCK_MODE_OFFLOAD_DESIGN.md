@@ -1,6 +1,6 @@
 # Block-Mode OFFLOAD — Design Note (Option B)
 
-**Status:** design draft, NOT implemented. Reviewer-gated; this doc is the artifact the implementation agents will be dispatched against once the user signs off.
+**Status:** partially implemented. M1 (config types + validator) and M2 (runtime hook) shipped on this branch in commit `8264f773`. M3 (cost-model wiring), M4 (test matrix), and M5 (docs/changelog rollup) are still pending — see [§7 Implementation roadmap](#7-implementation-roadmap).
 **Scope:** extend the ProTrain runtime so a non-persistent chunk's owning block can run under `BlockMode.NONE` (no recompute) — i.e. the param chunk is gathered for forward, offloaded after forward, AND re-gathered for backward without invoking `torch.utils.checkpoint`.
 **Builds on:** `DESIGN.md` (overall plugin), `CHECKPOINT_DESIGN.md` / `CHECKPOINT_DESIGN_PHASE2.md` (style template).
 **Branch base:** `protrain-optim-checkpoint-phase2-mode-c` @ tip (per `MEMORY.md::protrain_branch_state`).

@@ -29,6 +29,7 @@ from axolotl.integrations.protrain.block.layout_rules import (
     discover_blocks,
     flatten_block_trees,
 )
+from axolotl.integrations.protrain.block.offload import OffloadedBlock
 from axolotl.integrations.protrain.types import (
     BlockId,
     BlockStrategyMap,
@@ -99,17 +100,21 @@ def _make_backward_post_hook(scheduler: "Scheduler", block_id: BlockId):
 
 def install_hooks(
     model: nn.Module,
-    chunk_manager: "ChunkManager",  # noqa: ARG001 — reserved for future use
+    chunk_manager: "ChunkManager",
     block_map: BlockStrategyMap,  # noqa: ARG001 — scheduler already owns this
     scheduler: "Scheduler",
 ) -> list["RemovableHandle"]:
     """Attach the four-per-block scheduler hooks.
 
-    The ``chunk_manager`` and ``block_map`` parameters are accepted for
-    API symmetry with the design doc but are not consulted directly —
-    the scheduler already holds references to both. Keeping them in the
-    signature lets the plugin (M5) compose ``install_hooks`` without
-    reaching into the ``Scheduler``'s private state.
+    The ``block_map`` parameter is accepted for API symmetry with the
+    design doc but is not consulted directly — the scheduler already
+    holds a reference. Keeping it in the signature lets the plugin
+    (M5) compose ``install_hooks`` without reaching into the
+    ``Scheduler``'s private state. The ``chunk_manager`` IS consumed
+    here: ``OffloadedBlock`` wrappers need it injected via
+    :meth:`OffloadedBlock.attach_runtime` so their saved-tensor pack
+    hook can resolve storage pointers to chunk ids and the unpack
+    hook can call ``gather_for_backward``.
 
     Parameters
     ----------
@@ -161,6 +166,15 @@ def install_hooks(
                 lambda block_id=block_id: scheduler.ensure_block_resident(block_id)
             )
             handles.append(_RecomputePreHookHandle(block))  # type: ignore[arg-type]
+
+        # Wire OFFLOAD-mode wrappers to the runtime. Mirrors the SWAP
+        # wrapper path in ``api/model_wrapper.py``, but lives here so
+        # plugin authors composing ``install_hooks`` directly (without
+        # going through the full model wrapper) still get correctly-
+        # attached OFFLOAD blocks. ``attach_runtime`` is idempotent —
+        # re-calling with the same manager/scheduler is a no-op.
+        if isinstance(block, OffloadedBlock):
+            block.attach_runtime(chunk_manager, scheduler)
 
     LOG.debug(
         "install_hooks: attached %d handles across %d transformer blocks",

@@ -219,10 +219,10 @@ def test_assign_modes_with_offload() -> None:
     assert counts_4[BlockMode.NONE] == 0
     # Position checks under the placement rule:
     #   SWAP at block 0 (swap-early)
-    #   CKPT at blocks 1, 2 (math placement: n_swap=1, remaining=3,
-    #     n_checkpoint=2 → indices 1+(0*3)//2=1, 1+(1*3)//2=2)
-    #   OFFLOAD on the only remaining slot: block 3.
+    #   CKPT at blocks 1, 3 (round-3 R3-I — centered placement: n_swap=1,
+    #     remaining=3, n_checkpoint=2 → indices 1+(1*3)//4=1, 1+(3*3)//4=3)
+    #   OFFLOAD on the only remaining slot: block 2.
     assert modes_4[BlockId(0)] is BlockMode.SWAP
     assert modes_4[BlockId(1)] is BlockMode.CKPT
-    assert modes_4[BlockId(2)] is BlockMode.CKPT
-    assert modes_4[BlockId(3)] is BlockMode.OFFLOAD
+    assert modes_4[BlockId(2)] is BlockMode.OFFLOAD
+    assert modes_4[BlockId(3)] is BlockMode.CKPT

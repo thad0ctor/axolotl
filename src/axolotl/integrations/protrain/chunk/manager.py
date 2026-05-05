@@ -2255,6 +2255,51 @@ class ChunkManager:
         else:
             self._backward_refcount[chunk_id] = cur - 1
 
+    def drain_deferred_offloads(self) -> int:
+        """Flush every deferred offload whose backward refcount is now zero.
+
+        Defensive end-of-iteration drain (M3, §3.3 of
+        BLOCK_MODE_OFFLOAD_DESIGN). Today's Python ref-counting on
+        :class:`BackwardHandle` already drains via ``__del__`` when the
+        last unpack-returned view is collected, so in steady state this
+        method is a no-op. It exists to:
+
+        * make the drain timing explicit and composable with future
+          schedulers that might want a deterministic flush point
+          (e.g. before ``optimizer.step``);
+        * give debug paths an assertable invariant — after
+          ``Scheduler.drain``, ``_deferred_offloads`` MUST be empty if
+          every backward handle has dropped, otherwise something
+          leaked a strong reference into the autograd graph.
+
+        Chunks whose refcount is still > 0 are intentionally left in
+        ``_deferred_offloads``; the eventual handle drop will trigger
+        :meth:`_release_backward_handle` which will offload them then.
+
+        Returns
+        -------
+        int
+            Number of chunks actually offloaded by this drain (i.e.
+            chunks whose deferred offload was queued AND whose refcount
+            was zero at call time). Useful for telemetry / asserts.
+        """
+        # Snapshot to avoid concurrent mutation: ``offload`` clears the
+        # entry from ``_deferred_offloads`` via the path through
+        # ``_release_backward_handle`` semantics OR directly when its
+        # ``> 0`` guard fails-through.
+        drained = 0
+        for cid in tuple(self._deferred_offloads):
+            if self._backward_refcount.get(cid, 0) > 0:
+                continue
+            # Pop before calling offload so the offload path's deferral
+            # guard sees a clean refcount of zero (it would otherwise
+            # re-add the entry, masking the drain). This mirrors the
+            # _release_backward_handle path: discard, then call offload.
+            self._deferred_offloads.discard(cid)
+            self.offload(cid)
+            drained += 1
+        return drained
+
     # ---- introspection for tests --------------------------------------
 
     def sharded_chunk_ids(self) -> list[ChunkId]:

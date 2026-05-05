@@ -179,8 +179,12 @@ def main() -> None:
             "n_warmup": args.n_warmup,
         }
         # When --output is in extra args we honour it; otherwise default name.
+        # Accept both ``--output /path`` and ``--output=/path`` forms.
         out_path = Path("scripts/nccl_results_world1.json")
         for i, tok in enumerate(extra):
+            if tok.startswith("--output="):
+                out_path = Path(tok.split("=", 1)[1])
+                break
             if tok == "--output" and i + 1 < len(extra):
                 out_path = Path(extra[i + 1])
                 break

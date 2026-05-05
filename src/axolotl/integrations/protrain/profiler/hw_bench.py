@@ -627,10 +627,12 @@ def measure_compute_rate(
     b = torch.randn(matrix_size, matrix_size, dtype=torch.float16, device=device)
 
     # Warmup
+    c = None
     for _ in range(n_warmup):
         c = a @ b
     torch.cuda.synchronize(device)
-    del c
+    if c is not None:
+        del c
 
     # Timed — bind events + record + synchronize to ``device_idx`` so they
     # don't latch onto a stale ``current_device()`` under multi-GPU / masking.

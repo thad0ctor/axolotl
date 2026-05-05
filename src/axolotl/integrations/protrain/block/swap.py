@@ -367,11 +367,18 @@ class SwappedBlock(nn.Module):
 
         # Cold path — no runtime attached. Run the block plain.
         if pool is None or stream is None or not torch.cuda.is_available():
-            if pool is None and not self._warned_no_runtime:
+            if (pool is None or stream is None) and not self._warned_no_runtime:
+                missing = (
+                    "pool+stream"
+                    if pool is None and stream is None
+                    else ("pool" if pool is None else "stream")
+                )
                 LOG.warning(
-                    "SwappedBlock forward without attached runtime — "
-                    "degrading to identity. Call attach_runtime(pool, "
-                    "stream) after constructing the block."
+                    "SwappedBlock forward without attached runtime "
+                    "(missing %s) — degrading to identity. Call "
+                    "attach_runtime(pool, stream) after constructing "
+                    "the block.",
+                    missing,
                 )
                 self._warned_no_runtime = True
             return self.block(*args, **kwargs)

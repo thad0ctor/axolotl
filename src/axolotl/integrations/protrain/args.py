@@ -29,17 +29,20 @@ LOG = get_logger(__name__)
 
 
 # Canonical plugin identifier strings that activate the ProTrain validators.
-# `axolotl.integrations.protrain.ProTrainPlugin` is the form used by tests,
-# the example config (examples/protrain/3090-7b-lora.yml), and the docstrings
-# in this file — it's the only form that actually loads (the integration
-# loader rsplits on '.' for module/class). The bare module form
-# `axolotl.integrations.protrain` is included so that a user-typo'd
-# truncation still trips the validator (giving a clean ValueError) instead
-# of being silently treated as a non-ProTrain plugin and skipping the mutex
-# checks.
+# Only `axolotl.integrations.protrain.ProTrainPlugin` is accepted — that's
+# the form used by tests, the example config
+# (examples/protrain/3090-7b-lora.yml), and the docstrings in this file,
+# and it's the only form that actually loads (the integration loader
+# rsplits on '.' for module/class). The bare module form
+# `axolotl.integrations.protrain` is intentionally REJECTED: it would
+# silently bypass plugin registration entirely (the loader can't resolve
+# a class from it), so accepting it here would let
+# `protrain_auto_memory: true` pass validation while the runtime hooks
+# never install. Users who type the bare module form get the same
+# "missing plugin" ValueError as users who omit `plugins:` altogether,
+# pointing them at the correct class form.
 _PROTRAIN_PLUGIN_KEYS = frozenset(
     {
-        "axolotl.integrations.protrain",
         "axolotl.integrations.protrain.ProTrainPlugin",
     }
 )
@@ -70,10 +73,11 @@ class ProTrainArgs(BaseModel):
     """Input args for the ProTrain plugin.
 
     The plugin is opt-in at two levels: (1) the YAML must list
-    ``axolotl.integrations.protrain`` in ``plugins:``, and (2)
-    ``protrain_auto_memory`` must be True. The second gate lets users add
-    the plugin import for args-schema registration without actually
-    rewiring the training path (useful for validation / documentation).
+    ``axolotl.integrations.protrain.ProTrainPlugin`` in ``plugins:``,
+    and (2) ``protrain_auto_memory`` must be True. The second gate lets
+    users add the plugin import for args-schema registration without
+    actually rewiring the training path (useful for validation /
+    documentation).
     """
 
     protrain_auto_memory: bool | None = Field(

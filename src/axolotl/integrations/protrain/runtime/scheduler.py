@@ -322,6 +322,24 @@ class Scheduler:
                 "activation H2D scheduled by SwappedBlock on swap_stream",
                 block_id,
             )
+        elif mode is BlockMode.OFFLOAD:
+            # OFFLOAD-mode block: the wrapper installed
+            # saved_tensors_hooks during forward; backward will fire an
+            # unpack hook per saved param view that calls
+            # ``ChunkManager.gather_for_backward(chunk_id)``. The
+            # gather we issue below pre-warms the chunk so the unpack
+            # hook hits the resident fast-path instead of forcing a
+            # synchronous gather inside the autograd engine — see §3.3
+            # of BLOCK_MODE_OFFLOAD_DESIGN. Ordering invariant: this
+            # method runs from a backward-pre hook on the wrapper
+            # module, which fires BEFORE autograd starts decoding the
+            # block's saved tensors; that is what guarantees the
+            # gather completes before the first unpack callback.
+            LOG.debug(
+                "Scheduler.pre_block_backward: block=%d is OFFLOAD; "
+                "pre-warming chunk for saved-tensor unpack hook",
+                block_id,
+            )
 
         chunk_ids = self._chunks_for(block_id)
         if not chunk_ids:
@@ -410,10 +428,22 @@ class Scheduler:
         Called at the end of ``backward`` (or at the start of the next
         ``optimizer.step``) so the non-persistent optimizer updates are
         committed before the next forward observes stale params.
+
+        OFFLOAD-mode integration (M3, §3.3 of
+        BLOCK_MODE_OFFLOAD_DESIGN): we also drain any chunks whose
+        offload was deferred because a ``BackwardHandle`` was
+        outstanding at ``reduce_grads_and_offload`` time. In steady
+        state ``BackwardHandle.__del__`` already drains via Python
+        ref-counting on the unpack-returned view, so the drain call
+        here is defensive — it makes the timing explicit, composable
+        with future schedulers, and assertable by debug paths.
         """
         try:
             import torch
         except ImportError:  # pragma: no cover
+            # CPU-only path: still flush deferred offloads so the
+            # contract holds even without CUDA available.
+            self.chunk_manager.drain_deferred_offloads()
             self.chunk_manager.wait_cpu_optim()
             return
 
@@ -426,6 +456,13 @@ class Scheduler:
                 self._prefetch_stream.synchronize()
             if self._swap_stream is not None:
                 self._swap_stream.synchronize()
+
+        # Defensive end-of-iter drain for OFFLOAD-mode chunks. Any
+        # chunk whose backward refcount is still > 0 here indicates an
+        # autograd-engine reference that hasn't been released — leave
+        # it queued and the eventual handle drop will offload it.
+        # ``drain_deferred_offloads`` only runs on refcount==0 entries.
+        self.chunk_manager.drain_deferred_offloads()
 
         self.chunk_manager.wait_cpu_optim()
 
