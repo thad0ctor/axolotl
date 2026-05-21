@@ -321,13 +321,16 @@ def _build_mm_pretrain_cache(
 def _processor_fingerprint(processor: ProcessorMixin | None) -> str | None:
     if processor is None:
         return None
-    parts = [type(processor).__name__]
+    # Module-qualified identity so same-named classes in different modules don't collide.
+    proc_cls = type(processor)
+    parts = [f"{proc_cls.__module__}.{proc_cls.__qualname__}"]
     for attr in ("image_token", "video_token", "image_seq_length"):
         if hasattr(processor, attr):
             parts.append(f"{attr}={getattr(processor, attr)!r}")
     image_processor = getattr(processor, "image_processor", None)
     if image_processor is not None:
-        parts.append(f"image_processor={type(image_processor).__name__}")
+        ip_cls = type(image_processor)
+        parts.append(f"image_processor={ip_cls.__module__}.{ip_cls.__qualname__}")
         for attr in ("size", "patch_size", "merge_size", "min_pixels", "max_pixels"):
             if hasattr(image_processor, attr):
                 parts.append(f"ip.{attr}={getattr(image_processor, attr)!r}")
