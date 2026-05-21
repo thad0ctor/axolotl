@@ -78,7 +78,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-d0ae9245876894da5ac7e18953ecc5cc.css" rel="stylesheet" id="quarto-text-highlighting-styles">
 <script src="../site_libs/bootstrap/bootstrap.min.js"></script>
 <link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
-<link href="../site_libs/bootstrap/bootstrap-ab6ebd6eb475c4578b58908bc314f719.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-6cca919405fa2f273528256191175fbc.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
 <script id="quarto-search-options" type="application/json">{
   "location": "navbar",
   "copy-button": false,
@@ -245,6 +245,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/models/arcee.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Arcee AFM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/mistral-medium-3_5.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mistral Medium 3.5</span></a>
   </div>
 </li>
           <li class="sidebar-item sidebar-item-section">
@@ -624,6 +630,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 </li>
           <li class="sidebar-item">
   <div class="sidebar-item-container"> 
+  <a href="../docs/1_58bit_finetuning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1.58-bit Finetuning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
   <a href="../docs/optimizations.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Optimizations Guide</span></a>
   </div>
@@ -873,7 +885,7 @@ through a ring communication pattern.</p>
 <section id="limitations" class="level2">
 <h2 class="anchored" data-anchor-id="limitations">Limitations</h2>
 <ul>
-<li>Flash attention must be enabled for this to work (<code>flash_attention: true</code> in config YAML)</li>
+<li>Flash attention must be enabled for this to work (<code>attn_implementation: flash_attention_2</code> in config YAML)</li>
 <li>May have a small performance overhead due to communication between GPUs</li>
 </ul>
 </section>

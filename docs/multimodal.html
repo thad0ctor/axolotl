@@ -77,7 +77,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-d0ae9245876894da5ac7e18953ecc5cc.css" rel="stylesheet" id="quarto-text-highlighting-styles">
 <script src="../site_libs/bootstrap/bootstrap.min.js"></script>
 <link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
-<link href="../site_libs/bootstrap/bootstrap-ab6ebd6eb475c4578b58908bc314f719.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-6cca919405fa2f273528256191175fbc.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
 <script id="quarto-search-options" type="application/json">{
   "location": "navbar",
   "copy-button": false,
@@ -244,6 +244,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/models/arcee.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Arcee AFM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/mistral-medium-3_5.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mistral Medium 3.5</span></a>
   </div>
 </li>
           <li class="sidebar-item sidebar-item-section">
@@ -619,6 +625,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/quantize.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Quantization with torchao</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/1_58bit_finetuning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1.58-bit Finetuning</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -1188,6 +1200,19 @@ Tip
 <li><code>role</code> can be <code>system</code>, <code>user</code>, <code>assistant</code>, etc.</li>
 <li><code>content</code> is a list of <code>type</code> and (<code>text</code>, <code>image</code>, <code>path</code>, <code>url</code>, <code>base64</code>, or <code>audio</code>).</li>
 </ul>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+Note
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The recommended column name is <code>messages</code> with the OpenAI-style <code>role</code>/<code>content</code> schema shown above. If your upstream data already lives under a different column name (e.g., <code>conversations</code>, <code>dialogue</code>), set <code>field_messages: &lt;your_column&gt;</code> in the dataset config; this is a rename-only escape hatch — the inner schema must still match one of the two formats above (<code>role</code>/<code>content</code> or ShareGPT’s <code>from</code>/<code>value</code>).</p>
+</div>
+</div>
 <section id="image" class="level3">
 <h3 class="anchored" data-anchor-id="image">Image</h3>
 <div class="callout callout-style-default callout-note callout-titled">

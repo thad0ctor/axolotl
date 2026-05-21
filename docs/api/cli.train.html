@@ -77,7 +77,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="../../site_libs/quarto-html/quarto-syntax-highlighting-dark-d0ae9245876894da5ac7e18953ecc5cc.css" rel="stylesheet" id="quarto-text-highlighting-styles">
 <script src="../../site_libs/bootstrap/bootstrap.min.js"></script>
 <link href="../../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
-<link href="../../site_libs/bootstrap/bootstrap-ab6ebd6eb475c4578b58908bc314f719.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
+<link href="../../site_libs/bootstrap/bootstrap-6cca919405fa2f273528256191175fbc.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
 <script id="quarto-search-options" type="application/json">{
   "location": "navbar",
   "copy-button": false,
@@ -244,6 +244,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../../docs/models/arcee.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Arcee AFM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../../docs/models/mistral-medium-3_5.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mistral Medium 3.5</span></a>
   </div>
 </li>
           <li class="sidebar-item sidebar-item-section">
@@ -623,6 +629,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 </li>
           <li class="sidebar-item">
   <div class="sidebar-item-container"> 
+  <a href="../../docs/1_58bit_finetuning.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">1.58-bit Finetuning</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
   <a href="../../docs/optimizations.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Optimizations Guide</span></a>
   </div>
@@ -786,6 +798,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <ul class="collapse">
   <li><a href="#axolotl.cli.train.do_cli" id="toc-axolotl.cli.train.do_cli" class="nav-link" data-scroll-target="#axolotl.cli.train.do_cli">do_cli</a></li>
   <li><a href="#axolotl.cli.train.do_train" id="toc-axolotl.cli.train.do_train" class="nav-link" data-scroll-target="#axolotl.cli.train.do_train">do_train</a></li>
+  <li><a href="#axolotl.cli.train.ray_train_func" id="toc-axolotl.cli.train.ray_train_func" class="nav-link" data-scroll-target="#axolotl.cli.train.ray_train_func">ray_train_func</a></li>
   </ul></li>
   </ul></li>
   </ul>
@@ -818,6 +831,10 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <tr class="even">
 <td><a href="#axolotl.cli.train.do_train">do_train</a></td>
 <td>Trains a <code>transformers</code> model by first loading the dataset(s) specified in the</td>
+</tr>
+<tr class="odd">
+<td><a href="#axolotl.cli.train.ray_train_func">ray_train_func</a></td>
+<td>Ray Train entrypoint executed on each GPU worker.</td>
 </tr>
 </tbody>
 </table>
@@ -897,9 +914,16 @@ manager’s <code>post_train_unload</code> once training completes.</p>
 </tr>
 </tbody>
 </table>
-
-
 </section>
+</section>
+<section id="axolotl.cli.train.ray_train_func" class="level3">
+<h3 class="anchored" data-anchor-id="axolotl.cli.train.ray_train_func">ray_train_func</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>cli.train.ray_train_func(kwargs)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Ray Train entrypoint executed on each GPU worker.</p>
+<p>Re-validates the config against worker-local GPU capabilities (deferred from
+the driver), then runs the standard training pipeline.</p>
+
+
 </section>
 </section>
 </section>

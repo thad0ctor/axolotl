@@ -6,9 +6,8 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
-<meta name="description" content="A guide to the performance and memory optimizations available in Axolotl.">
 
-<title>Optimizations Guide – Axolotl</title>
+<title>multimodal_assistant_mask – Axolotl</title>
 <style>
 /* Default styles provided by pandoc.
 ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
@@ -23,6 +22,41 @@ ul.task-list li input[type="checkbox"] {
   width: 0.8em;
   margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
   vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
 }
 </style>
 
@@ -110,7 +144,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
       <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
         <i class="bi bi-layout-text-sidebar-reverse"></i>
       </button>
-        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../docs/multimodal.html">How To Guides</a></li><li class="breadcrumb-item"><a href="../docs/optimizations.html">Optimizations Guide</a></li></ol></nav>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"></ol></nav>
         <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
         </a>
     </div>
@@ -601,7 +635,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 </li>
           <li class="sidebar-item">
   <div class="sidebar-item-container"> 
-  <a href="../docs/optimizations.html" class="sidebar-item-text sidebar-link active">
+  <a href="../docs/optimizations.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Optimizations Guide</span></a>
   </div>
 </li>
@@ -758,230 +792,94 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
     <h2 id="toc-title">On this page</h2>
    
   <ul>
-  <li><a href="#speed-optimizations" id="toc-speed-optimizations" class="nav-link active" data-scroll-target="#speed-optimizations">Speed Optimizations</a>
+  <li><a href="#multimodal-assistant-only-loss-masking" id="toc-multimodal-assistant-only-loss-masking" class="nav-link active" data-scroll-target="#multimodal-assistant-only-loss-masking">Multimodal assistant-only loss masking</a>
   <ul class="collapse">
-  <li><a href="#sample-packing" id="toc-sample-packing" class="nav-link" data-scroll-target="#sample-packing">Sample Packing</a></li>
-  <li><a href="#attention-implementations" id="toc-attention-implementations" class="nav-link" data-scroll-target="#attention-implementations">Attention Implementations</a></li>
-  <li><a href="#lora-optimizations" id="toc-lora-optimizations" class="nav-link" data-scroll-target="#lora-optimizations">LoRA Optimizations</a></li>
-  </ul></li>
-  <li><a href="#memory-optimizations" id="toc-memory-optimizations" class="nav-link" data-scroll-target="#memory-optimizations">Memory Optimizations</a>
-  <ul class="collapse">
-  <li><a href="#parameter-efficient-finetuning-lora-qlora" id="toc-parameter-efficient-finetuning-lora-qlora" class="nav-link" data-scroll-target="#parameter-efficient-finetuning-lora-qlora">Parameter Efficient Finetuning (LoRA &amp; QLoRA)</a></li>
-  <li><a href="#gradient-checkpointing-activation-offloading" id="toc-gradient-checkpointing-activation-offloading" class="nav-link" data-scroll-target="#gradient-checkpointing-activation-offloading">Gradient Checkpointing &amp; Activation Offloading</a></li>
-  <li><a href="#layer-offloading" id="toc-layer-offloading" class="nav-link" data-scroll-target="#layer-offloading">Layer Offloading</a></li>
-  <li><a href="#cut-cross-entropy-cce" id="toc-cut-cross-entropy-cce" class="nav-link" data-scroll-target="#cut-cross-entropy-cce">Cut Cross Entropy (CCE)</a></li>
-  <li><a href="#liger-kernels" id="toc-liger-kernels" class="nav-link" data-scroll-target="#liger-kernels">Liger Kernels</a></li>
-  <li><a href="#expert-kernels" id="toc-expert-kernels" class="nav-link" data-scroll-target="#expert-kernels">Expert Kernels</a></li>
-  </ul></li>
-  <li><a href="#long-context-models" id="toc-long-context-models" class="nav-link" data-scroll-target="#long-context-models">Long Context Models</a>
-  <ul class="collapse">
-  <li><a href="#rope-scaling" id="toc-rope-scaling" class="nav-link" data-scroll-target="#rope-scaling">RoPE Scaling</a></li>
-  <li><a href="#sequence-parallelism" id="toc-sequence-parallelism" class="nav-link" data-scroll-target="#sequence-parallelism">Sequence Parallelism</a></li>
-  <li><a href="#artic-long-sequence-training-alst" id="toc-artic-long-sequence-training-alst" class="nav-link" data-scroll-target="#artic-long-sequence-training-alst">Artic Long Sequence Training (ALST)</a></li>
-  </ul></li>
-  <li><a href="#large-models-distributed-training" id="toc-large-models-distributed-training" class="nav-link" data-scroll-target="#large-models-distributed-training">Large Models (Distributed Training)</a>
-  <ul class="collapse">
-  <li><a href="#n-d-parallelism-beta" id="toc-n-d-parallelism-beta" class="nav-link" data-scroll-target="#n-d-parallelism-beta">N-D Parallelism (Beta)</a></li>
-  </ul></li>
-  <li><a href="#quantization" id="toc-quantization" class="nav-link" data-scroll-target="#quantization">Quantization</a>
-  <ul class="collapse">
-  <li><a href="#bit-training-qlora" id="toc-bit-training-qlora" class="nav-link" data-scroll-target="#bit-training-qlora">4-bit Training (QLoRA)</a></li>
-  <li><a href="#fp8-training" id="toc-fp8-training" class="nav-link" data-scroll-target="#fp8-training">FP8 Training</a></li>
-  <li><a href="#quantization-aware-training-qat" id="toc-quantization-aware-training-qat" class="nav-link" data-scroll-target="#quantization-aware-training-qat">Quantization Aware Training (QAT)</a></li>
-  <li><a href="#gptq" id="toc-gptq" class="nav-link" data-scroll-target="#gptq">GPTQ</a></li>
-  <li><a href="#moe-expert-quantization" id="toc-moe-expert-quantization" class="nav-link" data-scroll-target="#moe-expert-quantization">MoE Expert Quantization</a></li>
+  <li><a href="#correct-placement" id="toc-correct-placement" class="nav-link" data-scroll-target="#correct-placement">Correct placement</a></li>
+  <li><a href="#how-to-verify-at-runtime" id="toc-how-to-verify-at-runtime" class="nav-link" data-scroll-target="#how-to-verify-at-runtime">How to verify at runtime</a></li>
+  <li><a href="#config-based-override-cfg.role_boundaries" id="toc-config-based-override-cfg.role_boundaries" class="nav-link" data-scroll-target="#config-based-override-cfg.role_boundaries">Config-based override: <code>cfg.role_boundaries</code></a></li>
   </ul></li>
   </ul>
 </nav>
     </div>
 <!-- main -->
-<main class="content" id="quarto-document-content">
-
-<header id="title-block-header" class="quarto-title-block default"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../docs/multimodal.html">How To Guides</a></li><li class="breadcrumb-item"><a href="../docs/optimizations.html">Optimizations Guide</a></li></ol></nav>
-<div class="quarto-title">
-<h1 class="title">Optimizations Guide</h1>
-</div>
-
-<div>
-  <div class="description">
-    A guide to the performance and memory optimizations available in Axolotl.
-  </div>
-</div>
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"></header>
 
 
-<div class="quarto-title-meta">
-
-    
-  
-    
-  </div>
-  
 
 
-</header>
-
-
-<p>Axolotl includes numerous optimizations to speed up training, reduce memory usage, and handle large models.</p>
-<p>This guide provides a high-level overview and directs you to the detailed documentation for each feature.</p>
-<section id="speed-optimizations" class="level2">
-<h2 class="anchored" data-anchor-id="speed-optimizations">Speed Optimizations</h2>
-<p>These optimizations focus on increasing training throughput and reducing total training time.</p>
-<section id="sample-packing" class="level3">
-<h3 class="anchored" data-anchor-id="sample-packing">Sample Packing</h3>
-<p>Improves GPU utilization by combining multiple short sequences into a single packed sequence for training. This requires enabling one of the <a href="#attention-implementations">attention</a> implementations below.</p>
+<section id="multimodal-assistant-only-loss-masking" class="level1">
+<h1>Multimodal assistant-only loss masking</h1>
+<section id="correct-placement" class="level2">
+<h2 class="anchored" data-anchor-id="correct-placement">Correct placement</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Top-level: only train_on_inputs lives here.</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">train_on_inputs</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">datasets</span><span class="kw">:</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">path</span><span class="kw">:</span><span class="at"> data/train.jsonl</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> chat_template</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">roles_to_train</span><span class="kw">:</span><span class="co">          # per-dataset — this is what the MM scanner reads</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> assistant</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">train_on_eos</span><span class="kw">:</span><span class="at"> turn</span><span class="co">       # per-dataset — same</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="fu">test_datasets</span><span class="kw">:</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">path</span><span class="kw">:</span><span class="at"> data/val.jsonl</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> chat_template</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">split</span><span class="kw">:</span><span class="at"> train</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">roles_to_train</span><span class="kw">:</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> assistant</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">train_on_eos</span><span class="kw">:</span><span class="at"> turn</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+<section id="how-to-verify-at-runtime" class="level2">
+<h2 class="anchored" data-anchor-id="how-to-verify-at-runtime">How to verify at runtime</h2>
+<p><code>build_collator</code> logs the resolved knobs at INFO:</p>
+<pre class="text"><code>MM collator: train_on_inputs=False roles_to_train=['assistant'] train_on_eos=turn role_boundaries_override=none</code></pre>
+<p>If <code>roles_to_train</code> logs as <code>None</code>, the YAML knobs are not reaching the
+scanner — check that they are under <code>datasets[0]</code>, not at the root.</p>
+<p>Each verified strategy additionally logs its resolved boundary token ids at
+strategy init (e.g.&nbsp;<code>&lt;|turn&gt;model</code> → <code>[105, 4368]</code>, <code>&lt;turn|&gt;</code> → <code>[106]</code> for
+Gemma 4). If a strategy emits the “has no built-in role boundaries … only
+pad and media tokens are masked” one-shot warning instead, it is on the
+fallback path — declare per-role markers in YAML via <code>cfg.role_boundaries</code>
+(below) to activate masking. The strategies currently on this path are
+listed in the audit table above under <code>fallback + warn</code>.</p>
+</section>
+<section id="config-based-override-cfg.role_boundaries" class="level2">
+<h2 class="anchored" data-anchor-id="config-based-override-cfg.role_boundaries">Config-based override: <code>cfg.role_boundaries</code></h2>
+<p>For the “unverified” strategies above, or for custom chat templates that
+don’t match a built-in strategy’s markers, users can declare role boundaries
+directly in YAML without subclassing:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">role_boundaries</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">role</span><span class="kw">:</span><span class="at"> assistant</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">start</span><span class="kw">:</span><span class="at"> </span><span class="st">"&lt;|turn&gt;model"</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">end</span><span class="kw">:</span><span class="at"> </span><span class="st">"&lt;turn|&gt;"</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">role</span><span class="kw">:</span><span class="at"> user</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">start</span><span class="kw">:</span><span class="at"> </span><span class="st">"&lt;|turn&gt;user"</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">end</span><span class="kw">:</span><span class="at"> </span><span class="st">"&lt;turn|&gt;"</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">  # Optional keys:</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co">  # include_start: false   # default False</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">  # include_end: true      # default True, respects cfg.train_on_eos</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co">  # end: eos_token         # sentinel: resolves to tokenizer.eos_token_id</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co">  # end: null              # span runs to end of sequence</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Semantics:</p>
 <ul>
-<li><strong>Config:</strong> <code>sample_packing: true</code></li>
-<li><strong>Learn more:</strong> <a href="../docs/multipack.html">Sample Packing</a></li>
-</ul>
-</section>
-<section id="attention-implementations" class="level3">
-<h3 class="anchored" data-anchor-id="attention-implementations">Attention Implementations</h3>
-<p>Using an optimized attention implementation is critical for training speed.</p>
-<ul>
-<li><strong><a href="https://github.com/Dao-AILab/flash-attention">Flash Attention 2</a></strong>: <code>attn_implementation: flash_attention_2</code>. <strong>(Recommended)</strong> The industry standard for fast attention on modern GPUs. Requires Ampere or higher. For AMD, check <a href="https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#amd-rocm-support">AMD Support</a>.</li>
-<li><strong><a href="https://pytorch.org/blog/flexattention/">Flex Attention</a></strong>: <code>attn_implementation: flex_attention</code>.</li>
-<li><strong><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html">SDP Attention</a></strong>: <code>attn_implementation: sdpa</code>. PyTorch’s native implementation.</li>
-<li><strong><a href="https://github.com/facebookresearch/xformers">Xformers</a></strong>: <code>attn_implementation: xformers</code>. Works with FP16.</li>
-</ul>
-<p>See <a href="../docs/attention.html">Attention</a> for the full list of backends and the canonical values.</p>
-</section>
-<section id="lora-optimizations" class="level3">
-<h3 class="anchored" data-anchor-id="lora-optimizations">LoRA Optimizations</h3>
-<p>Leverages optimized kernels to accelerate LoRA training and reduce memory usage.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/lora_optims.html">LoRA Optimizations Documentation</a></li>
-</ul>
-</section>
-</section>
-<section id="memory-optimizations" class="level2">
-<h2 class="anchored" data-anchor-id="memory-optimizations">Memory Optimizations</h2>
-<p>These techniques help you fit larger models or use bigger batch sizes on your existing hardware.</p>
-<section id="parameter-efficient-finetuning-lora-qlora" class="level3">
-<h3 class="anchored" data-anchor-id="parameter-efficient-finetuning-lora-qlora">Parameter Efficient Finetuning (LoRA &amp; QLoRA)</h3>
-<p>Drastically reduces memory by training a small set of “adapter” parameters instead of the full model. This is the most common and effective memory-saving technique.</p>
-<ul>
-<li>Examples: Find configs with <code>lora</code> or <code>qlora</code> in the <a href="https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/llama-3">examples directory</a>.</li>
-<li>Config Reference: See <code>adapter</code>, <code>load_in_4bit</code>, and <code>load_in_8bit</code> in the <a href="../docs/config-reference.html">Configuration Reference</a>.</li>
-</ul>
-</section>
-<section id="gradient-checkpointing-activation-offloading" class="level3">
-<h3 class="anchored" data-anchor-id="gradient-checkpointing-activation-offloading">Gradient Checkpointing &amp; Activation Offloading</h3>
-<p>These techniques save VRAM by changing how activations are handled.</p>
-<ul>
-<li>Gradient Checkpointing: re-computes activations during the backward pass, trading compute time for VRAM.</li>
-<li>Activation Offloading: moves activations to CPU RAM or disk, trading I/O overhead for VRAM.</li>
-<li>Learn more: <a href="../docs/gradient_checkpointing.html">Gradient Checkpointing and Offloading Docs</a></li>
-</ul>
-</section>
-<section id="layer-offloading" class="level3">
-<h3 class="anchored" data-anchor-id="layer-offloading">Layer Offloading</h3>
-<p>Offloads frozen (non-trainable) decoder layer parameters to CPU and streams them back to GPU one layer at a time during forward/backward passes using CUDA stream prefetching. Especially effective for LoRA/QLoRA where most parameters are frozen.</p>
-<ul>
-<li><strong>Config:</strong> <code>layer_offloading: true</code></li>
-<li><strong>Learn more:</strong> <a href="../docs/gradient_checkpointing.html#enabling-layer-offloading">Layer Offloading Docs</a></li>
-</ul>
-</section>
-<section id="cut-cross-entropy-cce" class="level3">
-<h3 class="anchored" data-anchor-id="cut-cross-entropy-cce">Cut Cross Entropy (CCE)</h3>
-<p>Reduces VRAM usage by using an optimized cross-entropy loss calculation.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/custom_integrations.html#cut-cross-entropy">Custom Integrations - CCE</a></li>
-</ul>
-</section>
-<section id="liger-kernels" class="level3">
-<h3 class="anchored" data-anchor-id="liger-kernels">Liger Kernels</h3>
-<p>Provides efficient Triton kernels to improve training speed and reduce memory usage.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/custom_integrations.html#liger-kernels">Custom Integrations - Liger Kernels</a></li>
-</ul>
-</section>
-<section id="expert-kernels" class="level3">
-<h3 class="anchored" data-anchor-id="expert-kernels">Expert Kernels</h3>
-<p>Optimized kernel implementations for Mixture of Experts (MoE) model training.</p>
-<ul>
-<li><p><strong>ScatterMoE</strong>: Triton-based MoE kernels with fused LoRA support.</p></li>
-<li><p><strong>SonicMoE</strong>: CUTLASS-based MoE kernels for NVIDIA Hopper and Blackwell GPUs.</p></li>
-<li><p><strong>Learn more:</strong> <a href="../docs/custom_integrations.html#kernels-integration">Custom Integrations - Kernels Integration</a></p></li>
-</ul>
-</section>
-</section>
-<section id="long-context-models" class="level2">
-<h2 class="anchored" data-anchor-id="long-context-models">Long Context Models</h2>
-<p>Techniques to train models on sequences longer than their original context window.</p>
-<section id="rope-scaling" class="level3">
-<h3 class="anchored" data-anchor-id="rope-scaling">RoPE Scaling</h3>
-<p>Extends a model’s context window by interpolating its Rotary Position Embeddings.</p>
-<ul>
-<li><strong>Config:</strong> Pass the <code>rope_scaling</code> config under the <code>overrides_of_model_config:</code>. To learn how to set RoPE, check the respective model config.</li>
-</ul>
-</section>
-<section id="sequence-parallelism" class="level3">
-<h3 class="anchored" data-anchor-id="sequence-parallelism">Sequence Parallelism</h3>
-<p>Splits long sequences across multiple GPUs, enabling training with sequence lengths that would not fit on a single device.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/sequence_parallelism.html">Sequence Parallelism Documentation</a></li>
-</ul>
-</section>
-<section id="artic-long-sequence-training-alst" class="level3">
-<h3 class="anchored" data-anchor-id="artic-long-sequence-training-alst">Artic Long Sequence Training (ALST)</h3>
-<p>ALST is a recipe that combines several techniques to train long-context models efficiently. It typically involves:</p>
-<ul>
-<li><p>TiledMLP to reduce memory usage in MLP layers.</p></li>
-<li><p>Tiled Loss functions (like <a href="#cut-cross-entropy-(cce)%20or%20%5BLiger%5D(#liger-kernels)">CCE</a>.</p></li>
-<li><p>Activation Offloading to CPU.</p></li>
-<li><p>Example: <a href="https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/alst">ALST Example Configuration</a></p></li>
-</ul>
-</section>
-</section>
-<section id="large-models-distributed-training" class="level2">
-<h2 class="anchored" data-anchor-id="large-models-distributed-training">Large Models (Distributed Training)</h2>
-<p>To train models that don’t fit on a single GPU, you’ll need to use a distributed training strategy like FSDP or DeepSpeed. These frameworks shard the model weights, gradients, and optimizer states across multiple GPUs and nodes.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/multi-gpu.html">Multi-GPU Guide</a></li>
-<li><strong>Learn more:</strong> <a href="../docs/multi-node.html">Multi-Node Guide</a></li>
-</ul>
-<section id="n-d-parallelism-beta" class="level3">
-<h3 class="anchored" data-anchor-id="n-d-parallelism-beta">N-D Parallelism (Beta)</h3>
-<p>For advanced scaling, Axolotl allows you to compose different parallelism techniques (e.g., Data, Tensor, Sequence Parallelism). This is a powerful approach to train an extremely large model by overcoming multiple bottlenecks at once.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/nd_parallelism.html">N-D Parallelism Guide</a></li>
-</ul>
-</section>
-</section>
-<section id="quantization" class="level2">
-<h2 class="anchored" data-anchor-id="quantization">Quantization</h2>
-<p>Techniques to reduce the precision of model weights for memory savings.</p>
-<section id="bit-training-qlora" class="level3">
-<h3 class="anchored" data-anchor-id="bit-training-qlora">4-bit Training (QLoRA)</h3>
-<p>The recommended approach for quantization-based training. It loads the base model in 4-bit using <code>bitsandbytes</code> and then trains QLoRA adapters. See <a href="#adapter-finetuning-lora-qlora">Adapter Finetuning</a> for details.</p>
-</section>
-<section id="fp8-training" class="level3">
-<h3 class="anchored" data-anchor-id="fp8-training">FP8 Training</h3>
-<p>Enables training with 8-bit floating point precision on supported hardware (e.g., NVIDIA Hopper series GPUs) for significant speed and memory gains.</p>
-<ul>
-<li><strong>Example:</strong> <a href="https://github.com/axolotl-ai-cloud/axolotl/blob/main/examples/llama-3/3b-fp8-fsdp2.yaml">Llama 3 FP8 FSDP Example</a></li>
-</ul>
-</section>
-<section id="quantization-aware-training-qat" class="level3">
-<h3 class="anchored" data-anchor-id="quantization-aware-training-qat">Quantization Aware Training (QAT)</h3>
-<p>Simulates quantization effects during training, helping the model adapt and potentially improving the final accuracy of the quantized model.</p>
-<ul>
-<li><strong>Learn more:</strong> <a href="../docs/qat.html">QAT Documentation</a></li>
-</ul>
-</section>
-<section id="gptq" class="level3">
-<h3 class="anchored" data-anchor-id="gptq">GPTQ</h3>
-<p>Allows you to finetune LoRA adapters on top of a model that has already been quantized using the GPTQ method.</p>
-<ul>
-<li><strong>Example:</strong> <a href="https://github.com/axolotl-ai-cloud/axolotl/blob/main/examples/llama-2/gptq-lora.yml">GPTQ LoRA Example</a></li>
-</ul>
-</section>
-<section id="moe-expert-quantization" class="level3">
-<h3 class="anchored" data-anchor-id="moe-expert-quantization">MoE Expert Quantization</h3>
-<p>Quantizes MoE expert weights on load to reduce VRAM when training MoE models with adapters. Required for Transformers v5+ MoE models where experts use fused <code>nn.Parameter</code> tensors.</p>
-<ul>
-<li><strong>Config:</strong> <code>quantize_moe_experts: true</code></li>
-<li><strong>Learn more:</strong> <a href="../docs/expert_quantization.html">MoE Expert Quantization</a></li>
+<li><code>start</code> and <code>end</code> are literal strings; axolotl encodes them at strategy
+init via <code>tokenizer.encode(..., add_special_tokens=False)</code> and logs the
+resolved token-id sequences at INFO level.</li>
+<li>The special value <code>end: eos_token</code> is the portable way to express
+“Pixtral-style assistant turns end at EOS” without hard-coding an id.</li>
+<li><code>role_boundaries</code> is an <strong>opt-in override</strong>. A non-empty list <strong>replaces</strong>
+the strategy’s built-in declarations wholesale (partial overlays are
+intentionally unsupported — they’re hard to reason about at review time).
+Leaving the field unset <em>or</em> setting it to an empty list (<code>[]</code>) both mean
+“use the strategy’s built-ins.” Writing <code>role_boundaries: []</code> is almost
+always a typo or leftover — honoring it literally would produce all-masked
+labels and zero gradient, so it is treated the same as unset.</li>
+<li><code>cfg.roles_to_train</code> still governs which declared roles contribute to
+loss. You can declare <code>user</code> and <code>assistant</code> boundaries and set
+<code>roles_to_train: ["assistant"]</code> to have the scanner correctly identify
+user spans as masking boundaries without training on their content.</li>
+<li>Invalid specs fail loudly at strategy init (missing <code>role</code>/<code>start</code>,
+unencodable markers), not silently at loss-compute time.</li>
 </ul>
 
 
