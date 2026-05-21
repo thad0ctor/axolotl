@@ -6,7 +6,10 @@ changing output_dir should not bust the dataset cache when added_tokens_override
 is set.
 """
 
-from axolotl.utils.data.shared import generate_dataset_hash_from_config
+from axolotl.utils.data.shared import (
+    generate_dataset_hash_from_config,
+    generate_pretraining_dataset_hash,
+)
 from axolotl.utils.dict import DictDefault
 
 
@@ -133,3 +136,124 @@ class TestGenerateDatasetHashFromConfig:
         h2 = generate_dataset_hash_from_config(cfg, _datasets(), "some/other-model")
 
         assert h1 != h2
+
+
+def _mm_pretrain_cfg(**kwargs):
+    return DictDefault(
+        {
+            "sequence_len": 2048,
+            "eval_sequence_len": None,
+            "tokenizer_config": "Qwen/Qwen3.5-VL-9B-Instruct",
+            **kwargs,
+        }
+    )
+
+
+def _mm_pretrain_entry(**kwargs):
+    base = {
+        "path": "json",
+        "name": None,
+        "split": "train",
+        "data_files": "/data/train.jsonl",
+        "ds_type": "json",
+        "type": "multimodal_pretrain",
+        "text_column": "text",
+        "image_column": "images",
+        "image_base_dir": "/data/images",
+        "image_token": None,
+        "multimodal": None,
+        "skip": None,
+        "trust_remote_code": False,
+    }
+    base.update(kwargs)
+    return DictDefault(base)
+
+
+class TestGeneratePretrainingDatasetHash:
+    def test_same_inputs_same_hash(self):
+        cfg = _mm_pretrain_cfg()
+        h1 = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(), "Qwen/Qwen3.5-VL-9B-Instruct", "Qwen2VLProcessor"
+        )
+        h2 = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(), "Qwen/Qwen3.5-VL-9B-Instruct", "Qwen2VLProcessor"
+        )
+        assert h1 == h2
+
+    def test_different_data_files_different_hash(self):
+        cfg = _mm_pretrain_cfg()
+        h1 = generate_pretraining_dataset_hash(
+            cfg,
+            _mm_pretrain_entry(data_files="/data/a.jsonl"),
+            "tok",
+            "Proc",
+        )
+        h2 = generate_pretraining_dataset_hash(
+            cfg,
+            _mm_pretrain_entry(data_files="/data/b.jsonl"),
+            "tok",
+            "Proc",
+        )
+        assert h1 != h2
+
+    def test_different_processor_different_hash(self):
+        cfg = _mm_pretrain_cfg()
+        h1 = generate_pretraining_dataset_hash(cfg, _mm_pretrain_entry(), "tok", "A")
+        h2 = generate_pretraining_dataset_hash(cfg, _mm_pretrain_entry(), "tok", "B")
+        assert h1 != h2
+
+    def test_different_sequence_len_different_hash(self):
+        h1 = generate_pretraining_dataset_hash(
+            _mm_pretrain_cfg(sequence_len=2048), _mm_pretrain_entry(), "tok", "Proc"
+        )
+        h2 = generate_pretraining_dataset_hash(
+            _mm_pretrain_cfg(sequence_len=4096), _mm_pretrain_entry(), "tok", "Proc"
+        )
+        assert h1 != h2
+
+    def test_different_image_token_different_hash(self):
+        cfg = _mm_pretrain_cfg()
+        h1 = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(image_token="<image>"), "tok", "Proc"
+        )
+        h2 = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(image_token="<|image_pad|>"), "tok", "Proc"
+        )
+        assert h1 != h2
+
+    def test_none_processor_folds_to_none_string(self):
+        cfg = _mm_pretrain_cfg()
+        h_none = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(), "tok", None
+        )
+        h_named = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(), "tok", "None"
+        )
+        assert h_none == h_named
+
+    def test_eval_sequence_len_excluded(self):
+        # Cache stores train only; eval-only knobs must not bust it.
+        h1 = generate_pretraining_dataset_hash(
+            _mm_pretrain_cfg(eval_sequence_len=None),
+            _mm_pretrain_entry(),
+            "tok",
+            "Proc",
+        )
+        h2 = generate_pretraining_dataset_hash(
+            _mm_pretrain_cfg(eval_sequence_len=4096),
+            _mm_pretrain_entry(),
+            "tok",
+            "Proc",
+        )
+        assert h1 == h2
+
+    def test_image_base_dir_excluded(self):
+        # image_base_dir is collator-runtime, not baked into cached arrows.
+        cfg = _mm_pretrain_cfg()
+        h1 = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(image_base_dir="/data/a"), "tok", "Proc"
+        )
+        h2 = generate_pretraining_dataset_hash(
+            cfg, _mm_pretrain_entry(image_base_dir="/data/b"), "tok", "Proc"
+        )
+        assert h1 == h2
