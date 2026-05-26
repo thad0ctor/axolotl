@@ -218,6 +218,7 @@ def test_resume_hook_rolls_back_offload_when_original_load_fails(monkeypatch) ->
                 adam_epsilon=1e-8,
                 weight_decay=0.01,
                 optim="adamw_torch",
+                max_grad_norm=1.0,
             )
             self.model = SimpleNamespace()
             self.optimizer = "old"
@@ -227,7 +228,7 @@ def test_resume_hook_rolls_back_offload_when_original_load_fails(monkeypatch) ->
             raise RuntimeError("load boom")
 
     def _fake_optimizer_wrapper(*args, **kwargs):
-        calls.append("optim_rebuild")
+        calls.append(f"optim_rebuild:{kwargs.get('max_grad_norm')}")
         return "rebuilt"
 
     monkeypatch.setattr(
@@ -247,7 +248,13 @@ def test_resume_hook_rolls_back_offload_when_original_load_fails(monkeypatch) ->
     with pytest.raises(RuntimeError, match="load boom"):
         trainer._load_from_checkpoint("checkpoint")
 
-    assert calls == ["cpu_shutdown", "restore", "load", "materialize", "optim_rebuild"]
+    assert calls == [
+        "cpu_shutdown",
+        "restore",
+        "load",
+        "materialize",
+        "optim_rebuild:1.0",
+    ]
     assert trainer.optimizer == "rebuilt"
 
 

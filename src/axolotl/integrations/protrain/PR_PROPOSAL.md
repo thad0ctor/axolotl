@@ -62,7 +62,7 @@ non-NVLink PCIe topology; full setup in §11):
   final serialization and write an 8.5 GB `model.safetensors`. This is the
   practical smaller same-family regression shape for local 24 GiB cards; the
   9B full-FT shape reaches a finite first step locally but OOMs at step 2.
-- **Qwen3.5-9B Mode C full-FT NaN race isolated and fenced.** RunPod
+- **Qwen3.5-9B Mode C full-FT NaN race isolated; longer stability remains open.** RunPod
   2×95 GiB H100-class diagnostics showed the pre-fix step-2 NaN-collapse
   under both `adamw_bnb_8bit` and `adamw_torch`, while comparable vanilla
   no-ProTrain runs stayed finite. The fault localized to ProTrain finalizing
@@ -70,8 +70,13 @@ non-NVLink PCIe topology; full setup in §11):
   leaf grad accumulation had completed. Commit `dbb823e` fences the compute
   stream before post-block chunk finalization; a clean-worktree 3-step
   Qwen3.5-9B full-FT confirmation stayed finite
-  (`grad_norm` 25.09 → 19.84 → 35.38). The final save hit the RunPod disk
-  quota after training completed, not a training-stability failure.
+  (`grad_norm` 25.09 → 19.84 → 35.38), and a 1-step final-save check wrote
+  the 22 GB `model.safetensors` when the output filesystem had enough space.
+  A longer resume-from-checkpoint diagnostic loaded a real checkpoint and
+  stayed finite through step 25, then collapsed at step 26; a from-scratch
+  30-step control independently tripped the optimizer-target non-finite guard
+  after the step-10 metric. The step-2 race is fixed, but 9B Mode C full-FT
+  long-run numerics remain a Phase-3 follow-up.
 - **27B + 4-bit Mode C sharded on 2× 3090 (multi-GPU).** ProTrain Mode C
   with `protrain_zero3_shard: true` at seq=128, world_size=2 holds at
   **20.25 GiB/rank**, 4.564 global sps, loss 0.811 — the first
@@ -940,9 +945,12 @@ optimizer math failure; it was a ProTrain stream-lifetime race where
 leaf grad accumulation had completed. Commit `dbb823e` adds a compute-stream
 fence immediately before post-block chunk finalization. A clean-worktree
 Qwen3.5-9B full-FT confirmation on the RunPod completed 3/3 finite training
-steps (`grad_norm` 25.09, 19.84, 35.38); final save then failed on disk
-quota after the training signal was already recorded. Longer 9B >24 GiB
-coverage remains §16.B B1.
+steps (`grad_norm` 25.09, 19.84, 35.38), and a separate 1-step run wrote the
+22 GB final `model.safetensors` once enough local filesystem space was freed.
+Longer 9B >24 GiB coverage remains §16.B B1: a real checkpoint/resume run
+loaded from `checkpoint-1` and stayed finite through step 25 before collapsing
+at step 26, while a no-resume 30-step control independently tripped the
+optimizer-target non-finite guard after the step-10 metric.
 
 **Finding.** ProTrain Mode C's `zero3_shard` shards **chunk weights** but
 NOT **fp32 master optimizer state** for full-FT — the chunk manager's
@@ -1931,7 +1939,7 @@ prerequisites for the validated feature set above.
 
 | # | Follow-up | Scope |
 |---|---|---|
-| B1 | **9B full-FT Mode C: step-2 NaN fixed; long-run coverage open** | Qwen3.5-9B full-FT (no LoRA) on >24 GiB multi-GPU hardware mechanically reaches training under `protrain_zero3_shard: true` + bf16. Pre-fix diagnostics reproduced a step-2 NaN-collapse under both `adamw_bnb_8bit` and `adamw_torch`; comparable vanilla no-ProTrain and vanilla gradient-checkpointing runs stayed finite, so the root was not bnb-specific or a simple dependency math failure. The issue localized to ProTrain `post_block_backward` finalizing / offloading chunk storage before queued leaf grad accumulation completed; commit `dbb823e` fences the compute stream before post-block chunk finalization. A clean-worktree RunPod 2×95 GiB H100-class diagnostic completed 3/3 finite Qwen3.5-9B full-FT steps (`grad_norm` 25.09, 19.84, 35.38); final save failed on disk quota after training completed. Remaining coverage: a longer 25-step+ 9B run, resume/save verification on sufficient quota, and the default searcher-picked profile on >24 GiB hardware. On local 5× 3090-class 24 GiB cards, Qwen3.5-9B reaches a finite first step but OOMs at step 2; Qwen3.5-4B forced Mode C is the practical local regression shape and passes 25/25 steps with both optimizers plus final safetensors save. Mode A `force_all_persistent` remains incompatible with 9B+ full-FT under DDP because chunk-wrapper hooks conflict with DDP autograd, surfacing as ~100+ "parameters which did not receive grad" — Mode C is the supported full-FT path for this class. Software prerequisites listed in §6.nv. |
+| B1 | **9B full-FT Mode C: step-2 race fixed; longer-run NaN still open** | Qwen3.5-9B full-FT (no LoRA) on >24 GiB multi-GPU hardware mechanically reaches training under `protrain_zero3_shard: true` + bf16. Pre-fix diagnostics reproduced a step-2 NaN-collapse under both `adamw_bnb_8bit` and `adamw_torch`; comparable vanilla no-ProTrain and vanilla gradient-checkpointing runs stayed finite, so the root was not bnb-specific or a simple dependency math failure. The issue localized to ProTrain `post_block_backward` finalizing / offloading chunk storage before queued leaf grad accumulation completed; commit `dbb823e` fences the compute stream before post-block chunk finalization. Post-fix RunPod checks: 3/3 finite Qwen3.5-9B full-FT steps (`grad_norm` 25.09, 19.84, 35.38); 1-step final-save wrote a 22 GB `model.safetensors` after freeing disk; checkpoint/resume loaded from `checkpoint-1` and stayed finite through step 25 before collapsing at step 26; a no-resume 30-step control independently tripped the optimizer-target non-finite guard after the step-10 metric, with first bad tensors in early `linear_attn` and MLP weights on both ranks. Resume-specific guard bug found during this run: `_install_resume_hook` rebuilt the optimizer without preserving `max_grad_norm`, so resumed jobs could step through non-finite optimizer-target grads; the hook now carries that value into the rebuilt optimizer. Remaining coverage: localize the longer-run numerical source, validate a production checkpoint-save path that restores offloaded full-FT tensors on all ranks without breaking continued training, and exercise the default searcher-picked profile on >24 GiB hardware. On local 5× 3090-class 24 GiB cards, Qwen3.5-9B reaches a finite first step but OOMs at step 2; Qwen3.5-4B forced Mode C is the practical local regression shape and passes 25/25 steps with both optimizers plus final safetensors save. Mode A `force_all_persistent` remains incompatible with 9B+ full-FT under DDP because chunk-wrapper hooks conflict with DDP autograd, surfacing as ~100+ "parameters which did not receive grad" — Mode C is the supported full-FT path for this class. Software prerequisites listed in §6.nv. |
 | B2 | **bs=1 throughput is launch-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, per-step wallclock is dominated by ~9,000 `cudaLaunchKernel` calls per step on consumer 3090s. NCCL grad sync is overlap-shadowed by backward compute at this shape (Path B's coalesced sync produces a noise-level sps change at minimal-target bs=1 qlora despite a -68% NCCL collective-count reduction — Path B's measurable gain surfaces in the many-LoRA-tensor regime, see §6.pb). Recommended config: `gradient_accumulation_steps: 4` recovers per-sample throughput by amortizing the fixed launch tax — measured per-rank bs=1 = 0.229 sps → bs=4 (via grad-accum) = 0.738 sps (3.22×/sample). Future work: CUDA Graphs capture is the canonical fix for launch-tax-dominated regimes; not yet implemented in this branch. |
 | B3 | **3-rank Mode C bs=2 searcher infeasibility on homogeneous 3× 3090** | 2-rank and 4-rank Mode C paths pass. The homogeneous 3-rank case currently returns no finite runtime estimate for all capacity-feasible candidates. |
 

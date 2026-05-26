@@ -954,6 +954,7 @@ def _install_resume_hook(trainer, cfg, wrapped) -> None:
     rebuild_eps = float(args.adam_epsilon)
     rebuild_weight_decay = float(args.weight_decay)
     rebuild_optimizer_name = _resolve_optimizer_name(args, cfg)
+    rebuild_max_grad_norm = getattr(args, "max_grad_norm", None)
     rebuild_huge_threshold = int(
         getattr(cfg, "protrain_persistent_huge_param_threshold_bytes", None)
         or 512 * 1024 * 1024
@@ -1066,6 +1067,11 @@ def _install_resume_hook(trainer, cfg, wrapped) -> None:
                     optimizer_name=rebuild_optimizer_name,
                     huge_param_threshold_bytes=rebuild_huge_threshold,
                     lora_owned_params=rebuild_lora_params,
+                    max_grad_norm=(
+                        float(rebuild_max_grad_norm)
+                        if rebuild_max_grad_norm is not None
+                        else None
+                    ),
                 )
             except Exception:
                 LOG.exception(
