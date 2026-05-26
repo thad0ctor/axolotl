@@ -293,6 +293,8 @@ def save_trained_model(
             # final model weights have already been saved by `ReLoRACallback.on_train_end`
             return
 
+    _restore_protrain_fullft_offload_for_save(cfg, trainer)
+
     if trainer.is_fsdp_enabled or cfg.fsdp_config:
         if cfg.fsdp_config or cfg.fsdp:
             if cfg.fsdp_config.final_state_dict_type:
@@ -386,6 +388,25 @@ def save_trained_model(
         )
 
     LOG.info(f"Model successfully saved to {cfg.output_dir}")
+
+
+def _restore_protrain_fullft_offload_for_save(cfg: DictDefault, trainer: Any) -> None:
+    if getattr(cfg, "_protrain_wrapped", None) is None:
+        return
+
+    from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
+
+    moved = restore_fullft_offload_for_save(cfg)
+    if not moved:
+        return
+
+    accelerator = getattr(trainer, "accelerator", None)
+    if accelerator is not None and hasattr(accelerator, "wait_for_everyone"):
+        accelerator.wait_for_everyone()
+        return
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 def create_model_card(cfg: DictDefault, trainer: Trainer):

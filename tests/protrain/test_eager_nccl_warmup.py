@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 import pytest
 
+from axolotl.integrations.protrain.args import ProTrainArgs
+
 
 def _patch_dist(*, initialized: bool, world_size: int = 2, rank: int = 0):
     """Patch ``torch.distributed`` to look like a live process group."""
@@ -36,6 +38,51 @@ def _make_chunk_manager(*, zero3_shard: bool, n_chunk: int = 4):
     """Minimal duck-typed chunk_manager stand-in for the warmup helper."""
     layout = SimpleNamespace(N_chunk=n_chunk)
     return SimpleNamespace(zero3_shard=zero3_shard, layout=layout)
+
+
+def test_eager_nccl_warmup_defaults_disabled():
+    """Warm-up is opt-in because a stuck NCCL collective cannot be caught."""
+    args = ProTrainArgs.model_validate(
+        {
+            "plugins": ["axolotl.integrations.protrain.ProTrainPlugin"],
+            "protrain_auto_memory": True,
+            "base_model": "HuggingFaceTB/SmolLM2-135M",
+        }
+    )
+
+    assert args.protrain_eager_nccl_warmup is False
+
+
+def test_warmup_device_prefers_chunk_manager_device():
+    """Mode C bypass can leave Accelerate's device stale; use ProTrain's rank device."""
+    pytest.importorskip("torch")
+
+    import torch
+
+    from axolotl.integrations.protrain.plugin import _resolve_eager_nccl_warmup_device
+
+    chunk_manager = SimpleNamespace(device=torch.device("cuda", 3))
+    trainer = SimpleNamespace(accelerator=SimpleNamespace(device=torch.device("cuda", 0)))
+
+    assert _resolve_eager_nccl_warmup_device(chunk_manager, trainer) == torch.device(
+        "cuda", 3
+    )
+
+
+def test_warmup_device_falls_back_to_accelerator():
+    """Without a chunk-manager device, keep the older Accelerator fallback."""
+    pytest.importorskip("torch")
+
+    import torch
+
+    from axolotl.integrations.protrain.plugin import _resolve_eager_nccl_warmup_device
+
+    chunk_manager = SimpleNamespace(device=None)
+    trainer = SimpleNamespace(accelerator=SimpleNamespace(device=torch.device("cuda", 1)))
+
+    assert _resolve_eager_nccl_warmup_device(chunk_manager, trainer) == torch.device(
+        "cuda", 1
+    )
 
 
 def test_warmup_noop_when_dist_not_initialized():

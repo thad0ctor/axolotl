@@ -180,6 +180,31 @@ def test_explicit_skip_knob_still_honored_without_protrain() -> None:
     )
 
 
+def test_explicit_skip_knob_honored_without_4bit() -> None:
+    """``embeddings_skip_upcast: true`` is an explicit low-VRAM escape hatch."""
+    cfg = _ConfigSpy(
+        plugins=[],
+        load_in_4bit=False,
+        embeddings_skip_upcast=True,
+        model_config_type="llama",
+        adapter=None,
+        gradient_checkpointing=False,
+        gradient_checkpointing_kwargs=None,
+        flash_attention=False,
+        flex_attention=False,
+        sage_attention=False,
+        cut_cross_entropy=False,
+        torch_dtype="bfloat16",
+    )
+    loader = _make_loader(cfg)
+    calls = _capture_upcast_call(loader)
+
+    pre_kbit = [c for c in calls if c["before_kbit_train_or_finetune"]]
+    assert pre_kbit and pre_kbit[0]["embedding_modules"] == [], (
+        "explicit skip knob must not be ignored outside 4-bit loading"
+    )
+
+
 def test_no_skip_when_4bit_disabled_even_with_protrain() -> None:
     """Auto-defer is 4-bit-specific; bf16 paths still upcast under ProTrain."""
     cfg = _ConfigSpy(

@@ -42,6 +42,56 @@ LOG = get_logger(__name__)
 _INERT_AUTO_MEMORY_WARN_FIRED: bool = False
 
 
+def _bind_local_cuda_device_from_env() -> int | None:
+    """Bind torch's current CUDA device to LOCAL_RANK before any CUDA work."""
+    import os
+
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+
+    raw_local_rank = os.environ.get("LOCAL_RANK")
+    if raw_local_rank is None:
+        return None
+    try:
+        local_rank = int(raw_local_rank)
+    except ValueError:
+        LOG.warning(
+            "ProTrain: invalid LOCAL_RANK=%r; leaving current CUDA device at %s.",
+            raw_local_rank,
+            torch.cuda.current_device(),
+        )
+        return None
+
+    visible = torch.cuda.device_count()
+    if not (0 <= local_rank < visible):
+        LOG.warning(
+            "ProTrain: LOCAL_RANK=%d is out of visible CUDA range [0, %d); "
+            "leaving current CUDA device at %s.",
+            local_rank,
+            visible,
+            torch.cuda.current_device(),
+        )
+        return None
+
+    try:
+        torch.cuda.set_device(local_rank)
+    except RuntimeError as exc:
+        LOG.warning(
+            "ProTrain: torch.cuda.set_device(LOCAL_RANK=%d) failed (%s); "
+            "continuing with current CUDA device %s.",
+            local_rank,
+            exc,
+            torch.cuda.current_device(),
+        )
+        return None
+    return local_rank
+
+
 def _maybe_warn_inert_plugin(cfg) -> None:
     """One-time WARN when ProTrain plugin is listed but ``protrain_auto_memory`` is off.
 
@@ -132,16 +182,7 @@ def _early_init_dist_for_nccl(cfg) -> int:
         return 1
 
     # Bind LOCAL_RANK GPU before NCCL init so collectives target the per-rank shard.
-    try:
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-    except (ValueError, RuntimeError) as exc:
-        LOG.warning(
-            "ProTrain: torch.cuda.set_device(LOCAL_RANK=%s) failed (%s); "
-            "early dist init may pick the wrong device.",
-            os.environ.get("LOCAL_RANK"),
-            exc,
-        )
+    _bind_local_cuda_device_from_env()
 
     LOG.info(
         "ProTrain: bringing up torch.distributed (backend=nccl, "
@@ -169,6 +210,17 @@ def _early_init_dist_for_nccl(cfg) -> int:
     return live_world
 
 
+def _resolve_eager_nccl_warmup_device(chunk_manager, trainer=None):
+    """Prefer ProTrain's per-rank device over Accelerate's post-bypass device."""
+    warmup_device = getattr(chunk_manager, "device", None)
+    if warmup_device is not None:
+        return warmup_device
+    accelerator = getattr(trainer, "accelerator", None) if trainer is not None else None
+    if accelerator is not None:
+        return getattr(accelerator, "device", None)
+    return None
+
+
 def _eager_nccl_warmup(chunk_manager, device) -> None:
     """Fire one no-op of each NCCL collective the per-chunk path uses.
 
@@ -180,7 +232,8 @@ def _eager_nccl_warmup(chunk_manager, device) -> None:
     watchdog-measurable init phase BEFORE the first iter's autograd-internal
     dispatch.
 
-    Catches and logs all exceptions: a broken warmup must not block training.
+    Catches and logs Python-side exceptions. A stuck NCCL collective cannot be
+    interrupted safely in-process, so callers should keep this opt-in.
     """
     import time
 
@@ -213,6 +266,12 @@ def _eager_nccl_warmup(chunk_manager, device) -> None:
     t0 = time.perf_counter()
 
     try:
+        device = torch.device(device)
+        if device.type == "cuda" and torch.cuda.is_available():
+            if device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            torch.cuda.set_device(device)
+
         # bf16 matches the per-chunk all_reduce / reduce_scatter dtype used by
         # _coalesced_all_reduce_persistent_grads + _reduce_scatter_and_offload_shard.
         # NCCL's communicator init is one-shot per ProcessGroup; the dtype/shape
@@ -1137,30 +1196,29 @@ def _guard_full_ft_mode_a_ddp(cfg, trainer, wrapped) -> None:
 _guard_force_all_persistent_full_ft_ddp = _guard_full_ft_mode_a_ddp
 
 
-def _force_pickle_save_for_fullft_offload(cfg, trainer, wrapped) -> None:
-    """Force ``save_safetensors=False`` for ProTrain full-FT + offload paths.
+def _is_full_ft_cfg(cfg) -> bool:
+    adapter = getattr(cfg, "adapter", None)
+    return adapter is None or str(adapter).strip() == ""
 
-    ProTrain's released non-persistent chunks share one expand-placeholder
-    scratch tensor per dtype (`chunk/manager.py::_shape_preserving_placeholder`)
-    to preserve shape semantics during autograd capture. At save time,
-    safetensors detects that hundreds of params share storage with the same
-    scratch and raises ``RuntimeError: The weights trying to be saved
-    contained shared tensors``. LoRA-scope saves dodge this because only
-    adapter weights are serialized; full-FT saves include the chunk-managed
-    base weights and trip the check.
 
-    When ProTrain is active, full-FT (`cfg.adapter` is None/empty), and any
-    non-persistent chunks exist (offload regime), force ``save_safetensors``
-    to ``False`` so HF saves to pickle ``.bin`` instead. The override is
-    UNCONDITIONAL for this combination — even an explicit
-    ``save_safetensors: true`` from the user is flipped, because safetensors
-    would fail at save time regardless. A WARNING explains the override and
-    points users at the LoRA-scope save or no-offload alternatives if
-    .safetensors output is required.
-    """
+def _has_fullft_offload(cfg, wrapped) -> bool:
+    """Return true when full-FT save would include chunk-managed params."""
+    if not _is_full_ft_cfg(cfg):
+        return False
+
     chunk_manager = getattr(wrapped, "chunk_manager", None)
     if chunk_manager is None:
-        return
+        return False
+
+    layout = getattr(chunk_manager, "layout", None)
+    n_chunk = getattr(layout, "N_chunk", None) if layout is not None else None
+    if n_chunk is not None and int(n_chunk) > 0:
+        return True
+
+    if getattr(chunk_manager, "_cpu_slots", None):
+        return True
+    if getattr(chunk_manager, "_persistent_buffers", None):
+        return True
 
     non_persistent_ids = getattr(chunk_manager, "_non_persistent_ids", None)
     has_non_persistent_chunks = bool(non_persistent_ids)
@@ -1168,18 +1226,43 @@ def _force_pickle_save_for_fullft_offload(cfg, trainer, wrapped) -> None:
         search_result = getattr(wrapped, "search_result", None)
         picked = getattr(search_result, "cfg", None) if search_result else None
         n_persist = getattr(picked, "n_persist", None) if picked is not None else None
-        layout = getattr(chunk_manager, "layout", None)
-        n_chunk = getattr(layout, "N_chunk", None) if layout is not None else None
         if n_persist is not None and n_chunk is not None:
             has_non_persistent_chunks = int(n_persist) < int(n_chunk)
-    if not has_non_persistent_chunks:
-        return
+    return has_non_persistent_chunks
 
-    # Full-FT iff no LoRA adapter configured. The requires_grad check is
-    # unreliable after ProTrain wraps the model (chunk scratch / placeholder
-    # params can have requires_grad=False even in full-FT runs).
-    adapter = getattr(cfg, "adapter", None)
-    if adapter is not None and str(adapter).strip() != "":
+
+def restore_fullft_offload_for_save(cfg) -> int:
+    """Restore chunk-managed full-FT params before the final model save."""
+    wrapped = getattr(cfg, "_protrain_wrapped", None)
+    if wrapped is None:
+        return 0
+    if not _has_fullft_offload(cfg, wrapped):
+        return 0
+    if getattr(cfg, "_protrain_fullft_offload_restored_for_save", False):
+        return 0
+
+    chunk_manager = getattr(wrapped, "chunk_manager", None)
+    if chunk_manager is None:
+        return 0
+
+    moved = chunk_manager.restore_to_gpu()
+    cfg._protrain_fullft_offload_restored_for_save = True  # type: ignore[attr-defined]
+    LOG.info(
+        "ProTrain: restored %.3f GB of full-FT chunk-managed params before final save.",
+        moved / 1e9,
+    )
+    return moved
+
+
+def _force_pickle_save_for_fullft_offload(cfg, trainer, wrapped) -> None:
+    """Best-effort legacy guard for ProTrain full-FT + offload saves.
+
+    Older Transformers releases honored ``save_safetensors=False`` and wrote a
+    pickle checkpoint, avoiding shared-storage placeholder failures. Newer
+    save paths may always write safetensors, so the final save also restores
+    chunk-managed params to standalone GPU storage before serialization.
+    """
+    if not _has_fullft_offload(cfg, wrapped):
         return
 
     args = getattr(trainer, "args", None)
@@ -1192,17 +1275,10 @@ def _force_pickle_save_for_fullft_offload(cfg, trainer, wrapped) -> None:
 
     args.save_safetensors = False
     LOG.warning(
-        "ProTrain: forcing trainer.args.save_safetensors=False for full-FT + "
-        "offload. ProTrain's shape-preserving expand-placeholder shares "
-        "scratch storage across released chunks (chunk/manager.py); "
-        "safetensors detects this as 'shared tensors' and refuses to save. "
-        "Falling back to pickle .bin format. This override is unavoidable "
-        "for this combination — even an explicit `save_safetensors: true` "
-        "in your config will produce a save-time error. If you need "
-        ".safetensors output (e.g., HF Hub upload, vLLM compatibility), "
-        "use a LoRA-scope save (only adapter weights serialized) or run "
-        "without offload (single-GPU / Mode A all-persistent with enough "
-        "GPU memory)."
+        "ProTrain: forcing trainer.args.save_safetensors=False as a legacy "
+        "full-FT + offload save guard. The final save path also restores "
+        "chunk-managed params to standalone GPU storage before serialization "
+        "because newer Transformers save paths may always emit safetensors."
     )
 
 
@@ -1245,6 +1321,12 @@ class ProTrainPlugin(BasePlugin):
         _maybe_warn_inert_plugin(cfg)
         if not _is_plugin_active(cfg):
             return
+        bound_local_rank = _bind_local_cuda_device_from_env()
+        if bound_local_rank is not None:
+            LOG.info(
+                "ProTrain: bound current CUDA device to LOCAL_RANK=%d before model load.",
+                bound_local_rank,
+            )
         from axolotl.integrations.protrain.check import (
             assert_supported_peft_transformers_surface,
             warn_on_unvalidated_versions,
@@ -1812,15 +1894,13 @@ class ProTrainPlugin(BasePlugin):
 
         # Eager per-chunk NCCL warmup: pay ncclCommInitRank cost here, not
         # during the first training iter's autograd-internal dispatch.
-        if bool(getattr(cfg, "protrain_eager_nccl_warmup", True)):
+        if bool(getattr(cfg, "protrain_eager_nccl_warmup", False)):
             chunk_manager_for_warmup = getattr(wrapped, "chunk_manager", None)
             if chunk_manager_for_warmup is not None:
-                accelerator = getattr(trainer, "accelerator", None)
-                warmup_device = None
-                if accelerator is not None:
-                    warmup_device = getattr(accelerator, "device", None)
-                if warmup_device is None:
-                    warmup_device = getattr(chunk_manager_for_warmup, "device", None)
+                warmup_device = _resolve_eager_nccl_warmup_device(
+                    chunk_manager_for_warmup,
+                    trainer,
+                )
                 if warmup_device is not None:
                     _eager_nccl_warmup(chunk_manager_for_warmup, warmup_device)
                 else:

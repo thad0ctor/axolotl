@@ -16,11 +16,16 @@ from dataclasses import replace
 import pytest
 
 from axolotl.integrations.protrain.api.model_wrapper import (
+    _phase1_measured_iter_proxy_s,
+    _phase2_quickstart_post_measurement_should_skip,
     _phase2_quickstart_should_skip,
+    _phase2_quickstart_should_skip_unmeasured_upfront,
     _teardown_phase2_bootstrap_runtime,
 )
 from axolotl.integrations.protrain.args import ProTrainArgs
+from axolotl.integrations.protrain.block.layout_rules import assign_modes
 from axolotl.integrations.protrain.search import search
+from axolotl.integrations.protrain.types import CostConfig, SearchResult
 
 # Reuse the synthetic builders + fixtures from test_cost_search; pytest
 # only auto-injects fixtures defined in conftest.py or the importing
@@ -128,6 +133,151 @@ def test_quickstart_refuses_to_skip_on_nonpositive_predictions():
         _phase2_quickstart_should_skip(
             measured_iter_s=0.0,
             predicted_iter_s=1.0,
+            quickstart=True,
+            envelope=0.30,
+        )
+        is False
+    )
+
+
+def test_phase1_proxy_requires_backward_timing(toy_trace, toy_layout, toy_hw):
+    """Without a measured backward wall, quickstart must not skip Phase-2."""
+    cfg = CostConfig(
+        n_persist=toy_layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    block_map = assign_modes(
+        cfg.n_swap,
+        cfg.n_checkpoint,
+        len(toy_trace.activation_sizes),
+        n_offload=cfg.n_offload,
+    )
+
+    assert (
+        _phase1_measured_iter_proxy_s(
+            trace=toy_trace,
+            cfg=cfg,
+            layout=toy_layout,
+            block_map=block_map,
+            hw=toy_hw,
+        )
+        == 0.0
+    )
+
+
+def test_phase1_proxy_can_drive_upfront_quickstart(toy_trace, toy_layout, toy_hw):
+    """The upfront quickstart path uses existing Phase-1 trace timings."""
+    trace = replace(toy_trace, steady_bwd_wall_s=toy_trace.steady_fwd_wall_s * 2.0)
+    cfg = CostConfig(
+        n_persist=toy_layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
+    )
+    block_map = assign_modes(
+        cfg.n_swap,
+        cfg.n_checkpoint,
+        len(trace.activation_sizes),
+        n_offload=cfg.n_offload,
+    )
+
+    proxy_s = _phase1_measured_iter_proxy_s(
+        trace=trace,
+        cfg=cfg,
+        layout=toy_layout,
+        block_map=block_map,
+        hw=toy_hw,
+    )
+
+    assert proxy_s > trace.steady_fwd_wall_s + trace.steady_bwd_wall_s
+    assert _phase2_quickstart_should_skip(
+        measured_iter_s=proxy_s,
+        predicted_iter_s=proxy_s * 1.10,
+        quickstart=True,
+        envelope=0.30,
+    )
+
+
+def test_quickstart_skips_unmeasured_on_demand_trace(toy_trace):
+    """Large-model on-demand traces lack steady timing; opt-in quickstart keeps Phase-1."""
+    trace = replace(
+        toy_trace,
+        hooked_fwd_wall_s=46.0,
+        steady_fwd_wall_s=0.0,
+        steady_bwd_wall_s=0.0,
+    )
+
+    assert _phase2_quickstart_should_skip_unmeasured_upfront(
+        trace=trace,
+        predicted_iter_s=6.7,
+        quickstart=True,
+    )
+    assert not _phase2_quickstart_should_skip_unmeasured_upfront(
+        trace=trace,
+        predicted_iter_s=6.7,
+        quickstart=False,
+    )
+    assert not _phase2_quickstart_should_skip_unmeasured_upfront(
+        trace=trace,
+        predicted_iter_s=0.0,
+        quickstart=True,
+    )
+
+
+def test_quickstart_unmeasured_fallback_requires_absent_steady_timing(toy_trace):
+    """If steady timing exists, use the normal measured-envelope predicate."""
+    trace = replace(
+        toy_trace,
+        hooked_fwd_wall_s=46.0,
+        steady_fwd_wall_s=1.0,
+        steady_bwd_wall_s=2.0,
+    )
+
+    assert not _phase2_quickstart_should_skip_unmeasured_upfront(
+        trace=trace,
+        predicted_iter_s=6.7,
+        quickstart=True,
+    )
+
+
+def test_post_measurement_quickstart_uses_original_prediction():
+    """Regression: do not compare quickstart against the bootstrap prediction."""
+    cfg = CostConfig(n_persist=0, n_buffer=2, n_swap=0, n_checkpoint=8)
+    block_map = assign_modes(cfg.n_swap, cfg.n_checkpoint, 8)
+    phase1_result = SearchResult(
+        cfg=cfg,
+        block_map=block_map,
+        predicted_peak_bytes=1,
+        predicted_iter_s=1.0,
+    )
+
+    assert _phase2_quickstart_post_measurement_should_skip(
+        measured_iter_s=1.1,
+        phase1_result=phase1_result,
+        boot_cfg=cfg,
+        boot_block_map=block_map,
+        quickstart=True,
+        envelope=0.30,
+    )
+
+
+def test_post_measurement_quickstart_refuses_bootstrap_mismatch():
+    """Keeping the bootstrap runtime is not the same as keeping the Phase-1 pick."""
+    phase1_cfg = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=4)
+    phase1_block_map = assign_modes(
+        phase1_cfg.n_swap, phase1_cfg.n_checkpoint, 8
+    )
+    phase1_result = SearchResult(
+        cfg=phase1_cfg,
+        block_map=phase1_block_map,
+        predicted_peak_bytes=1,
+        predicted_iter_s=1.0,
+    )
+    boot_cfg = CostConfig(n_persist=0, n_buffer=2, n_swap=0, n_checkpoint=8)
+    boot_block_map = assign_modes(boot_cfg.n_swap, boot_cfg.n_checkpoint, 8)
+
+    assert (
+        _phase2_quickstart_post_measurement_should_skip(
+            measured_iter_s=1.1,
+            phase1_result=phase1_result,
+            boot_cfg=boot_cfg,
+            boot_block_map=boot_block_map,
             quickstart=True,
             envelope=0.30,
         )

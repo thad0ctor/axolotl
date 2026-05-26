@@ -45,6 +45,7 @@ from axolotl.integrations.protrain.search.exhaustive import (
 from axolotl.integrations.protrain.types import (
     BlockId,
     ChunkId,
+    ChunkLayout,
     CostConfig,
     HardwareProfile,
     ParamId,
@@ -576,6 +577,41 @@ def _calibrate_peak_with_actual_chunk_bytes(
     return calibrated
 
 
+def _ensure_persistent_params_on_device(
+    *,
+    chunk_manager: ChunkManager,
+    layout: ChunkLayout,
+    persistent_ids: set[ChunkId],
+    device: "torch.device | str",
+) -> int:
+    """Move persistent params back to the runtime device after trace-time CPU spill."""
+    import torch
+
+    target = torch.device(device)
+    moved_bytes = 0
+    moved_names: list[str] = []
+    for cid in sorted(persistent_ids):
+        for pid in layout.chunks[int(cid)]:
+            param = chunk_manager._params_by_id.get(pid)  # noqa: SLF001
+            if param is None:
+                continue
+            if param.data.device != target:
+                moved_bytes += int(param.numel()) * int(param.element_size())
+                moved_names.append(str(pid))
+                param.data = param.data.to(target, non_blocking=True)
+            if param.grad is not None and param.grad.device != target:
+                param.grad = param.grad.to(target, non_blocking=True)
+    if moved_bytes:
+        LOG.warning(
+            "ProTrain: moved %.3f GB of persistent param storage back to %s "
+            "after materialize_offload; sample params=%s",
+            moved_bytes / 1e9,
+            target,
+            moved_names[:5],
+        )
+    return moved_bytes
+
+
 def _cpu_ram_per_rank_bytes(world_size: int) -> int:
     """Best-effort estimate of per-rank available CPU RAM in bytes."""
     ws = max(1, int(world_size))
@@ -1010,6 +1046,12 @@ def _construct_runtime(
         torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
     )
     freed = chunk_manager.materialize_offload()
+    _ensure_persistent_params_on_device(
+        chunk_manager=chunk_manager,
+        layout=layout,
+        persistent_ids=chunk_manager._persistent_ids,  # noqa: SLF001
+        device=device,
+    )
     alloc_after = (
         torch.cuda.memory_allocated(device) if torch.cuda.is_available() else 0
     )
@@ -1437,7 +1479,7 @@ def _phase2_quickstart_should_skip(
 ) -> bool:
     """Phase-2 re-pick skip predicate (Item 3, opt-in via ``quickstart``).
 
-    Returns True iff ``quickstart`` is True and the measured Phase-1 iter
+    Returns True iff ``quickstart`` is True and the measured iter
     time is within ``envelope`` (fractional) of the cost-model prediction.
     """
     if not quickstart:
@@ -1446,6 +1488,68 @@ def _phase2_quickstart_should_skip(
         return False
     rel_err = abs(measured_iter_s - predicted_iter_s) / predicted_iter_s
     return rel_err < float(envelope)
+
+
+def _phase1_measured_iter_proxy_s(
+    *,
+    trace: Any,
+    cfg: CostConfig,
+    layout: ChunkLayout,
+    block_map: Any,
+    hw: HardwareProfile,
+) -> float:
+    """Existing trace timings plus the cfg's optimizer tail."""
+    fwd_s = float(getattr(trace, "steady_fwd_wall_s", 0.0) or 0.0)
+    bwd_s = float(getattr(trace, "steady_bwd_wall_s", 0.0) or 0.0)
+    if fwd_s <= 0.0 or bwd_s <= 0.0:
+        return 0.0
+    from axolotl.integrations.protrain.cost.runtime import (
+        _estimate_runtime_components,
+    )
+
+    try:
+        _, _, t_gpu_optim, t_cpu_optim, _, _ = _estimate_runtime_components(
+            cfg, trace, layout, block_map, hw
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort quickstart heuristic
+        LOG.debug("Phase-2 quickstart Phase-1 proxy unavailable: %s", exc)
+        return 0.0
+    return fwd_s + bwd_s + max(float(t_gpu_optim), float(t_cpu_optim))
+
+
+def _phase2_quickstart_should_skip_unmeasured_upfront(
+    *,
+    trace: Any,
+    predicted_iter_s: float,
+    quickstart: bool,
+) -> bool:
+    """Opt-in quickstart fallback when large-model on-demand traces lack steady timing."""
+    if not quickstart or predicted_iter_s <= 0.0:
+        return False
+    hooked_fwd_s = float(getattr(trace, "hooked_fwd_wall_s", 0.0) or 0.0)
+    steady_fwd_s = float(getattr(trace, "steady_fwd_wall_s", 0.0) or 0.0)
+    steady_bwd_s = float(getattr(trace, "steady_bwd_wall_s", 0.0) or 0.0)
+    return hooked_fwd_s > 0.0 and steady_fwd_s <= 0.0 and steady_bwd_s <= 0.0
+
+
+def _phase2_quickstart_post_measurement_should_skip(
+    *,
+    measured_iter_s: float,
+    phase1_result: SearchResult,
+    boot_cfg: CostConfig,
+    boot_block_map: Any,
+    quickstart: bool,
+    envelope: float,
+) -> bool:
+    """Post-measurement skip is only valid when bootstrap matches the Phase-1 pick."""
+    if boot_cfg != phase1_result.cfg or boot_block_map != phase1_result.block_map:
+        return False
+    return _phase2_quickstart_should_skip(
+        measured_iter_s=measured_iter_s,
+        predicted_iter_s=float(phase1_result.predicted_iter_s),
+        quickstart=quickstart,
+        envelope=envelope,
+    )
 
 
 def _teardown_phase2_bootstrap_runtime(
@@ -2034,7 +2138,7 @@ def protrain_model_wrapper(
     # Phase-2: build under conservative bootstrap, measure, splice trace, re-search.
     # Optimizer slots aren't wired into the trainer yet; rebuild here is safe.
     n_block = len(trace.activation_sizes)
-    use_phase2 = (
+    use_phase2_base = (
         torch.cuda.is_available()
         and trace.steady_bwd_chunked_wall_s == 0.0
         and n_block > 0
@@ -2042,6 +2146,65 @@ def protrain_model_wrapper(
         and not force_all_persistent
         and not all_overrides_set
     )
+    quickstart_skip_phase2 = False
+    if use_phase2_base and phase2_quickstart:
+        phase1_iter_proxy_s = _phase1_measured_iter_proxy_s(
+            trace=trace,
+            cfg=result.cfg,
+            layout=layout,
+            block_map=result.block_map,
+            hw=hardware_profile,
+        )
+        quickstart_skip_phase2 = _phase2_quickstart_should_skip(
+            measured_iter_s=phase1_iter_proxy_s,
+            predicted_iter_s=float(result.predicted_iter_s),
+            quickstart=True,
+            envelope=phase2_quickstart_envelope,
+        )
+        if quickstart_skip_phase2:
+            LOG.info(
+                "Phase-2 quickstart skipped chunked measurement/re-pick: "
+                "Phase-1 iter proxy %.3fs within %.1f%% of predicted %.3fs; "
+                "continuing with Phase-1 search config.",
+                phase1_iter_proxy_s,
+                float(phase2_quickstart_envelope) * 100.0,
+                float(result.predicted_iter_s),
+            )
+        elif _phase2_quickstart_should_skip_unmeasured_upfront(
+            trace=trace,
+            predicted_iter_s=float(result.predicted_iter_s),
+            quickstart=True,
+        ):
+            quickstart_skip_phase2 = True
+            LOG.info(
+                "Phase-2 quickstart skipped chunked measurement/re-pick: "
+                "Phase-1 steady iter proxy is unavailable "
+                "(hooked_fwd=%.3fs, steady_fwd=%.3fs, steady_bwd=%.3fs), "
+                "which is expected when large-model on-demand profiling "
+                "skips hook-less steady passes; continuing with Phase-1 "
+                "search config predicted %.3fs.",
+                float(getattr(trace, "hooked_fwd_wall_s", 0.0) or 0.0),
+                float(getattr(trace, "steady_fwd_wall_s", 0.0) or 0.0),
+                float(getattr(trace, "steady_bwd_wall_s", 0.0) or 0.0),
+                float(result.predicted_iter_s),
+            )
+        else:
+            rel_err = (
+                abs(phase1_iter_proxy_s - float(result.predicted_iter_s))
+                / max(float(result.predicted_iter_s), 1e-12)
+                if phase1_iter_proxy_s > 0.0
+                else float("inf")
+            )
+            LOG.info(
+                "Phase-2 quickstart did not skip upfront: Phase-1 iter proxy "
+                "%.3fs differs from predicted %.3fs by %.1f%% "
+                "(envelope %.1f%%); running chunked measurement.",
+                phase1_iter_proxy_s,
+                float(result.predicted_iter_s),
+                rel_err * 100.0,
+                float(phase2_quickstart_envelope) * 100.0,
+            )
+    use_phase2 = use_phase2_base and not quickstart_skip_phase2
     if use_phase2:
         from axolotl.integrations.protrain.profiler.phase2 import (
             estimate_per_block_recompute_s,
@@ -2049,6 +2212,7 @@ def protrain_model_wrapper(
             select_bootstrap_config,
         )
 
+        phase1_result = result
         boot_cfg, boot_block_map = select_bootstrap_config(
             initial_result=result,
             layout=layout,
@@ -2240,41 +2404,45 @@ def protrain_model_wrapper(
                 )
             trace = new_trace
 
-            # Phase-2 quickstart: opt-in skip of the re-pick teardown+rebuild
-            # when measurement is already within envelope of the prediction.
-            predicted_iter_s_boot = float(phase2_analytical_iter_s_val)
-            quickstart_skip = _phase2_quickstart_should_skip(
+            quickstart_skip = _phase2_quickstart_post_measurement_should_skip(
                 measured_iter_s=phase2_iter_s_val,
-                predicted_iter_s=predicted_iter_s_boot,
-                quickstart=phase2_quickstart,
+                phase1_result=phase1_result,
+                boot_cfg=boot_cfg,
+                boot_block_map=boot_block_map,
+                quickstart=bool(phase2_quickstart),
                 envelope=phase2_quickstart_envelope,
             )
             if quickstart_skip:
                 LOG.info(
-                    "Phase-2 re-pick skipped (quickstart=true): Phase-1 "
+                    "Phase-2 re-pick skipped (quickstart=true): measured "
                     "iter %.3fs within %.0f%% of predicted %.3fs; "
                     "continuing with Phase-1 config (set "
                     "protrain_phase2_quickstart: false to force standard "
                     "re-pick).",
                     phase2_iter_s_val,
                     float(phase2_quickstart_envelope) * 100.0,
-                    predicted_iter_s_boot,
+                    float(phase1_result.predicted_iter_s),
                 )
                 result = boot_result
                 wrapped = boot_wrapped
                 wrapped.search_result = result
             elif phase2_quickstart:
-                rel_err = abs(phase2_iter_s_val - predicted_iter_s_boot) / max(
-                    predicted_iter_s_boot, 1e-12
+                rel_err = abs(
+                    phase2_iter_s_val - float(phase1_result.predicted_iter_s)
+                ) / max(
+                    float(phase1_result.predicted_iter_s),
+                    1e-12,
                 )
                 LOG.info(
                     "Phase-2 quickstart did not skip re-pick: Phase-1 iter "
-                    "%.3fs differs from boot-cfg predicted %.3fs by %.1f%% "
-                    "(envelope %.1f%%).",
+                    "%.3fs differs from predicted %.3fs by %.1f%% "
+                    "(envelope %.1f%%; bootstrap_matches_phase1=%s).",
                     phase2_iter_s_val,
-                    predicted_iter_s_boot,
+                    float(phase1_result.predicted_iter_s),
                     rel_err * 100.0,
                     float(phase2_quickstart_envelope) * 100.0,
+                    boot_cfg == phase1_result.cfg
+                    and boot_block_map == phase1_result.block_map,
                 )
 
             if not quickstart_skip:

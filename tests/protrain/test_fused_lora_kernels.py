@@ -10,6 +10,7 @@ from torch import nn
 
 from axolotl.integrations.protrain.profiler.on_demand import (
     OnDemandTensorMgr,
+    _find_direct_weight_containers,
     _find_fused_kernel_containers,
     _is_fused_method,
 )
@@ -105,6 +106,41 @@ class TinyModel(nn.Module):
         return x
 
 
+class DirectConvContainer(nn.Module):
+    def __init__(self, channels: int = 4, kernel_size: int = 3):
+        super().__init__()
+        self.conv1d = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            groups=channels,
+            padding=kernel_size - 1,
+            bias=False,
+        )
+        self.causal_conv1d_fn = object()
+        self.seen_weight_shape: tuple[int, ...] | None = None
+
+    def forward(self, x):
+        self.seen_weight_shape = tuple(self.conv1d.weight.shape)
+        weight = self.conv1d.weight.squeeze(1)
+        out = torch.nn.functional.conv1d(
+            x,
+            weight.unsqueeze(1),
+            padding=self.conv1d.padding[0],
+            groups=x.shape[1],
+        )
+        return out[:, :, : x.shape[-1]]
+
+
+class DirectConvModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = DirectConvContainer()
+
+    def forward(self, x):
+        return self.layer(x)
+
+
 def _patch_mlp_swiglu(model: TinyModel) -> list[nn.Module]:
     """Install fused MLP kernel on every block's ``mlp`` (mirrors apply_lora_kernel_patches)."""
     patched: list[nn.Module] = []
@@ -168,6 +204,11 @@ def test_find_containers_empty_when_unpatched():
     """No containers when the model has no fused-kernel monkey-patch."""
     model = TinyModel()
     assert _find_fused_kernel_containers(model) == []
+
+
+def test_find_direct_weight_containers_picks_up_causal_conv_reader():
+    model = DirectConvModel()
+    assert _find_direct_weight_containers(model) == [model.layer]
 
 
 def test_find_containers_picks_up_mlp_only():
@@ -249,6 +290,21 @@ def test_container_pregather_fires_for_qkv_and_o():
     with mgr:
         assert len(mgr._fused_containers) == 1
         got = model(x)
+        assert torch.allclose(got, expected, atol=0, rtol=0)
+
+
+def test_direct_child_weight_reader_gets_subtree_pregather():
+    torch.manual_seed(4)
+    model = DirectConvModel()
+
+    x = torch.randn(2, 4, 5)
+    expected = model(x)
+
+    mgr = OnDemandTensorMgr(device=torch.device("cpu"), disabled=False, model=model)
+    with mgr:
+        assert mgr._direct_weight_containers == [model.layer]
+        got = model(x)
+        assert model.layer.seen_weight_shape == (4, 1, 3)
         assert torch.allclose(got, expected, atol=0, rtol=0)
 
 

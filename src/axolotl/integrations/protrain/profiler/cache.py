@@ -293,6 +293,18 @@ def _deepspeed_cpu_adam_importable() -> bool:
 _CPU_ADAM_INVALIDATED_PATHS: set[Path] = set()
 
 
+def _distributed_rank_for_cache_write() -> int:
+    """Best-effort rank; uninitialized distributed behaves like rank 0."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except Exception:  # noqa: BLE001 - cache writes must stay best-effort
+        return 0
+    return 0
+
+
 def load_cached_trace(
     key: ProfilerCacheKey,
     cache_dir: str | os.PathLike[str] | None = None,
@@ -390,6 +402,12 @@ def save_cached_trace(
     root = _cache_root(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     path = _path_for(key, cache_dir)
+    if _distributed_rank_for_cache_write() != 0:
+        LOG.debug(
+            "skipping profiler cache write on nonzero distributed rank for %s",
+            path,
+        )
+        return path
     # Cross-talk with load-side stale-zero invalidation: a non-zero save resets
     # the gate so any future regression to 0 can be invalidated again; a save
     # of 0.0 means we already tried and failed in this process — pin the gate

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from axolotl.integrations.protrain.profiler import (
@@ -171,6 +173,38 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
         arch_hash="feedface", bs=2, seq=128, sku="NVIDIA GeForce RTX 3090", world=1
     )
     assert load_cached_trace(other) is None
+
+
+def test_cache_write_nonzero_rank_does_not_clobber_rank0_trace(tmp_path, monkeypatch):
+    """Mixed-SKU distributed traces share rank-0's key; only rank 0 may persist it."""
+    from axolotl.integrations.protrain.profiler import cache as cache_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    key = ProfilerCacheKey(
+        arch_hash="deadbeef",
+        bs=2,
+        seq=128,
+        sku="NVIDIA GeForce RTX 3090",
+        world=4,
+    )
+    rank0_trace = _minimal_trace()
+    rank0_trace = replace(
+        rank0_trace,
+        world=4,
+        sku="NVIDIA GeForce RTX 3090",
+    )
+    rank1_trace = replace(rank0_trace, sku="NVIDIA GeForce RTX 3090 Ti")
+
+    monkeypatch.setattr(cache_mod, "_distributed_rank_for_cache_write", lambda: 0)
+    path = save_cached_trace(key, rank0_trace)
+    assert path.exists()
+
+    monkeypatch.setattr(cache_mod, "_distributed_rank_for_cache_write", lambda: 1)
+    assert save_cached_trace(key, rank1_trace) == path
+
+    monkeypatch.setattr(cache_mod, "_distributed_rank_for_cache_write", lambda: 0)
+    loaded = load_cached_trace(key)
+    assert loaded == rank0_trace
 
 
 def test_minimal_trace_defaults_new_bwd_peak_fields_to_zero():

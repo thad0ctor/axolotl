@@ -344,6 +344,62 @@ def test_materialize_offload_mixed_dtype() -> None:
     del pool
 
 
+def test_materialize_offload_aligns_replicated_mixed_dtype_grad_views() -> None:
+    """Replicated mixed-dtype grad shadows keep each typed view aligned."""
+    pytest.importorskip("torch")
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
+
+    class _TinyMixedGrad(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bf16 = nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+            self.fp32 = nn.Parameter(torch.ones(1, dtype=torch.float32))
+
+    model = _TinyMixedGrad()
+    exec_order = [ParamId(name) for name, _ in model.named_parameters()]
+    layout = build_layout(
+        model,
+        exec_order,
+        S_chunk=64,
+        block_spans={BlockId(0): exec_order},
+    )
+    host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+    pool = BufferPool(
+        n_buffer=1,
+        S_chunk=layout.S_chunk,
+        pinned_host=host,
+        device=torch.device("cpu"),
+    )
+    mgr = ChunkManager(
+        model=model,
+        layout=layout,
+        n_persist=0,
+        buffer_pool=pool,
+        cpu_optim=None,
+        gpu_optim=None,
+        device=torch.device("cpu"),
+    )
+
+    try:
+        mgr.materialize_offload()
+        slots = mgr._cpu_slots[ChunkId(0)]  # noqa: SLF001
+        assert [slot.dtype for slot in slots] == [torch.bfloat16, torch.float32]
+        for slot in slots:
+            assert slot.cpu_grad is not None
+            assert int(slot.cpu_grad.data_ptr()) % slot.element_size == 0
+        mgr.restore_to_gpu()
+    finally:
+        mgr.uninstall()
+        host.close()
+        del pool
+
+
 # ---------------------------------------------------------------------------
 # Test 2d: materialize_offload uses PinnedHostMemory with precise sizing (App B.2)
 # ---------------------------------------------------------------------------
@@ -465,14 +521,16 @@ def test_materialize_offload_uses_precise_pinned_pool() -> None:
         expected_param_bytes = (
             _align_up(expected_param_bytes, _INTER_CHUNK_ALIGN) + chunk_bytes
         )
-        # Replicated path: every trainable param contributes its full
-        # nbytes (no shard split). Sum across the chunk's params.
+        # Replicated path: every trainable grad view is also aligned
+        # to its dtype before being packed into the grad pool.
         chunk_grad_bytes = 0
         for pid in chunk_param_ids:
             p = dict(model.named_parameters()).get(str(pid))
             if p is None or not p.requires_grad:
                 continue
-            chunk_grad_bytes += int(p.numel()) * int(p.element_size())
+            esz = int(p.element_size())
+            chunk_grad_bytes = _align_up(chunk_grad_bytes, esz)
+            chunk_grad_bytes += int(p.numel()) * esz
         expected_grad_bytes = (
             _align_up(expected_grad_bytes, _INTER_CHUNK_ALIGN) + chunk_grad_bytes
         )
@@ -1062,6 +1120,69 @@ def test_optimizer_partition_uses_persistent_id_set_not_prefix() -> None:
 # ``test_zero3_sharded_roundtrip_2rank`` pattern in
 # ``test_chunk_manager_distributed.py`` (gloo + ``mp.spawn`` + CPU device
 # pool — the byte-level operations are identical to the CUDA path).
+
+
+def test_sharded_materialize_aligns_mixed_dtype_region_views_world_size5() -> None:
+    """World-size-5 mixed-dtype shards keep each typed region view aligned."""
+    pytest.importorskip("torch")
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.chunk.buffer_pool import BufferPool
+    from axolotl.integrations.protrain.chunk.layout import build_layout
+    from axolotl.integrations.protrain.chunk.manager import ChunkManager
+    from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
+
+    class _TinyMixed(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bf16 = nn.Parameter(torch.ones(1575, dtype=torch.bfloat16))
+            self.fp32 = nn.Parameter(torch.ones(1, dtype=torch.float32))
+
+    model = _TinyMixed()
+    exec_order = [ParamId(name) for name, _ in model.named_parameters()]
+    layout = build_layout(
+        model,
+        exec_order,
+        S_chunk=4096,
+        block_spans={BlockId(0): exec_order},
+    )
+    assert layout.N_chunk == 1
+
+    host = PinnedHostMemory(n_buffer=1, S_chunk=layout.S_chunk)
+    pool = BufferPool(
+        n_buffer=1,
+        S_chunk=layout.S_chunk,
+        pinned_host=host,
+        device=torch.device("cpu"),
+    )
+    mgr = ChunkManager(
+        model=model,
+        layout=layout,
+        n_persist=0,
+        buffer_pool=pool,
+        cpu_optim=None,
+        gpu_optim=None,
+        device=torch.device("cpu"),
+        world_size=5,
+        rank=0,
+        zero3_shard=True,
+    )
+
+    try:
+        mgr.materialize_offload()
+        shard_state = mgr._chunk_shards[ChunkId(0)]  # noqa: SLF001
+        assert len(shard_state.regions) == 2
+        for region in shard_state.regions:
+            offset = int(region.cpu_shard_bytes.storage_offset())
+            assert offset % region.element_size == 0
+            if region.cpu_shard_grad_bytes is not None:
+                grad_offset = int(region.cpu_shard_grad_bytes.storage_offset())
+                assert grad_offset % region.element_size == 0
+    finally:
+        mgr.uninstall()
+        host.close()
+        del pool
 
 
 def _worker_sharded_restore_round_trip(rank: int, world_size: int, tmpdir: str) -> None:

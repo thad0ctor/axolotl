@@ -390,7 +390,7 @@ class ModelLoader:
         if not self.is_fsdp_enabled:
             # We don't run this during FSDP because this will leave mixed and bfloat16
             # dtypes in the model which FSDP doesn't like
-            skip_upcast = self.cfg.load_in_4bit and self.cfg.embeddings_skip_upcast
+            skip_upcast = bool(self.cfg.embeddings_skip_upcast)
             if self.cfg.load_in_4bit and is_protrain_active(self.cfg):
                 # ProTrain upcasts embeddings lazily during forward; the load-time
                 # fp32 cast would OOM 27B + 4-bit on a 24 GiB card.

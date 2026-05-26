@@ -1,11 +1,9 @@
-"""Force `save_safetensors: False` for ProTrain full-FT + offload paths.
+"""Final-save guards for ProTrain full-FT + offload paths.
 
 ProTrain's shape-preserving expand-placeholder shares scratch storage across
 released chunks. safetensors detects this as "shared tensors" and refuses to
-save the full model. LoRA-scope saves are unaffected (only adapter weights
-serialized). The save_safetensors auto-override only fires under three
-combined conditions: full-FT (no LoRA adapter configured), offload regime
-(non-persistent chunks exist), and the trainer's save_safetensors is True.
+save the full model. LoRA-scope saves are unaffected because only adapter
+weights are serialized.
 """
 
 from __future__ import annotations
@@ -16,7 +14,9 @@ import pytest
 
 from axolotl.integrations.protrain.plugin import (
     _force_pickle_save_for_fullft_offload,
+    restore_fullft_offload_for_save,
 )
+from axolotl.train import _restore_protrain_fullft_offload_for_save
 
 
 def _make_cfg_and_trainer(adapter):
@@ -38,6 +38,16 @@ def _make_wrapped_with_effective_offload(non_persistent_ids, n_persist, n_chunk)
     )
     search_result = SimpleNamespace(cfg=SimpleNamespace(n_persist=n_persist))
     return SimpleNamespace(chunk_manager=chunk_manager, search_result=search_result)
+
+
+class _RestoringChunkManager:
+    def __init__(self, *, non_persistent_ids=None):
+        self._non_persistent_ids = non_persistent_ids or {1}
+        self.calls = 0
+
+    def restore_to_gpu(self):
+        self.calls += 1
+        return 1234
 
 
 @pytest.mark.parametrize("adapter", [None, ""])
@@ -116,3 +126,54 @@ def test_missing_trainer_args_is_safe():
 
     # Should not raise.
     _force_pickle_save_for_fullft_offload(cfg, trainer, wrapped)
+
+
+@pytest.mark.parametrize("adapter", [None, ""])
+def test_full_ft_offload_restore_runs_once_before_final_save(adapter):
+    """Full-FT + offload restores params to standalone storage before save."""
+    chunk_manager = _RestoringChunkManager()
+    wrapped = SimpleNamespace(chunk_manager=chunk_manager)
+    cfg = SimpleNamespace(adapter=adapter, _protrain_wrapped=wrapped)
+
+    assert restore_fullft_offload_for_save(cfg) == 1234
+    assert chunk_manager.calls == 1
+
+    assert restore_fullft_offload_for_save(cfg) == 0
+    assert chunk_manager.calls == 1
+
+
+def test_full_ft_effective_offload_restore_after_rebuild():
+    """Effective offload remains detectable even before ids are repopulated."""
+    chunk_manager = _RestoringChunkManager(non_persistent_ids=set())
+    chunk_manager.layout = SimpleNamespace(N_chunk=5)
+    search_result = SimpleNamespace(cfg=SimpleNamespace(n_persist=2))
+    wrapped = SimpleNamespace(chunk_manager=chunk_manager, search_result=search_result)
+    cfg = SimpleNamespace(adapter=None, _protrain_wrapped=wrapped)
+
+    assert restore_fullft_offload_for_save(cfg) == 1234
+    assert chunk_manager.calls == 1
+
+
+def test_lora_offload_restore_is_skipped():
+    """LoRA-scope save does not include base chunk placeholders."""
+    chunk_manager = _RestoringChunkManager()
+    wrapped = SimpleNamespace(chunk_manager=chunk_manager)
+    cfg = SimpleNamespace(adapter="lora", _protrain_wrapped=wrapped)
+
+    assert restore_fullft_offload_for_save(cfg) == 0
+    assert chunk_manager.calls == 0
+
+
+def test_train_save_hook_barriers_after_restore():
+    """All ranks must finish sharded restore before rank 0 serializes."""
+    events = []
+    chunk_manager = _RestoringChunkManager()
+    wrapped = SimpleNamespace(chunk_manager=chunk_manager)
+    cfg = SimpleNamespace(adapter=None, _protrain_wrapped=wrapped)
+    accelerator = SimpleNamespace(wait_for_everyone=lambda: events.append("barrier"))
+    trainer = SimpleNamespace(accelerator=accelerator)
+
+    _restore_protrain_fullft_offload_for_save(cfg, trainer)
+
+    assert chunk_manager.calls == 1
+    assert events == ["barrier"]

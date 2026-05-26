@@ -51,6 +51,35 @@ def _find_fused_kernel_containers(model: "nn.Module") -> "list[nn.Module]":
     return out
 
 
+def _has_child_parameter(module: Any, child_name: str, param_name: str) -> bool:
+    child = getattr(module, child_name, None)
+    params = getattr(child, "_parameters", None)
+    return isinstance(params, dict) and params.get(param_name) is not None
+
+
+def _is_direct_weight_container(module: Any) -> bool:
+    if not _has_child_parameter(module, "conv1d", "weight"):
+        return False
+    if "GatedDeltaNet" in module.__class__.__name__:
+        return True
+    return any(
+        hasattr(module, attr)
+        for attr in ("causal_conv1d_fn", "causal_conv1d_update")
+    )
+
+
+def _find_direct_weight_containers(model: "nn.Module") -> "list[nn.Module]":
+    """Return modules whose forward reads a child param directly before the child's own hook can gather it."""
+    fused = set(id(m) for m in _find_fused_kernel_containers(model))
+    out: list["nn.Module"] = []
+    for sub in model.modules():
+        if id(sub) in fused:
+            continue
+        if _is_direct_weight_container(sub):
+            out.append(sub)
+    return out
+
+
 # PEFT LoRA trainable-factor attribute name fragments (substring match).
 _PEFT_LORA_NAME_TAGS: frozenset[str] = frozenset(
     {
@@ -134,6 +163,8 @@ class OnDemandTensorMgr:
         self._fused_containers: list["nn.Module"] = []
         # PEFT-LoRA containers needing subtree gather/release so param.data stays live across backward
         self._peft_lora_containers: list["nn.Module"] = []
+        # Direct child-param readers such as Qwen3.5 GatedDeltaNet.
+        self._direct_weight_containers: list["nn.Module"] = []
 
     # ---- context-manager protocol --------------------------------------
 
@@ -258,8 +289,46 @@ class OnDemandTensorMgr:
                     )
                 )
 
+            self._direct_weight_containers = _find_direct_weight_containers(self.model)
+            if self._direct_weight_containers:
+                LOG.debug(
+                    "OnDemandTensorMgr: %d direct-weight container(s) "
+                    "detected; installing per-container gather hooks",
+                    len(self._direct_weight_containers),
+                )
+            for container in self._direct_weight_containers:
+                self._handles.append(
+                    container.register_forward_pre_hook(
+                        self._pre_gather_subtree, prepend=True
+                    )
+                )
+                self._handles.append(
+                    container.register_forward_hook(self._post_release_subtree)
+                )
+                self._handles.append(
+                    container.register_full_backward_pre_hook(
+                        self._pre_gather_subtree_bwd, prepend=True
+                    )
+                )
+                self._handles.append(
+                    container.register_full_backward_hook(
+                        self._post_release_subtree_bwd
+                    )
+                )
+
             # PEFT-LoRA subtree gather keeps factors + base weight live for autograd shape-derivation.
-            self._peft_lora_containers = _find_peft_lora_containers(self.model)
+            subtree_container_ids = {
+                id(container)
+                for container in [
+                    *self._fused_containers,
+                    *self._direct_weight_containers,
+                ]
+            }
+            self._peft_lora_containers = [
+                container
+                for container in _find_peft_lora_containers(self.model)
+                if id(container) not in subtree_container_ids
+            ]
             if self._peft_lora_containers:
                 LOG.debug(
                     "OnDemandTensorMgr: %d PEFT-LoRA container(s) "
@@ -392,6 +461,7 @@ class OnDemandTensorMgr:
         self._active_param_users.clear()
         self._fused_containers = []
         self._peft_lora_containers = []
+        self._direct_weight_containers = []
 
     def __exit__(self, exc_type, exc, tb) -> None:
         """Remove hooks and restore parameters from their pinned-CPU spill copies."""
@@ -489,6 +559,7 @@ class OnDemandTensorMgr:
         self._active_param_users.clear()
         self._fused_containers = []
         self._peft_lora_containers = []
+        self._direct_weight_containers = []
 
     # ---- spill / restore helpers ---------------------------------------
 
@@ -776,6 +847,7 @@ class OnDemandTensorMgr:
 
 __all__ = [
     "OnDemandTensorMgr",
+    "_find_direct_weight_containers",
     "_find_fused_kernel_containers",
     "_find_peft_lora_containers",
     "_has_peft_lora_factor",

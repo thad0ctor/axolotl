@@ -51,6 +51,17 @@ non-NVLink PCIe topology; full setup in §11):
   reduction is -49% because weights and activations are unchanged. ProTrain
   Mode A composes cleanly with both `adamw_torch` (5.58 GiB, 5.66 sps) and
   `paged_adamw_8bit` (2.84 GiB, 5.40 sps).
+- **Full-FT Mode C local 5×3090 diagnostic on the Qwen3.5 family.**
+  Qwen3.5-4B bf16 full-FT, seq=256, bs=1, forced Mode C
+  (`n_persist=0, n_buffer=4, n_swap=0, n_checkpoint=32`,
+  `zero3_shard: true`) completes 25/25 steps on 5× 3090-class GPUs
+  (2,4,5,1,7) with both `adamw_bnb_8bit` and `adamw_torch`.
+  bnb: rc=0, 197.3 s runtime, train_loss 0.952, 14.70 GiB peak.
+  torch: rc=0, 200.2 s runtime, train_loss 0.9518, 14.98 GiB peak.
+  Both restore 6.925 GB of chunk-managed full-FT params on all ranks before
+  final serialization and write an 8.5 GB `model.safetensors`. This is the
+  practical smaller same-family regression shape for local 24 GiB cards; the
+  9B full-FT shape reaches a finite first step locally but OOMs at step 2.
 - **27B + 4-bit Mode C sharded on 2× 3090 (multi-GPU).** ProTrain Mode C
   with `protrain_zero3_shard: true` at seq=128, world_size=2 holds at
   **20.25 GiB/rank**, 4.564 global sps, loss 0.811 — the first
@@ -145,12 +156,18 @@ non-NVLink PCIe topology; full setup in §11):
   (7.91 GiB peak) and 27B (18.27 GiB peak) both rc=0 (§6.jj).
   Full-stack `load_in_4bit + qlora + torch.compile + ProTrain Mode A`
   on Llama-3-8B 4× 3090 rc=0 at 9.29 GiB/rank (§6.nn).
+  Full-FT offload final save is covered under Transformers-v5-style
+  safetensors: `save_trained_model()` restores chunk-managed params on all
+  ranks before the rank-0 `save_pretrained()` branch, avoiding shared-storage
+  placeholder failures. The Qwen3.5-4B bnb and torch Mode C diagnostics both
+  wrote final `model.safetensors` checkpoints.
 
 **Search and first-iter cost.** Production-shape bs=2 Mode B search
 wall is ~74 s at-rig (~40 s synthetic). Mode B bs=1 seq=512 init is
-~30 s. An eager per-chunk NCCL warm-up (`protrain_eager_nccl_warmup`,
-default true) fires one no-op of each per-chunk collective at
-`post_trainer_create`, measuring 0.22 s (Mode B) / 0.24 s (Mode C).
+~30 s. An opt-in eager per-chunk NCCL warm-up
+(`protrain_eager_nccl_warmup`) fires one no-op of each per-chunk
+collective at `post_trainer_create`, measuring 0.22 s (Mode B) /
+0.24 s (Mode C) on the validation rig.
 
 **Mode B / Mode C bs=2 `n_offload > 0` on 4-rank non-NVLink.** The
 runtime uses a dedicated `_offload_stream` for backward OFFLOAD
@@ -416,7 +433,7 @@ memory backends are mutually exclusive.
 | `protrain_n_offload_override` | None | Manual `n_offload` (the Option B axis added by this integration). |
 | `protrain_force_replicated_cpu_offload` | `false` | Force Mode B (replicated CPU offload, no sharding). Requires `protrain_auto_mode: false`. Sibling to `protrain_force_all_persistent` (Mode A) and `protrain_zero3_shard` (Mode C). |
 | `protrain_own_lora_grad_sync` | `true` | Path B: ProTrain owns trainable LoRA-adapter grad sync via flattened all_reduce per dtype; DDP is told to ignore the same params. Opt out to revert to DDP's bucketed allreduce. See §6.pb. |
-| `protrain_eager_nccl_warmup` | `true` | Fire a one-shot no-op of each per-chunk NCCL collective at `post_trainer_create` to amortize the first-iter NCCL init cost. Measured ~0.22-0.24 s warm-up wallclock. |
+| `protrain_eager_nccl_warmup` | `false` | Opt-in one-shot no-op of each per-chunk NCCL collective at `post_trainer_create` to amortize the first-iter NCCL init cost. Disabled by default because a stuck NCCL collective cannot be interrupted safely in-process. |
 | `protrain_persistent_huge_param_threshold_bytes` | `512 MiB` | Params at or above this size (typically `lm_head` / `embed_tokens` at scale) are pinned persistent regardless of `n_persist`, since paging them dominates per-step cost. |
 | `protrain_ckpt_internal_residual_factor` | `1.0` | Scale applied to the per-block CKPT internal saved-tensor proxy (FFN-intermediate + attention scores + Q/K/V) in `estimate_peak`. Set `0.0` to disable the residual; lower values are more aggressive. Tune only when the calibrated peak diverges from measured at the runtime budget gate. |
 | `embeddings_skip_upcast` | `false` (Axolotl-side) | Skips the load-time fp32 embedding upcast in `loaders/model.py::_convert_embedding_modules_dtype`. **Auto-enabled when ProTrain is in `plugins`** — the loader gates on `is_protrain_active(cfg)`, so 27B + 4-bit + ProTrain on a 24 GiB 3090 works without the YAML knob. The flag remains available for non-ProTrain low-VRAM users. |
@@ -892,6 +909,23 @@ seq=256, bs=1, 25 steps:
 | Qwen3.5-2B full-FT | vanilla DDP, ProTrain Mode A, Mode C, Mode C + paged_adamw_8bit | all 4 phases OOM at ~22 GiB/rank |
 | Meta-Llama-3-8B full-FT | vanilla DDP, Mode C, Mode C + paged_adamw_8bit | all 3 phases OOM (same pattern) |
 
+Post-fix local 5-rank diagnostic uses Qwen3.5-4B, the nearest smaller
+same-family hybrid linear-attention causal LM available for the 24 GiB
+3090 pool:
+
+| Model | Phase | Result |
+|---|---|---|
+| Qwen3.5-4B full-FT | forced Mode C + `adamw_bnb_8bit`, 5× 3090-class, seq=256 | rc=0, 25/25 finite steps, runtime 197.3 s, train_loss 0.952, peak 14.70 GiB |
+| Qwen3.5-4B full-FT | forced Mode C + `adamw_torch`, 5× 3090-class, seq=256 | rc=0, 25/25 finite steps, runtime 200.2 s, train_loss 0.9518, peak 14.98 GiB |
+
+Both 4B runs restored 6.925 GB of chunk-managed full-FT params on all
+ranks before final save and wrote an 8.5 GB `model.safetensors`. The 9B
+full-FT local 5×24 GiB run now reaches a finite first step but OOMs at
+step 2, so the local 9B failure is a capacity ceiling. Separate NVLink
+9B runs show the same step-2 NaN-collapse under both `adamw_bnb_8bit`
+and `adamw_torch`, which invalidates the earlier bnb-specific hypothesis
+and leaves a true 9B numerical-stability follow-up in §16.B B1.
+
 **Finding.** ProTrain Mode C's `zero3_shard` shards **chunk weights** but
 NOT **fp32 master optimizer state** for full-FT — the chunk manager's
 scope is param chunks, not `torch.optim` state. Adam fp32 m+v at 2B
@@ -914,7 +948,9 @@ path). Explicit Mode C multi-rank DDP is handled by the runtime DDP bypass;
 the partition mechanism is unit-test-validated. The at-scale entry path uses
 auto-mode (let the searcher pick Mode B vs C), explicit Mode C, or an FSDP /
 DeepSpeed bypass.
-8B+ full-FT validation is still open in §16.B B1.
+4B full-FT Mode C is now mechanically and numerically validated on local
+5×3090-class hardware; 9B+ full-FT stability on >24 GiB / NVLink hardware
+remains open in §16.B B1.
 
 The single huge-tensor edge case still pins one rank under round-robin.
 For a tied-embedding 8B model, `lm_head` (or the shared embed/lm_head
@@ -1877,7 +1913,7 @@ prerequisites for the validated feature set above.
 
 | # | Follow-up | Scope |
 |---|---|---|
-| B1 | **8B+ full-FT mechanically validated on NVLink hardware via Mode C + 8-bit Adam** | Qwen3.5-9B full-FT (no LoRA) on 2× A100-SXM4-80GB with `protrain_zero3_shard: true` + `optimizer: adamw_bnb_8bit` + bf16 reaches iter-1 successfully (cold start ~18 min for DeepSpeed CpuAdam JIT + ProTrain Phase-1 trace + Phase-2 measurement + materialize_offload; subsequent steps run at the searcher-predicted ~2 s/step). Search picks `CostConfig(n_persist=103, n_buffer=18, n_swap=13, n_checkpoint=19, n_offload=0)` on 80 GB cards with 280 chunks offloaded to pinned CPU (~7 GB params + 7 GB grads per rank). Mode A `force_all_persistent` is **incompatible with 9B+ full-FT under DDP**: chunk-wrapper hooks conflict with DDP autograd, surfacing as ~100+ "parameters which did not receive grad" — Mode C is the supported full-FT path on NVLink. Software prerequisites listed in §6.nv. Step-level loss trajectory pending a longer-running validation pass. |
+| B1 | **9B full-FT Mode C: mechanically validated, training stability still open** | Qwen3.5-9B full-FT (no LoRA) on 2× A100-SXM4-80GB with `protrain_zero3_shard: true` + bf16 reaches iter-1 successfully (cold start ~18 min for DeepSpeed CpuAdam JIT + ProTrain Phase-1 trace + Phase-2 measurement + materialize_offload). Search picks `CostConfig(n_persist=103, n_buffer=18, n_swap=13, n_checkpoint=19, n_offload=0)` on 80 GB cards with 280 chunks offloaded to pinned CPU (~7 GB params + 7 GB grads per rank). Longer NVLink runs show step-2 NaN-collapse under both `adamw_bnb_8bit` and `adamw_torch`, so the instability is not bnb-8bit-specific and remains a Phase-3 numerical follow-up. On local 5× 3090-class 24 GiB cards, Qwen3.5-9B reaches a finite first step but OOMs at step 2; Qwen3.5-4B forced Mode C is the practical local regression shape and passes 25/25 steps with both optimizers plus final safetensors save. Mode A `force_all_persistent` remains incompatible with 9B+ full-FT under DDP because chunk-wrapper hooks conflict with DDP autograd, surfacing as ~100+ "parameters which did not receive grad" — Mode C is the supported full-FT path for this class. Software prerequisites listed in §6.nv. |
 | B2 | **bs=1 throughput is launch-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, per-step wallclock is dominated by ~9,000 `cudaLaunchKernel` calls per step on consumer 3090s. NCCL grad sync is overlap-shadowed by backward compute at this shape (Path B's coalesced sync produces a noise-level sps change at minimal-target bs=1 qlora despite a -68% NCCL collective-count reduction — Path B's measurable gain surfaces in the many-LoRA-tensor regime, see §6.pb). Recommended config: `gradient_accumulation_steps: 4` recovers per-sample throughput by amortizing the fixed launch tax — measured per-rank bs=1 = 0.229 sps → bs=4 (via grad-accum) = 0.738 sps (3.22×/sample). Future work: CUDA Graphs capture is the canonical fix for launch-tax-dominated regimes; not yet implemented in this branch. |
 | B3 | **3-rank Mode C bs=2 searcher infeasibility on homogeneous 3× 3090** | 2-rank and 4-rank Mode C paths pass. The homogeneous 3-rank case currently returns no finite runtime estimate for all capacity-feasible candidates. |
 

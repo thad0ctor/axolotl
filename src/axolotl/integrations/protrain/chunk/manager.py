@@ -639,6 +639,7 @@ class ChunkManager:
             # Compute per-region partition layout (sharded path).
             region_plans: list[dict] = []
             total_shard_bytes = 0
+            total_grad_shard_bytes = 0
             if chunk_is_shardable:
                 for (
                     dtype_r,
@@ -655,6 +656,12 @@ class ChunkManager:
                     ) * self.world_size
                     region_bytes_padded = padded_elems * esize_r
                     shard_bytes_r = region_bytes_padded // self.world_size
+                    region_param_offset = _align_up(total_shard_bytes, esize_r)
+                    total_shard_bytes = region_param_offset + shard_bytes_r
+                    region_grad_offset = None
+                    if trainable_r:
+                        region_grad_offset = _align_up(total_grad_shard_bytes, esize_r)
+                        total_grad_shard_bytes = region_grad_offset + shard_bytes_r
                     region_plans.append(
                         {
                             "dtype": dtype_r,
@@ -663,28 +670,34 @@ class ChunkManager:
                             "region_bytes": region_bytes,
                             "region_bytes_padded": region_bytes_padded,
                             "shard_bytes": shard_bytes_r,
+                            "param_offset": region_param_offset,
+                            "grad_offset": region_grad_offset,
                             "is_trainable": bool(trainable_r),
                         }
                     )
-                    total_shard_bytes += shard_bytes_r
 
             # Replicated: full chunk_bytes pinned; sharded: total_shard_bytes only.
             param_pool_chunk_bytes = (
                 total_shard_bytes if chunk_is_shardable else chunk_bytes
             )
             grad_pool_chunk_bytes = 0
+            grad_offsets: list[int | None] = [None] * len(param_ids)
             if chunk_is_shardable:
-                for plan in region_plans:
-                    if plan["is_trainable"]:
-                        grad_pool_chunk_bytes += plan["shard_bytes"]
+                grad_pool_chunk_bytes = total_grad_shard_bytes
             else:
-                for pid, nbytes in zip(param_ids, per_param_bytes, strict=True):
-                    if nbytes == 0:
+                grad_cursor = 0
+                for idx, (pid, nbytes, esz) in enumerate(
+                    zip(param_ids, per_param_bytes, element_sizes, strict=True)
+                ):
+                    if nbytes == 0 or esz == 0:
                         continue
                     p = self._params_by_id.get(pid)
                     if p is None or not p.requires_grad:
                         continue
-                    grad_pool_chunk_bytes += nbytes
+                    grad_cursor = _align_up(grad_cursor, esz)
+                    grad_offsets[idx] = grad_cursor
+                    grad_cursor += nbytes
+                grad_pool_chunk_bytes = grad_cursor
 
             param_pool_offset = _align_up(total_param_pool_bytes, _INTER_CHUNK_ALIGN)
             total_param_pool_bytes = param_pool_offset + param_pool_chunk_bytes
@@ -698,6 +711,7 @@ class ChunkManager:
                     "per_param_bytes": per_param_bytes,
                     "element_sizes": element_sizes,
                     "aligned_offsets": aligned_offsets,
+                    "grad_offsets": grad_offsets,
                     "chunk_bytes": chunk_bytes,
                     "shardable": chunk_is_shardable,
                     "region_plans": region_plans,
@@ -733,6 +747,7 @@ class ChunkManager:
             param_ids = plan["param_ids"]
             per_param_bytes = plan["per_param_bytes"]
             aligned_offsets = plan["aligned_offsets"]
+            grad_offsets = plan["grad_offsets"]
             chunk_bytes = plan["chunk_bytes"]
             chunk_is_shardable = plan["shardable"]
             region_plans = plan["region_plans"]
@@ -766,9 +781,8 @@ class ChunkManager:
 
             slots: list[_CpuParamSlot] = []
             trainable_count = 0
-            grad_running_off = 0
-            for pid, nbytes, off in zip(
-                param_ids, per_param_bytes, aligned_offsets, strict=True
+            for pid, nbytes, off, grad_off in zip(
+                param_ids, per_param_bytes, aligned_offsets, grad_offsets, strict=True
             ):
                 param = self._params_by_id.get(pid)
                 if param is None or nbytes == 0:
@@ -801,13 +815,13 @@ class ChunkManager:
                     trainable_count += 1
                     if not chunk_is_shardable:
                         assert chunk_grad_view is not None
+                        assert grad_off is not None
                         grad_byte_view = chunk_grad_view.narrow(
-                            0, grad_running_off, nbytes
+                            0, grad_off, nbytes
                         )
                         cpu_grad = grad_byte_view.view(dtype).view(shape)
                         # Pre-zero for tests / first accumulate-grad consumers.
                         cpu_grad.zero_()
-                        grad_running_off += nbytes
 
                 # Sharded: slot.cpu_data is None; bytes live in per-region shards.
                 slot_cpu_data: "torch.Tensor | None" = None
@@ -837,8 +851,6 @@ class ChunkManager:
                 assert chunk_param_view is not None  # holds per-region shards
 
                 regions: list[_DtypeRegion] = []
-                region_param_off = 0
-                region_grad_off = 0
                 for region_plan in region_plans:
                     r_dtype = region_plan["dtype"]
                     r_esize = region_plan["esize"]
@@ -846,6 +858,8 @@ class ChunkManager:
                     r_bytes = region_plan["region_bytes"]
                     r_bytes_padded = region_plan["region_bytes_padded"]
                     r_shard_bytes = region_plan["shard_bytes"]
+                    r_param_off = region_plan["param_offset"]
+                    r_grad_off = region_plan["grad_offset"]
                     r_is_trainable = region_plan["is_trainable"]
 
                     # Zero-init the padded region so peer ranks don't see uninitialized tail bytes.
@@ -856,22 +870,21 @@ class ChunkManager:
 
                     my_off = self.rank * r_shard_bytes
                     cpu_region_shard = chunk_param_view.narrow(
-                        0, region_param_off, r_shard_bytes
+                        0, r_param_off, r_shard_bytes
                     )
                     cpu_region_shard.copy_(
                         region_scratch.narrow(0, my_off, r_shard_bytes)
                     )
-                    region_param_off += r_shard_bytes
 
                     # Frozen regions get no grad shard; otherwise Adam's weight decay would rewrite frozen bytes.
                     cpu_region_grad: "torch.Tensor | None" = None
                     if r_is_trainable:
                         assert chunk_grad_view is not None
+                        assert r_grad_off is not None
                         cpu_region_grad = chunk_grad_view.narrow(
-                            0, region_grad_off, r_shard_bytes
+                            0, r_grad_off, r_shard_bytes
                         )
                         cpu_region_grad.zero_()
-                        region_grad_off += r_shard_bytes
 
                     # Shard-level nn.Parameter — one flat Adam step per region.
                     shard_numel = r_shard_bytes // r_esize
