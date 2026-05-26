@@ -756,9 +756,20 @@ class Scheduler:
                 return
             # frozenset from the init-time cache; avoids the per-step set() build.
             next_chunks = self._next_chunks_set_cached.get(block_id, frozenset())
-            for cid in self._chunks_for(block_id):
-                if cid in next_chunks:
-                    continue
+            chunks_to_release = tuple(
+                cid for cid in self._chunks_for(block_id) if cid not in next_chunks
+            )
+            if chunks_to_release and self._has_cuda:
+                import torch
+
+                # Buffer-reuse streams wait on compute so the next gather's H2D
+                # can't clobber pooled params this block is still reading.
+                compute = torch.cuda.current_stream()
+                if self._prefetch_stream is not None:
+                    self._prefetch_stream.wait_stream(compute)
+                if self._offload_stream is not None:
+                    self._offload_stream.wait_stream(compute)
+            for cid in chunks_to_release:
                 # offload() short-circuits for persistent chunks.
                 self.chunk_manager.offload(cid)
         finally:
