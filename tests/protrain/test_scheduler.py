@@ -179,3 +179,44 @@ def test_post_block_backward_unshared_chunks_finalize_normally() -> None:
         "Each block should finalize its own (unshared) chunk on its own "
         f"post_block_backward call. Got: {chunk_manager.reduce_calls!r}"
     )
+
+
+def test_post_block_backward_syncs_compute_stream_before_finalize(monkeypatch) -> None:
+    """CUDA finalize must wait for queued leaf-grad accumulation before offload."""
+    import torch
+
+    from axolotl.integrations.protrain.runtime.scheduler import Scheduler
+
+    p_b0 = cast(ParamId, "transformer.h.0.weight")
+    layout = ChunkLayout(
+        S_chunk=1 << 20,
+        N_chunk=1,
+        chunks=((p_b0,),),
+        param_to_chunk={p_b0: cast(ChunkId, 0)},
+        block_to_chunks={cast(BlockId, 0): (cast(ChunkId, 0),)},
+    )
+    chunk_manager = _RecordingChunkManager()
+    scheduler = Scheduler(
+        chunk_manager=cast("object", chunk_manager),  # type: ignore[arg-type]
+        block_map={cast(BlockId, 0): BlockMode.NONE},
+        layout=layout,
+        effective_h2d_bps=1.0,
+        effective_d2h_bps=1.0,
+    )
+    scheduler._has_cuda = True
+    events: list[str] = []
+
+    class _Stream:
+        def synchronize(self) -> None:
+            events.append("sync")
+
+    def _reduce(chunk_id: ChunkId) -> None:
+        events.append(f"reduce:{int(chunk_id)}")
+        chunk_manager.reduce_calls.append(chunk_id)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(chunk_manager, "reduce_grads_and_offload", _reduce)
+
+    scheduler.post_block_backward(cast(BlockId, 0))
+
+    assert events == ["sync", "reduce:0"]

@@ -861,10 +861,18 @@ class Scheduler:
         try:
             if self._is_inert:
                 return
+            chunks_to_finalize = self._owned_chunks_for_finalize_cached.get(
+                block_id, ()
+            )
+            if chunks_to_finalize and self._has_cuda:
+                import torch
+
+                # Full backward hooks can run before leaf grad accumulation finishes.
+                torch.cuda.current_stream().synchronize()
             # Pre-filtered at __init__ to skip the per-chunk owner lookup; the
             # shared-chunk filter (only earliest-forward owner finalizes) is
             # baked into the cached tuple.
-            for cid in self._owned_chunks_for_finalize_cached.get(block_id, ()):
+            for cid in chunks_to_finalize:
                 finalize = getattr(
                     self.chunk_manager,
                     "reduce_grads_and_offload_from_backward",
