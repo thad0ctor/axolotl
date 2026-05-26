@@ -489,6 +489,18 @@ class Scheduler:
         compute = torch.cuda.current_stream()
         compute.wait_stream(self._offload_stream)
 
+    def _sequence_background_gathers_after_compute(self) -> None:
+        """Prevent background gathers from reusing chunk buffers still read by compute."""
+        if not self._has_cuda:
+            return
+        import torch
+
+        compute = torch.cuda.current_stream()
+        if self._prefetch_stream is not None:
+            self._prefetch_stream.wait_stream(compute)
+        if self._offload_stream is not None:
+            self._offload_stream.wait_stream(compute)
+
     def ensure_block_resident(self, block_id: BlockId) -> None:
         """Sync gather block's chunks; used by checkpoint recompute path that bypasses pre-hooks."""
         _t0 = time.perf_counter_ns() if self._step_timing_enabled else 0
@@ -783,6 +795,7 @@ class Scheduler:
         """Untimed pre_block_backward body; split out to keep the timed wrapper readable."""
         if self._is_inert:
             return
+        self._sequence_background_gathers_after_compute()
         mode = self.block_map.get(block_id, BlockMode.NONE)
         if mode is BlockMode.SWAP:
             LOG.debug(
