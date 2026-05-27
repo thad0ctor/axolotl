@@ -19,6 +19,7 @@ import gc
 import json
 import os
 import shutil
+from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
@@ -1347,6 +1348,100 @@ def test_build_regions_per_chunk_empty_when_no_chunk_shards():
     chunk_manager = mock.MagicMock()
     chunk_manager._chunk_shards = {}
     assert _build_regions_per_chunk(chunk_manager) == {}
+
+
+def _fake_modec_optim(*, with_regions: bool):
+    import torch
+
+    region = SimpleNamespace(
+        chunk_offset=0,
+        region_bytes=1024,
+        region_bytes_padded=1024,
+        shard_bytes=1024,
+        dtype=torch.float16,
+    )
+    chunk_manager = SimpleNamespace(
+        zero3_shard=True,
+        _chunk_shards=(
+            {ChunkId(0): SimpleNamespace(regions=[region])} if with_regions else {}
+        ),
+        _persistent_ids=set(),
+        n_buffer=1,
+        layout=SimpleNamespace(S_chunk=1024, N_chunk=1, chunks=(("p",),)),
+        wait_cpu_optim_all=lambda: None,
+    )
+    inner = SimpleNamespace(state={}, loaded_state_dict=None)
+
+    def load_state_dict(state_dict):
+        inner.loaded_state_dict = state_dict
+
+    inner.load_state_dict = load_state_dict
+    inner.state_dict = lambda: {"state": {}, "param_groups": []}
+    cpu_optim = SimpleNamespace(_optims={ChunkId(0): inner})
+    optim = SimpleNamespace(
+        _gpu_optim=None,
+        _cpu_optim=cpu_optim,
+        _chunk_manager=chunk_manager,
+        _persistent_world_size=1,
+        _persistent_params_full=[],
+        _persistent_huge_originals=[],
+        param_groups=[],
+    )
+    return optim, chunk_manager, inner
+
+
+def test_sharded_save_preserves_existing_regions_when_restored_manager_empty(tmp_path):
+    optim, _, _ = _fake_modec_optim(with_regions=False)
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    proot.mkdir()
+    meta = {
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "regions_per_chunk": {"0": [_make_region_dict(shard_bytes=1024)]},
+        "saved_at_step": 1,
+    }
+    (proot / METADATA_FILENAME).write_text(json.dumps(meta))
+
+    wrote = _save_protrain_optim_dir(
+        optim,
+        str(tmp_path),
+        step=2,
+        save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+        rank=0,
+        world_size=1,
+    )
+
+    assert wrote is True
+    assert json.loads((proot / METADATA_FILENAME).read_text()) == meta
+
+
+def test_sharded_load_accepts_empty_regions_for_same_world_terminal_save(tmp_path):
+    import torch
+
+    optim, chunk_manager, inner = _fake_modec_optim(with_regions=True)
+    proot = tmp_path / PROTRAIN_OPTIM_DIRNAME
+    cpu_dir = proot / CPU_OPTIM_DIRNAME
+    cpu_dir.mkdir(parents=True)
+    meta = {
+        "format_version": SCHEMA_FORMAT_VERSION,
+        "protrain_layout_signature": _layout_signature(chunk_manager, 1, True),
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 1,
+        "protrain_world_size": 1,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {},
+    }
+    (proot / METADATA_FILENAME).write_text(json.dumps(meta))
+    state_dict = {"state": {}, "param_groups": []}
+    torch.save(state_dict, cpu_dir / "chunk_0_rank_0.pt")
+
+    assert _load_protrain_optim_dir(optim, str(tmp_path)) is True
+    assert inner.loaded_state_dict == state_dict
 
 
 def test_load_rejects_sharded_metadata_missing_regions_per_chunk(tmp_path):

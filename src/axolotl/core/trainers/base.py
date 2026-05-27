@@ -848,6 +848,10 @@ class AxolotlTrainer(
         if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
             return False
 
+        control = getattr(self, "control", None)
+        if bool(getattr(control, "should_training_stop", False)):
+            return True
+
         global_step = int(getattr(self.state, "global_step", 0) or 0)
         max_steps = int(
             getattr(self.state, "max_steps", 0)

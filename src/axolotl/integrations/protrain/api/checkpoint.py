@@ -334,6 +334,21 @@ def _build_regions_per_chunk(chunk_manager: Any) -> dict[str, list[dict[str, Any
     return out
 
 
+def _existing_sharded_metadata_has_regions(target: str) -> bool:
+    meta_path = os.path.join(target, METADATA_FILENAME)
+    if not os.path.isfile(meta_path):
+        return False
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        metadata.get("protrain_save_mode") == SAVE_MODE_SHARDED
+        and bool(metadata.get("regions_per_chunk"))
+    )
+
+
 def _validate_regions_match(
     saved: dict[str, list[dict[str, Any]]],
     current: dict[str, list[dict[str, Any]]],
@@ -582,6 +597,32 @@ def _save_protrain_optim_dir(
     )
 
     if zero3_shard:
+        regions_per_chunk = _build_regions_per_chunk(chunk_manager)
+        has_cpu_chunks = bool(
+            optim._cpu_optim is not None and optim._cpu_optim._optims
+        )
+        if has_cpu_chunks and not regions_per_chunk:
+            preserve_existing = [False]
+            if rank == 0:
+                preserve_existing[0] = _existing_sharded_metadata_has_regions(target)
+                if preserve_existing[0]:
+                    LOG.warning(
+                        "ProTrain optimizer save: preserving existing %s because "
+                        "current Mode-C chunk_manager has CPU optimizer chunks but "
+                        "no shard-region layout. This can happen after terminal "
+                        "full-FT save restore_to_gpu(); refusing to overwrite a "
+                        "valid pre-save with unusable metadata.",
+                        target,
+                    )
+            _broadcast_object_list_or_noop(preserve_existing, src=0)
+            if preserve_existing[0]:
+                return True
+            raise RuntimeError(
+                "ProTrain optimizer save: Mode-C CPU optimizer chunks are present "
+                "but chunk_manager._chunk_shards is empty, so regions_per_chunk "
+                "cannot be written safely."
+            )
+
         # Mode-C sharded save. Rank-0 metadata; per-rank gpu+cpu shards when partition active.
         rank0_status = 0
         try:
@@ -608,7 +649,7 @@ def _save_protrain_optim_dir(
                     "saved_at_step": int(step),
                     "torch_version": str(torch.__version__),
                     "estimated_optim_state_bytes": int(estimate),
-                    "regions_per_chunk": _build_regions_per_chunk(chunk_manager),
+                    "regions_per_chunk": regions_per_chunk,
                 }
                 if persistent_partition_active:
                     metadata["protrain_persistent_partition_version"] = 1
@@ -1107,6 +1148,25 @@ def _load_protrain_optim_dir(
                 "Mode-C support or the file is corrupt."
             )
         current_regions = _build_regions_per_chunk(chunk_manager)
+        if not saved_regions and current_regions:
+            expected_cpu_ids = (
+                set(int(cid) for cid in optim._cpu_optim._optims)
+                if optim._cpu_optim is not None
+                else set()
+            )
+            expected_sig = _layout_signature(chunk_manager, saved_world, saved_zero3)
+            if (
+                expected_cpu_ids
+                and saved_world == current_world
+                and metadata.get("protrain_layout_signature") == expected_sig
+            ):
+                LOG.warning(
+                    "ProTrain optimizer load: regions_per_chunk is empty in "
+                    "a same-world Mode-C checkpoint even though CPU optimizer "
+                    "shards are present. Treating it as legacy terminal-save "
+                    "metadata and validating against the current exact layout."
+                )
+                saved_regions = current_regions
         _validate_regions_match(saved_regions, current_regions)
 
         # Signature comparison uses saved values; saved_world == current_world here.

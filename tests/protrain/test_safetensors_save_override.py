@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from axolotl.core.trainers.base import AxolotlTrainer
 from axolotl.integrations.protrain.plugin import (
     _force_pickle_save_for_fullft_offload,
     restore_fullft_offload_for_save,
@@ -177,3 +178,15 @@ def test_train_save_hook_barriers_after_restore():
 
     assert chunk_manager.calls == 1
     assert events == ["barrier"]
+
+
+def test_training_stop_marks_protrain_checkpoint_terminal():
+    """Dataset exhaustion can make the final checkpoint arrive before max_steps."""
+    trainer = SimpleNamespace(
+        axolotl_cfg=SimpleNamespace(_protrain_wrapped=object()),
+        control=SimpleNamespace(should_training_stop=True),
+        state=SimpleNamespace(global_step=6, max_steps=100),
+        args=SimpleNamespace(max_steps=100),
+    )
+
+    assert AxolotlTrainer._is_protrain_terminal_checkpoint(trainer) is True
