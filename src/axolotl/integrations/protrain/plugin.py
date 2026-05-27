@@ -1717,6 +1717,9 @@ class ProTrainPlugin(BasePlugin):
             prefer_no_offload_on_non_nvlink=prefer_no_offload_on_non_nvlink,
             phase2_quickstart=phase2_quickstart,
             phase2_quickstart_envelope=phase2_quickstart_envelope,
+            adapter=getattr(cfg, "adapter", None),
+            load_in_4bit=bool(getattr(cfg, "load_in_4bit", False)),
+            load_in_8bit=bool(getattr(cfg, "load_in_8bit", False)),
         )
 
         cfg._protrain_wrapped = wrapped  # type: ignore[attr-defined]

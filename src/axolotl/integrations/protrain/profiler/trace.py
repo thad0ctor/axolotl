@@ -42,6 +42,22 @@ DEFAULT_PARAM_GRAD_BYTES_PER_PARAM = 4  # fp16 param + fp16 grad
 
 # Auto-engage on-demand mode when full model state exceeds 60% of device memory.
 ON_DEMAND_STATE_BYTES_FRACTION: float = 0.60
+ADAPTER_TRAINABLE_PARAM_FRACTION: float = 0.05
+
+
+@dataclass(frozen=True)
+class _ModelStateFootprint:
+    frozen_param_bytes: int
+    trainable_param_bytes: int
+    trainable_training_state_bytes: int
+    total_model_state_bytes: int
+    trainable_param_fraction: float
+
+
+class _OnDemandMode:
+    NONE = "none"
+    PARAM_AND_ACTIVATION = "param_and_activation"
+    ACTIVATION_ONLY = "activation_only"
 
 
 @dataclass
@@ -97,20 +113,93 @@ def _count_model_state_bytes(
     optim_state_bytes_per_param: int = DEFAULT_OPTIM_STATE_BYTES_PER_PARAM,
 ) -> int:
     """Constant-size model-state footprint: params + grads + optimizer states."""
+    return _model_state_footprint(
+        model,
+        param_byte_size=param_byte_size,
+        param_grad_bytes_per_param=param_grad_bytes_per_param,
+        optim_state_bytes_per_param=optim_state_bytes_per_param,
+    ).total_model_state_bytes
+
+
+def _model_state_footprint(
+    model: "nn.Module",
+    *,
+    param_byte_size: int | None = None,
+    param_grad_bytes_per_param: int = DEFAULT_PARAM_GRAD_BYTES_PER_PARAM,
+    optim_state_bytes_per_param: int = DEFAULT_OPTIM_STATE_BYTES_PER_PARAM,
+) -> _ModelStateFootprint:
+    """Split frozen resident params from trainable grad/optimizer state."""
     trainable_params = 0
+    total_params = 0
+    trainable_param_bytes = 0
     frozen_param_bytes = 0
     for _, p in model.named_parameters():
         n = int(p.numel())
+        total_params += n
+        if param_byte_size is None:
+            param_bytes = n * int(p.element_size())
+        else:
+            param_bytes = n * int(param_byte_size)
         if p.requires_grad:
             trainable_params += n
+            trainable_param_bytes += param_bytes
         else:
-            if param_byte_size is None:
-                frozen_param_bytes += n * int(p.element_size())
-            else:
-                frozen_param_bytes += n * int(param_byte_size)
-    return frozen_param_bytes + trainable_params * (
+            frozen_param_bytes += param_bytes
+
+    trainable_training_state_bytes = trainable_params * (
         int(param_grad_bytes_per_param) + int(optim_state_bytes_per_param)
     )
+    total_model_state_bytes = frozen_param_bytes + trainable_training_state_bytes
+    trainable_param_fraction = trainable_params / total_params if total_params else 0.0
+    return _ModelStateFootprint(
+        frozen_param_bytes=frozen_param_bytes,
+        trainable_param_bytes=trainable_param_bytes,
+        trainable_training_state_bytes=trainable_training_state_bytes,
+        total_model_state_bytes=total_model_state_bytes,
+        trainable_param_fraction=trainable_param_fraction,
+    )
+
+
+def _adapter_name(adapter: Any) -> str:
+    if adapter is None:
+        return ""
+    return str(adapter).strip().lower()
+
+
+def _is_adapter_style_frozen_base(
+    cfg: ProfilerConfig, footprint: _ModelStateFootprint
+) -> bool:
+    """Detect LoRA/QLoRA-style training where the frozen base stays resident."""
+    if (
+        footprint.frozen_param_bytes <= 0
+        or footprint.trainable_training_state_bytes <= 0
+    ):
+        return False
+
+    adapter = _adapter_name(getattr(cfg, "adapter", None))
+    if adapter in {"lora", "qlora"}:
+        return True
+
+    return footprint.trainable_param_fraction <= ADAPTER_TRAINABLE_PARAM_FRACTION
+
+
+def _select_on_demand_mode(
+    cfg: ProfilerConfig,
+    footprint: _ModelStateFootprint,
+    gpu_total_bytes: int,
+) -> str:
+    """Choose no offload, param+activation offload, or activation-only offload."""
+    if cfg.force_all_persistent or not cfg.on_demand:
+        return _OnDemandMode.NONE
+
+    threshold_bytes = ON_DEMAND_STATE_BYTES_FRACTION * int(gpu_total_bytes)
+    if footprint.total_model_state_bytes <= threshold_bytes:
+        return _OnDemandMode.NONE
+    if _is_adapter_style_frozen_base(cfg, footprint):
+        if footprint.trainable_training_state_bytes > threshold_bytes:
+            return _OnDemandMode.PARAM_AND_ACTIVATION
+        return _OnDemandMode.ACTIVATION_ONLY
+    return _OnDemandMode.PARAM_AND_ACTIVATION
 
 
 def _arch_hash(model: "nn.Module") -> str:
@@ -398,6 +487,7 @@ def run_trace(
 
     # Decide on-demand engagement before warmups; 13B+ models OOM on un-offloaded forward.
     engage_on_demand = False
+    spill_params_on_demand = True
     if cfg.force_all_persistent:
         # force_all_persistent bypasses the on-demand gate to honour Mode A.
         LOG.info(
@@ -408,13 +498,14 @@ def run_trace(
     elif cfg.on_demand and cuda_available:
         try:
             gpu_total = int(torch.cuda.get_device_properties(device).total_memory)
-            # Full model state (params + grads + Adam) — params alone misses optimizer state which OOMs warmup.
-            state_bytes = _count_model_state_bytes(
+            footprint = _model_state_footprint(
                 model,
                 param_grad_bytes_per_param=param_grad_bytes_per_param,
                 optim_state_bytes_per_param=optim_state_bytes_per_param,
             )
-            if state_bytes > ON_DEMAND_STATE_BYTES_FRACTION * gpu_total:
+            state_bytes = footprint.total_model_state_bytes
+            on_demand_mode = _select_on_demand_mode(cfg, footprint, gpu_total)
+            if on_demand_mode == _OnDemandMode.PARAM_AND_ACTIVATION:
                 engage_on_demand = True
                 LOG.info(
                     "Profiler engaging on-demand mode: model state=%.2f GB "
@@ -424,6 +515,35 @@ def run_trace(
                     state_bytes / 1e9,
                     ON_DEMAND_STATE_BYTES_FRACTION * 100,
                     gpu_total / 1e9,
+                )
+            elif on_demand_mode == _OnDemandMode.ACTIVATION_ONLY:
+                engage_on_demand = True
+                spill_params_on_demand = False
+                LOG.info(
+                    "Profiler engaging activation-only on-demand mode for "
+                    "resident-base adapter training: total model state=%.2f GB "
+                    "exceeds %.0f%% of %.2f GB device memory, but frozen "
+                    "params=%.2f GB and trainable grad/optimizer state=%.2f GB "
+                    "indicate adapter-style training. Offloading saved "
+                    "tensors to CPU while keeping frozen params resident.",
+                    state_bytes / 1e9,
+                    ON_DEMAND_STATE_BYTES_FRACTION * 100,
+                    gpu_total / 1e9,
+                    footprint.frozen_param_bytes / 1e9,
+                    footprint.trainable_training_state_bytes / 1e9,
+                )
+            elif state_bytes > ON_DEMAND_STATE_BYTES_FRACTION * gpu_total:
+                LOG.info(
+                    "Profiler using resident-base adapter path: total model "
+                    "state=%.2f GB exceeds %.0f%% of %.2f GB device memory, "
+                    "but frozen resident params=%.2f GB and trainable "
+                    "grad/optimizer state=%.2f GB indicate adapter-style "
+                    "training. Skipping on-demand CPU spill for frozen base.",
+                    state_bytes / 1e9,
+                    ON_DEMAND_STATE_BYTES_FRACTION * 100,
+                    gpu_total / 1e9,
+                    footprint.frozen_param_bytes / 1e9,
+                    footprint.trainable_training_state_bytes / 1e9,
                 )
         except Exception as exc:  # pragma: no cover - defensive
             LOG.debug(
@@ -677,7 +797,10 @@ def run_trace(
 
     # Wrapper honours engage decision; fast path stays a no-op context.
     on_demand_mgr = OnDemandTensorMgr(
-        device=device, disabled=not engage_on_demand, model=model
+        device=device,
+        disabled=not engage_on_demand,
+        model=model,
+        spill_params=spill_params_on_demand,
     )
 
     # Event-timed hooked forward wall: captures dispatch gaps the per-op sum misses.

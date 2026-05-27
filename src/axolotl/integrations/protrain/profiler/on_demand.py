@@ -63,8 +63,7 @@ def _is_direct_weight_container(module: Any) -> bool:
     if "GatedDeltaNet" in module.__class__.__name__:
         return True
     return any(
-        hasattr(module, attr)
-        for attr in ("causal_conv1d_fn", "causal_conv1d_update")
+        hasattr(module, attr) for attr in ("causal_conv1d_fn", "causal_conv1d_update")
     )
 
 
@@ -146,11 +145,13 @@ class OnDemandTensorMgr:
         *,
         disabled: bool = False,
         model: "nn.Module | None" = None,
+        spill_params: bool = True,
     ) -> None:
         """Configure target device and disabled-mode flag; defer spill until ``__enter__``."""
         self.device = device
         self.disabled = disabled
         self.model = model
+        self.spill_params = spill_params
         self._spills: dict[int, _ParamSpill] = {}
         # Per-param ref-count by id(param); tied params fire hooks per owner.
         self._active_param_users: dict[int, int] = {}
@@ -227,134 +228,137 @@ class OnDemandTensorMgr:
         # saved_tensors_hooks if entered) so the model is left in its
         # original state, then re-raise.
         try:
-            for _name, param in self.model.named_parameters():
-                self._spill_param_to_cpu(param, target_device)
+            if self.spill_params:
+                for _name, param in self.model.named_parameters():
+                    self._spill_param_to_cpu(param, target_device)
 
-            # Enabled mode spills params only; fail fast on CPU buffers when target is CUDA.
-            if target_device is not None:
-                for buffer_name, buffer in self.model.named_buffers():
-                    # Strict device equality catches cross-CUDA-index mismatches too.
-                    if getattr(buffer, "device", None) != target_device:
-                        raise RuntimeError(
-                            f"OnDemandTensorMgr: buffer {buffer_name!r} on "
-                            f"{getattr(buffer, 'device', None)!r} is not on "
-                            f"target_device {target_device!r}. Move the buffer "
-                            "to the target device or extend the spill hooks "
-                            "to cover buffers."
+                # Enabled mode spills params only; fail fast on CPU buffers when target is CUDA.
+                if target_device is not None:
+                    for buffer_name, buffer in self.model.named_buffers():
+                        # Strict device equality catches cross-CUDA-index mismatches too.
+                        if getattr(buffer, "device", None) != target_device:
+                            raise RuntimeError(
+                                f"OnDemandTensorMgr: buffer {buffer_name!r} on "
+                                f"{getattr(buffer, 'device', None)!r} is not on "
+                                f"target_device {target_device!r}. Move the buffer "
+                                "to the target device or extend the spill hooks "
+                                "to cover buffers."
+                            )
+
+                for sub in self.model.modules():
+                    # prepend=True so gather precedes the trace driver's allocated_before snapshot.
+                    self._handles.append(
+                        sub.register_forward_pre_hook(self._pre_gather, prepend=True)
+                    )
+                    # FIFO post-release so it fires after the trace measures peak.
+                    self._handles.append(sub.register_forward_hook(self._post_release))
+                    # Symmetric backward pair: prepend pre-gather, FIFO post-release.
+                    self._handles.append(
+                        sub.register_full_backward_pre_hook(
+                            self._pre_gather_bwd, prepend=True
                         )
+                    )
+                    self._handles.append(
+                        sub.register_full_backward_hook(self._post_release_bwd)
+                    )
 
-            for sub in self.model.modules():
-                # prepend=True so gather precedes the trace driver's allocated_before snapshot.
-                self._handles.append(
-                    sub.register_forward_pre_hook(self._pre_gather, prepend=True)
-                )
-                # FIFO post-release so it fires after the trace measures peak.
-                self._handles.append(sub.register_forward_hook(self._post_release))
-                # Symmetric backward pair: prepend pre-gather, FIFO post-release.
-                self._handles.append(
-                    sub.register_full_backward_pre_hook(
-                        self._pre_gather_bwd, prepend=True
+                # Container-level gather for fused-kernel modules whose patched forward bypasses per-Linear hooks.
+                self._fused_containers = _find_fused_kernel_containers(self.model)
+                if self._fused_containers:
+                    LOG.debug(
+                        "OnDemandTensorMgr: %d fused-kernel container(s) "
+                        "detected; installing per-container gather hooks",
+                        len(self._fused_containers),
                     )
-                )
-                self._handles.append(
-                    sub.register_full_backward_hook(self._post_release_bwd)
-                )
+                for container in self._fused_containers:
+                    self._handles.append(
+                        container.register_forward_pre_hook(
+                            self._pre_gather_subtree, prepend=True
+                        )
+                    )
+                    self._handles.append(
+                        container.register_forward_hook(self._post_release_subtree)
+                    )
+                    # Backward subtree gather: fused autograd Function bypasses saved_tensors_hooks via ctx.weights.
+                    self._handles.append(
+                        container.register_full_backward_pre_hook(
+                            self._pre_gather_subtree_bwd, prepend=True
+                        )
+                    )
+                    self._handles.append(
+                        container.register_full_backward_hook(
+                            self._post_release_subtree_bwd
+                        )
+                    )
 
-            # Container-level gather for fused-kernel modules whose patched forward bypasses per-Linear hooks.
-            self._fused_containers = _find_fused_kernel_containers(self.model)
-            if self._fused_containers:
-                LOG.debug(
-                    "OnDemandTensorMgr: %d fused-kernel container(s) "
-                    "detected; installing per-container gather hooks",
-                    len(self._fused_containers),
+                self._direct_weight_containers = _find_direct_weight_containers(
+                    self.model
                 )
-            for container in self._fused_containers:
-                self._handles.append(
-                    container.register_forward_pre_hook(
-                        self._pre_gather_subtree, prepend=True
+                if self._direct_weight_containers:
+                    LOG.debug(
+                        "OnDemandTensorMgr: %d direct-weight container(s) "
+                        "detected; installing per-container gather hooks",
+                        len(self._direct_weight_containers),
                     )
-                )
-                self._handles.append(
-                    container.register_forward_hook(self._post_release_subtree)
-                )
-                # Backward subtree gather: fused autograd Function bypasses saved_tensors_hooks via ctx.weights.
-                self._handles.append(
-                    container.register_full_backward_pre_hook(
-                        self._pre_gather_subtree_bwd, prepend=True
+                for container in self._direct_weight_containers:
+                    self._handles.append(
+                        container.register_forward_pre_hook(
+                            self._pre_gather_subtree, prepend=True
+                        )
                     )
-                )
-                self._handles.append(
-                    container.register_full_backward_hook(
-                        self._post_release_subtree_bwd
+                    self._handles.append(
+                        container.register_forward_hook(self._post_release_subtree)
                     )
-                )
+                    self._handles.append(
+                        container.register_full_backward_pre_hook(
+                            self._pre_gather_subtree_bwd, prepend=True
+                        )
+                    )
+                    self._handles.append(
+                        container.register_full_backward_hook(
+                            self._post_release_subtree_bwd
+                        )
+                    )
 
-            self._direct_weight_containers = _find_direct_weight_containers(self.model)
-            if self._direct_weight_containers:
-                LOG.debug(
-                    "OnDemandTensorMgr: %d direct-weight container(s) "
-                    "detected; installing per-container gather hooks",
-                    len(self._direct_weight_containers),
-                )
-            for container in self._direct_weight_containers:
-                self._handles.append(
-                    container.register_forward_pre_hook(
-                        self._pre_gather_subtree, prepend=True
-                    )
-                )
-                self._handles.append(
-                    container.register_forward_hook(self._post_release_subtree)
-                )
-                self._handles.append(
-                    container.register_full_backward_pre_hook(
-                        self._pre_gather_subtree_bwd, prepend=True
-                    )
-                )
-                self._handles.append(
-                    container.register_full_backward_hook(
-                        self._post_release_subtree_bwd
-                    )
-                )
-
-            # PEFT-LoRA subtree gather keeps factors + base weight live for autograd shape-derivation.
-            subtree_container_ids = {
-                id(container)
-                for container in [
-                    *self._fused_containers,
-                    *self._direct_weight_containers,
+                # PEFT-LoRA subtree gather keeps factors + base weight live for autograd shape-derivation.
+                subtree_container_ids = {
+                    id(container)
+                    for container in [
+                        *self._fused_containers,
+                        *self._direct_weight_containers,
+                    ]
+                }
+                self._peft_lora_containers = [
+                    container
+                    for container in _find_peft_lora_containers(self.model)
+                    if id(container) not in subtree_container_ids
                 ]
-            }
-            self._peft_lora_containers = [
-                container
-                for container in _find_peft_lora_containers(self.model)
-                if id(container) not in subtree_container_ids
-            ]
-            if self._peft_lora_containers:
-                LOG.debug(
-                    "OnDemandTensorMgr: %d PEFT-LoRA container(s) "
-                    "detected; installing per-container gather hooks",
-                    len(self._peft_lora_containers),
-                )
-            for container in self._peft_lora_containers:
-                self._handles.append(
-                    container.register_forward_pre_hook(
-                        self._pre_gather_subtree, prepend=True
+                if self._peft_lora_containers:
+                    LOG.debug(
+                        "OnDemandTensorMgr: %d PEFT-LoRA container(s) "
+                        "detected; installing per-container gather hooks",
+                        len(self._peft_lora_containers),
                     )
-                )
-                self._handles.append(
-                    container.register_forward_hook(self._post_release_subtree)
-                )
-                # Backward shape-derivation needs real weights; mirror fused-kernel pair.
-                self._handles.append(
-                    container.register_full_backward_pre_hook(
-                        self._pre_gather_subtree_bwd, prepend=True
+                for container in self._peft_lora_containers:
+                    self._handles.append(
+                        container.register_forward_pre_hook(
+                            self._pre_gather_subtree, prepend=True
+                        )
                     )
-                )
-                self._handles.append(
-                    container.register_full_backward_hook(
-                        self._post_release_subtree_bwd
+                    self._handles.append(
+                        container.register_forward_hook(self._post_release_subtree)
                     )
-                )
+                    # Backward shape-derivation needs real weights; mirror fused-kernel pair.
+                    self._handles.append(
+                        container.register_full_backward_pre_hook(
+                            self._pre_gather_subtree_bwd, prepend=True
+                        )
+                    )
+                    self._handles.append(
+                        container.register_full_backward_hook(
+                            self._post_release_subtree_bwd
+                        )
+                    )
 
             # Saved-tensors hooks spill to CPU; otherwise grad_fn pins gathered params alive.
             self._sthook_ctx = torch.autograd.graph.saved_tensors_hooks(

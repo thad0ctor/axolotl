@@ -580,6 +580,29 @@ def test_on_demand_enabled_requires_model():
         mgr.__enter__()
 
 
+def test_on_demand_activation_only_does_not_spill_params():
+    """Activation-only mode installs saved-tensor hooks without CPU-copying params."""
+    import torch
+    from torch import nn
+
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 1))
+    original_data_ptrs = [p.data_ptr() for p in model.parameters()]
+
+    mgr = OnDemandTensorMgr(
+        device="cpu", disabled=False, model=model, spill_params=False
+    )
+
+    x = torch.randn(2, 4)
+    with mgr:
+        assert tuple(mgr.live_tensor_ids()) == ()
+        assert [p.data_ptr() for p in model.parameters()] == original_data_ptrs
+        loss = model(x).sum()
+        loss.backward()
+
+    assert tuple(mgr.live_tensor_ids()) == ()
+    assert [p.data_ptr() for p in model.parameters()] == original_data_ptrs
+
+
 @pytest.mark.gpu
 def test_on_demand_enabled_param_offload_and_restore(gpu_device):
     """Enabled OnDemandTensorMgr offloads params and restores them byte-exact."""

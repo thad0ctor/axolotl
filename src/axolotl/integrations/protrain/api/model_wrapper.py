@@ -33,6 +33,8 @@ from axolotl.integrations.protrain.profiler.cache import ProfilerCacheKey
 from axolotl.integrations.protrain.profiler.hw_bench import measure_compute_rate
 from axolotl.integrations.protrain.profiler.trace import (
     _arch_hash,
+    _is_adapter_style_frozen_base,
+    _model_state_footprint,
     synth_trace_from_overrides,
 )
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
@@ -1552,6 +1554,26 @@ def _phase2_quickstart_post_measurement_should_skip(
     )
 
 
+def _phase2_should_skip_resident_base_adapter(
+    model: nn.Module,
+    *,
+    adapter: str | None,
+    load_in_4bit: bool,
+    load_in_8bit: bool,
+) -> bool:
+    """Phase-2 snapshot/restore is not worth the host spike for frozen-base adapters."""
+    footprint = _model_state_footprint(model)
+    cfg = ProfilerConfig(
+        batch_size=1,
+        seq_len=1,
+        device="cpu",
+        adapter=adapter,
+        load_in_4bit=bool(load_in_4bit),
+        load_in_8bit=bool(load_in_8bit),
+    )
+    return _is_adapter_style_frozen_base(cfg, footprint)
+
+
 def _teardown_phase2_bootstrap_runtime(
     *,
     model: nn.Module,
@@ -1591,6 +1613,41 @@ def _teardown_phase2_bootstrap_runtime(
         boot_wrapped.close()
 
 
+def _abort_phase2_bootstrap_runtime_without_restore(
+    *,
+    model: nn.Module,
+    blocks: list[nn.Module],
+    handles: list[object],
+    boot_wrapped: WrappedModel,
+    context: str,
+) -> None:
+    """Close a failed Phase-2 runtime without restoring offloaded chunks to GPU."""
+    for handle in handles:
+        try:
+            handle.remove()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            LOG.debug("%s: hook handle remove failed: %s", context, exc)
+    try:
+        boot_wrapped._hook_handles = []  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - defensive
+        pass
+
+    block_parent_map_unwrap = _find_block_parent_map(model, blocks)
+    for idx, block in enumerate(blocks):
+        unwrapped = unwrap_block(block)
+        if unwrapped is block:
+            continue
+        parent = block_parent_map_unwrap.get(id(block))
+        if parent is not None:
+            for slot, child in enumerate(parent):
+                if child is block:
+                    parent[slot] = unwrapped
+                    break
+        blocks[idx] = unwrapped
+
+    boot_wrapped.close()
+
+
 def protrain_model_wrapper(
     model: nn.Module,
     model_config: object,  # noqa: ARG001 — accepted for API symmetry with the plan
@@ -1614,6 +1671,9 @@ def protrain_model_wrapper(
     prefer_no_offload_on_non_nvlink: bool = True,
     phase2_quickstart: bool = False,
     phase2_quickstart_envelope: float = 0.30,
+    adapter: str | None = None,
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
 ) -> WrappedModel:
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
@@ -1782,6 +1842,9 @@ def protrain_model_wrapper(
             on_demand=True,
             force_all_persistent=bool(force_all_persistent),
             world_size=int(hardware_profile.gpu_count),
+            adapter=adapter,
+            load_in_4bit=bool(load_in_4bit),
+            load_in_8bit=bool(load_in_8bit),
         )
         batch = _dummy_batch(model, batch_size, seq_len, device)
         trace = run_trace(model, batch, profiler_cfg)
@@ -2146,6 +2209,25 @@ def protrain_model_wrapper(
         and not force_all_persistent
         and not all_overrides_set
     )
+    if use_phase2_base and _phase2_should_skip_resident_base_adapter(
+        model,
+        adapter=adapter,
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=load_in_8bit,
+    ):
+        footprint = _model_state_footprint(model)
+        LOG.info(
+            "Phase-2 skipped for resident-base adapter training: frozen "
+            "params=%.2f GB, trainable grad/optimizer state=%.2f GB, "
+            "trainable_param_fraction=%.4f. The Phase-2 timing pass "
+            "requires a real chunked forward/backward plus full "
+            "state-dict rollback; for frozen-base adapters this is a "
+            "low-value host/GPU memory spike.",
+            footprint.frozen_param_bytes / 1e9,
+            footprint.trainable_training_state_bytes / 1e9,
+            footprint.trainable_param_fraction,
+        )
+        use_phase2_base = False
     quickstart_skip_phase2 = False
     if use_phase2_base and phase2_quickstart:
         phase1_iter_proxy_s = _phase1_measured_iter_proxy_s(
@@ -2207,6 +2289,7 @@ def protrain_model_wrapper(
     use_phase2 = use_phase2_base and not quickstart_skip_phase2
     if use_phase2:
         from axolotl.integrations.protrain.profiler.phase2 import (
+            Phase2RestoreIntegrityError,
             estimate_per_block_recompute_s,
             measure_chunked_steady,
             select_bootstrap_config,
@@ -2261,6 +2344,26 @@ def protrain_model_wrapper(
             fwd_s, bwd_s, step_s, phase2_peak_bytes = measure_chunked_steady(
                 model=model, batch=boot_batch, optimizer=boot_optim
             )
+        except Phase2RestoreIntegrityError as exc:
+            LOG.error(
+                "Phase-2 rollback integrity failed; aborting instead of "
+                "restoring offloaded chunks to GPU and rebuilding under a "
+                "fallback config. The model may have changed its state_dict "
+                "surface during the timed measurement.",
+            )
+            _abort_phase2_bootstrap_runtime_without_restore(
+                model=model,
+                blocks=blocks,
+                handles=handles,
+                boot_wrapped=boot_wrapped,
+                context="phase-2 rollback-integrity abort",
+            )
+            raise RuntimeError(
+                "Phase-2 rollback integrity failed; aborting the run to "
+                "avoid a fallback restore/rebuild memory spike. Disable "
+                "Phase-2 quick calibration for this shape or investigate "
+                "the model state_dict mutation reported above."
+            ) from exc
         except Exception as exc:  # noqa: BLE001 — measurement is best-effort
             exc_repr = f"{type(exc).__name__}: {exc}"
             LOG.warning(

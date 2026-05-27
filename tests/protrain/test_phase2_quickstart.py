@@ -14,18 +14,22 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+import torch
+from torch import nn
 
 from axolotl.integrations.protrain.api.model_wrapper import (
+    _abort_phase2_bootstrap_runtime_without_restore,
     _phase1_measured_iter_proxy_s,
     _phase2_quickstart_post_measurement_should_skip,
     _phase2_quickstart_should_skip,
     _phase2_quickstart_should_skip_unmeasured_upfront,
+    _phase2_should_skip_resident_base_adapter,
     _teardown_phase2_bootstrap_runtime,
 )
 from axolotl.integrations.protrain.args import ProTrainArgs
 from axolotl.integrations.protrain.block.layout_rules import assign_modes
 from axolotl.integrations.protrain.search import search
-from axolotl.integrations.protrain.types import CostConfig, SearchResult
+from axolotl.integrations.protrain.types import CostConfig, SearchResult, WrappedModel
 
 # Reuse the synthetic builders + fixtures from test_cost_search; pytest
 # only auto-injects fixtures defined in conftest.py or the importing
@@ -142,9 +146,7 @@ def test_quickstart_refuses_to_skip_on_nonpositive_predictions():
 
 def test_phase1_proxy_requires_backward_timing(toy_trace, toy_layout, toy_hw):
     """Without a measured backward wall, quickstart must not skip Phase-2."""
-    cfg = CostConfig(
-        n_persist=toy_layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
+    cfg = CostConfig(n_persist=toy_layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
     block_map = assign_modes(
         cfg.n_swap,
         cfg.n_checkpoint,
@@ -167,9 +169,7 @@ def test_phase1_proxy_requires_backward_timing(toy_trace, toy_layout, toy_hw):
 def test_phase1_proxy_can_drive_upfront_quickstart(toy_trace, toy_layout, toy_hw):
     """The upfront quickstart path uses existing Phase-1 trace timings."""
     trace = replace(toy_trace, steady_bwd_wall_s=toy_trace.steady_fwd_wall_s * 2.0)
-    cfg = CostConfig(
-        n_persist=toy_layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0
-    )
+    cfg = CostConfig(n_persist=toy_layout.N_chunk, n_buffer=0, n_swap=0, n_checkpoint=0)
     block_map = assign_modes(
         cfg.n_swap,
         cfg.n_checkpoint,
@@ -260,9 +260,7 @@ def test_post_measurement_quickstart_uses_original_prediction():
 def test_post_measurement_quickstart_refuses_bootstrap_mismatch():
     """Keeping the bootstrap runtime is not the same as keeping the Phase-1 pick."""
     phase1_cfg = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=4)
-    phase1_block_map = assign_modes(
-        phase1_cfg.n_swap, phase1_cfg.n_checkpoint, 8
-    )
+    phase1_block_map = assign_modes(phase1_cfg.n_swap, phase1_cfg.n_checkpoint, 8)
     phase1_result = SearchResult(
         cfg=phase1_cfg,
         block_map=phase1_block_map,
@@ -283,6 +281,100 @@ def test_post_measurement_quickstart_refuses_bootstrap_mismatch():
         )
         is False
     )
+
+
+def test_phase2_skips_resident_base_adapter_training():
+    """Frozen-base adapter runs skip the extra Phase-2 snapshot/restore pass."""
+
+    class _AdapterModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.frozen_base = nn.Parameter(
+                torch.empty(1000, device="meta", dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.adapter = nn.Parameter(
+                torch.empty(1, device="meta", dtype=torch.float16),
+                requires_grad=True,
+            )
+
+    assert _phase2_should_skip_resident_base_adapter(
+        _AdapterModel(),
+        adapter="qlora",
+        load_in_4bit=True,
+        load_in_8bit=False,
+    )
+
+
+def test_phase2_does_not_skip_full_finetune_training():
+    """Full-FT still gets the standard Phase-2 calibration path."""
+
+    class _FullFtModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(1000, device="meta", dtype=torch.float16),
+                requires_grad=True,
+            )
+
+    assert not _phase2_should_skip_resident_base_adapter(
+        _FullFtModel(),
+        adapter=None,
+        load_in_4bit=False,
+        load_in_8bit=False,
+    )
+
+
+def test_phase2_abort_closes_without_restore_to_gpu():
+    """Rollback-integrity abort must not take the fallback full-restore path."""
+    calls: list[str] = []
+
+    class _Handle:
+        def remove(self) -> None:
+            calls.append("remove")
+
+    class _Scheduler:
+        def close(self) -> None:
+            calls.append("scheduler_close")
+
+    class _ChunkManager:
+        def restore_to_gpu(self) -> None:
+            raise AssertionError("restore_to_gpu must not be called")
+
+        def close(self) -> None:
+            calls.append("chunk_manager_close")
+
+    result = SearchResult(
+        cfg=CostConfig(n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=0),
+        block_map=assign_modes(0, 0, 1),
+        predicted_peak_bytes=0,
+        predicted_iter_s=0.0,
+    )
+    wrapped = WrappedModel(
+        module=nn.Sequential(),
+        search_result=result,
+        chunk_manager=_ChunkManager(),
+        scheduler=_Scheduler(),
+        _hook_handles=[_Handle()],
+    )
+
+    _abort_phase2_bootstrap_runtime_without_restore(
+        model=wrapped.module,
+        blocks=[],
+        handles=[_Handle()],
+        boot_wrapped=wrapped,
+        context="test abort",
+    )
+
+    assert calls == ["remove", "scheduler_close", "chunk_manager_close"]
+
+
+def test_phase2_restore_integrity_error_is_distinct():
+    from axolotl.integrations.protrain.profiler.phase2 import (
+        Phase2RestoreIntegrityError,
+    )
+
+    assert issubclass(Phase2RestoreIntegrityError, RuntimeError)
 
 
 def test_phase2_teardown_closes_bootstrap_when_restore_raises():

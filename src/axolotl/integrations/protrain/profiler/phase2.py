@@ -33,6 +33,10 @@ _PHASE2_N_WARMUP = 3
 _PHASE2_N_ITERS = 5
 
 
+class Phase2RestoreIntegrityError(RuntimeError):
+    """Raised when Phase-2 cannot prove it restored the pre-measurement state."""
+
+
 def _min_n_buffer_for_layout(layout: "ChunkLayout", n_persist: int) -> int:
     """Minimum pool size for adjacent-block prefetch at ``n_persist``."""
     if n_persist >= layout.N_chunk:
@@ -394,7 +398,7 @@ def measure_chunked_steady(
                     _result = model.load_state_dict(model_state, strict=False)
                     extra_missing = set(_result.missing_keys) - expected_missing_keys
                     if extra_missing:
-                        raise RuntimeError(
+                        raise Phase2RestoreIntegrityError(
                             "Phase-2 state_dict restore missed "
                             f"{len(extra_missing)} unexpected keys "
                             f"(first 3: {sorted(extra_missing)[:3]}). "
@@ -408,7 +412,7 @@ def measure_chunked_steady(
                     )
                     if extra_unexpected:
                         # unexpected_keys = snapshot keys absent in live model → incomplete rollback.
-                        raise RuntimeError(
+                        raise Phase2RestoreIntegrityError(
                             "Phase-2 state_dict restore saw "
                             f"{len(extra_unexpected)} unexpected snapshot "
                             f"keys (first 3: {sorted(extra_unexpected)[:3]}). "
@@ -452,7 +456,11 @@ def measure_chunked_steady(
                 else:
                     m.eval()
             if restore_error is not None:
-                raise restore_error
+                if isinstance(restore_error, Phase2RestoreIntegrityError):
+                    raise restore_error
+                raise Phase2RestoreIntegrityError(
+                    "Phase-2 restore failed; rollback is incomplete."
+                ) from restore_error
     LOG.info(
         "Phase-2 chunked-runtime measurement: "
         "steady_fwd_chunked_wall_s=%.4f (n=%d, samples=%s) "

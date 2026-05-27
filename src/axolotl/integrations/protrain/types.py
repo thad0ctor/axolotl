@@ -76,6 +76,9 @@ class ProfilerConfig:
     force_all_persistent: bool = False
     # None = auto-detect from torch.distributed; explicit int sanity-checked.
     world_size: int | None = None
+    adapter: str | None = None
+    load_in_4bit: bool = False
+    load_in_8bit: bool = False
 
 
 @dataclass(frozen=True)
