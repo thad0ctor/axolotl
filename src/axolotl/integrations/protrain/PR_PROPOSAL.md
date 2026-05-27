@@ -8,8 +8,8 @@ This document describes a ProTrain
 from-scratch Python port of the paper's automatic memory manager, adapted to
 the Axolotl + HuggingFace Trainer + PEFT-LoRA + bitsandbytes-4-bit ecosystem.
 
-Validated headline numbers (all on 4× RTX 3090 / 3090 Ti class hardware,
-non-NVLink PCIe topology; full setup in §11):
+Validated headline numbers (on RTX 3090 / 3090 Ti class hardware unless a
+high-memory RunPod host is called out explicitly; full setup in §11):
 
 - **Memory reduction on Meta-Llama-3-8B BF16 LoRA, single 3090.** Vanilla
   peak `memory/max_active` = **15.83 GiB**; ProTrain Mode A peak after
@@ -64,6 +64,12 @@ non-NVLink PCIe topology; full setup in §11):
   final serialization and write an 8.5 GB `model.safetensors`. This is the
   practical smaller same-family regression shape for local 24 GiB cards; the
   9B full-FT shape reaches a finite first step locally but OOMs at step 2.
+- **Cross-world full optimizer-state resume on local 3090-class hardware.**
+  Qwen3.5-4B bf16 full-FT, forced Mode C, packed seq=1024 and seq=2048 both
+  validate 4-rank save → online 2-rank optimizer reshard → finite resumed
+  training through steps 4-6 with final safetensors saves. The seq=2048 run
+  peaks at **14.5 GiB/rank** and records resumed hot-step throughput of
+  **113.7-115.5 tokens/sec/GPU** after the first resumed step (§6.cc).
 - **RunPod 9B full-FT B1 check on 2× H100 NVL SKU, non-NVLink fabric.**
   The pod reported `NODE` between GPUs in `nvidia-smi topo -m`, so this is
   treated as a >90 GiB/rank capacity run rather than an NVLink result.
@@ -212,7 +218,7 @@ on the 4-rank mixed-SKU shape: rc=0, 9.44 GiB peak, 5.396 sps/rank,
 **Remaining carried limitations:**
 
 - Mode A 4-rank full-FT at 8B+ class OOMs at DDP-reducer load order
-  on 24 GiB cards (frozen base + reducer bucket > 24 GiB) — tracked in §16.B B1.
+  on 24 GiB cards (frozen base + reducer bucket > 24 GiB) — see §16.B B1.
 
 > **Cost-model framing (read before tuning near the 24 GiB ceiling).**
 > The raw `estimate_peak` predictor is a **lower-bound search gate**, not
@@ -999,7 +1005,7 @@ binding next to the rest of the working set, and a within-param shard
 fallback is the natural extension. **The within-shard fallback is part of the current implementation** (sentinel
 `_PROTRAIN_PERSISTENT_HUGE_PARAM_WITHIN_SHARD_VERSION = 1`,
 default threshold 512 MiB). At-scale validation on >24 GiB / NVLinked
-nodes (where 8B+ full-FT can fit) is tracked in §16.B B1.
+nodes (where 8B+ full-FT can fit) is recorded in §16.B B1.
 
 ### 6.aa Long-horizon convergence — Llama-13B + 4-bit Mode A vs vanilla
 
@@ -1051,9 +1057,7 @@ Mode C cross-world-size resume. Sentinel:
 Validation: NCCL-subprocess unit test in
 `tests/protrain/test_optimizer_checkpoint.py` (gated on 2+ CUDA
 devices and a real NCCL backend). Explicit Mode C multi-rank DDP is
-handled by the runtime bypass; the cross-world bridge mechanism itself is
-unit-test-validated; at-scale full optimizer-state 4-rank save → 2-rank
-resume is tracked in §16.B. ProTrain's cross-mode resume contract (A↔C
+handled by the runtime bypass. ProTrain's cross-mode resume contract (A↔C
 round-trip, shard reslicing on world-size change) is also exercised end-to-end in
 `tests/protrain/test_cross_mode_resume.py`.
 
@@ -1061,6 +1065,20 @@ The 4 → 2 rank round-trip additionally requires
 `protrain_allow_online_reshard: true` (or an offline reshard step
 between phases) so that `checkpoint.py:991`'s world-size hard-error
 does not fire after the bridge resolves the collective.
+
+Hardware validation on RTX 3090 / 3090 Ti class GPUs, Qwen3.5-4B bf16
+full-FT, forced Mode C, `adamw_bnb_8bit`:
+
+| Packed sequence | Resume path | Outcome |
+|---|---|---|
+| 1024 | 4-rank `checkpoint-3/protrain_optim` → online 2-rank reshard → steps 4-6 | rc=0, finite losses **0.6399 / 0.8439 / 0.8798**, grad_norm **8.926 / 7.88 / 7.905**, **14.5 GiB/rank** peak, final 9.08 GB `model.safetensors` |
+| 2048 | 4-rank `checkpoint-3/protrain_optim` → online 2-rank reshard → steps 4-6 | rc=0, finite losses **1.211 / 0.7567 / 0.8289**, grad_norm **8.108 / 6.798 / 6.381**, **14.5 GiB/rank** peak, final 9.08 GB `model.safetensors` |
+
+Cross-world persistent GPU optimizer state is resharded by stable param-name
+sidecar metadata (`gpu_optim_rank_*.pt.meta.json`), not rank-local optimizer
+state-dict integer order. Older sidecar-less persistent-state checkpoints fail
+closed for cross-world resume and should be resumed same-world, re-saved under
+the new format, or resumed without optimizer state.
 
 ### 6.dd Mode B explicit-force knob
 
@@ -1137,7 +1155,9 @@ quantized re-load.
   `test_optimizer_checkpoint.py`; save-side optimizer-state size
   estimation routes through `_dist_status_tensor` so CPU-tensor
   collectives work against the NCCL default process group. At-scale
-  full optimizer-state 4-rank save → 2-rank resume remains open in §16.B.
+  Qwen3.5-4B full-FT packed seq=1024 and seq=2048 validate 4-rank save
+  → online 2-rank full optimizer-state resume on local 3090-class hardware
+  (§6.cc).
 - **torch.compile compatibility.** Unit-validated by 9 cases in
   `test_torch_compile_compat.py`, with sentinel
   `_PROTRAIN_TORCH_COMPILE_COMPAT = 1`. At-scale closed end-to-end on
@@ -1715,12 +1735,12 @@ construction-time NCCL measurement unavailable; this integration adapts.
 
 The current implementation is feature-complete for LoRA / QLoRA ProTrain
 training on the validated 3090-class topologies. The remaining limits are
-hardware coverage, at-scale cross-world optimizer resume, or known throughput
+hardware coverage, exact multimodal checkpoint fidelity, and known throughput
 tradeoffs.
 
-- **8B+ full-finetune validation needs larger hardware.** Full-finetune at
-  8B-class scale is still hardware-bound on 24 GiB cards even with optimizer
-  state partitioning. Validation on >24 GiB / NVLinked nodes is tracked in
+- **8B+ full-finetune needs larger hardware than 24 GiB cards.**
+  Full-finetune at 8B-class scale is hardware-bound locally even with optimizer
+  state partitioning; the high-memory Qwen3.5-9B validation is recorded in
   §16.B B1.
 - **bs=1 Mode A is launch-latency dominated.** The Python hot path is reduced,
   but the remaining tax is dominated by small-kernel launch overhead. Use
@@ -1729,10 +1749,11 @@ tradeoffs.
 - **27B + 4-bit on a single 3090 is validated at seq=128 in Mode A and
   seq=256 in explicit Mode B.** Higher-throughput Mode A at longer 27B
   sequence lengths still requires multi-GPU or larger-memory hardware.
-- **At-scale cross-world Mode C full optimizer-state resume remains open.**
-  The NCCL bridge and limited reshard cases are unit validated; real
-  Qwen3.5-4B full-FT 4-rank save → 2-rank full-state resume on 3090-class
-  hardware reaches optimizer load but is not yet a stable training claim.
+- **Cross-world Mode C full optimizer-state resume requires sidecar metadata.**
+  Qwen3.5-4B full-FT packed seq=1024 and seq=2048 validate 4-rank save →
+  online 2-rank resume on 3090-class hardware. Older persistent GPU optimizer
+  checkpoints without `gpu_optim_rank_*.pt.meta.json` fail closed for
+  cross-world resume.
 - **Apex `FusedAdam` is available when the environment is CUDA-aligned.**
   This validation host has a CUDA toolkit / torch-wheel mismatch, so
   `adamw_apex_fused` is documented as supported but not benchmarked here.
@@ -1772,7 +1793,7 @@ capabilities:
   hot-path residency checks are all present in the current runtime.
 - **Checkpoint and resume.** ProTrain optimizer state is saved under
   `protrain_optim/`, supports same-world and cross-world resume, and includes
-  persistent optimizer-state sharding for Mode C full-finetune paths.
+  stable param-name sidecars for Mode C persistent optimizer-state resharding.
 - **Loader integration.** The loader auto-defers the 4-bit embedding upcast
   when ProTrain is active and installs the PEFT preparation patch through the
   same `is_protrain_active(cfg)` gate.
@@ -1881,7 +1902,7 @@ The status column reflects the current validation evidence on the 4× RTX 3090 /
 | M5 | 27B-class single-3090 fit + merge-lora deployability | **Validated at-scale for train + merge-lora on 13B and 27B** | §6.j: 19.98 GiB peak at seq=128; §6.dd: explicit Mode B reaches seq=256 at 22.06 GiB peak. ProTrain auto-defers the load-time embedding upcast. §6.jj produced rc=0 train + rc=0 merge-lora for both Llama-2-13B 4-bit qlora and Qwen3.5-27B 4-bit qlora, with safetensors-format merged checkpoints written to disk. **End-to-end deployment** (10-token generation from the merged model on the same 3090) is OOM-blocked by the single-3090 capacity ceiling (merged fp16 13B ≈ 26 GiB, 27B ≈ 52 GiB > 24 GiB) — this is a deployment-hardware concern, not a ProTrain / merge-lora defect. Users redeploying merged models need either a card with >24 GiB VRAM or an int8 / 4-bit quantized re-load. M5 verdict: **fully validated** at the train + merge boundary; 10-token deployment is hardware-bound. |
 | M6 | Save / merge / resume round-trip on standard- and linear-attn architectures | **Validated** | §6.o |
 | M7 | Mode A vs Mode C head-to-head (Mode A faster on non-NVLink PCIe) | **Validated** | §6.e (Mode A 24.68 vs Mode C 23.67 global sps); Mode C gracefully degrades to single-rank at world_size=1 (§6.k) |
-| M8 | 74.6% Adam-state reduction at full-finetune; Mode C full-FT memory efficiency | **Validated at small full-FT scale; 9B full optimizer-state high-memory path validated** | §6.g substantiates the 74.6% Adam-state slice / -49% total peak on Qwen3-0.6B full-FT. §6.nw validates 9B Mode C full-FT train, restored safetensors save, full `protrain_optim/` save, resume from full optimizer state to step 100, and a second full-state resume from `checkpoint-100` to step 105 on a 2× H100 NVL RunPod host reporting NODE fabric. Optimizer-state sharding, same-world full-state resume, within-shard fallback, and torch.compile compatibility are part of the current feature set; at-scale cross-world full-state resume is tracked in §16.B. |
+| M8 | 74.6% Adam-state reduction at full-finetune; Mode C full-FT memory efficiency | **Validated at small full-FT scale; 9B high-memory path and 4B cross-world resume validated** | §6.g substantiates the 74.6% Adam-state slice / -49% total peak on Qwen3-0.6B full-FT. §6.nw validates 9B Mode C full-FT train, restored safetensors save, full `protrain_optim/` save, resume from full optimizer state to step 100, and a second full-state resume from `checkpoint-100` to step 105 on a 2× H100 NVL RunPod host reporting NODE fabric. §6.cc validates Qwen3.5-4B full-FT packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume on 3090-class hardware. Optimizer-state sharding, same-world and cross-world full-state resume, within-shard fallback, and torch.compile compatibility are part of the current feature set. |
 | M9 | Four-mode behavior (A / B / C / auto) at production scale | **Validated** | Mode A reaches all measured bs=1/2 shapes at seq=256/512; explicit Mode B reaches end-to-end at bs=2; Mode C reaches end-to-end at bs=1 and bs=2 including the 4-rank mixed-SKU case. See §6.zz and §6.zz.X. |
 | M10 | LoRA-rank compatibility (r=16/32/64) on 13B + 4-bit Mode A | **Validated** | §6.l |
 | M11 | gradient_accumulation_steps compatibility (memory-neutral, throughput-positive) | **Validated** | §6.m |
@@ -1991,17 +2012,17 @@ without re-validation.
 
 ---
 
-## 16. Open follow-ups
+## 16. At-scale validation and follow-ups
 
-Open hardware-coverage and at-scale optimizer-resume gaps, plus a documented
-bs=1 throughput characteristic with a recommended workaround. None are
-prerequisites for the validated feature set above.
+At-scale closure rows are retained here with the remaining throughput follow-up
+so the proposal has one status table for the large-run validation surface. None
+are prerequisites for the validated feature set above.
 
-| # | Follow-up | Scope |
+| # | Area | Scope |
 |---|---|---|
 | B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. This validates the text full-FT path; exact multimodal visual-weight fidelity is not claimed. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because 9B OOMs locally after a finite first step. |
 | B2 | **bs=1 throughput is launch-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, per-step wallclock is dominated by ~9,000 `cudaLaunchKernel` calls per step on consumer 3090s. NCCL grad sync is overlap-shadowed by backward compute at this shape (Path B's coalesced sync produces a noise-level sps change at minimal-target bs=1 qlora despite a -68% NCCL collective-count reduction — Path B's measurable gain surfaces in the many-LoRA-tensor regime, see §6.pb). Recommended config: `gradient_accumulation_steps: 4` recovers per-sample throughput by amortizing the fixed launch tax — measured per-rank bs=1 = 0.229 sps → bs=4 (via grad-accum) = 0.738 sps (3.22×/sample). Future work: CUDA Graphs capture is the canonical fix for launch-tax-dominated regimes; not yet implemented in this branch. |
-| B3 | **At-scale cross-world Mode C full optimizer-state resume** | Unit coverage validates the NCCL CPU bridge and limited reshard cases. Real Qwen3.5-4B full-FT on 3090-class hardware validates 4-rank save, same-world resume, and 3×3090 Mode C bs=2 search, but 4-rank save → 2-rank full optimizer-state resume is not yet a stable training claim. |
+| B3 | **At-scale cross-world Mode C full optimizer-state resume** | Closed for the local regression class: Qwen3.5-4B full-FT forced Mode C validates packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume through finite steps 4-6, with final safetensors saves. The path requires param-name sidecar metadata for persistent GPU optimizer state; older sidecar-less checkpoints fail closed for cross-world resume. |
 
 ---
 
