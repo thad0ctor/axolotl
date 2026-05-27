@@ -795,7 +795,6 @@ class Scheduler:
         """Untimed pre_block_backward body; split out to keep the timed wrapper readable."""
         if self._is_inert:
             return
-        self._sequence_background_gathers_after_compute()
         mode = self.block_map.get(block_id, BlockMode.NONE)
         if mode is BlockMode.SWAP:
             LOG.debug(
@@ -837,6 +836,7 @@ class Scheduler:
                 # Re-claim the slot (removes from free list if present).
                 self.chunk_manager.gather(cid, phase="backward_regather")
         if misses:
+            self._sequence_background_gathers_after_compute()
             if is_offload:
                 self._gather_on_offload_stream(misses)
                 self._sync_offload_with_compute()
@@ -861,6 +861,7 @@ class Scheduler:
             # upcoming block is OFFLOAD; otherwise stay on the prefetch stream
             # (SWAP / NONE blocks).
             nxt_mode = self.block_map.get(nxt_bwd, BlockMode.NONE)
+            self._sequence_background_gathers_after_compute()
             if nxt_mode is BlockMode.OFFLOAD and self._offload_stream is not None:
                 self._gather_on_offload_stream(need)
             else:
