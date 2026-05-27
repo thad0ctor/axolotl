@@ -831,6 +831,7 @@ class AxolotlTrainer(
             with open(tokens_state_path, "w", encoding="utf-8") as f:
                 json.dump(tokens_state, f)
 
+        self._restore_protrain_fullft_offload_for_terminal_checkpoint()
         result = super()._save_checkpoint(model, trial, **kwargs)
 
         # Reclaim VRAM held by the FSDP full-state-dict gather.
@@ -839,6 +840,35 @@ class AxolotlTrainer(
             torch.cuda.empty_cache()
 
         return result
+
+    def _restore_protrain_fullft_offload_for_terminal_checkpoint(self) -> None:
+        cfg = self.axolotl_cfg
+        if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
+            return
+
+        global_step = int(getattr(self.state, "global_step", 0) or 0)
+        max_steps = int(
+            getattr(self.state, "max_steps", 0)
+            or getattr(self.args, "max_steps", 0)
+            or 0
+        )
+        if max_steps <= 0 or global_step < max_steps:
+            return
+
+        from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
+
+        moved = restore_fullft_offload_for_save(cfg)
+        if not moved:
+            return
+
+        if self.accelerator is not None and hasattr(
+            self.accelerator, "wait_for_everyone"
+        ):
+            self.accelerator.wait_for_everyone()
+            return
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # TODO(wing): remove once https://github.com/huggingface/transformers/pull/39866/files is merged
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
