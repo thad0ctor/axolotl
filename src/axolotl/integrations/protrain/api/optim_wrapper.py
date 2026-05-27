@@ -883,7 +883,7 @@ def protrain_optimizer_wrapper(
                         f"({huge_param_threshold_bytes} bytes) but dim-0 "
                         f"size {int(p.shape[0])} is not divisible by "
                         f"world_size={persistent_world_size}. Pad-and-mask "
-                        "fallback is not implemented; either reduce "
+                        "fallback is not implemented; either increase "
                         "protrain_persistent_huge_param_threshold_bytes to "
                         "keep this param on the round-robin path, or use a "
                         f"world_size that divides {int(p.shape[0])}."

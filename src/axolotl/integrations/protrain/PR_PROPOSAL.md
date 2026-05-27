@@ -964,6 +964,15 @@ Qwen3.5-9B Mode C run completes finite on the RunPod high-memory host
 and writes the final safetensors model (`train_runtime=362.4 s`,
 `train_loss=0.9155`).
 
+Multimodal checkpoint-key fidelity is also validated on the local regression
+shape. Qwen3.5-4B full-FT with `AutoProcessor`, a multimodal `qwen3_5`
+chat-template batch, forced Mode C, 5× 3090-class GPUs, seq=512, bs=1, and
+`adamw_bnb_8bit` completes a finite train/save keycheck. Final save restores
+6.925 GB of chunk-managed params, unwraps 32 ProTrain block wrappers, and the
+written `model.safetensors` contains native Qwen3.5 visual keys
+(`model.visual.*`: 297, nested `model.language_model.visual.*`: 0,
+`.block.` wrapper keys: 0).
+
 **Finding.** ProTrain Mode C's `zero3_shard` shards **chunk weights** but
 NOT **fp32 master optimizer state** for full-FT — the chunk manager's
 scope is param chunks, not `torch.optim` state. Adam fp32 m+v at 2B
@@ -1478,7 +1487,7 @@ Each cell shows the latest at-rig passing measurement.
 | bs=2 seq=256 | rc=0 9.5 GiB sps **4.23/rank** 71 s | rc=0 9.28 GiB sps **2.848/rank** 83 s | rc=0 9.44 GiB sps **4.942/rank** 434 s | rc=0 9.44 GiB sps **5.396/rank** 423 s |
 | bs=2 seq=256 (3× 3090 + 1× 3090 Ti mixed-SKU) | n/a | n/a | n/a | rc=0 8.23 GiB sps **4.963/rank** 340 s |
 | bs=2 seq=256 (2× 3090 Ti homogeneous, world=2) | n/a | n/a | n/a | rc=0 9.18 GiB sps **4.61/rank** 114 s |
-| bs=2 seq=512 | rc=0 11.0 GiB sps **3.47/rank** 96 s | (`n_persist=128 n_offload=0` projected good; not measured) | not measured | not measured |
+| bs=2 seq=512 | rc=0 11.0 GiB sps **3.47/rank** 96 s | rc=0 14.86 GiB, 25/25 finite, 47.0 s | rc=0 14.86 GiB, 25/25 finite, auto picks `n_persist=128 n_offload=0`, 46.8 s | rc=0 14.86 GiB, 25/25 finite, 45.6 s |
 
 **Architecture summary for the bs=2 `n_offload > 0` end-to-end paths.**
 Mode B bs=2 uses the dedicated `_offload_stream` so per-chunk
@@ -2025,7 +2034,7 @@ are prerequisites for the validated feature set above.
 
 | # | Area | Scope |
 |---|---|---|
-| B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. This validates the text full-FT path; exact multimodal visual-weight fidelity is not claimed. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because 9B OOMs locally after a finite first step. |
+| B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because 9B OOMs locally after a finite first step; the same 4B local shape also validates Qwen3.5 multimodal visual-key checkpoint fidelity at the final save boundary. |
 | B2 | **bs=1 throughput is launch-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, per-step wallclock is dominated by ~9,000 `cudaLaunchKernel` calls per step on consumer 3090s. NCCL grad sync is overlap-shadowed by backward compute at this shape (Path B's coalesced sync produces a noise-level sps change at minimal-target bs=1 qlora despite a -68% NCCL collective-count reduction — Path B's measurable gain surfaces in the many-LoRA-tensor regime, see §6.pb). Recommended config: `gradient_accumulation_steps: 4` recovers per-sample throughput by amortizing the fixed launch tax — measured per-rank bs=1 = 0.229 sps → bs=4 (via grad-accum) = 0.738 sps (3.22×/sample). Future work: CUDA Graphs capture is the canonical fix for launch-tax-dominated regimes; not yet implemented in this branch. |
 | B3 | **At-scale cross-world Mode C full optimizer-state resume** | Closed for the local regression class: Qwen3.5-4B full-FT forced Mode C validates packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume through finite steps 4-6, with final safetensors saves. The seq=1024 and seq=2048 `adamw_bnb_8bit` paths pass, and seq=2048 repeats under `adamw_torch`. The path requires param-name sidecar metadata for persistent GPU optimizer state; older sidecar-less checkpoints fail closed for cross-world resume. |
 

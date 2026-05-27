@@ -38,6 +38,12 @@ if TYPE_CHECKING:
 LOG = get_logger(__name__)
 
 
+_QWEN35_VISUAL_PREFIX_REMAPS = (
+    ("model.language_model.visual.", "model.visual."),
+    ("language_model.visual.", "visual."),
+)
+
+
 # One-shot session flag so the inert-plugin WARN fires at most once per process.
 _INERT_AUTO_MEMORY_WARN_FIRED: bool = False
 
@@ -1252,12 +1258,180 @@ def restore_fullft_offload_for_save(cfg) -> int:
         return 0
 
     moved = chunk_manager.restore_to_gpu()
+    unwrapped = _unwrap_protrain_blocks_for_save(getattr(wrapped, "module", None))
     cfg._protrain_fullft_offload_restored_for_save = True  # type: ignore[attr-defined]
     LOG.info(
         "ProTrain: restored %.3f GB of full-FT chunk-managed params before final save.",
         moved / 1e9,
     )
+    if unwrapped:
+        LOG.info(
+            "ProTrain: unwrapped %d block wrapper(s) before final save.",
+            unwrapped,
+        )
     return moved
+
+
+def _unwrap_protrain_blocks_for_save(model: "nn.Module | None") -> int:
+    if model is None:
+        return 0
+
+    from torch import nn
+
+    from axolotl.integrations.protrain.block import unwrap_block
+
+    def replace_child(parent: nn.Module, name: str, child: nn.Module) -> None:
+        if isinstance(parent, (nn.ModuleList, nn.Sequential)):
+            parent[int(name)] = child
+        elif isinstance(parent, nn.ModuleDict):
+            parent[name] = child
+        else:
+            setattr(parent, name, child)
+
+    def visit(parent: nn.Module) -> int:
+        count = 0
+        for name, child in list(parent.named_children()):
+            unwrapped = unwrap_block(child)
+            if unwrapped is not child:
+                replace_child(parent, name, unwrapped)
+                child = unwrapped
+                count += 1
+            count += visit(child)
+        return count
+
+    return visit(model)
+
+
+def normalize_state_dict_for_save(cfg, state_dict):
+    """Return a ProTrain-restored state dict with native HF checkpoint keys."""
+    if not getattr(cfg, "_protrain_wrapped", None):
+        return state_dict
+
+    if not any(
+        key.startswith(nested_prefix)
+        for nested_prefix, _ in _QWEN35_VISUAL_PREFIX_REMAPS
+        for key in state_dict
+    ):
+        return state_dict
+
+    remapped = type(state_dict)()
+    n_remapped = 0
+    for key, value in state_dict.items():
+        original_key = key
+        for nested_prefix, native_prefix in _QWEN35_VISUAL_PREFIX_REMAPS:
+            if key.startswith(nested_prefix):
+                key = native_prefix + key[len(nested_prefix) :]
+                n_remapped += 1
+                break
+        if key != original_key and key in state_dict:
+            raise RuntimeError(
+                "ProTrain final-save state_dict contains both native Qwen3.5 "
+                "visual keys and nested visual keys; refusing to guess "
+                "checkpoint names."
+            )
+        if key in remapped:
+            raise RuntimeError(
+                "ProTrain final-save state_dict remap produced duplicate key "
+                f"{key!r}; refusing to overwrite checkpoint data."
+            )
+        remapped[key] = value
+
+    metadata = getattr(state_dict, "_metadata", None)
+    if metadata is not None:
+        remapped._metadata = metadata  # type: ignore[attr-defined]
+
+    LOG.info(
+        "ProTrain: remapped %d Qwen3.5 visual state_dict key(s) before save.",
+        n_remapped,
+    )
+    return remapped
+
+
+def normalize_saved_safetensors_for_save(cfg, output_dir) -> int:
+    """Rewrite saved Qwen3.5 visual keys when HF save_pretrained ignored state_dict."""
+    if not getattr(cfg, "_protrain_wrapped", None):
+        return 0
+
+    import json
+    from collections import OrderedDict
+    from pathlib import Path
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    output_path = Path(output_dir)
+    index_path = output_path / "model.safetensors.index.json"
+    single_path = output_path / "model.safetensors"
+
+    def remap_key(key: str) -> str:
+        for nested_prefix, native_prefix in _QWEN35_VISUAL_PREFIX_REMAPS:
+            if key.startswith(nested_prefix):
+                return native_prefix + key[len(nested_prefix) :]
+        return key
+
+    def rewrite_file(path: Path) -> int:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            keys = list(handle.keys())
+            remapped_keys = [remap_key(key) for key in keys]
+            if keys == remapped_keys:
+                return 0
+            if len(set(remapped_keys)) != len(remapped_keys):
+                raise RuntimeError(
+                    "ProTrain saved safetensors key remap produced duplicate "
+                    f"keys in {path}; refusing to overwrite checkpoint data."
+                )
+            original_key_set = set(keys)
+            for original, remapped in zip(keys, remapped_keys, strict=True):
+                if original != remapped and remapped in original_key_set:
+                    raise RuntimeError(
+                        "ProTrain saved safetensors contains both native "
+                        "Qwen3.5 visual keys and nested visual keys; refusing "
+                        "to guess checkpoint names."
+                    )
+            metadata = handle.metadata()
+            tensors = OrderedDict(
+                (remapped, handle.get_tensor(original))
+                for original, remapped in zip(keys, remapped_keys, strict=True)
+            )
+
+        tmp_path = path.with_suffix(path.suffix + ".protrain_tmp")
+        save_file(tensors, tmp_path, metadata=metadata)
+        tmp_path.replace(path)
+        return sum(
+            1
+            for original, remapped in zip(keys, remapped_keys, strict=True)
+            if original != remapped
+        )
+
+    total = 0
+    if index_path.exists():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = index.get("weight_map", {})
+        new_weight_map = {}
+        for key, shard in weight_map.items():
+            remapped = remap_key(key)
+            if remapped in new_weight_map:
+                raise RuntimeError(
+                    "ProTrain saved safetensors index remap produced duplicate "
+                    f"key {remapped!r}; refusing to overwrite checkpoint data."
+                )
+            new_weight_map[remapped] = shard
+        for shard in sorted(set(weight_map.values())):
+            total += rewrite_file(output_path / shard)
+        if new_weight_map != weight_map:
+            index["weight_map"] = new_weight_map
+            tmp_index = index_path.with_suffix(index_path.suffix + ".protrain_tmp")
+            tmp_index.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+            tmp_index.replace(index_path)
+    elif single_path.exists():
+        total += rewrite_file(single_path)
+
+    if total:
+        LOG.info(
+            "ProTrain: remapped %d saved Qwen3.5 visual safetensors key(s).",
+            total,
+        )
+    return total
 
 
 def _force_pickle_save_for_fullft_offload(cfg, trainer, wrapped) -> None:

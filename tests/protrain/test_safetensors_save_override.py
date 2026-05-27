@@ -8,13 +8,19 @@ weights are serialized.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
+import torch
+from torch import nn
 
 from axolotl.core.trainers.base import AxolotlTrainer
+from axolotl.integrations.protrain.block import BlockMode, wrap_block
 from axolotl.integrations.protrain.plugin import (
     _force_pickle_save_for_fullft_offload,
+    normalize_saved_safetensors_for_save,
+    normalize_state_dict_for_save,
     restore_fullft_offload_for_save,
 )
 from axolotl.train import _restore_protrain_fullft_offload_for_save
@@ -153,6 +159,91 @@ def test_full_ft_effective_offload_restore_after_rebuild():
 
     assert restore_fullft_offload_for_save(cfg) == 1234
     assert chunk_manager.calls == 1
+
+
+def test_full_ft_restore_unwraps_block_wrappers_before_final_save():
+    """Final model saves should expose native HF keys, not ProTrain wrapper names."""
+    chunk_manager = _RestoringChunkManager()
+    block = nn.Linear(2, 2)
+    model = nn.Sequential(wrap_block(block, BlockMode.CKPT))
+    wrapped = SimpleNamespace(chunk_manager=chunk_manager, module=model)
+    cfg = SimpleNamespace(adapter=None, _protrain_wrapped=wrapped)
+
+    assert "0.block.weight" in dict(model.named_parameters())
+
+    assert restore_fullft_offload_for_save(cfg) == 1234
+
+    assert model[0] is block
+    assert "0.weight" in dict(model.named_parameters())
+    assert "0.block.weight" not in dict(model.named_parameters())
+
+
+def test_full_ft_save_remaps_qwen35_visual_keys_to_native_prefix():
+    cfg = SimpleNamespace(_protrain_wrapped=object())
+    state_dict = OrderedDict(
+        [
+            ("model.language_model.visual.blocks.0.norm1.weight", object()),
+            ("model.language_model.layers.0.input_layernorm.weight", object()),
+        ]
+    )
+
+    remapped = normalize_state_dict_for_save(cfg, state_dict)
+
+    assert "model.visual.blocks.0.norm1.weight" in remapped
+    assert "model.language_model.visual.blocks.0.norm1.weight" not in remapped
+    assert "model.language_model.layers.0.input_layernorm.weight" in remapped
+
+
+def test_full_ft_save_remaps_inner_qwen35_visual_keys_before_save_pretrained_prefix():
+    cfg = SimpleNamespace(_protrain_wrapped=object())
+    state_dict = OrderedDict(
+        [
+            ("language_model.visual.blocks.0.norm1.weight", object()),
+            ("language_model.layers.0.input_layernorm.weight", object()),
+        ]
+    )
+
+    remapped = normalize_state_dict_for_save(cfg, state_dict)
+
+    assert "visual.blocks.0.norm1.weight" in remapped
+    assert "language_model.visual.blocks.0.norm1.weight" not in remapped
+    assert "language_model.layers.0.input_layernorm.weight" in remapped
+
+
+def test_full_ft_save_rejects_ambiguous_qwen35_visual_keys():
+    cfg = SimpleNamespace(_protrain_wrapped=object())
+    state_dict = OrderedDict(
+        [
+            ("model.visual.blocks.0.norm1.weight", object()),
+            ("model.language_model.visual.blocks.0.norm1.weight", object()),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="contains both native Qwen3.5 visual"):
+        normalize_state_dict_for_save(cfg, state_dict)
+
+
+def test_full_ft_save_rewrites_saved_qwen35_visual_safetensors(tmp_path):
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    cfg = SimpleNamespace(_protrain_wrapped=object())
+    path = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "model.language_model.visual.blocks.0.norm1.weight": torch.ones(1),
+            "model.language_model.layers.0.input_layernorm.weight": torch.zeros(1),
+        },
+        path,
+    )
+
+    assert normalize_saved_safetensors_for_save(cfg, tmp_path) == 1
+
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+    assert "model.visual.blocks.0.norm1.weight" in keys
+    assert "model.language_model.visual.blocks.0.norm1.weight" not in keys
+    assert "model.language_model.layers.0.input_layernorm.weight" in keys
 
 
 def test_lora_offload_restore_is_skipped():

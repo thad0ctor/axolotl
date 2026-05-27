@@ -872,7 +872,9 @@ class AxolotlTrainer(
 
     def _save_protrain_optimizer_state_for_checkpoint(self, output_dir: str) -> None:
         cfg = self.axolotl_cfg
-        if cfg is None or not bool(getattr(cfg, "protrain_save_optimizer_state", False)):
+        if cfg is None or not bool(
+            getattr(cfg, "protrain_save_optimizer_state", False)
+        ):
             return
 
         from axolotl.integrations.protrain.api.checkpoint import (
@@ -915,12 +917,35 @@ class AxolotlTrainer(
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+    def _normalize_protrain_state_dict_for_save(self, state_dict):
+        cfg = self.axolotl_cfg
+        if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
+            return state_dict
+
+        from axolotl.integrations.protrain.plugin import normalize_state_dict_for_save
+
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        return normalize_state_dict_for_save(cfg, state_dict)
+
+    def _normalize_protrain_saved_safetensors(self, output_dir: str) -> None:
+        cfg = self.axolotl_cfg
+        if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
+            return
+
+        from axolotl.integrations.protrain.plugin import (
+            normalize_saved_safetensors_for_save,
+        )
+
+        normalize_saved_safetensors_for_save(cfg, output_dir)
+
     # TODO(wing): remove once https://github.com/huggingface/transformers/pull/39866/files is merged
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         LOG.info(f"Saving model checkpoint to {output_dir}")
+        state_dict = self._normalize_protrain_state_dict_for_save(state_dict)
 
         # fix for Context Parallel save: CP eval invalidates tensor storage
         # pointers, so clone to CPU to get fresh valid storage for safetensors
@@ -978,6 +1003,7 @@ class AxolotlTrainer(
                 is_main_process=self.accelerator.is_main_process,
                 safe_serialization=safe_serialization,
             )
+        self._normalize_protrain_saved_safetensors(output_dir)
 
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)
