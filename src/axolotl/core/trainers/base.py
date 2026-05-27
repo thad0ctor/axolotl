@@ -25,7 +25,7 @@ from torch.utils.data import (
     SequentialSampler,
 )
 from transformers import PreTrainedModel, Trainer
-from transformers.trainer import TRAINING_ARGS_NAME
+from transformers.trainer import TRAINER_STATE_NAME, TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length, seed_worker
 from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME, is_peft_available
 from trl.experimental.utils import pad_to_length
@@ -831,6 +831,8 @@ class AxolotlTrainer(
             with open(tokens_state_path, "w", encoding="utf-8") as f:
                 json.dump(tokens_state, f)
 
+        if self._is_protrain_terminal_checkpoint():
+            self._presave_protrain_terminal_checkpoint_state(output_dir)
         self._restore_protrain_fullft_offload_for_terminal_checkpoint()
         result = super()._save_checkpoint(model, trial, **kwargs)
 
@@ -841,10 +843,10 @@ class AxolotlTrainer(
 
         return result
 
-    def _restore_protrain_fullft_offload_for_terminal_checkpoint(self) -> None:
+    def _is_protrain_terminal_checkpoint(self) -> bool:
         cfg = self.axolotl_cfg
         if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
-            return
+            return False
 
         global_step = int(getattr(self.state, "global_step", 0) or 0)
         max_steps = int(
@@ -852,12 +854,51 @@ class AxolotlTrainer(
             or getattr(self.args, "max_steps", 0)
             or 0
         )
-        if max_steps <= 0 or global_step < max_steps:
+        return max_steps > 0 and global_step >= max_steps
+
+    def _presave_protrain_terminal_checkpoint_state(self, output_dir: str) -> None:
+        if not self.args.save_only_model:
+            self._save_optimizer_and_scheduler(output_dir)
+            self._save_scaler(output_dir)
+            self._save_rng_state(output_dir)
+            self._save_protrain_optimizer_state_for_checkpoint(output_dir)
+
+        if self.args.should_save:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+    def _save_protrain_optimizer_state_for_checkpoint(self, output_dir: str) -> None:
+        cfg = self.axolotl_cfg
+        if cfg is None or not bool(getattr(cfg, "protrain_save_optimizer_state", False)):
+            return
+
+        from axolotl.integrations.protrain.api.checkpoint import (
+            DEFAULT_SAVE_MAX_BYTES,
+            _save_protrain_optim_dir,
+            _unwrap_protrain_optim,
+        )
+
+        raw = _unwrap_protrain_optim(getattr(self, "optimizer", None))
+        if raw is None:
+            return
+
+        cfg_max = getattr(cfg, "protrain_optim_save_max_bytes", None)
+        save_max = int(cfg_max) if cfg_max is not None else DEFAULT_SAVE_MAX_BYTES
+        _save_protrain_optim_dir(
+            raw,
+            output_dir,
+            step=int(getattr(self.state, "global_step", 0) or 0),
+            save_max_bytes=save_max,
+            rank=int(getattr(self.args, "process_index", 0)),
+            world_size=int(getattr(self.args, "world_size", 1)),
+        )
+
+    def _restore_protrain_fullft_offload_for_terminal_checkpoint(self) -> None:
+        if not self._is_protrain_terminal_checkpoint():
             return
 
         from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
 
-        moved = restore_fullft_offload_for_save(cfg)
+        moved = restore_fullft_offload_for_save(self.axolotl_cfg)
         if not moved:
             return
 
