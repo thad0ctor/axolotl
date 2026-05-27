@@ -333,6 +333,7 @@ def test_post_model_load_calls_early_init_before_wrapper():
 
     # Track call ordering: early-init then wrapper.
     call_log: list[str] = []
+    wrapper_kwargs: dict = {}
 
     def fake_early_init(cfg):
         call_log.append("early_init")
@@ -340,6 +341,7 @@ def test_post_model_load_calls_early_init_before_wrapper():
 
     def fake_wrapper(*args, **kwargs):
         call_log.append("wrapper")
+        wrapper_kwargs.update(kwargs)
         # Build a minimal fake WrappedModel — only the attrs
         # post_model_load reads (search_result.cfg, chunk_manager,
         # _trace) need to exist.
@@ -371,6 +373,9 @@ def test_post_model_load_calls_early_init_before_wrapper():
         protrain_n_checkpoint_override=None,
         protrain_zero3_shard=None,
         protrain_auto_mode=False,
+        adapter="qlora",
+        load_in_4bit=True,
+        load_in_8bit=False,
     )
     fake_model = torch.nn.Linear(4, 4)
 
@@ -392,6 +397,9 @@ def test_post_model_load_calls_early_init_before_wrapper():
     assert call_log == ["early_init", "wrapper"], (
         f"early init must precede wrapper; saw {call_log!r}"
     )
+    assert wrapper_kwargs["adapter"] == "qlora"
+    assert wrapper_kwargs["load_in_4bit"] is True
+    assert wrapper_kwargs["load_in_8bit"] is False
     # The wrapper handle was stashed back on cfg as expected.
     assert getattr(cfg, "_protrain_wrapped", None) is not None
 
