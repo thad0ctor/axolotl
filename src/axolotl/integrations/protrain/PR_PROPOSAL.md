@@ -1071,14 +1071,18 @@ full-FT, forced Mode C, `adamw_bnb_8bit`:
 
 | Packed sequence | Resume path | Outcome |
 |---|---|---|
-| 1024 | 4-rank `checkpoint-3/protrain_optim` → online 2-rank reshard → steps 4-6 | rc=0, finite losses **0.6399 / 0.8439 / 0.8798**, grad_norm **8.926 / 7.88 / 7.905**, **14.5 GiB/rank** peak, final 9.08 GB `model.safetensors` |
-| 2048 | 4-rank `checkpoint-3/protrain_optim` → online 2-rank reshard → steps 4-6 | rc=0, finite losses **1.211 / 0.7567 / 0.8289**, grad_norm **8.108 / 6.798 / 6.381**, **14.5 GiB/rank** peak, final 9.08 GB `model.safetensors` |
+| 1024 | 4-rank `checkpoint-3/protrain_optim` → online 2-rank reshard → steps 4-6 | rc=0, finite losses **0.6399 / 0.8439 / 0.8798**, grad_norm **8.926 / 7.88 / 7.905**, **14.5 GiB/rank** peak, **58.6-60.5 tokens/sec/GPU** on hot resumed steps, final 9.08 GB `model.safetensors` |
+| 2048 | 4-rank `checkpoint-3/protrain_optim` → online 2-rank reshard → steps 4-6 | rc=0, finite losses **1.211 / 0.7567 / 0.8289**, grad_norm **8.108 / 6.798 / 6.381**, **14.5 GiB/rank** peak, **113.7-115.5 tokens/sec/GPU** on hot resumed steps, final 9.08 GB `model.safetensors` |
 
 Cross-world persistent GPU optimizer state is resharded by stable param-name
 sidecar metadata (`gpu_optim_rank_*.pt.meta.json`), not rank-local optimizer
 state-dict integer order. Older sidecar-less persistent-state checkpoints fail
 closed for cross-world resume and should be resumed same-world, re-saved under
 the new format, or resumed without optimizer state.
+
+The fresh online 4 → 2 optimizer reshard writes completed in about **100 s**
+for these checkpoints before optimizer restore. This is a resume-time
+checkpoint conversion cost, not steady-state training overhead.
 
 ### 6.dd Mode B explicit-force knob
 
