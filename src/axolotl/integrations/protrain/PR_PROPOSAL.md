@@ -28,7 +28,9 @@ non-NVLink PCIe topology; full setup in §11):
   load-time upcast (ProTrain handles the cast lazily during forward). The selected cost-config
   is `n_persist=64, n_buffer=0, n_swap=1, n_checkpoint=0, n_offload=0` with
   `predicted=15409 MB`. This is the largest model class validated on a
-  single 3090 in this work.
+  single 3090 in this work. Explicit Mode B also validates the same
+  27B + 4-bit shape at seq=256 under the 24 GiB ceiling: **22.06 GiB** peak,
+  **0.816 sps**, loss 0.716 (§6.dd).
 - **Sequence-length headroom at 13B + 4-bit, single 3090.** Mode A holds at
   seq=512 (10.95 GiB), seq=1024 (13.66 GiB), and seq=2048 (**18.94 GiB**,
   loss 0.99) — the multi-sequence claim is validated up to 2048
@@ -1873,7 +1875,7 @@ The status column reflects the current validation evidence on the 4× RTX 3090 /
 | M3-seq | M3 extends across seq=512 / 1024 / 2048 on single 3090 | **Validated** | §6.h |
 | M4 | DDP scaling ~3.5–3.9× on non-NVLink PCIe, 4× 3090, Mode A | **Validated** | §6.e, §6.p |
 | M4-bs | DDP batch-size scaling near-linear through bs=4 on 13B + 4-bit | **Validated** | §6.i |
-| M5 | 27B-class single-3090 fit + merge-lora deployability | **Validated at-scale for train + merge-lora on 13B and 27B** | §6.j: 19.98 GiB peak at seq=128; ProTrain auto-defers the load-time embedding upcast. §6.jj produced rc=0 train + rc=0 merge-lora for both Llama-2-13B 4-bit qlora and Qwen3.5-27B 4-bit qlora, with safetensors-format merged checkpoints written to disk. **End-to-end deployment** (10-token generation from the merged model on the same 3090) is OOM-blocked by the single-3090 capacity ceiling (merged fp16 13B ≈ 26 GiB, 27B ≈ 52 GiB > 24 GiB) — this is a deployment-hardware concern, not a ProTrain / merge-lora defect. Users redeploying merged models need either a card with >24 GiB VRAM or an int8 / 4-bit quantized re-load. M5 verdict: **fully validated** at the train + merge boundary; 10-token deployment is hardware-bound. Larger seq at 27B remains a current limitation in §9. |
+| M5 | 27B-class single-3090 fit + merge-lora deployability | **Validated at-scale for train + merge-lora on 13B and 27B** | §6.j: 19.98 GiB peak at seq=128; §6.dd: explicit Mode B reaches seq=256 at 22.06 GiB peak. ProTrain auto-defers the load-time embedding upcast. §6.jj produced rc=0 train + rc=0 merge-lora for both Llama-2-13B 4-bit qlora and Qwen3.5-27B 4-bit qlora, with safetensors-format merged checkpoints written to disk. **End-to-end deployment** (10-token generation from the merged model on the same 3090) is OOM-blocked by the single-3090 capacity ceiling (merged fp16 13B ≈ 26 GiB, 27B ≈ 52 GiB > 24 GiB) — this is a deployment-hardware concern, not a ProTrain / merge-lora defect. Users redeploying merged models need either a card with >24 GiB VRAM or an int8 / 4-bit quantized re-load. M5 verdict: **fully validated** at the train + merge boundary; 10-token deployment is hardware-bound. |
 | M6 | Save / merge / resume round-trip on standard- and linear-attn architectures | **Validated** | §6.o |
 | M7 | Mode A vs Mode C head-to-head (Mode A faster on non-NVLink PCIe) | **Validated** | §6.e (Mode A 24.68 vs Mode C 23.67 global sps); Mode C gracefully degrades to single-rank at world_size=1 (§6.k) |
 | M8 | 74.6% Adam-state reduction at full-finetune; Mode C full-FT memory efficiency | **Validated at small full-FT scale; 9B full optimizer-state high-memory path validated** | §6.g substantiates the 74.6% Adam-state slice / -49% total peak on Qwen3-0.6B full-FT. §6.nw validates 9B Mode C full-FT train, restored safetensors save, full `protrain_optim/` save, resume from full optimizer state to step 100, and a second full-state resume from `checkpoint-100` to step 105 on a 2× H100 NVL RunPod host reporting NODE fabric. Optimizer-state sharding, within-shard fallback, cross-world checkpointing, and torch.compile compatibility are part of the current feature set. |
