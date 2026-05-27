@@ -27,7 +27,7 @@ from torch.utils.data import (
 from transformers import PreTrainedModel, Trainer
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length, seed_worker
-from transformers.utils import SAFE_WEIGHTS_NAME, is_peft_available
+from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME, is_peft_available
 from trl.experimental.utils import pad_to_length
 from typing_extensions import override
 
@@ -865,6 +865,7 @@ class AxolotlTrainer(
             if not is_peft_available()
             else (PreTrainedModel, PeftModel)
         )
+        safe_serialization = bool(getattr(self.args, "save_safetensors", True))
         # Save a trained model and configuration using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
         if not isinstance(self.model, supported_classes):
@@ -881,21 +882,26 @@ class AxolotlTrainer(
                     output_dir,
                     state_dict=state_dict,
                     is_main_process=self.accelerator.is_main_process,
+                    safe_serialization=safe_serialization,
                 )
             else:
                 LOG.info(
                     "Trainer.model is not a `PreTrainedModel`, only saving its state dict."
                 )
-                safetensors.torch.save_file(
-                    state_dict,
-                    os.path.join(output_dir, SAFE_WEIGHTS_NAME),
-                    metadata={"format": "pt"},
-                )
+                if safe_serialization:
+                    safetensors.torch.save_file(
+                        state_dict,
+                        os.path.join(output_dir, SAFE_WEIGHTS_NAME),
+                        metadata={"format": "pt"},
+                    )
+                else:
+                    torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
         else:
             self.model.save_pretrained(
                 output_dir,
                 state_dict=state_dict,
                 is_main_process=self.accelerator.is_main_process,
+                safe_serialization=safe_serialization,
             )
 
         if self.processing_class is not None:
