@@ -36,6 +36,7 @@ CHUNK_FILE_RE = re.compile(r"^chunk_(\d+)\.pt$")
 CHUNK_SHARD_FILE_RE = re.compile(r"^chunk_(\d+)_rank_(\d+)\.pt$")
 # v3 persistent partition: gpu_optim_rank_<R>.pt (one per rank).
 GPU_OPTIM_RANK_FILE_RE = re.compile(r"^gpu_optim_rank_(\d+)\.pt$")
+GPU_OPTIM_RANK_META_SUFFIX = ".meta.json"
 SCHEMA_FORMAT_VERSION = 4
 SAVE_MODE_REPLICATED = "replicated"
 SAVE_MODE_SHARDED = "sharded"
@@ -261,6 +262,98 @@ def _layout_signature(chunk_manager: Any, world_size: int, zero3_shard: bool) ->
     )
 
 
+def _persistent_param_names_full(chunk_manager: Any) -> list[str]:
+    persistent_ids = set(_effective_persistent_ids(chunk_manager))
+    names: list[str] = []
+    seen: set[str] = set()
+    for cid, chunk_param_ids in enumerate(chunk_manager.layout.chunks):
+        if cid not in persistent_ids:
+            continue
+        for param_id in chunk_param_ids:
+            name = str(param_id)
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _gpu_optim_rank_param_name_meta(
+    optim: Any, state_dict: dict[str, Any]
+) -> dict[str, Any]:
+    inner = getattr(getattr(optim, "_gpu_optim", None), "_optim", None)
+    if inner is None:
+        return {
+            "format": "protrain_gpu_optim_rank_param_names_v1",
+            "param_names_by_state_index": {},
+            "param_groups_param_names": [],
+        }
+
+    chunk_manager = optim._chunk_manager
+    param_names_by_obj_id = {
+        id(param): str(param_id)
+        for param_id, param in (
+            getattr(chunk_manager, "_params_by_id", {}) or {}
+        ).items()
+    }
+    saved_groups = state_dict.get("param_groups", [])
+    actual_groups = getattr(inner, "param_groups", [])
+    if len(saved_groups) != len(actual_groups):
+        raise RuntimeError(
+            "ProTrain optimizer save: persistent GPU optimizer param-group "
+            f"count mismatch while writing rank metadata "
+            f"(state_dict={len(saved_groups)}, optimizer={len(actual_groups)})."
+        )
+
+    names_by_state_index: dict[str, str] = {}
+    group_names: list[list[str]] = []
+    for group_idx, (saved_group, actual_group) in enumerate(
+        zip(saved_groups, actual_groups, strict=True)
+    ):
+        saved_param_ids = list(saved_group.get("params", []))
+        actual_params = list(actual_group.get("params", []))
+        if len(saved_param_ids) != len(actual_params):
+            raise RuntimeError(
+                "ProTrain optimizer save: persistent GPU optimizer group "
+                f"{group_idx} size mismatch while writing rank metadata "
+                f"(state_dict={len(saved_param_ids)}, optimizer={len(actual_params)})."
+            )
+        cur_names: list[str] = []
+        for saved_id, param in zip(saved_param_ids, actual_params, strict=True):
+            name = param_names_by_obj_id.get(id(param))
+            if name is None:
+                raise RuntimeError(
+                    "ProTrain optimizer save: could not resolve a stable "
+                    "persistent parameter name while writing rank metadata."
+                )
+            names_by_state_index[str(int(saved_id))] = name
+            cur_names.append(name)
+        group_names.append(cur_names)
+
+    return {
+        "format": "protrain_gpu_optim_rank_param_names_v1",
+        "param_names_by_state_index": names_by_state_index,
+        "param_groups_param_names": group_names,
+    }
+
+
+def _write_gpu_optim_rank_state(
+    optim: Any,
+    path: str,
+    *,
+    rank: int,
+) -> None:
+    state_dict = optim._gpu_optim._optim.state_dict()
+    torch.save(state_dict, path)
+    meta = _gpu_optim_rank_param_name_meta(optim, state_dict)
+    meta["rank"] = int(rank)
+    meta["persistent_param_names_full"] = _persistent_param_names_full(
+        optim._chunk_manager
+    )
+    with open(path + GPU_OPTIM_RANK_META_SUFFIX, "w") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+
+
 def _estimate_optim_state_bytes(optim: Any) -> int:
     """Estimated bytes for the optimizer's persisted Adam state (cluster-wide under Mode-C)."""
     replicated = 0
@@ -343,9 +436,8 @@ def _existing_sharded_metadata_has_regions(target: str) -> bool:
             metadata = json.load(f)
     except (OSError, json.JSONDecodeError):
         return False
-    return (
-        metadata.get("protrain_save_mode") == SAVE_MODE_SHARDED
-        and bool(metadata.get("regions_per_chunk"))
+    return metadata.get("protrain_save_mode") == SAVE_MODE_SHARDED and bool(
+        metadata.get("regions_per_chunk")
     )
 
 
@@ -598,9 +690,7 @@ def _save_protrain_optim_dir(
 
     if zero3_shard:
         regions_per_chunk = _build_regions_per_chunk(chunk_manager)
-        has_cpu_chunks = bool(
-            optim._cpu_optim is not None and optim._cpu_optim._optims
-        )
+        has_cpu_chunks = bool(optim._cpu_optim is not None and optim._cpu_optim._optims)
         if has_cpu_chunks and not regions_per_chunk:
             preserve_existing = [False]
             if rank == 0:
@@ -691,9 +781,10 @@ def _save_protrain_optim_dir(
                         f"{target!r} is not visible on rank {rank}. Mode-C "
                         "saves require a shared filesystem across all ranks."
                     )
-                torch.save(
-                    optim._gpu_optim._optim.state_dict(),
+                _write_gpu_optim_rank_state(
+                    optim,
                     os.path.join(target, f"gpu_optim_rank_{int(rank)}.pt"),
+                    rank=rank,
                 )
 
             if optim._cpu_optim is not None and optim._cpu_optim._optims:
@@ -806,9 +897,10 @@ def _save_protrain_optim_dir(
                         "Per-rank persistent-partition save requires a "
                         "shared filesystem across all ranks."
                     )
-                torch.save(
-                    optim._gpu_optim._optim.state_dict(),
+                _write_gpu_optim_rank_state(
+                    optim,
                     os.path.join(target, f"gpu_optim_rank_{int(rank)}.pt"),
+                    rank=rank,
                 )
         except Exception:
             per_rank_status = 1
@@ -1030,40 +1122,6 @@ def _load_protrain_optim_dir(
             f"(this build expects {SCHEMA_FORMAT_VERSION}). Refusing to load."
         )
 
-    # v3 round-robin partition: when present on disk, world_size must match exactly.
-    saved_partition_version = metadata.get("protrain_persistent_partition_version")
-    if saved_partition_version is not None:
-        saved_world_for_partition = int(
-            metadata.get(
-                "protrain_persistent_owner_world_size",
-                metadata.get("protrain_world_size", 0),
-            )
-        )
-        current_world_for_partition = _current_world_size()
-        if int(saved_world_for_partition) != int(current_world_for_partition):
-            raise RuntimeError(
-                "world_size mismatch on resume: persistent fp32 master is "
-                "round-robin partitioned and offline reshard does not "
-                "support repartitioning. Resume with the original "
-                f"world_size of {int(saved_world_for_partition)}."
-            )
-
-    # v4 within-param shard fallback: when huge-param shards are recorded,
-    # world_size must match identity — offline reshard does not yet support
-    # repartitioning the within-shard dim-0 slices.
-    saved_huge_shards = metadata.get("protrain_persistent_huge_param_shards")
-    if saved_huge_shards:
-        # Use the first shard's recorded world_size; all entries share the value by construction.
-        saved_world_for_huge = int(saved_huge_shards[0].get("world_size", 0))
-        current_world_for_huge = _current_world_size()
-        if saved_world_for_huge != current_world_for_huge:
-            raise RuntimeError(
-                "protrain: cross-world-size resume not supported when "
-                "huge-param within-shard partition is active. Resume with "
-                f"the original world_size of {saved_world_for_huge}, or "
-                "run an offline reshard."
-            )
-
     chunk_manager = optim._chunk_manager
     current_world = _current_world_size()
     current_zero3 = bool(getattr(chunk_manager, "zero3_shard", False))
@@ -1138,6 +1196,39 @@ def _load_protrain_optim_dir(
             )
         else:
             online_reshard_temp_dir = None
+
+        # v3 round-robin partition: after optional online reshard, the
+        # persistent-owner world must now match the current world.
+        saved_partition_version = metadata.get("protrain_persistent_partition_version")
+        if saved_partition_version is not None:
+            saved_world_for_partition = int(
+                metadata.get(
+                    "protrain_persistent_owner_world_size",
+                    metadata.get("protrain_world_size", 0),
+                )
+            )
+            if int(saved_world_for_partition) != int(current_world):
+                raise RuntimeError(
+                    "world_size mismatch on resume: persistent fp32 master is "
+                    "round-robin partitioned and this checkpoint has not been "
+                    "resharded for the current world_size. Resume with the "
+                    f"original world_size of {int(saved_world_for_partition)}, "
+                    "run the offline reshard tool, or enable "
+                    "protrain_allow_online_reshard."
+                )
+
+        # v4 within-param shard fallback: when huge-param shards are recorded,
+        # world_size must match identity. The reshard tool rejects cross-world
+        # huge-param saves before this point.
+        saved_huge_shards = metadata.get("protrain_persistent_huge_param_shards")
+        if saved_huge_shards:
+            saved_world_for_huge = int(saved_huge_shards[0].get("world_size", 0))
+            if saved_world_for_huge != current_world:
+                raise RuntimeError(
+                    "protrain: cross-world-size resume not supported when "
+                    "huge-param within-shard partition is active. Resume with "
+                    f"the original world_size of {saved_world_for_huge}."
+                )
 
         # Region-layout match: drift means saved bytes won't fit the rebuilt shard_param.
         saved_regions = metadata.get("regions_per_chunk")
@@ -1324,6 +1415,32 @@ def _load_protrain_optim_dir(
                         cleanup_exc,
                     )
         return True
+
+    saved_partition_version = metadata.get("protrain_persistent_partition_version")
+    if saved_partition_version is not None:
+        saved_world_for_partition = int(
+            metadata.get(
+                "protrain_persistent_owner_world_size",
+                metadata.get("protrain_world_size", 0),
+            )
+        )
+        if int(saved_world_for_partition) != int(current_world):
+            raise RuntimeError(
+                "world_size mismatch on resume: persistent fp32 master is "
+                "round-robin partitioned and replicated checkpoints cannot "
+                "repartition it automatically. Resume with the original "
+                f"world_size of {int(saved_world_for_partition)}."
+            )
+
+    saved_huge_shards = metadata.get("protrain_persistent_huge_param_shards")
+    if saved_huge_shards:
+        saved_world_for_huge = int(saved_huge_shards[0].get("world_size", 0))
+        if saved_world_for_huge != current_world:
+            raise RuntimeError(
+                "protrain: cross-world-size resume not supported when "
+                "huge-param within-shard partition is active. Resume with "
+                f"the original world_size of {saved_world_for_huge}."
+            )
 
     # Mode-B replicated load; world_size differences tolerated (state is rank-independent).
     if saved_world != current_world:

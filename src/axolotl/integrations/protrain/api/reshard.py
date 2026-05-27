@@ -16,9 +16,12 @@ import torch
 METADATA_FILENAME = "metadata.json"
 GPU_OPTIM_FILENAME = "gpu_optim.pt"
 CPU_OPTIM_DIRNAME = "cpu_optim"
-SCHEMA_FORMAT_VERSION = 2
+SCHEMA_FORMAT_VERSION = 4
+SUPPORTED_FORMAT_VERSIONS = {2, 3, 4}
 SAVE_MODE_SHARDED = "sharded"
 CHUNK_SHARD_FILE_RE = re.compile(r"^chunk_(\d+)_rank_(\d+)\.pt$")
+GPU_OPTIM_RANK_FILE_RE = re.compile(r"^gpu_optim_rank_(\d+)\.pt$")
+GPU_OPTIM_RANK_META_SUFFIX = ".meta.json"
 
 _DTYPE_NAME_TO_TORCH: dict[str, torch.dtype] = {
     "torch.float16": torch.float16,
@@ -72,7 +75,8 @@ def _reshard_region_state(
         Un-padded valid bytes of the region (constant across world
         sizes).
     elem_size:
-        ``dtype.itemsize`` for the region.
+        Element size for the region's chunk-storage dtype, not necessarily
+        the optimizer-state tensor dtype.
     region_bytes_padded_old / region_bytes_padded_new:
         If supplied (typically from the saved metadata), use these
         directly instead of recomputing — guards against any drift
@@ -169,10 +173,11 @@ def _read_metadata(src_dir: str) -> dict[str, Any]:
 
 def _validate_src_metadata(meta: dict[str, Any]) -> None:
     fmt = int(meta.get("format_version", 0))
-    if fmt != SCHEMA_FORMAT_VERSION:
+    if fmt not in SUPPORTED_FORMAT_VERSIONS:
         raise RuntimeError(
             f"reshard: source format_version={fmt}, expected "
-            f"{SCHEMA_FORMAT_VERSION}. Only Phase-2 v2 saves are supported."
+            f"one of {sorted(SUPPORTED_FORMAT_VERSIONS)}. "
+            "Only Phase-2 sharded saves with layout_fingerprint are supported."
         )
     save_mode = meta.get("protrain_save_mode")
     if save_mode != SAVE_MODE_SHARDED:
@@ -239,6 +244,385 @@ def _scan_src_chunks(src_dir: str, src_world: int) -> dict[int, list[str]]:
     return out
 
 
+def _scan_gpu_rank_files(src_dir: str, src_world: int) -> list[str]:
+    by_rank: dict[int, str] = {}
+    for name in sorted(os.listdir(src_dir)):
+        m = GPU_OPTIM_RANK_FILE_RE.match(name)
+        if m is None:
+            continue
+        rank = int(m.group(1))
+        if rank < 0 or rank >= src_world:
+            raise RuntimeError(
+                f"reshard: file {name!r} rank ordinal {rank} outside "
+                f"[0, {src_world}) — corrupt source dir."
+            )
+        by_rank[rank] = os.path.join(src_dir, name)
+    if not by_rank:
+        return []
+    if set(by_rank.keys()) != set(range(src_world)):
+        missing = set(range(src_world)) - set(by_rank.keys())
+        raise RuntimeError(
+            "reshard: persistent gpu optimizer partition is missing "
+            f"per-rank files for ranks {sorted(missing)}"
+        )
+    return [by_rank[r] for r in range(src_world)]
+
+
+def _clone_state_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    return value
+
+
+def _param_group_metas(param_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{k: v for k, v in group.items() if k != "params"} for group in param_groups]
+
+
+def _local_param_count(param_groups: list[dict[str, Any]]) -> int:
+    max_idx = -1
+    for group in param_groups:
+        for idx in group.get("params", []):
+            max_idx = max(max_idx, int(idx))
+    return max_idx + 1
+
+
+def _persistent_param_names_from_metadata(metadata: dict[str, Any]) -> list[str] | None:
+    fingerprint = metadata.get("layout_fingerprint")
+    if not isinstance(fingerprint, dict):
+        return None
+    chunks = fingerprint.get("chunks")
+    persistent_ids = metadata.get("protrain_persistent_ids")
+    if chunks is None or persistent_ids is None:
+        return None
+
+    try:
+        names: list[str] = []
+        seen: set[str] = set()
+        for cid in persistent_ids:
+            for raw_name in chunks[int(cid)]:
+                name = str(raw_name)
+                if name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+        return names
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _load_gpu_rank_metas(src_paths: list[str]) -> list[dict[str, Any]]:
+    metas: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for path in src_paths:
+        meta_path = path + GPU_OPTIM_RANK_META_SUFFIX
+        if not os.path.isfile(meta_path):
+            missing.append(os.path.basename(meta_path))
+            continue
+        with open(meta_path) as f:
+            metas.append(json.load(f))
+    if missing:
+        raise RuntimeError(
+            "reshard: persistent gpu optimizer cross-world reshard requires "
+            "per-rank parameter-name sidecars written by the current save "
+            "format; missing " + ", ".join(sorted(missing)) + ". Resume with "
+            "the original world_size or re-save the checkpoint with a build "
+            "that writes gpu_optim_rank_<R>.pt.meta.json."
+        )
+    return metas
+
+
+def _rank_meta_group_names(meta: dict[str, Any], *, rank: int) -> list[list[str]]:
+    if meta.get("format") != "protrain_gpu_optim_rank_param_names_v1":
+        raise RuntimeError(
+            f"reshard: gpu optimizer rank {rank} metadata has unsupported "
+            f"format {meta.get('format')!r}"
+        )
+    groups = meta.get("param_groups_param_names")
+    if not isinstance(groups, list):
+        raise RuntimeError(
+            f"reshard: gpu optimizer rank {rank} metadata is missing "
+            "'param_groups_param_names'"
+        )
+    return [[str(name) for name in group] for group in groups]
+
+
+def _rank_meta_key_to_name(meta: dict[str, Any], *, rank: int) -> dict[int, str]:
+    raw = meta.get("param_names_by_state_index")
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"reshard: gpu optimizer rank {rank} metadata is missing "
+            "'param_names_by_state_index'"
+        )
+    return {int(key): str(value) for key, value in raw.items()}
+
+
+def _reshard_persistent_gpu_optim(
+    src_dir: str,
+    dst_dir: str,
+    *,
+    src_world: int,
+    dst_world: int,
+    metadata: dict[str, Any],
+) -> None:
+    """Repartition round-robin persistent GPU optimizer state.
+
+    Saved optimizer state_dict keys are post-param-group integer ids, not the
+    original round-robin local order. The rank sidecars map those ids back to
+    stable parameter names so state moves by parameter identity.
+    """
+    if metadata.get("protrain_persistent_huge_param_shards"):
+        raise RuntimeError(
+            "reshard: cross-world persistent optimizer reshard does not yet "
+            "support huge-param within-shard saves "
+            "('protrain_persistent_huge_param_shards' present). Re-save with "
+            "a higher protrain_persistent_huge_param_threshold_bytes so "
+            "persistent params use the round-robin whole-param path, or "
+            "resume with the original world_size."
+        )
+
+    src_paths = _scan_gpu_rank_files(src_dir, src_world)
+    if not src_paths:
+        raise RuntimeError(
+            "reshard: persistent gpu optimizer partition metadata is present, "
+            "but no gpu_optim_rank_<R>.pt files were found. Resume with the "
+            "original world_size or re-save the checkpoint with persistent "
+            "optimizer rank files."
+        )
+
+    per_rank = [torch.load(p, map_location="cpu", weights_only=True) for p in src_paths]
+    per_rank_meta = _load_gpu_rank_metas(src_paths)
+    for rank, sd in enumerate(per_rank):
+        if "state" not in sd or "param_groups" not in sd:
+            raise RuntimeError(
+                f"reshard: gpu_optim_rank_{rank}.pt missing 'state' or 'param_groups'"
+            )
+
+    group_metas = _param_group_metas(per_rank[0]["param_groups"])
+    source_group_names: list[list[list[str]]] = []
+    for rank, (sd, meta) in enumerate(zip(per_rank, per_rank_meta, strict=True)):
+        if _param_group_metas(sd["param_groups"]) != group_metas:
+            raise RuntimeError(
+                "reshard: persistent gpu optimizer param-group hyperparams "
+                f"differ between rank 0 and rank {rank}"
+            )
+        group_names = _rank_meta_group_names(meta, rank=rank)
+        if len(group_names) != len(sd["param_groups"]):
+            raise RuntimeError(
+                f"reshard: gpu optimizer rank {rank} metadata has "
+                f"{len(group_names)} param group(s), but state_dict has "
+                f"{len(sd['param_groups'])}"
+            )
+        for group_idx, (names, group) in enumerate(
+            zip(group_names, sd["param_groups"], strict=True)
+        ):
+            if len(names) != len(group.get("params", [])):
+                raise RuntimeError(
+                    f"reshard: gpu optimizer rank {rank} group {group_idx} "
+                    "metadata size does not match state_dict param count"
+                )
+        source_group_names.append(group_names)
+
+    local_counts = [_local_param_count(sd["param_groups"]) for sd in per_rank]
+    total_params = sum(local_counts)
+    param_names = _persistent_param_names_from_metadata(metadata)
+    if param_names is None:
+        raise RuntimeError(
+            "reshard: persistent gpu optimizer cross-world reshard requires "
+            "layout_fingerprint.chunks and protrain_persistent_ids metadata. "
+            "Resume with the original world_size or re-save the checkpoint "
+            "with current metadata."
+        )
+    if param_names is not None and len(param_names) != total_params:
+        raise RuntimeError(
+            "reshard: persistent parameter metadata length mismatch: "
+            f"metadata has {len(param_names)} names, optimizer shards cover "
+            f"{total_params} params"
+        )
+    expected_counts = [
+        len(range(rank, total_params, src_world)) for rank in range(src_world)
+    ]
+    if local_counts != expected_counts:
+        raise RuntimeError(
+            "reshard: persistent gpu optimizer rank-local param counts "
+            f"{local_counts} do not match round-robin counts {expected_counts} "
+            f"for src_world={src_world}, total_params={total_params}"
+        )
+
+    name_to_global = {name: idx for idx, name in enumerate(param_names)}
+    if len(name_to_global) != len(param_names):
+        raise RuntimeError(
+            "reshard: persistent parameter metadata contains duplicate names"
+        )
+
+    name_to_group: dict[str, int] = {}
+    state_by_name: dict[str, dict[str, Any]] = {}
+    for src_rank, (sd, meta, group_names) in enumerate(
+        zip(per_rank, per_rank_meta, source_group_names, strict=True)
+    ):
+        rank_key_to_name = _rank_meta_key_to_name(meta, rank=src_rank)
+        seen_rank_names: list[str] = []
+        for group_idx, names in enumerate(group_names):
+            for name in names:
+                if name not in name_to_global:
+                    raise RuntimeError(
+                        "reshard: gpu optimizer rank "
+                        f"{src_rank} metadata references unknown persistent "
+                        f"parameter {name!r}"
+                    )
+                global_idx = name_to_global[name]
+                if global_idx % src_world != src_rank:
+                    raise RuntimeError(
+                        "reshard: gpu optimizer rank "
+                        f"{src_rank} metadata claims parameter {name!r} "
+                        f"(global index {global_idx}), owned by rank "
+                        f"{global_idx % src_world} under src_world={src_world}"
+                    )
+                seen_rank_names.append(name)
+                prior = name_to_group.setdefault(name, group_idx)
+                if prior != group_idx:
+                    raise RuntimeError(
+                        "reshard: persistent parameter "
+                        f"{name!r} appears in multiple param groups "
+                        f"({prior} and {group_idx})"
+                    )
+
+        expected_rank_names = param_names[src_rank::src_world]
+        if len(seen_rank_names) != len(expected_rank_names) or set(
+            seen_rank_names
+        ) != set(expected_rank_names):
+            raise RuntimeError(
+                "reshard: gpu optimizer rank "
+                f"{src_rank} metadata parameter coverage does not match the "
+                "saved layout fingerprint"
+            )
+
+        for state_idx_raw, state in sd["state"].items():
+            state_idx = int(state_idx_raw)
+            if state_idx not in rank_key_to_name:
+                raise RuntimeError(
+                    "reshard: gpu optimizer rank "
+                    f"{src_rank} state key {state_idx} is missing from "
+                    "the parameter-name sidecar"
+                )
+            name = rank_key_to_name[state_idx]
+            if name in state_by_name:
+                raise RuntimeError(
+                    f"reshard: duplicate persistent optimizer state for {name!r}"
+                )
+            state_by_name[name] = {
+                key: _clone_state_value(value) for key, value in state.items()
+            }
+
+    if set(name_to_group) != set(param_names):
+        missing = set(param_names) - set(name_to_group)
+        raise RuntimeError(
+            "reshard: persistent optimizer param-group coverage is incomplete; "
+            f"missing names {sorted(missing)[:10]}"
+        )
+
+    for dst_rank in range(dst_world):
+        owned_names = param_names[dst_rank::dst_world]
+        new_name_to_key: dict[str, int] = {}
+        new_group_names: list[list[str]] = []
+        new_groups: list[dict[str, Any]] = []
+        next_saved_key = 0
+        for group_idx, meta in enumerate(group_metas):
+            names = [name for name in owned_names if name_to_group[name] == group_idx]
+            params: list[int] = []
+            for name in names:
+                new_name_to_key[name] = next_saved_key
+                params.append(next_saved_key)
+                next_saved_key += 1
+            new_group_names.append(names)
+            new_groups.append(dict(meta) | {"params": params})
+
+        new_state: dict[int, dict[str, Any]] = {}
+        for name in owned_names:
+            state = state_by_name.get(name)
+            if state is None:
+                continue
+            new_state[new_name_to_key[name]] = {
+                key: _clone_state_value(value) for key, value in state.items()
+            }
+
+        dst_path = os.path.join(dst_dir, f"gpu_optim_rank_{dst_rank}.pt")
+        torch.save({"state": new_state, "param_groups": new_groups}, dst_path)
+        dst_meta = {
+            "format": "protrain_gpu_optim_rank_param_names_v1",
+            "rank": int(dst_rank),
+            "persistent_param_names_full": param_names,
+            "param_names_by_state_index": {
+                str(idx): name for name, idx in sorted(new_name_to_key.items())
+            },
+            "param_groups_param_names": new_group_names,
+        }
+        with open(dst_path + GPU_OPTIM_RANK_META_SUFFIX, "w") as f:
+            json.dump(dst_meta, f, indent=2, sort_keys=True)
+
+
+def _region_expected_shard_numel(
+    region_meta: dict[str, Any], *, world_size: int
+) -> int:
+    region_dtype = _DTYPE_NAME_TO_TORCH[region_meta["dtype"]]
+    elem_size = region_dtype.itemsize
+    region_bytes_padded = int(region_meta["region_bytes_padded"])
+    unit = int(world_size) * elem_size
+    if region_bytes_padded % unit != 0:
+        raise RuntimeError(
+            f"reshard: region_bytes_padded={region_bytes_padded} is not divisible "
+            f"by world_size * elem_size ({unit})"
+        )
+    return region_bytes_padded // unit
+
+
+def _map_cpu_state_keys_to_regions(
+    *,
+    cid: int,
+    regs: list[dict[str, Any]],
+    rank0_state: dict[Any, dict[str, Any]],
+    src_world: int,
+) -> dict[Any, int]:
+    expected_by_region = {
+        region_idx: _region_expected_shard_numel(region_meta, world_size=src_world)
+        for region_idx, region_meta in enumerate(regs)
+    }
+    unused = set(expected_by_region)
+    mapping: dict[Any, int] = {}
+
+    for state_key in sorted(rank0_state):
+        state_entry = rank0_state[state_key]
+        moment = state_entry.get("exp_avg")
+        if not isinstance(moment, torch.Tensor):
+            raise RuntimeError(
+                f"reshard: chunk {cid} state key {state_key!r} is missing tensor "
+                "'exp_avg'; cannot map optimizer state to dtype regions"
+            )
+        numel = int(moment.numel())
+        candidates = [
+            region_idx
+            for region_idx in sorted(unused)
+            if expected_by_region[region_idx] == numel
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"reshard: chunk {cid} state key {state_key!r} has numel={numel}, "
+                f"but matches {len(candidates)} unused region(s). CPU optimizer "
+                "state order cannot be inferred safely from this checkpoint; "
+                "re-save with unique region shard sizes or resume with the "
+                "original world_size."
+            )
+        region_idx = candidates[0]
+        mapping[state_key] = region_idx
+        unused.remove(region_idx)
+
+    if unused:
+        raise RuntimeError(
+            f"reshard: chunk {cid} optimizer state covers {len(mapping)} region(s), "
+            f"but metadata has unused region index/indices {sorted(unused)}"
+        )
+    return mapping
+
+
 def reshard_mode_c_shards(
     src_dir: str,
     dst_dir: str,
@@ -287,9 +671,22 @@ def reshard_mode_c_shards(
     os.makedirs(dst_dir, exist_ok=True)
     cpu_dst_dir = os.path.join(dst_dir, CPU_OPTIM_DIRNAME)
 
-    # gpu_optim.pt is rank-independent in Mode-C; just copy.
+    persistent_partition_active = (
+        meta.get("protrain_persistent_partition_version") is not None
+    )
+
+    # gpu_optim.pt is rank-independent in Mode-C; partitioned saves need
+    # rank-file reassignment to the target round-robin owner set.
     src_gpu = os.path.join(src_dir, GPU_OPTIM_FILENAME)
-    if os.path.isfile(src_gpu):
+    if persistent_partition_active:
+        _reshard_persistent_gpu_optim(
+            src_dir,
+            dst_dir,
+            src_world=src_world,
+            dst_world=target_world_size,
+            metadata=meta,
+        )
+    elif os.path.isfile(src_gpu):
         shutil.copyfile(src_gpu, os.path.join(dst_dir, GPU_OPTIM_FILENAME))
 
     saved_regions: dict[str, list[dict[str, Any]]] = meta["regions_per_chunk"]
@@ -338,45 +735,50 @@ def reshard_mode_c_shards(
         ]
         regs = saved_regions[str(cid)]
 
-        # Each per-rank state_dict must have state[i] per region in order.
+        # Each per-rank state_dict must have one state entry per region.
+        rank0_state_keys = set(per_rank_state_dicts[0].get("state", {}).keys())
+        if len(rank0_state_keys) != len(regs):
+            raise RuntimeError(
+                f"reshard: chunk {cid} rank 0 state has {len(rank0_state_keys)} "
+                f"entries, expected {len(regs)} (one per region)"
+            )
         for r_idx, sd in enumerate(per_rank_state_dicts):
             if "state" not in sd or "param_groups" not in sd:
                 raise RuntimeError(
                     f"reshard: chunk {cid} rank {r_idx} state_dict missing "
                     "'state' or 'param_groups' key"
                 )
-            if set(sd["state"].keys()) != set(range(len(regs))):
+            if set(sd["state"].keys()) != rank0_state_keys:
                 raise RuntimeError(
                     f"reshard: chunk {cid} rank {r_idx} state has keys "
                     f"{sorted(sd['state'].keys())}, expected "
-                    f"{list(range(len(regs)))} (one per region)"
+                    f"{sorted(rank0_state_keys)}"
                 )
+        state_key_to_region_idx = _map_cpu_state_keys_to_regions(
+            cid=cid,
+            regs=regs,
+            rank0_state=per_rank_state_dicts[0]["state"],
+            src_world=src_world,
+        )
 
         # param_groups + step are rank-replicated; copy from rank-0.
-        new_per_rank_states: list[dict[int, dict[str, Any]]] = [
+        new_per_rank_states: list[dict[Any, dict[str, Any]]] = [
             {} for _ in range(target_world_size)
         ]
-        for region_idx, region_meta in enumerate(regs):
+        for optim_state_key, region_idx in state_key_to_region_idx.items():
+            region_meta = regs[region_idx]
             region_bytes = int(region_meta["region_bytes"])
-            expected_dtype = _DTYPE_NAME_TO_TORCH[region_meta["dtype"]]
-            elem_size_int = expected_dtype.itemsize
+            region_dtype = _DTYPE_NAME_TO_TORCH[region_meta["dtype"]]
+            elem_size_int = region_dtype.itemsize
             saved_padded_old = int(region_meta["region_bytes_padded"])
             new_padded = new_regions[str(cid)][region_idx]["region_bytes_padded"]
 
             for state_key in ("exp_avg", "exp_avg_sq"):
                 per_rank_inputs = [
-                    sd["state"][region_idx][state_key] for sd in per_rank_state_dicts
+                    sd["state"][optim_state_key][state_key]
+                    for sd in per_rank_state_dicts
                 ]
                 per_rank_inputs = [t.flatten() for t in per_rank_inputs]
-                # Validate dtype against metadata; mismatch would silently corrupt via byte-stride math.
-                for r_idx, tensor in enumerate(per_rank_inputs):
-                    if tensor.dtype != expected_dtype:
-                        raise ValueError(
-                            f"reshard: chunk {cid} region {region_idx} "
-                            f"state_key {state_key!r} rank {r_idx} dtype "
-                            f"{tensor.dtype} does not match metadata dtype "
-                            f"{expected_dtype}"
-                        )
                 new_slices = _reshard_region_state(
                     per_rank_inputs,
                     region_bytes=region_bytes,
@@ -387,17 +789,18 @@ def reshard_mode_c_shards(
                     region_bytes_padded_new=int(new_padded),
                 )
                 for r2, slice_ in enumerate(new_slices):
-                    new_per_rank_states[r2].setdefault(region_idx, {})[state_key] = (
-                        slice_
-                    )
+                    new_per_rank_states[r2].setdefault(optim_state_key, {})[
+                        state_key
+                    ] = slice_
 
             # Validate rank-replicated scalars before copying rank-0.
-            rank0_region = per_rank_state_dicts[0]["state"][region_idx]
+            rank0_region = per_rank_state_dicts[0]["state"][optim_state_key]
             for r_other in range(1, src_world):
-                other_region = per_rank_state_dicts[r_other]["state"][region_idx]
+                other_region = per_rank_state_dicts[r_other]["state"][optim_state_key]
                 if set(other_region.keys()) != set(rank0_region.keys()):
                     raise ValueError(
-                        f"reshard: chunk {cid} region {region_idx} state keys "
+                        f"reshard: chunk {cid} state key {optim_state_key!r} "
+                        f"(region {region_idx}) state keys "
                         f"differ between rank 0 ({sorted(rank0_region.keys())}) "
                         f"and rank {r_other} ({sorted(other_region.keys())})"
                     )
@@ -405,7 +808,7 @@ def reshard_mode_c_shards(
                 if k in ("exp_avg", "exp_avg_sq"):
                     continue
                 for r_other in range(1, src_world):
-                    other_v = per_rank_state_dicts[r_other]["state"][region_idx][k]
+                    other_v = per_rank_state_dicts[r_other]["state"][optim_state_key][k]
                     if isinstance(v, torch.Tensor) or isinstance(other_v, torch.Tensor):
                         if not (
                             isinstance(v, torch.Tensor)
@@ -413,19 +816,21 @@ def reshard_mode_c_shards(
                             and torch.equal(v, other_v)
                         ):
                             raise ValueError(
-                                f"reshard: chunk {cid} region {region_idx} "
+                                f"reshard: chunk {cid} state key "
+                                f"{optim_state_key!r} (region {region_idx}) "
                                 f"non-moment state key {k!r} differs between "
                                 f"rank 0 and rank {r_other}"
                             )
                     elif v != other_v:
                         raise ValueError(
-                            f"reshard: chunk {cid} region {region_idx} "
+                            f"reshard: chunk {cid} state key {optim_state_key!r} "
+                            f"(region {region_idx}) "
                             f"non-moment state key {k!r} differs between "
                             f"rank 0 ({v!r}) and rank {r_other} ({other_v!r})"
                         )
                 for r2 in range(target_world_size):
                     val = v.clone() if isinstance(v, torch.Tensor) else v
-                    new_per_rank_states[r2].setdefault(region_idx, {})[k] = val
+                    new_per_rank_states[r2].setdefault(optim_state_key, {})[k] = val
 
         # Verify rank-replicated param_groups before reusing rank 0.
         param_groups = per_rank_state_dicts[0]["param_groups"]
@@ -484,6 +889,8 @@ def reshard_mode_c_shards(
 
     new_meta = dict(meta)
     new_meta["protrain_world_size"] = int(target_world_size)
+    if new_meta.get("protrain_persistent_partition_version") is not None:
+        new_meta["protrain_persistent_owner_world_size"] = int(target_world_size)
     new_meta["layout_fingerprint"] = fp
     new_meta["protrain_layout_signature"] = new_signature
     new_meta["regions_per_chunk"] = new_regions

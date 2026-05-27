@@ -1423,3 +1423,533 @@ def test_persistent_partition_refuses_world_size_change_on_resume(tmp_path):
     ):
         with pytest.raises(RuntimeError, match="world_size mismatch on resume"):
             _load_protrain_optim_dir(fake_optim, str(tmp_path))
+
+
+def test_reshard_repartitions_persistent_gpu_rank_files(tmp_path):
+    """Offline Mode-C reshard rewrites v4 round-robin persistent rank files."""
+    import torch
+
+    from axolotl.integrations.protrain.api.reshard import reshard_mode_c_shards
+
+    src_world = 4
+    dst_world = 2
+    total_params = 5
+    param_names = [f"p{i}" for i in range(total_params)]
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    meta = {
+        "format_version": 4,
+        "layout_fingerprint": {
+            "S_chunk": 1024,
+            "N_chunk": 1,
+            "chunks": [param_names],
+            "persistent_ids": [0],
+            "world_size": src_world,
+            "zero3_shard": True,
+        },
+        "protrain_layout_signature": "old",
+        "protrain_persistent_ids": [0],
+        "protrain_n_buffer": 0,
+        "protrain_world_size": src_world,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {},
+        "protrain_persistent_partition_version": 1,
+        "protrain_persistent_owner_world_size": src_world,
+    }
+    (src / METADATA_FILENAME).write_text(json.dumps(meta))
+
+    for rank in range(src_world):
+        owned_globals = list(range(rank, total_params, src_world))
+        state = {}
+        for local_idx, global_idx in enumerate(owned_globals):
+            state[local_idx] = {
+                "step": torch.tensor(3),
+                "exp_avg": torch.tensor([float(global_idx)]),
+                "exp_avg_sq": torch.tensor([float(global_idx + 10)]),
+            }
+        torch.save(
+            {
+                "state": state,
+                "param_groups": [
+                    {
+                        "lr": 1e-3,
+                        "betas": (0.9, 0.999),
+                        "eps": 1e-8,
+                        "weight_decay": 0.0,
+                        "params": list(range(len(owned_globals))),
+                    }
+                ],
+            },
+            src / f"gpu_optim_rank_{rank}.pt",
+        )
+        rank_meta = {
+            "format": "protrain_gpu_optim_rank_param_names_v1",
+            "rank": rank,
+            "persistent_param_names_full": param_names,
+            "param_names_by_state_index": {
+                str(local_idx): param_names[global_idx]
+                for local_idx, global_idx in enumerate(owned_globals)
+            },
+            "param_groups_param_names": [
+                [param_names[global_idx] for global_idx in owned_globals]
+            ],
+        }
+        (src / f"gpu_optim_rank_{rank}.pt.meta.json").write_text(json.dumps(rank_meta))
+
+    reshard_mode_c_shards(str(src), str(dst), dst_world)
+
+    out_meta = json.loads((dst / METADATA_FILENAME).read_text())
+    assert out_meta["protrain_world_size"] == dst_world
+    assert out_meta["protrain_persistent_owner_world_size"] == dst_world
+
+    rank0 = torch.load(
+        dst / "gpu_optim_rank_0.pt", map_location="cpu", weights_only=True
+    )
+    rank1 = torch.load(
+        dst / "gpu_optim_rank_1.pt", map_location="cpu", weights_only=True
+    )
+    assert rank0["param_groups"][0]["params"] == [0, 1, 2]
+    assert rank1["param_groups"][0]["params"] == [0, 1]
+    assert [float(rank0["state"][i]["exp_avg"].item()) for i in range(3)] == [
+        0.0,
+        2.0,
+        4.0,
+    ]
+    assert [float(rank1["state"][i]["exp_avg"].item()) for i in range(2)] == [
+        1.0,
+        3.0,
+    ]
+
+
+def test_reshard_persistent_gpu_uses_saved_param_group_order(tmp_path):
+    """Persistent optimizer keys are saved after decay/no-decay group splitting."""
+    import torch
+
+    from axolotl.integrations.protrain.api.reshard import reshard_mode_c_shards
+
+    src_world = 4
+    dst_world = 2
+    total_params = 16
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    names = [
+        (
+            f"layers.{global_idx}.input_layernorm.weight"
+            if (global_idx // src_world) % 2
+            else f"layers.{global_idx}.mlp.weight"
+        )
+        for global_idx in range(total_params)
+    ]
+    meta = {
+        "format_version": 4,
+        "layout_fingerprint": {
+            "N_chunk": 1,
+            "S_chunk": 1024,
+            "chunks": [names],
+            "persistent_ids": [0],
+            "world_size": src_world,
+            "zero3_shard": True,
+        },
+        "protrain_layout_signature": "old",
+        "protrain_persistent_ids": [0],
+        "protrain_n_buffer": 0,
+        "protrain_world_size": src_world,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {},
+        "protrain_persistent_partition_version": 1,
+        "protrain_persistent_owner_world_size": src_world,
+    }
+    (src / METADATA_FILENAME).write_text(json.dumps(meta))
+
+    for rank in range(src_world):
+        decay_globals = [rank, rank + 2 * src_world]
+        no_decay_globals = [rank + src_world, rank + 3 * src_world]
+        group_order = decay_globals + no_decay_globals
+        rank_path = src / f"gpu_optim_rank_{rank}.pt"
+        torch.save(
+            {
+                "state": {
+                    saved_key: {
+                        "step": torch.tensor(3),
+                        "exp_avg": torch.tensor([float(global_idx)]),
+                        "exp_avg_sq": torch.tensor([float(global_idx + 100)]),
+                    }
+                    for saved_key, global_idx in enumerate(group_order)
+                },
+                "param_groups": [
+                    {
+                        "lr": 1e-3,
+                        "weight_decay": 0.1,
+                        "params": [0, 1],
+                    },
+                    {
+                        "lr": 1e-3,
+                        "weight_decay": 0.0,
+                        "params": [2, 3],
+                    },
+                ],
+            },
+            rank_path,
+        )
+        (src / f"gpu_optim_rank_{rank}.pt.meta.json").write_text(
+            json.dumps(
+                {
+                    "format": "protrain_gpu_optim_rank_param_names_v1",
+                    "rank": rank,
+                    "persistent_param_names_full": names,
+                    "param_names_by_state_index": {
+                        str(saved_key): names[global_idx]
+                        for saved_key, global_idx in enumerate(group_order)
+                    },
+                    "param_groups_param_names": [
+                        [names[global_idx] for global_idx in decay_globals],
+                        [names[global_idx] for global_idx in no_decay_globals],
+                    ],
+                }
+            )
+        )
+
+    reshard_mode_c_shards(str(src), str(dst), dst_world)
+
+    rank0 = torch.load(
+        dst / "gpu_optim_rank_0.pt", map_location="cpu", weights_only=True
+    )
+    rank1 = torch.load(
+        dst / "gpu_optim_rank_1.pt", map_location="cpu", weights_only=True
+    )
+    assert [len(group["params"]) for group in rank0["param_groups"]] == [4, 4]
+    assert [len(group["params"]) for group in rank1["param_groups"]] == [4, 4]
+    assert [float(rank0["state"][i]["exp_avg"].item()) for i in range(8)] == [
+        0.0,
+        2.0,
+        8.0,
+        10.0,
+        4.0,
+        6.0,
+        12.0,
+        14.0,
+    ]
+    assert [float(rank1["state"][i]["exp_avg"].item()) for i in range(8)] == [
+        1.0,
+        3.0,
+        9.0,
+        11.0,
+        5.0,
+        7.0,
+        13.0,
+        15.0,
+    ]
+
+
+def test_reshard_rejects_persistent_huge_param_partition(tmp_path):
+    """Huge-param persistent shards need tensor reslicing, not rank reassignment."""
+    import torch
+
+    from axolotl.integrations.protrain.api.reshard import reshard_mode_c_shards
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    meta = {
+        "format_version": 4,
+        "layout_fingerprint": {"world_size": 4, "zero3_shard": True},
+        "protrain_layout_signature": "old",
+        "protrain_persistent_ids": [0],
+        "protrain_n_buffer": 0,
+        "protrain_world_size": 4,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {},
+        "protrain_persistent_partition_version": 1,
+        "protrain_persistent_owner_world_size": 4,
+        "protrain_persistent_huge_param_shards": [
+            {"param_shape": [8, 4], "shard_shape": [2, 4], "world_size": 4}
+        ],
+    }
+    (src / METADATA_FILENAME).write_text(json.dumps(meta))
+    for rank in range(4):
+        torch.save(
+            {"state": {}, "param_groups": [{"params": []}]},
+            src / f"gpu_optim_rank_{rank}.pt",
+        )
+
+    with pytest.raises(RuntimeError, match="huge-param"):
+        reshard_mode_c_shards(str(src), str(dst), 2)
+
+
+def test_reshard_rejects_missing_persistent_gpu_rank_files(tmp_path):
+    """Partition metadata without rank files must not rewrite owner metadata."""
+    import torch
+
+    from axolotl.integrations.protrain.api.reshard import reshard_mode_c_shards
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    meta = {
+        "format_version": 4,
+        "layout_fingerprint": {
+            "N_chunk": 1,
+            "S_chunk": 1024,
+            "chunks": [["p0", "p1"]],
+            "persistent_ids": [0],
+            "world_size": 4,
+            "zero3_shard": True,
+        },
+        "protrain_layout_signature": "old",
+        "protrain_persistent_ids": [0],
+        "protrain_n_buffer": 0,
+        "protrain_world_size": 4,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {},
+        "protrain_persistent_partition_version": 1,
+        "protrain_persistent_owner_world_size": 4,
+    }
+    (src / METADATA_FILENAME).write_text(json.dumps(meta))
+
+    with pytest.raises(RuntimeError, match="no gpu_optim_rank"):
+        reshard_mode_c_shards(str(src), str(dst), 2)
+    assert not (dst / METADATA_FILENAME).exists()
+
+
+def test_reshard_cpu_moments_can_differ_from_region_dtype(tmp_path):
+    """CPU Adam moments may be fp32 even when chunk regions are bf16."""
+    import torch
+
+    from axolotl.integrations.protrain.api.reshard import reshard_mode_c_shards
+
+    src_world = 4
+    dst_world = 2
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    cpu_dir = src / CPU_OPTIM_DIRNAME
+    cpu_dir.mkdir(parents=True)
+
+    meta = {
+        "format_version": 4,
+        "layout_fingerprint": {"world_size": src_world, "zero3_shard": True},
+        "protrain_layout_signature": "old",
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 0,
+        "protrain_world_size": src_world,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {
+            "4": [
+                {
+                    "chunk_offset": 0,
+                    "region_bytes": 16,
+                    "region_bytes_padded": 16,
+                    "shard_bytes": 4,
+                    "dtype": "torch.bfloat16",
+                }
+            ]
+        },
+    }
+    (src / METADATA_FILENAME).write_text(json.dumps(meta))
+
+    for rank in range(src_world):
+        start = rank * 2
+        torch.save(
+            {
+                "state": {
+                    0: {
+                        "step": torch.tensor(3),
+                        "exp_avg": torch.tensor(
+                            [float(start), float(start + 1)], dtype=torch.float32
+                        ),
+                        "exp_avg_sq": torch.tensor(
+                            [float(start + 10), float(start + 11)],
+                            dtype=torch.float32,
+                        ),
+                    }
+                },
+                "param_groups": [{"lr": 1e-3, "params": [0]}],
+            },
+            cpu_dir / f"chunk_4_rank_{rank}.pt",
+        )
+
+    reshard_mode_c_shards(str(src), str(dst), dst_world)
+
+    out_meta = json.loads((dst / METADATA_FILENAME).read_text())
+    assert out_meta["regions_per_chunk"]["4"][0]["dtype"] == "torch.bfloat16"
+    assert out_meta["regions_per_chunk"]["4"][0]["shard_bytes"] == 8
+
+    rank0 = torch.load(
+        dst / CPU_OPTIM_DIRNAME / "chunk_4_rank_0.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    rank1 = torch.load(
+        dst / CPU_OPTIM_DIRNAME / "chunk_4_rank_1.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert rank0["state"][0]["exp_avg"].dtype is torch.float32
+    assert rank0["state"][0]["exp_avg"].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert rank1["state"][0]["exp_avg"].tolist() == [4.0, 5.0, 6.0, 7.0]
+
+
+def test_reshard_cpu_state_key_order_can_differ_from_region_order(tmp_path):
+    """DeepSpeedCPUAdam state keys may not follow chunk-region order."""
+    import torch
+
+    from axolotl.integrations.protrain.api.reshard import reshard_mode_c_shards
+
+    src_world = 4
+    dst_world = 2
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    cpu_dir = src / CPU_OPTIM_DIRNAME
+    cpu_dir.mkdir(parents=True)
+
+    regions = [
+        {
+            "chunk_offset": 0,
+            "region_bytes": 16,
+            "region_bytes_padded": 16,
+            "shard_bytes": 4,
+            "dtype": "torch.bfloat16",
+        },
+        {
+            "chunk_offset": 16,
+            "region_bytes": 16,
+            "region_bytes_padded": 16,
+            "shard_bytes": 4,
+            "dtype": "torch.float32",
+        },
+        {
+            "chunk_offset": 32,
+            "region_bytes": 32,
+            "region_bytes_padded": 32,
+            "shard_bytes": 8,
+            "dtype": "torch.bfloat16",
+        },
+        {
+            "chunk_offset": 64,
+            "region_bytes": 48,
+            "region_bytes_padded": 48,
+            "shard_bytes": 12,
+            "dtype": "torch.float32",
+        },
+    ]
+    state_to_region = {0: 2, 1: 0, 2: 1, 3: 3}
+    meta = {
+        "format_version": 4,
+        "layout_fingerprint": {"world_size": src_world, "zero3_shard": True},
+        "protrain_layout_signature": "old",
+        "protrain_persistent_ids": [],
+        "protrain_n_buffer": 0,
+        "protrain_world_size": src_world,
+        "protrain_zero3_shard": True,
+        "protrain_save_mode": SAVE_MODE_SHARDED,
+        "saving_rank": 0,
+        "param_groups_meta": [],
+        "saved_at_step": 3,
+        "torch_version": str(torch.__version__),
+        "estimated_optim_state_bytes": 0,
+        "regions_per_chunk": {"9": regions},
+    }
+    (src / METADATA_FILENAME).write_text(json.dumps(meta))
+
+    def full_region_values(region_idx):
+        region = regions[region_idx]
+        dtype = getattr(torch, region["dtype"].split(".")[-1])
+        elem_size = torch.empty((), dtype=dtype).element_size()
+        total_numel = region["region_bytes_padded"] // elem_size
+        base = float(region_idx * 100)
+        return torch.arange(base, base + total_numel, dtype=torch.float32)
+
+    for rank in range(src_world):
+        state = {}
+        for state_key, region_idx in state_to_region.items():
+            full = full_region_values(region_idx)
+            shard_numel = full.numel() // src_world
+            state[state_key] = {
+                "step": torch.tensor(3),
+                "exp_avg": full[rank * shard_numel : (rank + 1) * shard_numel].clone(),
+                "exp_avg_sq": full[rank * shard_numel : (rank + 1) * shard_numel].add(
+                    1000.0
+                ),
+            }
+        torch.save(
+            {
+                "state": state,
+                "param_groups": [{"lr": 1e-3, "params": [0, 1, 2, 3]}],
+            },
+            cpu_dir / f"chunk_9_rank_{rank}.pt",
+        )
+
+    reshard_mode_c_shards(str(src), str(dst), dst_world)
+
+    rank0 = torch.load(
+        dst / CPU_OPTIM_DIRNAME / "chunk_9_rank_0.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    rank1 = torch.load(
+        dst / CPU_OPTIM_DIRNAME / "chunk_9_rank_1.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert sorted(rank0["state"]) == [0, 1, 2, 3]
+    assert rank0["state"][0]["exp_avg"].tolist() == [
+        200.0,
+        201.0,
+        202.0,
+        203.0,
+        204.0,
+        205.0,
+        206.0,
+        207.0,
+    ]
+    assert rank1["state"][0]["exp_avg"].tolist() == [
+        208.0,
+        209.0,
+        210.0,
+        211.0,
+        212.0,
+        213.0,
+        214.0,
+        215.0,
+    ]
+    assert rank0["state"][1]["exp_avg"].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert rank0["state"][2]["exp_avg"].tolist() == [100.0, 101.0]
+    assert rank0["state"][3]["exp_avg"].tolist() == [
+        300.0,
+        301.0,
+        302.0,
+        303.0,
+        304.0,
+        305.0,
+    ]
