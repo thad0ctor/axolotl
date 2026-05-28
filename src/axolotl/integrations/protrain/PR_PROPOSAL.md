@@ -300,7 +300,7 @@ memory backends are mutually exclusive.
 | `protrain_phase2_quickstart_envelope` | `0.30` | Relative-error envelope used by `protrain_phase2_quickstart`. |
 | `protrain_persistent_huge_param_threshold_bytes` | `512 MiB` | Params at or above this size (typically `lm_head` / `embed_tokens` at scale) are pinned persistent regardless of `n_persist`, since paging them dominates per-step cost. |
 | `protrain_ckpt_internal_residual_factor` | `1.0` | Scale applied to the per-block CKPT internal saved-tensor proxy (FFN-intermediate + attention scores + Q/K/V) in `estimate_peak`. Set `0.0` to disable the residual; lower values are more aggressive. Tune only when the calibrated peak diverges from measured at the runtime budget gate. |
-| `embeddings_skip_upcast` | `false` (Axolotl-side) | Skips the load-time fp32 embedding upcast in `loaders/model.py::_convert_embedding_modules_dtype`. **Auto-enabled when ProTrain is in `plugins`** — the loader gates on `is_protrain_active(cfg)`, so 27B + 4-bit + ProTrain on a 24 GiB 3090 works without the YAML knob. The flag remains available for non-ProTrain low-VRAM users. |
+| `embeddings_skip_upcast` | `false` (Axolotl-side) | Skips the load-time fp32 embedding upcast in `loaders/model.py::_convert_embedding_modules_dtype`. **Auto-enabled only when ProTrain is active** — the loader gates on `is_protrain_active(cfg)`, which requires both the plugin and `protrain_auto_memory: true`, so 27B + 4-bit + ProTrain works without the YAML knob while plugin-only schema registration remains inert. The flag remains available for non-ProTrain low-VRAM users. |
 
 ### 4.3 Compatibility constraints
 
@@ -317,11 +317,12 @@ These must be honored or the config will OOM or misbehave:
 - **`deepspeed:` / `fsdp:` must be absent.** The pydantic validator rejects
   combinations.
 - **For 27B-class + 4-bit on a 24 GiB 3090, no extra knob required.** The
-  loader auto-defers the fp32 embedding upcast when ProTrain is in
-  `plugins` (`is_protrain_active(cfg)` gate in
+  loader auto-defers the fp32 embedding upcast only when ProTrain is active
+  (`is_protrain_active(cfg)` gate in
   `loaders/model.py::_configure_embedding_dtypes`), so the ~5 GiB
   transient that would otherwise push peak load-time memory above 24 GiB
-  no longer fires. Non-ProTrain users on low-VRAM cards may still set
+  no longer fires. Listing the plugin without `protrain_auto_memory: true`
+  remains inert. Non-ProTrain users on low-VRAM cards may still set
   `embeddings_skip_upcast: true` explicitly.
 
 ### 4.4 ProTrain config overlays and conflicts
@@ -431,10 +432,10 @@ protrain_zero3_shard: true
 optimizer: adafactor
 ```
 
-**Non-conflicting low-VRAM behavior.** For 4-bit ProTrain configs, the loader
-auto-defers the fp32 embedding upcast when the plugin is present. Users do not
-need to set `embeddings_skip_upcast: true` for ProTrain; that knob remains a
-non-ProTrain low-VRAM escape hatch.
+**Non-conflicting low-VRAM behavior.** For active 4-bit ProTrain configs, the
+loader auto-defers the fp32 embedding upcast. Users do not need to set
+`embeddings_skip_upcast: true` for ProTrain; that knob remains a non-ProTrain
+low-VRAM escape hatch.
 
 **Launch-time conflict to avoid.** Use an explicit accelerate config file for
 single-GPU and multi-GPU runs. On multi-GPU hosts, the user-level default
@@ -787,8 +788,9 @@ hardware capacity for larger full-FT shapes, bounded multimodal batch sizing on
   `FusedAdam` CUDA step, and an Axolotl `adamw_apex_fused` validation run
   (§6.ee).
 - **27B-class 4-bit ProTrain auto-defers the load-time fp32 embedding upcast.**
-  The loader detects ProTrain in `plugins` and skips the upcast; non-ProTrain
-  low-VRAM configs may still use `embeddings_skip_upcast: true` explicitly.
+  The loader skips the upcast only when ProTrain is active; plugin-only schema
+  registration remains inert. Non-ProTrain low-VRAM configs may still use
+  `embeddings_skip_upcast: true` explicitly.
 - **Mixed-SKU rigs should set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.** This keeps
   `CUDA_VISIBLE_DEVICES` aligned with the physical devices shown by
   `nvidia-smi`.
@@ -863,7 +865,7 @@ Config constraints that affect reproducibility:
 - Do not set `gradient_checkpointing: true`; ProTrain owns block-level CKPT.
 - Force modes with `protrain_auto_mode: false` plus one force flag.
 - 27B-class 4-bit ProTrain configs auto-defer the load-time fp32 embedding
-  upcast when ProTrain is present in `plugins`.
+  upcast only when `protrain_auto_memory: true` is active.
 
 ---
 
@@ -871,6 +873,15 @@ Config constraints that affect reproducibility:
 
 This is the claim surface the proposal relies on. Detailed evidence is in §6
 and §16.
+
+Reviewer-facing support status:
+
+| Status | Scope |
+|---|---|
+| Supported and validated | LoRA/QLoRA Mode A/B/C at stated 3090-class shapes; same-world resume; cross-world Mode C optimizer resume at stated Qwen3.5-4B full-FT shapes; final safetensors save; Path B LoRA sync with topology-aware default; active-ProTrain 4-bit embedding-upcast deferral. |
+| Supported with environment constraint | Apex FusedAdam requires a CUDA/toolkit-aligned source build; GPU and multi-GPU regression lanes require suitable local/self-hosted hardware. |
+| Future optimization, not correctness gap | bs=1 CUDA Graphs / deeper launch capture work. Correctness and cost attribution are already validated; production guidance is higher micro-batch or gradient accumulation. |
+| Rejected by validator | DeepSpeed/FSDP composition, Axolotl-level `gradient_checkpointing`, unsafe force-mode combinations, unsupported optimizer families, and `protrain_auto_memory: true` without the ProTrain plugin. |
 
 | Claim group | Status | Evidence |
 |---|---|---|
@@ -956,6 +967,15 @@ requirements:
 | Default-marker (CPU / dev) | 618 pytest cases covering chunk management, validators, cost/search math, layout rules, checkpointing, torch.compile compatibility, schema behavior, sentinel re-exports, and Path B LoRA grad sync. | Run on standard Axolotl CI **without GPU**. Latest recorded result: **618 passed, 5 skipped, 179 deselected**. |
 | GPU-marker (single-GPU) | ~10 tests requiring CUDA + a transformer model load (alpha measurement against a real model, profiler trace round-trip, chunk-residency end-to-end) | Needs self-hosted runner with at least one 3090-class GPU. Marker: `@pytest.mark.gpu`. Recommended: dedicated runner pool or scheduled nightly job; **not blocking on default CI**. |
 | Multi-GPU regression | `test_paged_adam_offload_mgpu`, `test_cross_mode_resume` | Needs **4× 3090-class self-hosted runner**. **Intentionally excluded from default CI** with a documented manual-run procedure: `CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID pytest tests/protrain/ -m gpu`. |
+
+Maintainer acceptance recipe:
+
+| Lane | Command / shape | Purpose |
+|---|---|---|
+| CPU/default | `PYTHONPATH=src python -m pytest tests/protrain -q` | Portable validators, cost/search math, checkpoint metadata, API guards, and no-GPU runtime invariants. |
+| One GPU, 24 GiB | Small 4-bit QLoRA train/save/resume smoke with active ProTrain | Confirms loader deferral, LoRA hooks, safetensors save, and resume without requiring the local 5-GPU rig. |
+| Two GPUs | Forced Mode C small-model train/save/resume smoke | Confirms DDP bypass, chunk collectives, and ProTrain optimizer-state path on minimal multi-rank hardware. |
+| Optional four GPUs | `pytest tests/protrain/ -m gpu` on a 3090-class PCIe pool | Covers Path B / Mode C PCIe regressions and cross-mode resume. |
 
 ### Version guardrails (load-bearing for monkey-patches)
 

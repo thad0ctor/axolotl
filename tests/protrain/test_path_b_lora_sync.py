@@ -846,7 +846,12 @@ def test_path_b_modeb_disjoint_param_sets():
 # ---------------------------------------------------------------------------
 
 
-def _build_real_peft_model(target_modules, *, use_dora: bool = False):
+def _build_real_peft_model(
+    target_modules,
+    *,
+    use_dora: bool = False,
+    modules_to_save=None,
+):
     """Build a real PEFT-wrapped tiny model so we exercise actual PEFT naming.
 
     Returns the wrapped model; skips the test if PEFT or torch are missing.
@@ -871,6 +876,7 @@ def _build_real_peft_model(target_modules, *, use_dora: bool = False):
         lora_alpha=8,
         target_modules=list(target_modules),
         use_dora=use_dora,
+        modules_to_save=modules_to_save,
     )
     model = get_peft_model(_TinyForLora(), cfg)
     # Sanity: ensure PEFT version actually injected the requested modules.
@@ -879,6 +885,47 @@ def _build_real_peft_model(target_modules, *, use_dora: bool = False):
         f"target_modules={target_modules}"
     )
     return model
+
+
+def test_real_peft_modules_to_save_stays_ddp_owned():
+    """Real PEFT ``modules_to_save`` params must not be DDP-ignored by Path B.
+
+    This is the concrete ownership invariant for mixed LoRA + extra trainables:
+    Path B owns LoRA factors only; extra trainables stay visible to DDP so they
+    are not dropped from cross-rank synchronization.
+    """
+    from axolotl.integrations.protrain.plugin import (
+        _discover_lora_params,
+        _register_lora_ddp_ignore,
+    )
+
+    model = _build_real_peft_model(["q_proj"], modules_to_save=["lm_head"])
+    trainable_names = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert any("lm_head" in n for n in trainable_names), (
+        f"PEFT did not expose lm_head modules_to_save as trainable: {trainable_names}"
+    )
+
+    lora_names, _ = _discover_lora_params(model)
+    lora_name_set = set(lora_names)
+    extra_trainables = trainable_names - lora_name_set
+    assert extra_trainables, "setup error: expected trainables outside LoRA factors"
+    assert any("lm_head" in n for n in extra_trainables), (
+        f"lm_head modules_to_save was incorrectly discovered as Path B LoRA: "
+        f"lora={sorted(lora_name_set)} trainable={sorted(trainable_names)}"
+    )
+
+    _register_lora_ddp_ignore(model, lora_names)
+    ignored = set(model._ddp_params_and_buffers_to_ignore)
+
+    assert lora_name_set.issubset(ignored)
+    assert ignored.isdisjoint(extra_trainables), (
+        "Path B added non-LoRA trainables to DDP ignore list; those params would "
+        f"not be synchronized by DDP. ignored_extras={sorted(ignored & extra_trainables)}"
+    )
+    assert len(trainable_names) > len(lora_names), (
+        "Path B DDP bypass gate must stay off when modules_to_save adds "
+        "non-LoRA trainables"
+    )
 
 
 def test_dora_discovery_or_clean_exclusion(caplog):

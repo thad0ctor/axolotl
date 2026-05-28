@@ -5,9 +5,9 @@ the load-time upcast in
 ``axolotl.loaders.model.ModelLoader._convert_embedding_modules_dtype`` is
 redundant under ProTrain and OOMs 27B + 4-bit on a single 24 GiB card.
 
-When ProTrain is registered in ``cfg.plugins`` the loader now skips the
-load-time upcast automatically — the legacy ``embeddings_skip_upcast: true``
-YAML knob is no longer required for that path.
+When ProTrain is registered in ``cfg.plugins`` and ``protrain_auto_memory`` is
+enabled, the loader skips the load-time upcast automatically — the legacy
+``embeddings_skip_upcast: true`` YAML knob is no longer required for that path.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from axolotl.loaders.model import ModelLoader
-from axolotl.loaders.utils import is_protrain_active
+from axolotl.loaders.utils import is_protrain_active, is_protrain_plugin_registered
 
 _PROTRAIN_PLUGIN_ID = "axolotl.integrations.protrain.ProTrainPlugin"
 
@@ -54,12 +54,22 @@ def _make_loader(cfg) -> ModelLoader:
     return loader
 
 
-# ----- is_protrain_active --------------------------------------------------
+# ----- ProTrain activation predicates --------------------------------------
 
 
-def test_is_protrain_active_true_when_plugin_listed() -> None:
+def test_is_protrain_plugin_registered_true_when_plugin_listed() -> None:
     cfg = _ConfigSpy(plugins=[_PROTRAIN_PLUGIN_ID])
+    assert is_protrain_plugin_registered(cfg) is True
+
+
+def test_is_protrain_active_true_when_plugin_listed_and_enabled() -> None:
+    cfg = _ConfigSpy(plugins=[_PROTRAIN_PLUGIN_ID], protrain_auto_memory=True)
     assert is_protrain_active(cfg) is True
+
+
+def test_is_protrain_active_false_when_plugin_listed_but_disabled() -> None:
+    cfg = _ConfigSpy(plugins=[_PROTRAIN_PLUGIN_ID], protrain_auto_memory=False)
+    assert is_protrain_active(cfg) is False
 
 
 def test_is_protrain_active_false_when_plugin_absent() -> None:
@@ -107,9 +117,10 @@ def _capture_upcast_call(loader: ModelLoader):
 
 
 def test_auto_defer_when_protrain_in_plugins() -> None:
-    """ProTrain in plugins + 4-bit => load-time upcast list is empty."""
+    """Active ProTrain + 4-bit => load-time upcast list is empty."""
     cfg = _ConfigSpy(
         plugins=[_PROTRAIN_PLUGIN_ID],
+        protrain_auto_memory=True,
         load_in_4bit=True,
         embeddings_skip_upcast=None,  # legacy knob NOT set
         model_config_type="llama",
@@ -130,6 +141,33 @@ def test_auto_defer_when_protrain_in_plugins() -> None:
     assert pre_kbit[0]["embedding_modules"] == [], (
         "ProTrain-active path must clear the embedding-module list so the "
         "load-time fp32 upcast is a no-op"
+    )
+
+
+def test_no_auto_defer_when_plugin_listed_but_disabled() -> None:
+    """Listing ProTrain for schema only must not change loader behavior."""
+    cfg = _ConfigSpy(
+        plugins=[_PROTRAIN_PLUGIN_ID],
+        protrain_auto_memory=False,
+        load_in_4bit=True,
+        embeddings_skip_upcast=None,
+        model_config_type="llama",
+        adapter="qlora",
+        gradient_checkpointing=False,
+        gradient_checkpointing_kwargs=None,
+        flash_attention=False,
+        flex_attention=False,
+        sage_attention=False,
+        cut_cross_entropy=False,
+        torch_dtype="bfloat16",
+    )
+    loader = _make_loader(cfg)
+    calls = _capture_upcast_call(loader)
+
+    pre_kbit = [c for c in calls if c["before_kbit_train_or_finetune"]]
+    assert pre_kbit and pre_kbit[0]["embedding_modules"], (
+        "plugin-listed but disabled ProTrain must stay inert and keep the "
+        "default load-time embedding upcast"
     )
 
 
@@ -212,6 +250,7 @@ def test_no_skip_when_4bit_disabled_even_with_protrain() -> None:
     """Auto-defer is 4-bit-specific; bf16 paths still upcast under ProTrain."""
     cfg = _ConfigSpy(
         plugins=[_PROTRAIN_PLUGIN_ID],
+        protrain_auto_memory=True,
         load_in_4bit=False,
         embeddings_skip_upcast=None,
         model_config_type="llama",
@@ -236,7 +275,7 @@ def test_no_skip_when_4bit_disabled_even_with_protrain() -> None:
 # ----- PatchManager._apply_adapter_patches ---------------------------------
 
 
-def test_patch_manager_fires_peft_patch_under_protrain(monkeypatch) -> None:
+def test_patch_manager_fires_peft_patch_under_active_protrain(monkeypatch) -> None:
     """The peft prep-code patch fires when ProTrain is active (mirrors the
     historical ``embeddings_skip_upcast`` gate so the embed/lm_head upcast
     inside ``prepare_model_for_kbit_training`` is also skipped)."""
@@ -252,10 +291,34 @@ def test_patch_manager_fires_peft_patch_under_protrain(monkeypatch) -> None:
     pm.cfg = _ConfigSpy(  # type: ignore[assignment]
         adapter="qlora",
         plugins=[_PROTRAIN_PLUGIN_ID],
+        protrain_auto_memory=True,
         embeddings_skip_upcast=None,
     )
     pm._apply_adapter_patches()
     assert called == [True]
+
+
+def test_patch_manager_skips_peft_patch_when_plugin_listed_but_disabled(
+    monkeypatch,
+) -> None:
+    """Plugin registration alone is schema-only and must not patch PEFT."""
+    from axolotl.loaders import patch_manager as pm_mod
+
+    called: list[bool] = []
+    monkeypatch.setattr(
+        "axolotl.monkeypatch.peft.utils.patch_peft_prep_code",
+        lambda: called.append(True),
+    )
+
+    pm = pm_mod.PatchManager.__new__(pm_mod.PatchManager)
+    pm.cfg = _ConfigSpy(  # type: ignore[assignment]
+        adapter="qlora",
+        plugins=[_PROTRAIN_PLUGIN_ID],
+        protrain_auto_memory=False,
+        embeddings_skip_upcast=None,
+    )
+    pm._apply_adapter_patches()
+    assert called == []
 
 
 def test_patch_manager_skips_peft_patch_without_gate(monkeypatch) -> None:

@@ -12,12 +12,15 @@ under-stating peak under full FT.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from axolotl.integrations.protrain.api.model_wrapper import (
+    _apply_calibrated_runtime_peak_gate,
     _calibrate_peak_with_actual_chunk_bytes,
 )
 from axolotl.integrations.protrain.cost.memory import ALPHA_FRAGMENTATION
@@ -28,6 +31,7 @@ from axolotl.integrations.protrain.types import (
     CostConfig,
     ParamId,
     ProfilerTrace,
+    SearchResult,
 )
 
 
@@ -213,4 +217,67 @@ def test_calibrate_peak_lora_path_unchanged_from_pre_fix() -> None:
     expected = int(1.05 * (2048 + 2048 + 1000))
     assert abs(calibrated - expected) <= 5, (
         f"calibrated={calibrated}, expected={expected}"
+    )
+
+
+def test_calibrated_runtime_peak_gate_uses_replaced_prediction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    layout = _layout(n_chunk=4, s_chunk=1024)
+    cfg = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=0)
+    cm = _stub_chunk_manager(
+        layout,
+        persistent_ids={0, 1},
+        chunk_param_bytes={0: 4096, 1: 4096, 2: 1024, 3: 1024},
+    )
+    trace = _trace(model_state_bytes=layout.N_chunk * layout.S_chunk)
+
+    raw_peak = int(ALPHA_FRAGMENTATION * (2 * layout.S_chunk + 2 * layout.S_chunk))
+    raw_result = SearchResult(
+        cfg=cfg,
+        block_map={},
+        predicted_peak_bytes=raw_peak,
+        predicted_iter_s=1.25,
+    )
+    calibrated_peak = _calibrate_peak_with_actual_chunk_bytes(
+        original_peak=raw_result.predicted_peak_bytes,
+        layout=layout,
+        chunk_manager=cm,
+        cfg=cfg,
+        trace=trace,
+    )
+
+    assert raw_result.predicted_peak_bytes < calibrated_peak
+    raw_fitting_capacity = raw_result.predicted_peak_bytes + 1
+    assert raw_result.predicted_peak_bytes <= raw_fitting_capacity < calibrated_peak
+
+    with pytest.raises(RuntimeError, match="calibrated peak exceeds"):
+        _apply_calibrated_runtime_peak_gate(
+            raw_result,
+            calibrated_peak_bytes=calibrated_peak,
+            init_transient_peak_bytes=0,
+            capacity_bytes=raw_fitting_capacity,
+        )
+
+    caplog.clear()
+    with caplog.at_level(
+        logging.INFO,
+        logger="axolotl.integrations.protrain.api.model_wrapper",
+    ):
+        accepted = _apply_calibrated_runtime_peak_gate(
+            raw_result,
+            calibrated_peak_bytes=calibrated_peak,
+            init_transient_peak_bytes=123,
+            capacity_bytes=calibrated_peak,
+        )
+
+    assert accepted.predicted_peak_bytes == calibrated_peak
+    assert accepted.predicted_init_transient_peak_bytes == 123
+    assert accepted.predicted_iter_s == raw_result.predicted_iter_s
+    assert any(
+        "calibrated steady peak prediction" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(
+        "raw search peak" in record.getMessage() for record in caplog.records
     )

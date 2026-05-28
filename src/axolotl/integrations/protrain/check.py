@@ -10,12 +10,114 @@ upper bounds.
 
 from __future__ import annotations
 
+import inspect
 import warnings
+from collections.abc import Callable
 
 from packaging.version import Version
 
 VALIDATED_TRANSFORMERS_MAX = "5.9"
 VALIDATED_PEFT_MAX = "0.21"
+
+_EXPECTED_TRAINER_LOAD_CHECKPOINT_SIGNATURE = (
+    "(self, resume_from_checkpoint, model=None)"
+)
+
+
+def _trainer_load_from_checkpoint_signature_error(
+    method: Callable[..., object],
+) -> str | None:
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError) as exc:
+        return (
+            "transformers.Trainer._load_from_checkpoint is not introspectable "
+            f"with inspect.signature: {exc}"
+        )
+
+    parameters = signature.parameters
+    positional = [
+        parameter
+        for parameter in parameters.values()
+        if parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if positional and positional[0].name in {"self", "cls"}:
+        positional = positional[1:]
+
+    resume_from_checkpoint = parameters.get("resume_from_checkpoint")
+    if resume_from_checkpoint is None:
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: expected a positional/keyword "
+            "'resume_from_checkpoint' parameter in "
+            f"{_EXPECTED_TRAINER_LOAD_CHECKPOINT_SIGNATURE}; got {signature}"
+        )
+    if resume_from_checkpoint.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD:
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: expected 'resume_from_checkpoint' "
+            "to be positional-or-keyword; got "
+            f"{resume_from_checkpoint.kind.name} in {signature}"
+        )
+    if not positional or positional[0].name != "resume_from_checkpoint":
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: ProTrain forwards the checkpoint "
+            "path positionally, so 'resume_from_checkpoint' must be the first "
+            f"argument after self/cls; got {signature}"
+        )
+
+    model = parameters.get("model")
+    if model is None:
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: expected optional positional/keyword "
+            f"'model' handling in {_EXPECTED_TRAINER_LOAD_CHECKPOINT_SIGNATURE}; "
+            f"got {signature}"
+        )
+    if model.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD:
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: expected 'model' to be "
+            f"positional-or-keyword; got {model.kind.name} in {signature}"
+        )
+    if model.default is inspect.Parameter.empty:
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: expected 'model' to be optional; "
+            f"got {signature}"
+        )
+    if len(positional) < 2 or positional[1].name != "model":
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: ProTrain forwards model as the "
+            f"second positional argument when provided; got {signature}"
+        )
+
+    required_extra = [
+        parameter.name
+        for parameter in parameters.values()
+        if parameter.name not in {"self", "cls", "resume_from_checkpoint", "model"}
+        and parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+    if required_extra:
+        return (
+            "transformers.Trainer._load_from_checkpoint signature is incompatible "
+            "with ProTrain's resume wrapper: unexpected required parameter(s) "
+            f"{required_extra} in {signature}"
+        )
+
+    return None
 
 
 def assert_supported_peft_transformers_surface() -> None:
@@ -43,6 +145,12 @@ def assert_supported_peft_transformers_surface() -> None:
         ) from exc
     if not hasattr(Trainer, "_load_from_checkpoint"):
         missing.append("transformers.Trainer._load_from_checkpoint")
+    else:
+        signature_error = _trainer_load_from_checkpoint_signature_error(
+            Trainer._load_from_checkpoint
+        )
+        if signature_error is not None:
+            missing.append(signature_error)
 
     if missing:
         import peft

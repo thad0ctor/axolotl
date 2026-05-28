@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from axolotl.integrations.protrain.check import (
+    _trainer_load_from_checkpoint_signature_error,
     assert_supported_peft_transformers_surface,
 )
 
@@ -55,3 +56,46 @@ def test_assert_raises_on_missing_trainer_load(
     msg = str(excinfo.value)
     assert "transformers.Trainer._load_from_checkpoint" in msg
     assert "Validated upper bounds" in msg
+
+
+def test_trainer_load_signature_helper_accepts_expected_surface() -> None:
+    """The supported HF Trainer resume surface must pass the signature guard."""
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        return None
+
+    assert _trainer_load_from_checkpoint_signature_error(_load_from_checkpoint) is None
+
+
+def test_assert_raises_on_incompatible_trainer_load_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Renaming the checkpoint argument must fail before training starts."""
+    from transformers import Trainer
+
+    def _load_from_checkpoint(self, checkpoint, model=None):
+        return None
+
+    monkeypatch.setattr(Trainer, "_load_from_checkpoint", _load_from_checkpoint)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        assert_supported_peft_transformers_surface()
+
+    msg = str(excinfo.value)
+    assert "resume_from_checkpoint" in msg
+    assert "signature is incompatible" in msg
+    assert "transformers=" in msg
+    assert "Validated upper bounds" in msg
+
+
+def test_trainer_load_signature_helper_rejects_required_model() -> None:
+    """The wrapper can only forward model safely when HF keeps it optional."""
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model):
+        return None
+
+    msg = _trainer_load_from_checkpoint_signature_error(_load_from_checkpoint)
+
+    assert msg is not None
+    assert "model" in msg
+    assert "optional" in msg

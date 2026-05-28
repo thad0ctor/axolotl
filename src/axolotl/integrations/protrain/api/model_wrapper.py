@@ -916,6 +916,49 @@ def _select_mode(
     )
 
 
+def _apply_calibrated_runtime_peak_gate(
+    result: SearchResult,
+    *,
+    calibrated_peak_bytes: int,
+    init_transient_peak_bytes: int,
+    capacity_bytes: int,
+) -> SearchResult:
+    """Return a runtime result whose steady peak has already passed calibration."""
+    raw_peak_bytes = int(result.predicted_peak_bytes)
+    calibrated_peak_bytes = int(calibrated_peak_bytes)
+    init_transient_peak_bytes = int(init_transient_peak_bytes)
+
+    if calibrated_peak_bytes != raw_peak_bytes:
+        LOG.info(
+            "ProTrain: calibrated steady peak prediction %.2f GiB "
+            "using actual per-chunk byte footprint",
+            calibrated_peak_bytes / (1 << 30),
+        )
+        LOG.debug(
+            "ProTrain: raw search peak before calibration was %.2f GiB",
+            raw_peak_bytes / (1 << 30),
+        )
+
+    calibrated_result = SearchResult(
+        cfg=result.cfg,
+        block_map=result.block_map,
+        predicted_peak_bytes=calibrated_peak_bytes,
+        predicted_iter_s=result.predicted_iter_s,
+        predicted_init_transient_peak_bytes=init_transient_peak_bytes,
+    )
+    capacity_bytes = int(capacity_bytes)
+    if calibrated_result.predicted_peak_bytes > capacity_bytes:
+        raise RuntimeError(
+            "ProTrain calibrated peak exceeds the per-rank GPU budget: "
+            f"calibrated_peak={calibrated_result.predicted_peak_bytes / (1 << 30):.2f} GiB "
+            f"capacity={capacity_bytes / (1 << 30):.2f} GiB "
+            f"(raw_search_peak={raw_peak_bytes / (1 << 30):.2f} GiB). "
+            "The raw search estimate is search-internal; runtime fit uses "
+            "the calibrated peak."
+        )
+    return calibrated_result
+
+
 def _construct_runtime(
     *,
     model: nn.Module,
@@ -1056,28 +1099,19 @@ def _construct_runtime(
     init_transient_peak = predict_init_transient_peak_bytes(
         layout, hardware_profile, chunk_manager
     )
-    if calibrated_peak != result.predicted_peak_bytes or init_transient_peak > 0:
-        if calibrated_peak != result.predicted_peak_bytes:
-            LOG.info(
-                "ProTrain: peak prediction calibrated %.2f -> %.2f GB "
-                "using actual per-chunk byte footprint",
-                result.predicted_peak_bytes / (1 << 30),
-                calibrated_peak / (1 << 30),
-            )
-        # cfg.n_persist preserves the search's prefix length.
-        result = SearchResult(
-            cfg=CostConfig(
-                n_persist=result.cfg.n_persist,
-                n_buffer=result.cfg.n_buffer,
-                n_swap=result.cfg.n_swap,
-                n_checkpoint=result.cfg.n_checkpoint,
-                n_offload=result.cfg.n_offload,
-            ),
-            block_map=result.block_map,
-            predicted_peak_bytes=calibrated_peak,
-            predicted_iter_s=result.predicted_iter_s,
-            predicted_init_transient_peak_bytes=init_transient_peak,
+    try:
+        result = _apply_calibrated_runtime_peak_gate(
+            result,
+            calibrated_peak_bytes=calibrated_peak,
+            init_transient_peak_bytes=init_transient_peak,
+            capacity_bytes=capacity_bytes,
         )
+    except Exception:
+        try:
+            chunk_manager.close()
+        except Exception as exc:  # noqa: BLE001 - preserve the gate failure
+            LOG.debug("ProTrain: chunk_manager.close failed after peak gate: %s", exc)
+        raise
     LOG.info(
         "ProTrain: predicted peaks: steady=%.2f GiB iter1_transient=%.2f GiB "
         "(ratio=%.2fx; > 2x suggests Mode-C offload regime)",
@@ -1513,9 +1547,6 @@ def _construct_runtime(
                 "to reduce chunk-managed param gradients.",
                 _exc,
             )
-
-    # capacity_bytes kept in signature for future per-capacity derating.
-    del capacity_bytes
 
     return chunk_manager, scheduler, list(handles), result
 
@@ -2323,8 +2354,8 @@ def protrain_model_wrapper(
         )
         _sys2.stderr.write(
             f"[protrain] search done: cfg={result.cfg} "
-            f"peak={result.predicted_peak_bytes / 1e9:.2f}GB "
-            f"iter={result.predicted_iter_s:.3f}s\n"
+            f"iter={result.predicted_iter_s:.3f}s "
+            "(peak pending runtime calibration)\n"
         )
         _sys2.stderr.flush()
 
@@ -2835,24 +2866,23 @@ def protrain_model_wrapper(
                     init_transient_peak = (
                         boot_result.predicted_init_transient_peak_bytes
                     )
-                    if (
-                        calibrated_peak != new_result.predicted_peak_bytes
-                        or init_transient_peak
-                        != new_result.predicted_init_transient_peak_bytes
-                    ):
-                        new_result = SearchResult(
-                            cfg=CostConfig(
-                                n_persist=new_result.cfg.n_persist,
-                                n_buffer=new_result.cfg.n_buffer,
-                                n_swap=new_result.cfg.n_swap,
-                                n_checkpoint=new_result.cfg.n_checkpoint,
-                                n_offload=new_result.cfg.n_offload,
-                            ),
-                            block_map=new_result.block_map,
-                            predicted_peak_bytes=calibrated_peak,
-                            predicted_iter_s=new_result.predicted_iter_s,
-                            predicted_init_transient_peak_bytes=init_transient_peak,
+                    try:
+                        new_result = _apply_calibrated_runtime_peak_gate(
+                            new_result,
+                            calibrated_peak_bytes=calibrated_peak,
+                            init_transient_peak_bytes=init_transient_peak,
+                            capacity_bytes=capacity_bytes,
                         )
+                    except Exception:
+                        _teardown_phase2_bootstrap_runtime(
+                            model=model,
+                            blocks=blocks,
+                            handles=handles,
+                            chunk_manager=chunk_manager,
+                            boot_wrapped=boot_wrapped,
+                            context="phase-2 calibrated peak gate",
+                        )
+                        raise
                     LOG.info(
                         "Phase-2: post-measurement search picked the same cfg "
                         "(predicted_iter_s %.4f -> %.4f); keeping bootstrap "
