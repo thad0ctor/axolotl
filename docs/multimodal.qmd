@@ -382,6 +382,13 @@ The non-streaming path stores token metadata plus image paths in the prepared
 dataset; decoded image tensors are loaded by the collator at batch time.
 :::
 
+Full config examples are available under `examples/qwen2_5-vl/`:
+
+- `mm-cpt-nonstreaming-qlora.yaml` for raw `datasets:`
+  preprocessing plus `num_epochs` based training.
+- `mm-cpt-streaming-qlora.yaml` for streaming `pretraining_dataset:`
+  training with prepared-cache resume.
+
 ### Dataset format (JSONL)
 
 Two keys per row: `text` (the raw string) and `images` (list of local paths).
@@ -487,6 +494,12 @@ gradient_accumulation_steps: 8
 Because this route creates a map-style dataset with a known length, Axolotl can
 infer scheduler/training steps from `num_epochs`; unlike streaming
 `pretraining_dataset`, you do not need to manually calculate `max_steps`.
+
+You can run `axolotl preprocess` on this mode. The prepared Arrow dataset keeps
+`images` as image references and `_mm_text` as raw text for the collator; the
+collator loads images and calls the configured processor during training. If
+your JSONL stores relative image paths, keep `image_base_dir` set in the train
+config that consumes the prepared dataset.
 
 ### Already-tokenized MM CPT rows
 
