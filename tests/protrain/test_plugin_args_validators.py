@@ -169,6 +169,34 @@ def test_force_all_persistent_default_is_false() -> None:
     assert args.protrain_force_all_persistent is False
 
 
+def test_warns_when_effective_batch_below_throughput_threshold(caplog) -> None:
+    cfg = _minimal_active_cfg(
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+    )
+    with caplog.at_level("WARNING"):
+        ProTrainArgs.model_validate(cfg)
+
+    assert any(
+        "ProTrain throughput cliff" in rec.getMessage()
+        and "effective bs=1 < 4" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_no_throughput_warning_at_effective_batch_threshold(caplog) -> None:
+    cfg = _minimal_active_cfg(
+        micro_batch_size=1,
+        gradient_accumulation_steps=4,
+    )
+    with caplog.at_level("WARNING"):
+        ProTrainArgs.model_validate(cfg)
+
+    assert not any(
+        "ProTrain throughput cliff" in rec.getMessage() for rec in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------
 # Optimizer allow-list (M6B) — ProTrain's chunk-manager adapters only
 # drive AdamW-shaped state. Unsupported optimizers must be rejected at

@@ -609,14 +609,10 @@ class ProTrainArgs(BaseModel):
     def _warn_bs1_low_ga_throughput_cliff(cls, data):
         """Warn when ``micro_batch_size=1`` + ``gradient_accumulation_steps<4`` under ProTrain.
 
-        ProTrain's per-iter scheduler walk and chunk-management hook fan-out
-        carry a fixed overhead that amortizes once the optimizer step is
-        amortized across enough forward/backward passes. Below the bs * ga = 4
-        threshold the per-step overhead dominates and users see ~5-7x
-        throughput regressions vs vanilla bs=1 (documented in proposal §6.d
-        and §16 follow-up PR #4 for the eventual hot-path fix). Emit a warning
-        so the user doesn't open a "ProTrain is mysteriously slow" support
-        thread when the right answer is "raise gradient_accumulation_steps".
+        ProTrain carries fixed per-step costs that amortize once the optimizer
+        step covers enough forward/backward work. Below the bs * ga = 4
+        threshold, small-batch wall time is often dominated by runtime launch,
+        distributed, optimizer, and framework overhead rather than model math.
         """
         if not isinstance(data, dict):
             return data
@@ -635,12 +631,10 @@ class ProTrainArgs(BaseModel):
             LOG.warning(
                 "ProTrain throughput cliff: micro_batch_size=%s * "
                 "gradient_accumulation_steps=%s = effective bs=%d < 4. "
-                "Per-iter overhead (scheduler walk + chunk-hook fan-out) "
-                "amortizes poorly below this threshold; expect ~5-7x slower "
-                "than vanilla. Either raise gradient_accumulation_steps to "
-                ">= 4 (recommended; same effective batch, much better "
-                "throughput) or drop ProTrain if memory permits. See "
-                "proposal §6.d and §16 follow-up PR #4.",
+                "Fixed per-step overhead amortizes poorly below this "
+                "threshold; raise gradient_accumulation_steps to >= 4 when "
+                "memory permits, or drop ProTrain for workloads that already "
+                "fit comfortably without it. See proposal §16.B B2.",
                 mbs,
                 ga,
                 effective,

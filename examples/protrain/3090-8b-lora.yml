@@ -67,7 +67,7 @@ protrain_auto_memory: true
 protrain_auto_mode: true
 # protrain_force_all_persistent: true   # explicit override (only honoured when protrain_auto_mode=false)
 
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 micro_batch_size: 1
 max_steps: 20
 optimizer: adamw_torch      # adamw_torch baseline; ProTrainPlugin.post_trainer_create replaces this with protrain_optimizer_wrapper

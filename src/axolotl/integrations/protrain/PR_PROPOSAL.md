@@ -1767,10 +1767,11 @@ tradeoffs.
   Full-finetune at 8B-class scale is hardware-bound locally even with optimizer
   state partitioning; the high-memory Qwen3.5-9B validation is recorded in
   §16.B B1.
-- **bs=1 Mode A is launch-latency dominated.** The Python hot path is reduced,
-  but the remaining tax is dominated by small-kernel launch overhead. Use
-  higher micro-batches where possible; deeper profiling and CUDA Graphs are
-  tracked in §16.B B2.
+- **bs=1 Mode A is fixed-overhead dominated.** The all-persistent inert path
+  prunes ProTrain's block hooks, but the remaining per-step runtime tax still
+  amortizes poorly at effective batch < 4. Use higher micro-batches or
+  gradient accumulation where possible; deeper launch/NCCL profiling and CUDA
+  Graphs are tracked in §16.B B2.
 - **27B + 4-bit on a single 3090 is validated at seq=128 in Mode A and
   seq=256 in explicit Mode B.** Higher-throughput Mode A at longer 27B
   sequence lengths still requires multi-GPU or larger-memory hardware.
@@ -2046,7 +2047,7 @@ are prerequisites for the validated feature set above.
 | # | Area | Scope |
 |---|---|---|
 | B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because 9B OOMs locally after a finite first step; the same 4B local shape also validates Qwen3.5 multimodal visual-key checkpoint fidelity at the final save boundary. |
-| B2 | **bs=1 throughput is launch-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, per-step wallclock is dominated by ~9,000 `cudaLaunchKernel` calls per step on consumer 3090s. NCCL grad sync is overlap-shadowed by backward compute at this shape (Path B's coalesced sync produces a noise-level sps change at minimal-target bs=1 qlora despite a -68% NCCL collective-count reduction — Path B's measurable gain surfaces in the many-LoRA-tensor regime, see §6.pb). Recommended config: `gradient_accumulation_steps: 4` recovers per-sample throughput by amortizing the fixed launch tax — measured per-rank bs=1 = 0.229 sps → bs=4 (via grad-accum) = 0.738 sps (3.22×/sample). Future work: CUDA Graphs capture is the canonical fix for launch-tax-dominated regimes; not yet implemented in this branch. |
+| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain's block-hook aggregate is zero, but wall-clock remains dominated by fixed per-step runtime overheads instead of useful model math. The CPU hot-path guard shows the old LoRA-hook Python delta reduced from the 4.7 ms/step baseline to ~2.8 ms/step, and bs=4 is only 1.07× bs=1 in that hook-only microbench, so the remaining cost is batch-independent and should be amortized. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). Path B's coalesced sync is noise-level on minimal-target LoRA but material on many-LoRA-tensor PCIe profiles (§6.pb). Future work: deeper launch/NCCL profiling and CUDA Graphs capture. |
 | B3 | **At-scale cross-world Mode C full optimizer-state resume** | Closed for the local regression class: Qwen3.5-4B full-FT forced Mode C validates packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume through finite steps 4-6, with final safetensors saves. The seq=1024 and seq=2048 `adamw_bnb_8bit` paths pass, and seq=2048 repeats under `adamw_torch`. The path requires param-name sidecar metadata for persistent GPU optimizer state; older sidecar-less checkpoints fail closed for cross-world resume. |
 
 ---
