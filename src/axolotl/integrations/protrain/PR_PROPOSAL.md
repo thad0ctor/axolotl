@@ -979,11 +979,17 @@ requirements:
 
 Maintainer acceptance recipe:
 
+The runnable entry point is
+`PYTHONPATH=src python -m axolotl.integrations.protrain.validation`
+(`validation/README.md`). It emits PASS/FAIL/SKIP/GAP summaries and applies
+finite-loss, finite-grad-norm, no-NaN/Inf, checkpoint-artifact, and resume
+loss-continuity gates where the lane trains a model.
+
 | Lane | Run | Acceptance bar |
 |---|---|---|
-| CPU/default | `PYTHONPATH=src python -m pytest tests/protrain -q` | Validators, cost/search math, checkpoint metadata, optimizer-state metadata, and deterministic chunk layout pass without a GPU. |
-| One GPU, 24 GiB | 8B 4-bit QLoRA, 50 train steps, save, resume for additional steps. Use `examples/protrain/3090-8b-lora.yml` with `adapter: qlora`, `load_in_4bit: true`, `max_steps: 50`, and `save_steps: 50`. | The run emits ProTrain wrapper/optimizer logs, writes `checkpoint-50`, resumes from it, keeps every logged loss finite, and the first resumed loss is continuous with the last pre-resume loss rather than a restart/divergence spike. |
-| Two GPUs | Small forced-Mode-C model, save, resume, and parity check. Set `protrain_auto_mode: false`, `protrain_zero3_shard: true`, and a small `protrain_n_persist_override` so at least one chunk is non-persistent. | The resumed run restores model + `protrain_optim/`, produces finite losses on both ranks, and matches the same-seed uninterrupted continuation within the test tolerance. |
+| CPU/default | `--suite cpu-core` or `--suite cpu-full` | Validators, cost/search math, checkpoint metadata, optimizer-state metadata, deterministic chunk layout, model-family ownership, and non-finite optimizer-boundary guards pass without a GPU. |
+| One GPU, 24 GiB | `--suite single-gpu` | 8B 4-bit QLoRA trains 50 steps from `validation/recipes/3090-8b-qlora-acceptance.yml`, writes `checkpoint-50`, resumes for additional steps, keeps logged losses/grad norms finite, and preserves bounded resume loss continuity. |
+| Two GPUs | `--suite two-gpu` | Forced Mode C finite-training coverage plus maintained resume and non-finite-boundary tests pass on the visible two-GPU set. |
 | Optional four GPUs | `pytest tests/protrain/ -m gpu` on a 3090-class PCIe pool | Covers Path B / Mode C PCIe regressions and cross-mode / cross-world resume beyond the minimal maintainer lanes. |
 
 ### Version guardrails (load-bearing for monkey-patches)
