@@ -2018,7 +2018,7 @@ class ProTrainPlugin(BasePlugin):
                 if torch.cuda.is_available()
                 else 0.0
             )
-            LOG.warning(
+            LOG.debug(
                 "[protrain-diag] post_trainer_create entry: "
                 "alloc=%.2f GiB is_ddp_wrapped=%s "
                 "inner_has_ignore_attr=%s inner_ignore_size=%d",
@@ -2028,7 +2028,7 @@ class ProTrainPlugin(BasePlugin):
                 _diag_ignore_size,
             )
         except Exception as _diag_exc:  # noqa: BLE001
-            LOG.warning(
+            LOG.debug(
                 "[protrain-diag] post_trainer_create logging failed: %s",
                 _diag_exc,
             )
