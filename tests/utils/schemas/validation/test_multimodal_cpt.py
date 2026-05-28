@@ -122,6 +122,13 @@ class TestMultimodalCPTGates:
         assert ds.image_column == "images"
         assert ds.image_base_dir == "/images"
 
+    def test_datasets_cfg_allows_num_epochs_without_max_steps(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg, num_epochs=2)
+        cfg.pop("max_steps", None)
+        validated = validate_config(cfg)
+        assert validated.max_steps is None
+        assert validated.num_epochs == 2
+
     def test_datasets_cfg_missing_processor_type_raises(self, min_base_cfg):
         cfg = _mm_cpt_datasets_cfg(min_base_cfg)
         cfg.pop("processor_type", None)

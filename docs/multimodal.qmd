@@ -479,9 +479,14 @@ sequence_len: 2048
 sample_packing: false                  # REQUIRED — see below
 remove_unused_columns: false           # auto-set by validator
 
+num_epochs: 1                           # max_steps is optional in this path
 micro_batch_size: 1
 gradient_accumulation_steps: 8
 ```
+
+Because this route creates a map-style dataset with a known length, Axolotl can
+infer scheduler/training steps from `num_epochs`; unlike streaming
+`pretraining_dataset`, you do not need to manually calculate `max_steps`.
 
 ### Already-tokenized MM CPT rows
 
@@ -506,6 +511,7 @@ skip_prepare_dataset: true
 sequence_len: 2048
 sample_packing: false
 remove_unused_columns: false
+num_epochs: 1
 ```
 
 ```json
