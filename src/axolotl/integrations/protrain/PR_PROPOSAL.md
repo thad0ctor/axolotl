@@ -22,7 +22,8 @@ The PR adds:
   optimizer wrapping, safetensors save, optimizer-state checkpointing, and
   cross-world resume.
 - Config validation that rejects known-conflicting stacks rather than silently
-  composing with DeepSpeed/FSDP, adapter merges, or unsupported lazy-load paths.
+  composing with DeepSpeed/FSDP, in-training adapter merges, or unsupported
+  lazy-load paths. Post-training `merge-lora` is validated separately.
 
 Reviewer-facing validation summary:
 
@@ -33,17 +34,18 @@ Reviewer-facing validation summary:
 | Full fine-tune | Qwen3-0.6B full-FT validates Adam-state memory reduction across torch, bnb 8-bit, and paged Adam (§6.g). Qwen3.5-4B full-FT forced Mode C validates locally on 5× 3090-class cards with both `adamw_bnb_8bit` and `adamw_torch` (§6.z). Qwen3.5-9B full-FT forced Mode C validates train/save/resume on a high-memory 2-rank host (§6.nw). |
 | Checkpointing and resume | LoRA save/resume/merge, ProTrain optimizer sidecars, safetensors final save, full-FT chunk restoration, same-world resume, cross-world 4→2 and 2→4 optimizer-state resume, and checkpoint fidelity for visual keys are covered (§6.o, §6.cc, §6.gg, §6.jj, §16.B). |
 | LoRA sync and topology | Path B LoRA grad sync is default-on for PCIe and default-off for NVLink-class fabric. PCIe all-linear LoRA improves steady-state throughput by 15.1%; NVLink validation shows native NCCL buckets are faster, justifying the topology-aware default (§6.pb, §6.nv). |
-| Compatibility | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA, torch.compile, Apex FusedAdam, LoRA-rank sweeps, gradient accumulation, and merge-lora are validated at the levels claimed in §6 and §12. |
-| CI and tests | The default ProTrain suite is 618 passed, 5 skipped, 179 deselected on the rebased branch; targeted GPU and multi-GPU tests cover the non-portable CUDA/NCCL paths (§6.n, §11). |
+| Compatibility | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA, torch.compile, Apex FusedAdam with the documented CUDA/toolkit constraint, LoRA-rank sweeps, gradient accumulation, and merge-lora command/reload paths are validated at the levels claimed in §6 and §12. |
+| CI and tests | The default ProTrain suite is 630 passed, 5 skipped, 179 deselected on the rebased branch; targeted GPU and multi-GPU tests cover the non-portable CUDA/NCCL paths (§6.n, §11). |
 
 Current boundaries are explicit rather than hidden:
 
 - ProTrain is mutually exclusive with DeepSpeed/FSDP in the same Axolotl run.
 - Mode A full-FT at 8B+ can exceed 24 GiB cards because DDP reducer and frozen
   base load order still matter; Mode C is the intended full-FT path.
-- bs=1 correctness and cost attribution are validated. Throughput is
-  fixed-overhead-bound, so gradient accumulation is the recommended production
-  path; CUDA Graphs remains optional future optimization work.
+- bs=1 correctness and cost attribution are validated for the listed Mode A
+  inert and Path B rerun shapes. Throughput is fixed-overhead-bound, so
+  gradient accumulation is the recommended production path; CUDA Graphs remains
+  optional future optimization work.
 - 9B text full-FT train/save/resume is validated; exact multimodal visual-key
   checkpoint fidelity is validated on the local 4B/9B fidelity-specific paths
   called out in §16.B, not generalized beyond those shapes.
@@ -231,7 +233,8 @@ registers the args schema but leaves the runtime hooks dormant.
    │  post-bwd hook → reduce_grads_and_offload   │
    │       │                                      │
    │  optimizer.step                              │
-   │   - persistent chunks  → GPU FusedAdam       │
+   │   - persistent chunks  → Apex FusedAdam      │
+   │                          or torch AdamW      │
    │   - non-persistent     → DeepSpeedCPUAdam   │
    └──────────────────────────────────────────────┘
 ```
@@ -521,7 +524,7 @@ this proposal while removing per-run log detail.
 | §6.f, §6.g | Optimizer memory | At LoRA scope, bnb 8-bit Adam saves little because trainable state is small. At full-FT scope on Qwen3-0.6B, paged 8-bit Adam cuts total peak from 5.59 GiB to 2.84 GiB and composes with ProTrain. |
 | §6.z | Local full-FT Mode C | Qwen3.5-4B bf16 full-FT forced Mode C validates on 5× 3090-class cards with both `adamw_bnb_8bit` and `adamw_torch`, final safetensors save, and chunk-managed param restoration. |
 | §6.nw | 9B full-FT capacity validation | Qwen3.5-9B bf16 full-FT forced Mode C validates 30/30 finite train steps, final safetensors save, full optimizer-state checkpoint/resume to step 100, and second resume to step 105 on a high-memory 2-rank host. Vanilla Axolotl full-FT is faster on the same high-memory host but uses about twice the active memory. |
-| §6.o, §6.gg, §6.jj | Save, merge, reload | LoRA save/resume/merge passes for standard-attention and linear-attention models; production 13B/27B merge-lora paths return successfully with expected memory ceilings. |
+| §6.o, §6.gg, §6.jj | Save, merge, reload | LoRA save/resume/merge passes for standard-attention and linear-attention models; 13B/27B merge-lora command/reload paths return successfully with expected memory ceilings. No serving throughput or merged-model quality claim is made. |
 | §6.cc, §6.kk-oo | Cross-world optimizer resume | Full optimizer-state sidecars validate same-world resume plus 4→2 and 2→4 cross-world online resharding on Qwen3.5-4B full-FT packed seq=1024/2048 shapes. Param-group identity and reorder defenses are covered by the focused tests. |
 | §16.B | Multimodal checkpoint fidelity | Qwen3.5 visual-key checkpoint fidelity is validated on the local fidelity-specific paths: saved keys remain native `model.visual.*` keys with no nested `model.language_model.visual.*` or wrapper-key leakage. |
 
@@ -529,12 +532,12 @@ this proposal while removing per-run log detail.
 
 | Ref | Area | Result |
 |---|---|---|
-| §6.n | Tests | Rebased branch default ProTrain suite: 618 passed, 5 skipped, 179 deselected; GPU and multi-GPU marker tests cover CUDA/NCCL-specific paths. |
+| §6.n | Tests | Rebased branch default ProTrain suite: 630 passed, 5 skipped, 179 deselected; GPU and multi-GPU marker tests cover CUDA/NCCL-specific paths. |
 | §6.w | FlashAttention | 8B BF16 LoRA + ProTrain Mode A + `flash_attention: true` validates under the extended search timeout. |
 | §6.y, §6.ss | torch.compile | ProTrain hook bodies are compile-disabled where needed, NF4 dequant uses a custom op, and end-to-end torch.compile runs pass. On bs=1 QLoRA Mode A, compile gives no throughput benefit after warmup, so it is compatibility coverage rather than a speed recommendation. |
 | §6.ee | Apex FusedAdam | Source-built Apex FusedAdam validates in the supported local environment; proposal claims support with the documented environment constraint. |
 | §6.qq, §6.ww | Fused/custom kernels | `lora_mlp_kernel` composition avoids unsafe `n_offload>0` plans, and shape-preserving placeholders keep custom autograd backward shape checks valid. |
-| §6.bb | MoE | tiny Mixtral-class MoE passes vanilla and ProTrain Mode A; Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA completes bounded-image 100-step validation on 5× 3090-class cards. |
+| §6.bb | MoE | tiny Mixtral-class MoE passes vanilla and ProTrain Mode A; Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA completes bounded-image 100-step validation on 5× 3090-class cards. This is finite-run compatibility coverage, not numerical parity coverage. |
 | §6.aa | Long-horizon convergence | 1500-step Llama-13B 4-bit Mode A vs vanilla remains within expected variance, with no evidence of chunk-shuffling-induced trajectory drift. |
 
 ### 6.5 Documented limits
@@ -592,7 +595,7 @@ agreement or divergence.
 
 | Paper claim | This integration | Agreement |
 |---|---|---|
-| §5.3.2 + §C.2: runtime and peak-memory estimators within **4% error** on the 10B GPT-2 model; within **10% over-estimate** on peak memory across the model ladder for safety | This integration's `estimate_peak` predicts 19.6 GB for Meta-Llama-3-8B BF16 LoRA Mode A search candidate; pre-offload measured is 17.31 GB (∼13% over-estimate, Mode A). On Mode-C-CKPT the raw `estimate_peak` is a lower-bound search gate, not a runtime feasibility check. The cost-model carries (a) a per-mode α split (Mode-A 0.75 / Mode-C-CKPT 0.95) and (b) a per-block CKPT internal saved-tensor proxy in `_compute_ckpt_chain_bytes` (FFN-intermediate + attention scores + Q/K/V; one-block per-block-max bump, not chained N_block × residual, so the O(seq^2) attention term does not over-correct at high seq). Calibrated `alpha_steady` on 30B-Llama Mode-C lands at ~1.18 / 0.99 / 0.80 across seq=512/1024/2048 — slight under-prediction at low seq, slight over-prediction at seq=2048 (safer for the runtime gate). The 27B + 4-bit + seq=128 run picks a config where raw `predicted=15.05 GiB` vs measured 19.98 GiB peak (~24.7% under). The wrapper-side `_calibrate_peak_with_actual_chunk_bytes` (`api/model_wrapper.py:296`) *raises* the prediction by 0.6-0.9 GiB before the budget check, absorbing whatever raw residual remains — the runtime-visible "peak prediction calibrated X -> Y GB" log line is the value users should watch. | **Safe by construction at common configurations** because the wrapper-side calibration raises the raw prediction toward measured; the per-mode α split + per-block residual close the low-seq Mode-C-CKPT under-prediction. The `protrain_ckpt_internal_residual_factor` knob (default 1.0, 0.0 disables) lets users dial in conservative tuning. At-scale re-profiling on > 24 GiB hardware is §16.B B1; the analytical model is part of the current implementation. |
+| §5.3.2 + §C.2: runtime and peak-memory estimators within **4% error** on the 10B GPT-2 model; within **10% over-estimate** on peak memory across the model ladder for safety | This integration's `estimate_peak` predicts 19.6 GB for Meta-Llama-3-8B BF16 LoRA Mode A search candidate; pre-offload measured is 17.31 GB (∼13% over-estimate, Mode A). On Mode-C-CKPT the raw `estimate_peak` is a lower-bound search gate, not a runtime feasibility check. The cost model carries (a) a per-mode α split (Mode-A 0.75 / Mode-C-CKPT 0.95) and (b) a per-block CKPT internal saved-tensor proxy in `_compute_ckpt_chain_bytes` (FFN-intermediate + attention scores + Q/K/V; one-block per-block-max bump, not chained N_block × residual, so the O(seq^2) attention term does not over-correct at high seq). Calibrated `alpha_steady` on 30B-Llama Mode-C lands at ~1.18 / 0.99 / 0.80 across seq=512/1024/2048 — slight under-prediction at low seq, slight over-prediction at seq=2048. The 27B + 4-bit + seq=128 run demonstrates why the distinction matters: raw `predicted=15.05 GiB` vs measured 19.98 GiB peak is not presented as a final fit decision. The wrapper-side `_calibrate_peak_with_actual_chunk_bytes` (`api/model_wrapper.py`) raises the prediction before the budget check; the runtime-visible "peak prediction calibrated X -> Y GB" log line is the value users should watch, especially near the 24 GiB ceiling. | **Safe at the runtime gate by construction** because final acceptance uses the calibrated wrapper prediction, not the raw search estimate. The per-mode α split + per-block residual make raw Mode-C-CKPT estimates tighter, and `protrain_ckpt_internal_residual_factor` (default 1.0, 0.0 disables) lets users dial in conservative tuning. At-scale validation is recorded in §16.B B1; the analytical model is part of the current implementation. |
 
 ### 7.7 CPU Adam and the overlap window
 
@@ -627,16 +630,21 @@ on parameter dtype.
 
 **This integration.** `cost/memory.py::alpha_fragmentation_for_dtype` returns
 **1.10** for fp16 / bf16 / 8-bit dtypes (`bpe ≥ 1.0`) and **0.75** for bnb
-4-bit (`bpe = 0.5` via `Params4bit` packing). The dominant dtype is
-detected at `protrain_model_wrapper` construction by aggregating logical
-element counts over `model.named_parameters()`.
+4-bit Mode-A-style callers (`bpe = 0.5` via `Params4bit` packing).
+Mode-aware callers use `alpha_fragmentation_for_cfg`: 4-bit configs with
+checkpointed Mode-C blocks use **0.95**, while non-4-bit dtypes keep **1.10**.
+The dominant dtype is detected at `protrain_model_wrapper` construction by
+aggregating logical element counts over `model.named_parameters()`.
 
 **Why.** Measured `α_steady ≈ 0.70` across four 8B-Llama 4-bit rows
 vs the paper's 1.10 default; 1.10 over-predicts bnb-4-bit Mode-A
 peak by ~37% and rejects otherwise-valid 4-bit configs at the
 searcher gate. 0.75 (slightly conservative vs the 0.70 empirical
-floor) keeps the search space open. Tests:
-`tests/protrain/test_alpha_per_dtype.py`.
+floor) keeps the Mode-A search space open; 0.95 narrows the Mode-C-CKPT raw
+under-prediction without replacing the wrapper-side calibrated budget gate.
+Tests: `tests/protrain/test_alpha_per_dtype.py`,
+`tests/protrain/test_cost_model.py`, and
+`tests/protrain/test_alpha_diagnostics.py`.
 
 ### 8.2 bnb 4-bit support (paper-era ProTrain didn't have this)
 
@@ -812,8 +820,9 @@ capabilities:
   (`protrain_zero3_shard`). Force-mode validators keep those choices mutually
   exclusive.
 - **QLoRA and LoRA compatibility.** The integration composes with PEFT LoRA,
-  bnb 4-bit QLoRA, LoRA MLP kernels, DoRA/RSLora-style adapter options, and
-  `torch.compile` on the validated NF4 path.
+  bnb 4-bit QLoRA, LoRA MLP kernels, DoRA coverage, LoRA-style PEFT adapter
+  surfaces whose parameter ownership matches LoRA, and `torch.compile` on the
+  validated NF4 path.
 - **Cost model and searcher.** The searcher accounts for dtype-specific
   fragmentation, CKPT internal saved tensors, bnb 4-bit companion buffers,
   CPU/offload overlap windows, NCCL re-measurement, non-NVLink preferences,
@@ -880,7 +889,7 @@ Reviewer-facing support status:
 |---|---|
 | Supported and validated | LoRA/QLoRA Mode A/B/C at stated 3090-class shapes; same-world resume; cross-world Mode C optimizer resume at stated Qwen3.5-4B full-FT shapes; final safetensors save; Path B LoRA sync with topology-aware default; active-ProTrain 4-bit embedding-upcast deferral. |
 | Supported with environment constraint | Apex FusedAdam requires a CUDA/toolkit-aligned source build; GPU and multi-GPU regression lanes require suitable local/self-hosted hardware. |
-| Future optimization, not correctness gap | bs=1 CUDA Graphs / deeper launch capture work. Correctness and cost attribution are already validated; production guidance is higher micro-batch or gradient accumulation. |
+| Future optimization, not correctness gap | bs=1 CUDA Graphs / deeper launch capture work. Correctness and cost attribution are validated for the stated Mode A inert and Path B rerun shapes; production guidance is higher micro-batch or gradient accumulation. |
 | Rejected by validator | DeepSpeed/FSDP composition, Axolotl-level `gradient_checkpointing`, unsafe force-mode combinations, unsupported optimizer families, and `protrain_auto_memory: true` without the ProTrain plugin. |
 
 | Claim group | Status | Evidence |
@@ -888,13 +897,13 @@ Reviewer-facing support status:
 | Consumer-card memory fit | **Validated** | 8B BF16 LoRA memory reduction, 13B 4-bit seq=2048, and 27B 4-bit single-3090 / Mode B coverage (§6.a, §6.h, §6.j, §6.dd). |
 | Throughput recovery | **Validated where claimed** | 13B 4-bit single-GPU speedup, 9B bs=4 speedup, DDP scaling, and batch-size scaling through bs=4 (§6.c, §6.d, §6.e, §6.i, §6.p). |
 | Mode A/B/C behavior | **Validated** | Forced and auto-mode paths, single-rank Mode C fallback, consumer non-NVLink Mode C bypass, and mixed-SKU plan determinism are covered (§6.k, §6.rr, §6.uu, §6.zz, §6.zz.X). |
-| Save, merge, resume | **Validated** | Standard- and linear-attn LoRA round trips, production merge-lora, full-FT safetensors save, same-world resume, and 4→2 / 2→4 full optimizer-state resume (§6.o, §6.cc, §6.jj, §6.nw). |
+| Save, merge, resume | **Validated** | Standard- and linear-attn LoRA round trips, merge-lora command/reload paths, full-FT safetensors save, same-world resume, and 4→2 / 2→4 full optimizer-state resume (§6.o, §6.cc, §6.jj, §6.nw). |
 | Full fine-tune | **Validated within stated hardware boundaries** | Qwen3-0.6B Adam-state reduction, Qwen3.5-4B local Mode C full-FT, and Qwen3.5-9B high-memory train/save/resume (§6.g, §6.z, §6.nw). |
-| Optimizers | **Validated** | `adamw_torch`, bnb 8-bit Adam, paged 8-bit Adam, DeepSpeed CPU Adam, and source-built Apex FusedAdam paths have targeted coverage (§6.g, §6.ee). |
-| LoRA / QLoRA compatibility | **Validated** | PEFT LoRA container hooks, DoRA/extended targets, Path B LoRA grad sync, LoRA-rank sweep, gradient accumulation, and torch.compile guardrails (§6.l, §6.m, §6.pb, §6.y, §6.ss). |
-| Model-family coverage | **Validated at claimed scope** | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, and Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA (§6.bb, §16.B). |
+| Optimizers | **Validated** | `adamw_torch`, bnb 8-bit Adam, paged 8-bit Adam, DeepSpeed CPU Adam, and source-built Apex FusedAdam paths have targeted coverage; Apex requires the CUDA/toolkit-aligned source build documented in §6.ee. |
+| LoRA / QLoRA compatibility | **Validated at claimed scope** | PEFT LoRA container hooks, DoRA/extended-target ownership, Path B LoRA grad sync, LoRA-rank sweep, gradient accumulation, and torch.compile guardrails (§6.l, §6.m, §6.pb, §6.y, §6.ss). Numerical parity evidence is scoped to the stated LoRA Path B runs. |
+| Model-family coverage | **Validated at claimed scope** | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, and Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA (§6.bb, §16.B). MoE/multimodal rows are finite-run and checkpoint-fidelity coverage, not broad numerical-parity claims. |
 | Framework comparisons | **Measured, not overclaimed** | ProTrain, FSDP2, DeepSpeed ZeRO-2/3, ZeRO-3+CPU, vanilla DDP, PCIe, and NVLink-class behavior are separated by hardware/regime (§6.x, §6.nv). |
-| CI and regression coverage | **Validated** | 618 default ProTrain tests plus targeted GPU and multi-GPU runs cover portable and hardware-bound behavior (§6.n, §15). |
+| CI and regression coverage | **Validated** | 630 default ProTrain tests plus targeted GPU and multi-GPU runs cover portable and hardware-bound behavior (§6.n, §15). |
 
 ---
 
@@ -964,7 +973,7 @@ requirements:
 
 | Tier | Tests | CI compatibility |
 |---|---|---|
-| Default-marker (CPU / dev) | 618 pytest cases covering chunk management, validators, cost/search math, layout rules, checkpointing, torch.compile compatibility, schema behavior, sentinel re-exports, and Path B LoRA grad sync. | Run on standard Axolotl CI **without GPU**. Latest recorded result: **618 passed, 5 skipped, 179 deselected**. |
+| Default-marker (CPU / dev) | 630 pytest cases covering chunk management, validators, cost/search math, layout rules, checkpointing, torch.compile compatibility, schema behavior, sentinel re-exports, alpha diagnostics, rsLoRA ownership, and Path B LoRA grad sync. | Run on standard Axolotl CI **without GPU**. Latest recorded result: **630 passed, 5 skipped, 179 deselected**. |
 | GPU-marker (single-GPU) | ~10 tests requiring CUDA + a transformer model load (alpha measurement against a real model, profiler trace round-trip, chunk-residency end-to-end) | Needs self-hosted runner with at least one 3090-class GPU. Marker: `@pytest.mark.gpu`. Recommended: dedicated runner pool or scheduled nightly job; **not blocking on default CI**. |
 | Multi-GPU regression | `test_paged_adam_offload_mgpu`, `test_cross_mode_resume` | Needs **4× 3090-class self-hosted runner**. **Intentionally excluded from default CI** with a documented manual-run procedure: `CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID pytest tests/protrain/ -m gpu`. |
 

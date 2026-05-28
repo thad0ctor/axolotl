@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace as _replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,6 +25,7 @@ from axolotl.integrations.protrain.chunk import (
     pick_S_chunk,
 )
 from axolotl.integrations.protrain.cost.bandwidth import effective_bw
+from axolotl.integrations.protrain.cost.memory import alpha_fragmentation_for_cfg
 from axolotl.integrations.protrain.profiler import (
     load_cached_trace,
     run_trace,
@@ -2360,6 +2362,25 @@ def protrain_model_wrapper(
         _sys2.stderr.flush()
 
     result = _broadcast_runtime_search_result(result)
+    if LOG.isEnabledFor(logging.DEBUG):
+        _alpha = alpha_fragmentation_for_cfg(
+            hardware_profile.dominant_param_bytes_per_element,
+            result.cfg,
+        )
+        if hardware_profile.dominant_param_bytes_per_element >= 1.0:
+            _alpha_regime = "non-4bit"
+        elif int(result.cfg.n_checkpoint) > 0:
+            _alpha_regime = "4bit-mode-c-ckpt"
+        else:
+            _alpha_regime = "4bit-mode-a"
+        LOG.debug(
+            "ProTrain alpha diagnostic: dominant_param_bytes_per_element=%.3f "
+            "alpha=%.2f regime=%s cfg=%s",
+            hardware_profile.dominant_param_bytes_per_element,
+            _alpha,
+            _alpha_regime,
+            result.cfg,
+        )
 
     # Auto-mode selection.
     if auto_mode:

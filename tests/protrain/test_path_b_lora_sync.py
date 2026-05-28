@@ -850,6 +850,7 @@ def _build_real_peft_model(
     target_modules,
     *,
     use_dora: bool = False,
+    use_rslora: bool = False,
     modules_to_save=None,
 ):
     """Build a real PEFT-wrapped tiny model so we exercise actual PEFT naming.
@@ -871,13 +872,21 @@ def _build_real_peft_model(
         def forward(self, x):  # pragma: no cover - never called
             return x
 
-    cfg = LoraConfig(
-        r=4,
-        lora_alpha=8,
-        target_modules=list(target_modules),
-        use_dora=use_dora,
-        modules_to_save=modules_to_save,
-    )
+    lora_kwargs = {
+        "r": 4,
+        "lora_alpha": 8,
+        "target_modules": list(target_modules),
+        "use_dora": use_dora,
+        "modules_to_save": modules_to_save,
+    }
+    if use_rslora:
+        lora_kwargs["use_rslora"] = True
+    try:
+        cfg = LoraConfig(**lora_kwargs)
+    except TypeError as exc:
+        if use_rslora:
+            pytest.skip(f"PEFT {peft.__version__} does not expose use_rslora: {exc}")
+        raise
     model = get_peft_model(_TinyForLora(), cfg)
     # Sanity: ensure PEFT version actually injected the requested modules.
     assert any(p.requires_grad for _, p in model.named_parameters()), (
@@ -975,6 +984,24 @@ def test_dora_discovery_or_clean_exclusion(caplog):
         f"{sorted(lora_AB_names - found)}"
     )
     # Returned params list must align with names list.
+    assert len(params) == len(names)
+
+
+def test_rslora_discovery_stays_lora_owned():
+    """rsLoRA changes scaling only; Path B ownership should match plain LoRA."""
+    from axolotl.integrations.protrain.plugin import _discover_lora_params
+
+    model = _build_real_peft_model(["q_proj"], use_rslora=True)
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert trainable, "PEFT produced no trainable rsLoRA params"
+
+    names, params = _discover_lora_params(model)
+    discovered = set(names)
+
+    assert trainable.issubset(discovered), (
+        "rsLoRA trainables should remain in Path B's LoRA-owned set because "
+        f"the parameter names are standard LoRA factors. missing={sorted(trainable - discovered)}"
+    )
     assert len(params) == len(names)
 
 

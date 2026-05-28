@@ -33,7 +33,7 @@ src/axolotl/integrations/protrain/
 │   ├── manager.py               # persistent/non-persistent split, gather/offload drivers
 │   ├── buffer_pool.py           # pre-allocated chunk buffer pool, forward→backward reuse
 │   ├── pinned_alloc.py          # ctypes → cudaHostAlloc, precise-size (App B.2)
-│   └── optim.py                 # DeepSpeedCPUAdam adapter (non-persist) + GPU FusedAdam (persist)
+│   └── optim.py                 # DeepSpeedCPUAdam plus persistent GPU optimizer adapter
 ├── block/
 │   ├── __init__.py
 │   ├── strategy.py              # BlockMode enum {NONE, CKPT, SWAP, OFFLOAD}
@@ -266,14 +266,15 @@ Benchmark: fresh-init Llama-3B + LoRA r=8, bs=2 per rank, seq=256, fp16. 6 itera
 
 Note: ZeRO-3 throughput fell below the "within 15% of replicated" design target in this measurement — at Llama-3B / bs=2 / seq=256 the compute per chunk is too small to hide the two per-chunk collectives on PCIe. The ratio should improve at larger batch size / sequence length where compute dominates; see M7 profiler runs before broad deployment.
 
-## Out of Scope
+## Historical Scope Notes
 
-Mirrors `plan.md`:
-- A100/H100, NVLink, InfiniBand, multi-node
-- TP, PP, any non-ZeRO-3 parallelism
-- FP8/FP4, quantization, FlashAttention variants
-- Windows / macOS
-- Edits to Axolotl core files outside this plugin package — ProTrain is additive, DeepSpeed/FSDP/Unsloth paths unchanged
+This file preserves the implementation history that led to the current plugin.
+For the reviewer-facing validation boundary, use `PR_PROPOSAL.md`. The original
+prototype scope excluded high-memory H100/NVLink hosts, quantized 4-bit paths,
+and FlashAttention variants; those exclusions are no longer the current PR
+boundary where `PR_PROPOSAL.md` records later validation. Still out of scope:
+multi-node, tensor/pipeline parallelism, Windows/macOS validation, and changing
+DeepSpeed/FSDP/Unsloth execution paths outside the ProTrain plugin contract.
 
 ## Design Decisions (previously open questions, now resolved)
 
@@ -311,7 +312,7 @@ Mirrors `plan.md`:
 
     Tests: `tests/protrain/test_modec_steady_peak_accuracy.py` (pins the per-seq scaling + ±35% tolerance against the three audit data points). Existing tests adjusted: none — the `cost/memory.py` op-walk's recompute-bump refinement is backwards-compatible in every fallback regime (`_saved_tensor_bytes_per_block == activation_sizes`); the cap path and all cap-based tests are unchanged.
 
-### Per-mode alpha-fragmentation calibration (commit-pending)
+### Per-mode alpha-fragmentation calibration
 
     `ALPHA_FRAGMENTATION_4BIT` was historically a single constant (0.75) calibrated
     against Mode-A peaks where frozen 4-bit weights dominate per-rank residency.
@@ -322,9 +323,8 @@ Mirrors `plan.md`:
     without changing the wrapper-side `_calibrate_peak_with_actual_chunk_bytes`
     safety semantics. The audit table (Decision 1) shows residual
     `alpha_steady = 1.43 / 1.25 / 1.08` at seq=512/1024/2048 on 30B-Llama Mode-C;
-    the mode split narrows this to roughly 1.12 / 1.08 / 1.04 (estimated;
-    needs at-scale re-profiling to confirm). The wrapper-side calibration
-    continues to absorb whatever residual remains. Dispatch is centralized in
+    the mode split narrows the raw predictor and the wrapper-side calibrated
+    budget gate remains the final fit decision. Dispatch is centralized in
     `alpha_fragmentation_for_cfg(bpe, cfg)`, called by `estimate_peak`, the
     exhaustive searcher (`search/exhaustive.py`), and the wrapper-side
     calibrator. The dtype-only `alpha_fragmentation_for_dtype` path is preserved
@@ -334,7 +334,7 @@ Mirrors `plan.md`:
     matches `estimate_peak`'s chain-sum semantics instead of the prior
     single-block max. Tests: `tests/protrain/test_cost_model.py`.
 
-### Per-block internal saved-tensor proxy (commit-pending)
+### Per-block internal saved-tensor proxy
 
     The `_compute_ckpt_chain_bytes` helper sums the block-output proxy
     (`trace.activation_sizes[bid]`) across CKPT blocks. This proxy
@@ -374,7 +374,11 @@ Mirrors `plan.md`:
     >24 GiB hardware is the §16 follow-up scope; this PR ships the
     analytical model.
 
-    *Out of scope.* The iter-1 transient observed at bnb-4-bit Mode-C (~6.9x pred during the model-load → `materialize_offload` window) is an init-time chunk-residency phenomenon, not a fragmentation or activation-accounting one, and is documented separately as an "init window" not covered by alpha. Tracked as the remaining open audit item.
+    The iter-1 transient observed at bnb-4-bit Mode-C is an init-time
+    chunk-residency phenomenon, not a fragmentation or activation-accounting
+    term. It is modeled by `predict_init_transient_peak_bytes` and tested in
+    `tests/protrain/test_init_transient_peak.py`, while steady-state alpha
+    remains scoped to the runtime predictor.
 2. **Pinned-memory allocator:** `ctypes` → `cudaHostAlloc` directly. ~50 LOC, zero new deps, matches App B.2 precisely (avoids `CUDAHostAllocator` pow-2 rounding). DeepSpeed's `PinnedMemoryAllocator` rejected: may inherit same wart, adds import-graph weight.
 3. **CPU FusedAdam source:** `deepspeed.ops.adam.DeepSpeedCPUAdam`. Paper builds directly on ZeRO-Offload's CPU Adam. Pure-Python reimpl is >10x slower and would collapse the T_bwd / T_cpu_optim overlap window the cost model assumes. DeepSpeed is already in Axolotl's env.
 4. **S_chunk grid:** `{32, 64, 128, 256} MB`. 7B Llama blocks are ~200 MB fp16 → chunks want to be block-scale. 16 MB is too fine-grained; per-chunk sync overhead dominates. M2 agent extends the grid if optimum lands at an endpoint.
@@ -429,7 +433,7 @@ App B.2 of the paper has **two distinct components**, each addressing a differen
 
 #### Measurement status
 
-Peak-memory delta from the wire-up has not been measured on RTX 3090 reference hardware in this commit (the `alpha = 1.10` fragmentation factor — item 1 above — was already absorbing the un-wired fragmentation cost in the cost model). To-be-measured in a follow-up: re-run the M1 profiler ground-truth before and after the wire-up; if peak drops by more than ~5% on a 1.5B-param target shape, recalibrate `alpha` downward. The single-stream wire-up's correctness — the `record_stream` discipline at every cross-stream site — has been validated by the new `tests/protrain/test_single_stream_allocator.py` test (heap-affinity assertion via free-then-reallocate fragmentation probe + nested-stream context-manager composition test). The pinned-host wire-up's correctness — total pool bytes equals the sum of per-chunk aligned bytes — is asserted by `tests/protrain/test_chunk_manager_offload.py::test_materialize_offload_uses_precise_pinned_pool`.
+The single-stream wire-up's correctness — the `record_stream` discipline at every cross-stream site — is validated by `tests/protrain/test_single_stream_allocator.py` (heap-affinity assertion via free-then-reallocate fragmentation probe + nested-stream context-manager composition test). The pinned-host wire-up's correctness — total pool bytes equals the sum of per-chunk aligned bytes — is asserted by `tests/protrain/test_chunk_manager_offload.py::test_materialize_offload_uses_precise_pinned_pool`. Current peak-memory calibration is documented in `PR_PROPOSAL.md` and guarded by the alpha/cost-model tests rather than by this historical M1 note.
 
 ## Known Limitations
 
