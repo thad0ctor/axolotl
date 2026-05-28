@@ -226,6 +226,15 @@ def test_build_image_token_spec_no_candidates_raises():
 # ---- wrap_streaming_dataset routing --------------------------------------
 
 
+def _patch_streaming_partial(monkeypatch, fake_partial):
+    import axolotl.utils.data.streaming as streaming_mod
+
+    if hasattr(streaming_mod, "partial"):
+        monkeypatch.setattr(streaming_mod, "partial", fake_partial)
+    else:
+        monkeypatch.setattr(streaming_mod.functools, "partial", fake_partial)
+
+
 def test_wrap_streaming_dataset_uses_pretraining_config_arg(
     smolvlm_processor, monkeypatch
 ):
@@ -238,7 +247,7 @@ def test_wrap_streaming_dataset_uses_pretraining_config_arg(
         captured["kwargs"] = kwargs
         return lambda batch: batch
 
-    monkeypatch.setattr("axolotl.utils.data.streaming.functools.partial", fake_partial)
+    _patch_streaming_partial(monkeypatch, fake_partial)
 
     class _Dataset:
         features = {"text": None, "images": None}
@@ -300,7 +309,7 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
         captured["kwargs"] = kwargs
         return lambda batch: batch
 
-    monkeypatch.setattr("axolotl.utils.data.streaming.functools.partial", fake_partial)
+    _patch_streaming_partial(monkeypatch, fake_partial)
 
     class _Dataset:
         features = {"text": None, "images": None}
