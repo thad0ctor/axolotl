@@ -904,9 +904,7 @@ class AxolotlTrainer(
 
         from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
 
-        moved = restore_fullft_offload_for_save(self.axolotl_cfg)
-        if not moved:
-            return
+        restore_fullft_offload_for_save(self.axolotl_cfg)
 
         if self.accelerator is not None and hasattr(
             self.accelerator, "wait_for_everyone"

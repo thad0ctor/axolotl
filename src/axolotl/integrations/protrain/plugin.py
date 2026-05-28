@@ -1250,7 +1250,7 @@ def restore_fullft_offload_for_save(cfg) -> int:
         return 0
     if not _has_fullft_offload(cfg, wrapped):
         return 0
-    if getattr(cfg, "_protrain_fullft_offload_restored_for_save", False):
+    if getattr(wrapped, "_protrain_fullft_offload_restored_for_save", False):
         return 0
 
     chunk_manager = getattr(wrapped, "chunk_manager", None)
@@ -1259,7 +1259,7 @@ def restore_fullft_offload_for_save(cfg) -> int:
 
     moved = chunk_manager.restore_to_gpu()
     unwrapped = _unwrap_protrain_blocks_for_save(getattr(wrapped, "module", None))
-    cfg._protrain_fullft_offload_restored_for_save = True  # type: ignore[attr-defined]
+    wrapped._protrain_fullft_offload_restored_for_save = True
     LOG.info(
         "ProTrain: restored %.3f GB of full-FT chunk-managed params before final save.",
         moved / 1e9,

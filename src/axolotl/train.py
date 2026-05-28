@@ -401,9 +401,7 @@ def _restore_protrain_fullft_offload_for_save(cfg: DictDefault, trainer: Any) ->
 
     from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
 
-    moved = restore_fullft_offload_for_save(cfg)
-    if not moved:
-        return
+    restore_fullft_offload_for_save(cfg)
 
     accelerator = getattr(trainer, "accelerator", None)
     if accelerator is not None and hasattr(accelerator, "wait_for_everyone"):

@@ -278,6 +278,49 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
             seen.add(grad_id)
             yield target
 
+    def _target_is_partitioned_for_norm(self, target: _GradTarget) -> bool:
+        if target.source == "cpu_shard":
+            return True
+        if target.source == "gpu_optimizer":
+            return int(self._persistent_world_size) > 1
+        return False
+
+    @staticmethod
+    def _dist_collective_scalar(value: float) -> torch.Tensor:
+        import torch.distributed as dist
+
+        device = torch.device("cpu")
+        try:
+            backend = str(dist.get_backend()).lower()
+        except (RuntimeError, ValueError):
+            backend = ""
+        if backend == "nccl" and torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        return torch.tensor([value], dtype=torch.float64, device=device)
+
+    @staticmethod
+    def _distributed_world_size() -> int:
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return 1
+        try:
+            return int(dist.get_world_size())
+        except (RuntimeError, ValueError):
+            return 1
+
+    def _expects_partitioned_grad_norm(self) -> bool:
+        return int(self._persistent_world_size) > 1 or bool(
+            getattr(self._chunk_manager, "zero3_shard", False)
+        )
+
+    def _all_reduce_partitioned_grad_sq(self, value: float) -> float:
+        import torch.distributed as dist
+
+        total = self._dist_collective_scalar(value)
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        return float(total.item())
+
     def _format_grad_target_diagnostic(
         self, targets: list[_GradTarget], total_norm: float
     ) -> str:
@@ -333,14 +376,38 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
         if max_norm is None or float(max_norm) <= 0.0:
             return
         targets = list(self._iter_optimizer_targets())
+        world_size = self._distributed_world_size()
+        reduce_partitioned = world_size > 1 and self._expects_partitioned_grad_norm()
         if not targets:
+            if reduce_partitioned:
+                total_norm = self._all_reduce_partitioned_grad_sq(0.0) ** 0.5
+                if not math.isfinite(total_norm):
+                    diagnostic = self._format_grad_target_diagnostic(
+                        targets, total_norm
+                    )
+                    LOG.error(diagnostic)
+                    raise RuntimeError(
+                        "ProTrain: non-finite gradient norm detected at optimizer "
+                        "target boundary before CPU/GPU optimizer step. Refusing to "
+                        "step and corrupt weights.\n" + diagnostic
+                    )
             return
-        total_sq = 0.0
+        replicated_sq = 0.0
+        partitioned_sq = 0.0
         for target in targets:
             norm = torch.linalg.vector_norm(
                 target.grad.detach(), ord=2, dtype=torch.float32
             )
-            total_sq += float(norm.item()) ** 2
+            norm_sq = float(norm.item()) ** 2
+            if self._target_is_partitioned_for_norm(target):
+                partitioned_sq += norm_sq
+            else:
+                replicated_sq += norm_sq
+
+        if reduce_partitioned:
+            partitioned_sq = self._all_reduce_partitioned_grad_sq(partitioned_sq)
+
+        total_sq = replicated_sq + partitioned_sq
         total_norm = total_sq**0.5
         if not math.isfinite(total_norm):
             diagnostic = self._format_grad_target_diagnostic(targets, total_norm)

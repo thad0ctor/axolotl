@@ -254,6 +254,203 @@ def test_optimizer_clips_sharded_offloaded_grads_before_cpu_step() -> None:
     assert torch.allclose(grad_seen_by_step[0], torch.tensor([0.6, 0.8]))
 
 
+def test_optimizer_clips_sharded_offloaded_grads_with_global_norm(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    cid = ChunkId(0)
+    shard_param = torch.nn.Parameter(torch.zeros(2))
+    shard_param.grad = torch.tensor([3.0, 4.0])
+    grad_seen_by_step: list[torch.Tensor] = []
+    reduced_values: list[float] = []
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._cpu_step_ready_chunks = {cid}
+            self._cpu_step_events: dict[ChunkId, object] = {}
+            self._cpu_slots: dict[ChunkId, list[_CpuParamSlot]] = {}
+            self._chunk_shards = {
+                cid: SimpleNamespace(regions=[SimpleNamespace(shard_param=shard_param)])
+            }
+
+        def step_ready_cpu_chunks(self) -> None:
+            assert shard_param.grad is not None
+            grad_seen_by_step.append(shard_param.grad.clone())
+            self._cpu_step_ready_chunks.clear()
+
+        def wait_cpu_optim_all(self) -> None:
+            return None
+
+        def reset_optimizer_step_tracking(self) -> None:
+            return None
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+
+    def _fake_all_reduce(tensor, op=None):  # noqa: ANN001, ARG001
+        reduced_values.append(float(tensor.item()))
+        tensor.fill_(100.0)
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce)
+
+    optim = _ProTrainOptimizer(
+        gpu_optim=None,
+        cpu_optim=None,
+        params=[torch.nn.Parameter(torch.zeros(1))],
+        defaults=_optim_defaults(),
+        chunk_manager=_Manager(),
+        max_grad_norm=5.0,
+    )
+
+    optim.step()
+
+    assert reduced_values == [pytest.approx(25.0)]
+    assert len(grad_seen_by_step) == 1
+    assert torch.allclose(grad_seen_by_step[0], torch.tensor([1.5, 2.0]))
+
+
+def test_optimizer_does_not_all_reduce_replicated_grad_norm(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    cid = ChunkId(0)
+    slot = _slot()
+    assert slot.cpu_grad is not None
+    slot.cpu_grad.copy_(torch.tensor([6.0, 8.0]))
+    step_grads: list[torch.Tensor] = []
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._cpu_step_ready_chunks = {cid}
+            self._cpu_step_events: dict[ChunkId, object] = {}
+            self._cpu_slots = {cid: [slot]}
+            self._chunk_shards: dict[ChunkId, object] = {}
+
+        def step_ready_cpu_chunks(self) -> None:
+            assert slot.cpu_grad is not None
+            step_grads.append(slot.cpu_grad.clone())
+            self._cpu_step_ready_chunks.clear()
+
+        def wait_cpu_optim_all(self) -> None:
+            return None
+
+        def reset_optimizer_step_tracking(self) -> None:
+            return None
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+
+    def _unexpected_all_reduce(tensor, op=None):  # noqa: ANN001, ARG001
+        raise AssertionError("replicated grad norm must stay rank-local")
+
+    monkeypatch.setattr(dist, "all_reduce", _unexpected_all_reduce)
+
+    optim = _ProTrainOptimizer(
+        gpu_optim=None,
+        cpu_optim=None,
+        params=[torch.nn.Parameter(torch.zeros(1))],
+        defaults=_optim_defaults(),
+        chunk_manager=_Manager(),
+        max_grad_norm=5.0,
+    )
+
+    optim.step()
+
+    assert len(step_grads) == 1
+    assert torch.allclose(step_grads[0], torch.tensor([3.0, 4.0]))
+
+
+def test_optimizer_participates_in_partitioned_norm_when_no_local_targets(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+
+    reduced_values: list[float] = []
+
+    class _Manager:
+        def wait_cpu_optim_all(self) -> None:
+            return None
+
+        def reset_optimizer_step_tracking(self) -> None:
+            return None
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+
+    def _fake_all_reduce(tensor, op=None):  # noqa: ANN001, ARG001
+        reduced_values.append(float(tensor.item()))
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce)
+
+    optim = _ProTrainOptimizer(
+        gpu_optim=None,
+        cpu_optim=None,
+        params=[torch.nn.Parameter(torch.zeros(1))],
+        defaults=_optim_defaults(),
+        chunk_manager=_Manager(),
+        max_grad_norm=5.0,
+        persistent_world_size=2,
+    )
+
+    optim.step()
+
+    assert reduced_values == [0.0]
+
+
+def test_optimizer_clips_partitioned_gpu_targets_with_global_norm(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    gpu_param = torch.nn.Parameter(torch.zeros(2))
+    gpu_param.grad = torch.tensor([3.0, 4.0])
+    reduced_values: list[float] = []
+
+    class _Gpu:
+        underlying = SimpleNamespace(param_groups=[{"params": [gpu_param]}])
+
+        def step(self) -> None:
+            return None
+
+    class _Manager:
+        rank = 0
+        world_size = 2
+
+        def wait_cpu_optim_all(self) -> None:
+            return None
+
+        def reset_optimizer_step_tracking(self) -> None:
+            return None
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+
+    def _fake_all_reduce(tensor, op=None):  # noqa: ANN001, ARG001
+        reduced_values.append(float(tensor.item()))
+        tensor.fill_(100.0)
+
+    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce)
+
+    optim = _ProTrainOptimizer(
+        gpu_optim=cast(Any, _Gpu()),
+        cpu_optim=None,
+        params=[gpu_param],
+        defaults=_optim_defaults(),
+        chunk_manager=_Manager(),
+        max_grad_norm=5.0,
+        persistent_world_size=2,
+    )
+
+    optim.step()
+
+    assert reduced_values == [pytest.approx(25.0)]
+    assert gpu_param.grad is not None
+    assert torch.allclose(gpu_param.grad, torch.tensor([1.5, 2.0]))
+
+
 def test_optimizer_clips_gpu_and_hidden_cpu_targets_together() -> None:
     cid = ChunkId(0)
     slot = _slot()

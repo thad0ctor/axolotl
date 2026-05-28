@@ -48,13 +48,14 @@ def _make_wrapped_with_effective_offload(non_persistent_ids, n_persist, n_chunk)
 
 
 class _RestoringChunkManager:
-    def __init__(self, *, non_persistent_ids=None):
+    def __init__(self, *, non_persistent_ids=None, restore_value=1234):
         self._non_persistent_ids = non_persistent_ids or {1}
+        self.restore_value = restore_value
         self.calls = 0
 
     def restore_to_gpu(self):
         self.calls += 1
-        return 1234
+        return self.restore_value
 
 
 @pytest.mark.parametrize("adapter", [None, ""])
@@ -269,6 +270,58 @@ def test_train_save_hook_barriers_after_restore():
 
     assert chunk_manager.calls == 1
     assert events == ["barrier"]
+
+
+def test_train_save_hook_barriers_even_when_rank_has_nothing_to_restore():
+    """Rank-local restore counts must not decide collective participation."""
+    events = []
+    chunk_manager = _RestoringChunkManager(restore_value=0)
+    wrapped = SimpleNamespace(chunk_manager=chunk_manager)
+    cfg = SimpleNamespace(adapter=None, _protrain_wrapped=wrapped)
+    accelerator = SimpleNamespace(wait_for_everyone=lambda: events.append("barrier"))
+    trainer = SimpleNamespace(accelerator=accelerator)
+
+    _restore_protrain_fullft_offload_for_save(cfg, trainer)
+
+    assert chunk_manager.calls == 1
+    assert events == ["barrier"]
+
+
+def test_trainer_terminal_save_barriers_even_when_rank_has_nothing_to_restore():
+    events = []
+    chunk_manager = _RestoringChunkManager(restore_value=0)
+    cfg = SimpleNamespace(
+        adapter=None,
+        _protrain_wrapped=SimpleNamespace(chunk_manager=chunk_manager),
+    )
+    trainer = SimpleNamespace(
+        axolotl_cfg=cfg,
+        accelerator=SimpleNamespace(wait_for_everyone=lambda: events.append("barrier")),
+        _is_protrain_terminal_checkpoint=lambda: True,
+    )
+
+    AxolotlTrainer._restore_protrain_fullft_offload_for_terminal_checkpoint(trainer)
+
+    assert chunk_manager.calls == 1
+    assert events == ["barrier"]
+
+
+def test_full_ft_restore_latch_is_scoped_to_wrapped_instance():
+    first = _RestoringChunkManager()
+    second = _RestoringChunkManager()
+    cfg = SimpleNamespace(
+        adapter=None,
+        _protrain_wrapped=SimpleNamespace(chunk_manager=first),
+    )
+
+    assert restore_fullft_offload_for_save(cfg) == 1234
+    assert restore_fullft_offload_for_save(cfg) == 0
+
+    cfg._protrain_wrapped = SimpleNamespace(chunk_manager=second)
+
+    assert restore_fullft_offload_for_save(cfg) == 1234
+    assert first.calls == 1
+    assert second.calls == 1
 
 
 def test_training_stop_marks_protrain_checkpoint_terminal():
