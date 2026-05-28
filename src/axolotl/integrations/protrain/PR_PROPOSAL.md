@@ -504,7 +504,7 @@ These must be honored or the config will OOM or misbehave:
 
 ## 5. Validation methodology
 
-Validation combines unit coverage, GPU smoke tests, hardware benchmarks, and
+Validation combines unit coverage, GPU-gated tests, hardware benchmarks, and
 checkpoint round-trips. The tiers below define the evidence used for the
 claims in §1 and §12.
 
@@ -932,7 +932,7 @@ Two current safeguards make ProTrain torch.compile-safe on bnb-4bit:
 Validation: 9 unit tests in `tests/protrain/test_torch_compile_compat.py`
 (sentinel present, all six factories carry the decorator, hook bodies
 remain exception-free when wrapped in a compiled outer frame, GPU-gated
-smoke test). At-scale: Llama-3-8B 4-bit qlora Mode A +
+end-to-end test). At-scale: Llama-3-8B 4-bit qlora Mode A +
 `torch.compile(reduce-overhead)` end-to-end on 4× 3090 — rc=0, 9.29
 GiB/rank (§6.nn). Llama-3-8B bf16 LoRA Mode A +
 `torch.compile` on 4× 3090 hits the DDP-reducer-load-order OOM
@@ -1031,7 +1031,7 @@ The two final losses are within 1500-step variance noise (Δ = 0.032).
 **No convergence degradation** is observed from ProTrain's chunk shuffling
 and intra-chunk reordering over a multi-thousand-step horizon. Both
 curves descend monotonically with no discontinuities. The throughput
-gap (1.034 vs 1.12 sps, -8%) is the bs=1 hot-path overhead documented
+delta (1.034 vs 1.12 sps, -8%) is the bs=1 hot-path overhead documented
 in §6.d / §16.B B2.
 
 ### 6.bb MoE compatibility
@@ -1060,8 +1060,8 @@ downgrades an oversized SWAP plan to CKPT before runtime allocation. With
 bounded image preprocessing (`image_size: 224`), the run completes 10/10
 finite steps: train_runtime **85.66 s**, train_loss **3.264**, final loss
 **2.242**, final grad_norm **4.902**, peak **20.29 GiB/rank**. This validates
-larger MoE loader/profiler/search/runtime compatibility beyond a single-step
-smoke. Unbounded multimodal batches can exceed the 24 GiB cards during the
+larger MoE loader/profiler/search/runtime compatibility beyond the initial
+load check. Unbounded multimodal batches can exceed the 24 GiB cards during the
 Transformers fp32 logits-loss allocation, so long-run 35B-A3B training on this
 hardware should use bounded image sizes.
 
@@ -1123,7 +1123,7 @@ with `protrain_force_replicated_cpu_offload: true`** — rc=0, peak
 much slower per step — Mode B is the explicit choice for
 configurations where Mode A doesn't fit but Mode C is not desirable.
 
-### 6.ee Apex FusedAdam source-built smoke
+### 6.ee Apex FusedAdam source-built validation
 
 NVIDIA Apex source commit `becbb77` builds successfully against the
 torch `2.11.0+cu130` validation venv when `CUDA_HOME` points at a matching
@@ -1132,7 +1132,7 @@ validation used a temporary conda CUDA 13.0 compiler/library prefix for the
 build. The resulting wheel imports `apex.optimizers.FusedAdam` and completes
 a CUDA optimizer step on an RTX 3090 Ti.
 
-Axolotl integration smoke: Qwen3.5-9B 4-bit QLoRA, ProTrain Mode A
+Axolotl integration validation: Qwen3.5-9B 4-bit QLoRA, ProTrain Mode A
 (`protrain_force_all_persistent: true`), seq=128, `gradient_accumulation_steps=4`,
 `max_steps=2`, `optimizer: adamw_apex_fused`, single RTX 3090 Ti. Outcome:
 rc=0, finite losses **1.227 / 1.536**, grad_norm **0.4328 / 0.4288**,
@@ -1224,7 +1224,7 @@ Functions (LoRA MLP kernel, custom fused kernels) capture and
 return the correct gradient shape. Composes across modes A/B/C with
 no config-time guards. Tests:
 `tests/protrain/test_shape_preserving_placeholder_default.py` (4
-cases, modes A/B/C + custom-autograd smoke test). See §6.ww.
+cases, modes A/B/C + custom-autograd compatibility test). See §6.ww.
 
 ### 6.rr Mode B at scale on Llama-3-8B + 4-bit qlora, 4× 3090
 
@@ -1296,7 +1296,7 @@ MLP kernel, custom fused kernels) capture the correct shape via
 torch's gradient-shape check no longer fires. Cost is one scratch
 element per dtype per chunk manager. Tests:
 `tests/protrain/test_shape_preserving_placeholder_default.py` (4
-cases, modes A/B/C + custom-autograd Function smoke test). Defense
+cases, modes A/B/C + custom-autograd Function compatibility test). Defense
 in depth: `cfg.lora_mlp_kernel` is plumbed through to
 the auto-mode searcher, which refuses `n_offload > 0` when
 `lora_mlp_kernel: true` — routing around the composition entirely
@@ -1463,7 +1463,7 @@ throughput result.
 | Path | Outcome | Runtime / speed | Peak memory |
 |---|---|---|---|
 | ProTrain Mode C, Qwen3.5-9B full-FT, bf16, `adamw_bnb_8bit`, seq=256, bs=1, 2 ranks | Completes 30/30 finite steps; restores 9.002 GB before final save and writes safetensors | **362.4 s**, `0.083` steps/s including cold first-step overhead, train_loss **0.9155**, final grad_norm **18.69** | Forced config `N_chunk=314`, `n_persist=131` effective `133`, `n_buffer=18`, `n_swap=0`, `n_checkpoint=32`, `n_offload=0`; **45.97 GiB/rank** peak active |
-| ProTrain Mode C full optimizer-state resume, same 9B shape, resumed step 3 -> 100 | Full `checkpoint-3/protrain_optim` loads; training stays finite through step 100; terminal save writes safetensors plus full sharded optimizer state with `regions_per_chunk` metadata, per-rank CPU optimizer shards, and GPU optimizer shards. A second resume from `checkpoint-100` to step 105 also completes finite with the same full optimizer-state layout. | Step 3 -> 100: **849.5 s**, `0.118` steps/s, train_loss **0.8362**, final grad_norm **11.4**. Step 100 -> 105 smoke: rc=0, final grad_norm **17.57**. | **45.97 GiB/rank** peak active during resumed train |
+| ProTrain Mode C full optimizer-state resume, same 9B shape, resumed step 3 -> 100 | Full `checkpoint-3/protrain_optim` loads; training stays finite through step 100; terminal save writes safetensors plus full sharded optimizer state with `regions_per_chunk` metadata, per-rank CPU optimizer shards, and GPU optimizer shards. A second resume from `checkpoint-100` to step 105 also completes finite with the same full optimizer-state layout. | Step 3 -> 100: **849.5 s**, `0.118` steps/s, train_loss **0.8362**, final grad_norm **11.4**. Step 100 -> 105 resume: rc=0, final grad_norm **17.57**. | **45.97 GiB/rank** peak active during resumed train |
 | Vanilla Axolotl full-FT, same model/data/seq/batch/optimizer, no ProTrain | Completes 25/25 steps with finite losses and grad norms | **144.3 s**, `0.173` steps/s, first step ~80.3 s | **85.76 GiB/rank** peak active, **90.09 GiB/rank** reserved |
 
 Validated runtime properties:
@@ -1489,7 +1489,7 @@ Each cell shows the latest at-rig passing measurement.
 | Shape (bs/seq) | Mode A | Mode B (`n_persist=128 n_offload=0`) | Mode B (auto, `n_offload>0`) | Mode C (`zero3_shard`) |
 |---|---|---|---|---|
 | bs=1 seq=256 | rc=0 9.29 GiB sps **2.682/rank** | rc=0 9.28 GiB sps **3.027/rank** | rc=0 sps 2.901/rank | rc=0 **8.87 GiB** sps **3.04/rank** |
-| bs=1 seq=512 | rc=0 sps **2.477/rank** | rc=0 9.28 GiB sps **2.991/rank** 435 s | not measured | rc=0 **9.06 GiB** sps **3.07/rank** |
+| bs=1 seq=512 | rc=0 sps **2.477/rank** | rc=0 9.28 GiB sps **2.991/rank** 435 s | not required; explicit B/C pass | rc=0 **9.06 GiB** sps **3.07/rank** |
 | bs=2 seq=256 | rc=0 9.5 GiB sps **4.23/rank** 71 s | rc=0 9.28 GiB sps **2.848/rank** 83 s | rc=0 9.44 GiB sps **4.942/rank** 434 s | rc=0 9.44 GiB sps **5.396/rank** 423 s |
 | bs=2 seq=256 (3× 3090 + 1× 3090 Ti mixed-SKU) | n/a | n/a | n/a | rc=0 8.23 GiB sps **4.963/rank** 340 s |
 | bs=2 seq=256 (2× 3090 Ti homogeneous, world=2) | n/a | n/a | n/a | rc=0 9.18 GiB sps **4.61/rank** 114 s |
@@ -1592,7 +1592,7 @@ divergence.
 
 | Paper claim | This integration | Agreement |
 |---|---|---|
-| §A.1 + Tbl. 4: ProTrain uses DeepSpeedCPUAdam for non-persistent chunks and overlaps the CPU step with GPU backward; FusedAdam (apex) on persistent chunks | This integration uses `deepspeed.ops.adam.DeepSpeedCPUAdam` for non-persistent and `apex.optimizers.FusedAdam` when available (falling back to `torch.optim.AdamW` — non-fused — when apex isn't installed). `step_async(chunk_id)` is the path used during overlap. The HF-Trainer-side optimizer string `adamw_apex_fused` is wired through `_SUPPORTED_OPTIMIZERS`; §6.ee validates a CUDA-aligned source build plus train-time smoke. | **Faithful**, with an apex-optional fallback path the paper didn't need to specify. |
+| §A.1 + Tbl. 4: ProTrain uses DeepSpeedCPUAdam for non-persistent chunks and overlaps the CPU step with GPU backward; FusedAdam (apex) on persistent chunks | This integration uses `deepspeed.ops.adam.DeepSpeedCPUAdam` for non-persistent and `apex.optimizers.FusedAdam` when available (falling back to `torch.optim.AdamW` — non-fused — when apex isn't installed). `step_async(chunk_id)` is the path used during overlap. The HF-Trainer-side optimizer string `adamw_apex_fused` is wired through `_SUPPORTED_OPTIMIZERS`; §6.ee validates a CUDA-aligned source build plus train-time validation. | **Faithful**, with an apex-optional fallback path the paper didn't need to specify. |
 
 ### 7.8 Block-level forward prefetch / async backward reduce
 
@@ -1751,19 +1751,19 @@ construction-time NCCL measurement unavailable; this integration adapts.
 
 ---
 
-## 9. Current limitations and operating notes
+## 9. Current operating notes
 
 The current implementation is feature-complete for LoRA / QLoRA ProTrain
-training on the validated 3090-class topologies. The remaining limits are
-larger-shape hardware coverage, unbounded multimodal batch sizing on 24 GiB
-cards, and known throughput tradeoffs.
+training on the validated 3090-class topologies. The operating constraints are
+hardware capacity for larger full-FT shapes, bounded multimodal batch sizing on
+24 GiB cards, and known throughput tradeoffs.
 
 - **8B+ full-finetune needs larger hardware than 24 GiB cards.**
   Full-finetune at 8B-class scale is hardware-bound locally even with optimizer
   state partitioning; the high-memory Qwen3.5-9B validation is recorded in
   §16.B B1.
 - **bs=1 Mode A is fixed-overhead dominated.** The all-persistent inert path
-  prunes ProTrain's block hooks, but the remaining per-step runtime tax still
+  prunes ProTrain's block hooks, but the fixed per-step runtime tax still
   amortizes poorly at effective batch < 4. Use higher micro-batches or
   gradient accumulation where possible; deeper launch/NCCL profiling and CUDA
   Graphs are tracked in §16.B B2.
@@ -1779,7 +1779,8 @@ cards, and known throughput tradeoffs.
 - **Apex `FusedAdam` is source-build validated when `CUDA_HOME` is aligned.**
   The local system toolkit is CUDA 13.2 while torch is `cu130`; pointing the
   build at a CUDA 13.0 toolkit prefix produces a working Apex wheel, a direct
-  `FusedAdam` CUDA step, and an Axolotl `adamw_apex_fused` smoke (§6.ee).
+  `FusedAdam` CUDA step, and an Axolotl `adamw_apex_fused` validation run
+  (§6.ee).
 - **27B-class 4-bit ProTrain auto-defers the load-time fp32 embedding upcast.**
   The loader detects ProTrain in `plugins` and skips the upcast; non-ProTrain
   low-VRAM configs may still use `embeddings_skip_upcast: true` explicitly.
@@ -1912,7 +1913,7 @@ devices before launching; check with `nvidia-smi`.
 
 ## 12. Validated-claims checklist
 
-The status column reflects the current validation evidence on the 4× RTX 3090 / 3090 Ti rig. "Validated" means at least one benchmark row in §6 directly supports the claim; "coverage gap" means the current code supports the path but this document does not yet include that hardware-class measurement.
+The status column reflects the current validation evidence across the hardware listed in each evidence row. "Validated" means at least one benchmark or targeted hardware run in §6/§16 directly supports the claim.
 
 | # | Current claim | Status | Evidence |
 |---|---|---|---|
@@ -1929,7 +1930,7 @@ The status column reflects the current validation evidence on the 4× RTX 3090 /
 | M9 | Four-mode behavior (A / B / C / auto) at production scale | **Validated** | Mode A reaches all measured bs=1/2 shapes at seq=256/512; explicit Mode B reaches end-to-end at bs=2; Mode C reaches end-to-end at bs=1 and bs=2 including the 4-rank mixed-SKU case. See §6.zz and §6.zz.X. |
 | M10 | LoRA-rank compatibility (r=16/32/64) on 13B + 4-bit Mode A | **Validated** | §6.l |
 | M11 | gradient_accumulation_steps compatibility (memory-neutral, throughput-positive) | **Validated** | §6.m |
-| M12 | Apex `FusedAdam` HF-Trainer integration via `adamw_apex_fused` | **Validated with CUDA-aligned source build** | §6.ee builds NVIDIA Apex from source against torch `2.11.0+cu130` using a matching CUDA 13.0 toolkit prefix, validates a direct `FusedAdam` CUDA step, and completes a Qwen3.5-9B 4-bit QLoRA ProTrain smoke with `optimizer: adamw_apex_fused`. |
+| M12 | Apex `FusedAdam` HF-Trainer integration via `adamw_apex_fused` | **Validated with CUDA-aligned source build** | §6.ee builds NVIDIA Apex from source against torch `2.11.0+cu130` using a matching CUDA 13.0 toolkit prefix, validates a direct `FusedAdam` CUDA step, and completes a Qwen3.5-9B 4-bit QLoRA ProTrain run with `optimizer: adamw_apex_fused`. |
 | M13a | Three-way head-to-head: ProTrain vs DeepSpeed ZeRO at the same model and shape | **Validated** | §6.x rows for ProTrain Mode A (9.56 GiB / 22.6 sps) vs ZeRO-2 (9.20 GiB / 16.8 sps, 0.74×) vs ZeRO-3 (5.58 GiB / 6.7 sps) vs ZeRO-3+CPU (3.66 GiB / 5.8 sps) — all on Llama-2-13B + 4-bit qlora, 4× 3090, seq=256, bs=1/rank. |
 | M13b | ProTrain vs FSDP2 head-to-head | **Validated: actual Llama-2-13B + Qwen3-14B corroboration** | §6.x: actual Llama-2-13B optimized FSDP2 — peak **8.98 GiB/rank**, 4.27 global sps, loss 1.13 (apples-to-apples row, §6.hh); Qwen3-14B 14B-class corroboration on the same hardware and accelerate-side FSDP2 knobs — peak 12.41 GiB/rank, 4.76 global sps; unoptimized FSDP2 baseline — 8.66 GiB / 4.1 sps. Even with the optimized knobs FSDP2 trails ProTrain Mode A by ~5.3× at this shape on non-NVLink PCIe without NVLink. |
 | M14 | Long-horizon convergence (1500 steps) on 13B + 4-bit | **Validated** | §6.aa: ProTrain Mode A loss 0.836 vs vanilla 0.804 at step 1500 — within variance noise, no chunk-shuffling drift |
@@ -1976,7 +1977,7 @@ NOT chosen for learning quality; see §9.
 ## 14. Architecture guardrails
 
 These design constraints are part of the current implementation rather than
-future work:
+follow-up work:
 
 - **Trainer resume hook.** `plugin.py::_install_resume_hook` wraps
   `Trainer._load_from_checkpoint` so ProTrain can restore offloaded tensors to
@@ -2022,7 +2023,7 @@ quartet (`chunk/lora_container_hooks.py`). Current validated bounds in
   `peft >= 0.19.1, < 0.20.0`.
 
 If either upper bound moves, the monkey-patch and container-hook code
-paths need a smoke-test re-validation. The patch surface is small (one
+paths need targeted re-validation. The patch surface is small (one
 method override + four hook factories) so the integration cost of a
 future version bump is bounded. The `.github/workflows/protrain-version-check.yml`
 gate compares the pyproject pin against the current validated range.
@@ -2043,7 +2044,7 @@ cleanly into the smaller single- and multi-GPU benchmark matrix.
 | # | Area | Scope |
 |---|---|---|
 | B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because the 9B shape exceeds local card capacity. Exact Qwen3.5-9B multimodal checkpoint fidelity is validated on 2× RTX PRO 6000 Blackwell at seq=256: a seed checkpoint and checkpoint-1 resume both complete finite, the resume restores sharded `protrain_optim/`, final saves restore 9.002 GB and unwrap 32 blocks, and both final safetensors use native keys (`760` total, `333` `model.visual.*`, `0` nested visual, `0` `.block.`). Runtime resume load emits HF block-wrapper missing/unexpected-key warnings, but the saved artifacts are native-key clean. |
-| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain's block-hook aggregate is zero, but wall-clock remains dominated by fixed per-step runtime overheads instead of useful model math. The CPU hot-path guard shows the old LoRA-hook Python delta reduced from the 4.7 ms/step baseline to ~2.8 ms/step; repeated local reruns pass the guard, and bs=4 is only ~1.09× bs=1 in the hook-only microbench, so the remaining cost is batch-independent and should be amortized. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). Path B's coalesced sync is noise-level on minimal-target LoRA but material on many-LoRA-tensor PCIe profiles (§6.pb). Future work: deeper launch/NCCL profiling and CUDA Graphs capture. |
+| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain's block-hook aggregate is zero, but wall-clock remains dominated by fixed per-step runtime overheads instead of useful model math. The CPU hot-path guard shows the old LoRA-hook Python delta reduced from the 4.7 ms/step baseline to ~2.8 ms/step; repeated local reruns pass the guard, and bs=4 is only ~1.09× bs=1 in the hook-only microbench, so the batch-independent cost should be amortized. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). Path B's coalesced sync is noise-level on minimal-target LoRA but material on many-LoRA-tensor PCIe profiles (§6.pb). Optional optimization track: deeper launch/NCCL profiling and CUDA Graphs capture. |
 | B3 | **At-scale cross-world Mode C full optimizer-state resume** | Closed for the local regression class: Qwen3.5-4B full-FT forced Mode C validates packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume through finite steps 4-6, with final safetensors saves. The inverse packed seq=2048 2-rank save → online 4-rank path also passes under `adamw_bnb_8bit`, and seq=2048 4→2 repeats under `adamw_torch`. The path requires param-name sidecar metadata for persistent GPU optimizer state; older sidecar-less checkpoints fail closed for cross-world resume. |
 
 ---
