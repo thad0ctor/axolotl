@@ -1,4 +1,4 @@
-"""CPU microbench for the ProTrain bs=1 hot path (§16 PR #4).
+"""Manual CPU microbench for the ProTrain bs=1 hot path (§16 PR #4).
 
 Profiles the Python-side per-step overhead introduced by ProTrain hooks
 on a tiny synthetic transformer wired up the way a real Meta-Llama-3-8B
@@ -7,15 +7,10 @@ on a tiny synthetic transformer wired up the way a real Meta-Llama-3-8B
 ``lora_A`` / ``lora_B`` sub-modules per block (so
 ``_find_peft_lora_containers`` discovers them).
 
-The bs=1 cliff documented in proposal §6.a / §6.d is a Python-side
-per-step overhead that doesn't amortize at small batch sizes. This
-harness measures that overhead in isolation (no CUDA, no real model
-compute) so a regression-guard can run on CPU CI.
-
-Baseline (pre-PR #4, measured on this rig, see body for the captured
-value) and post-fix figures live in the source; the assertion is a
-loose ``post_fix_per_step_us <= baseline_us * 0.7`` so we catch the
-optimisation regressing in either direction.
+The bs=1 cliff documented in proposal §6.a / §6.d is Python-side
+per-step overhead that doesn't amortize at small batch sizes. The
+default-suite test checks hook attribution, while the wall-clock
+thresholds below run only when ``PROTRAIN_RUN_BS1_MICROBENCH=1`` is set.
 """
 
 from __future__ import annotations
@@ -203,6 +198,15 @@ def _time_steps(model, bs: int, dim: int, n_iters: int = 100) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _run_bs1_microbench() -> bool:
+    return os.environ.get("PROTRAIN_RUN_BS1_MICROBENCH", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def test_hooks_fire_on_synthetic_model():
     """Sanity check: every hook actually fires on the synthetic model."""
     model, sched, _cm, handles = _build_model_with_hooks(n_blocks=4, dim=64)
@@ -235,13 +239,10 @@ def test_hooks_fire_on_synthetic_model():
 
 
 @pytest.mark.skipif(
-    os.environ.get("CI", "").lower() in ("true", "1", "yes"),
+    not _run_bs1_microbench(),
     reason=(
-        "Wall-clock microbench: GitHub Actions shared runners exhibit 5-10x "
-        "variance on Python-side timings (observed ~30 ms/step vs the "
-        "4.7 ms/step CPU baseline captured on dedicated dev HW). The "
-        "regression-guard is meaningful only on consistent hardware; run "
-        "locally to enforce the budget."
+        "Manual wall-clock microbench; set PROTRAIN_RUN_BS1_MICROBENCH=1 "
+        "on dedicated hardware to enforce the bs=1 hot-path budget."
     ),
 )
 def test_bs1_per_step_overhead_within_budget():
@@ -320,11 +321,10 @@ def test_bs1_per_step_overhead_within_budget():
 
 
 @pytest.mark.skipif(
-    os.environ.get("CI", "").lower() in ("true", "1", "yes"),
+    not _run_bs1_microbench(),
     reason=(
-        "Wall-clock microbench: same shared-runner variance caveat as "
-        "test_bs1_per_step_overhead_within_budget — the 2× bs=1→bs=4 "
-        "regression-guard is meaningful only on consistent hardware."
+        "Manual wall-clock microbench; set PROTRAIN_RUN_BS1_MICROBENCH=1 "
+        "on dedicated hardware to enforce the bs=1 to bs=4 budget."
     ),
 )
 def test_bs4_no_regression_relative_to_bs1():
