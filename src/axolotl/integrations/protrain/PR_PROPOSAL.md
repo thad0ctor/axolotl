@@ -464,16 +464,23 @@ memory backends are mutually exclusive.
 | `protrain_auto_mode` | `true` | Run the mode selector. Set `false` to honor manual mode flags below. |
 | `protrain_force_all_persistent` | `false` | Force Mode A (every chunk GPU-resident). Skips the search entirely. Requires `protrain_auto_mode: false`. |
 | `protrain_zero3_shard` | auto | Force Mode C (ZeRO-3 sharded CPU offload). Requires `protrain_auto_mode: false`. |
-| `protrain_save_optimizer_state` | `true` | Emit `protrain_optim/{gpu_optim.pt, metadata.json}` next to every HF checkpoint, for cross-mode and same-mode resume. |
+| `protrain_save_optimizer_state` | `false` | Emit `protrain_optim/{gpu_optim.pt, metadata.json}` next to every HF checkpoint, for cross-mode and same-mode resume. |
+| `protrain_optim_save_max_bytes` | `2 GiB` | Soft size gate for optimizer-state checkpoint writes. Raise explicitly for full-FT checkpoints. |
 | `protrain_cache_dir` | `~/.cache/axolotl/protrain` | On-disk cache for profiler traces (keyed by `(arch_hash, bs, seq, sku, world)`). |
+| `protrain_capacity_bytes` | auto | Optional GPU budget override in bytes; default is detected VRAM minus headroom. |
+| `protrain_cpu_capacity_bytes` | auto | Optional per-rank pinned CPU RAM budget override in bytes. |
 | `protrain_n_persist_override` | None | Manual `n_persist` for searcher validation. |
 | `protrain_n_buffer_override` | None | Manual `n_buffer`. |
 | `protrain_n_swap_override` | None | Manual `n_swap`. |
 | `protrain_n_checkpoint_override` | None | Manual `n_checkpoint`. |
 | `protrain_n_offload_override` | None | Manual `n_offload` (the Option B axis added by this integration). |
 | `protrain_force_replicated_cpu_offload` | `false` | Force Mode B (replicated CPU offload, no sharding). Requires `protrain_auto_mode: false`. Sibling to `protrain_force_all_persistent` (Mode A) and `protrain_zero3_shard` (Mode C). |
-| `protrain_own_lora_grad_sync` | `true` | Path B: ProTrain owns trainable LoRA-adapter grad sync via flattened all_reduce per dtype; DDP is told to ignore the same params. Opt out to revert to DDP's bucketed allreduce. See §6.pb. |
+| `protrain_own_lora_grad_sync` | topology-aware | Path B: ProTrain owns trainable LoRA-adapter grad sync via flattened all_reduce per dtype; DDP is told to ignore the same params. Explicit `true` / `false` overrides the auto decision. See §6.pb. |
 | `protrain_eager_nccl_warmup` | `false` | Opt-in one-shot no-op of each per-chunk NCCL collective at `post_trainer_create` to amortize the first-iter NCCL init cost. Measured ~0.22-0.24 s warm-up wallclock. |
+| `protrain_prefer_no_offload_on_non_nvlink` | `true` | Non-NVLink multi-rank tie-break that prefers `n_offload=0` within the prediction noise band. |
+| `protrain_allow_online_reshard` | `false` | Opt-in Mode C optimizer-state load from a different current world size. |
+| `protrain_phase2_quickstart` | `false` | Opt-in skip of the Phase-2 re-pick when Phase-1 measured time is already within the configured envelope. |
+| `protrain_phase2_quickstart_envelope` | `0.30` | Relative-error envelope used by `protrain_phase2_quickstart`. |
 | `protrain_persistent_huge_param_threshold_bytes` | `512 MiB` | Params at or above this size (typically `lm_head` / `embed_tokens` at scale) are pinned persistent regardless of `n_persist`, since paging them dominates per-step cost. |
 | `protrain_ckpt_internal_residual_factor` | `1.0` | Scale applied to the per-block CKPT internal saved-tensor proxy (FFN-intermediate + attention scores + Q/K/V) in `estimate_peak`. Set `0.0` to disable the residual; lower values are more aggressive. Tune only when the calibrated peak diverges from measured at the runtime budget gate. |
 | `embeddings_skip_upcast` | `false` (Axolotl-side) | Skips the load-time fp32 embedding upcast in `loaders/model.py::_convert_embedding_modules_dtype`. **Auto-enabled when ProTrain is in `plugins`** — the loader gates on `is_protrain_active(cfg)`, so 27B + 4-bit + ProTrain on a 24 GiB 3090 works without the YAML knob. The flag remains available for non-ProTrain low-VRAM users. |
@@ -499,6 +506,233 @@ These must be honored or the config will OOM or misbehave:
   transient that would otherwise push peak load-time memory above 24 GiB
   no longer fires. Non-ProTrain users on low-VRAM cards may still set
   `embeddings_skip_upcast: true` explicitly.
+
+### 4.4 Config usage examples
+
+ProTrain is ordinary Axolotl YAML plus two required entries:
+
+```yaml
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+protrain_auto_memory: true
+```
+
+The rest of the Axolotl config stays recognizable: model, dataset, adapter,
+optimizer, batch, sequence length, and save policy are still configured through
+the normal keys. ProTrain must be the only memory backend in the file: leave
+`deepspeed`, `fsdp`, `fsdp_config`, tensor/context/sequence parallel settings,
+and Axolotl-level `gradient_checkpointing: true` out of ProTrain configs.
+
+**Recommended QLoRA auto-mode config.** This is the default user path for
+single-GPU and multi-GPU LoRA/QLoRA. The selector chooses Mode A/B/C from the
+measured model shape and hardware envelope.
+
+```yaml
+base_model: Qwen/Qwen3.5-9B
+chat_template: qwen3_5
+strict: false
+
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+protrain_auto_memory: true
+protrain_auto_mode: true
+
+datasets:
+  - path: mlabonne/FineTome-100k
+    type: chat_template
+    split: train[:5%]
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+dataset_prepared_path: last_run_prepared
+val_set_size: 0.0
+output_dir: ./outputs/qwen35-9b-protrain-qlora
+
+sequence_len: 1024
+sample_packing: true
+pad_to_sequence_len: true
+
+load_in_4bit: true
+adapter: qlora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+micro_batch_size: 1
+gradient_accumulation_steps: 4
+num_epochs: 1
+optimizer: adamw_bnb_8bit
+max_grad_norm: 1.0
+learning_rate: 2.0e-4
+lr_scheduler: cosine
+warmup_ratio: 0.03
+
+bf16: auto
+tf32: true
+attn_implementation: flash_attention_2
+gradient_checkpointing: false
+
+logging_steps: 1
+save_strategy: steps
+save_steps: 100
+```
+
+**Force Mode A when the model already fits.** This keeps every chunk
+GPU-resident and avoids the searcher. It is the production path for shapes
+where ProTrain's wrapping and LoRA grad-sync features help but CPU offload is
+not needed.
+
+```yaml
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+protrain_auto_memory: true
+protrain_auto_mode: false
+protrain_force_all_persistent: true
+
+load_in_4bit: true
+adapter: qlora
+optimizer: adamw_bnb_8bit
+max_grad_norm: 1.0
+micro_batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: false
+```
+
+**Force Mode B on consumer non-NVLink multi-GPU rigs.** Mode B keeps
+non-persistent chunks in CPU memory replicated on every rank. The validated
+consumer recommendation is `n_persist=128, n_offload=0` when the auto-selector
+would otherwise pick a slower or less stable sharded/offload layout for the
+same shape.
+
+```yaml
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+protrain_auto_memory: true
+protrain_auto_mode: false
+protrain_force_replicated_cpu_offload: true
+protrain_n_persist_override: 128
+protrain_n_offload_override: 0
+
+load_in_4bit: true
+adapter: qlora
+optimizer: adamw_bnb_8bit
+max_grad_norm: 1.0
+micro_batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: false
+```
+
+**Force Mode C for full fine-tuning.** Mode C is the ZeRO-3-style ProTrain
+path: non-persistent chunks and optimizer state are sharded across ranks, and
+ProTrain owns the per-chunk reduce-scatter/all-gather path. Use this for
+full-FT shapes that do not fit as replicated state. Full optimizer-state saves
+must opt in to a realistic size cap.
+
+```yaml
+base_model: Qwen/Qwen3.5-4B
+chat_template: qwen3_5
+strict: false
+
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+protrain_auto_memory: true
+protrain_auto_mode: false
+protrain_zero3_shard: true
+protrain_save_optimizer_state: true
+protrain_optim_save_max_bytes: 120000000000
+protrain_allow_online_reshard: true
+
+datasets:
+  - path: mlabonne/FineTome-100k
+    type: chat_template
+    split: train[:2%]
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+output_dir: ./outputs/qwen35-4b-protrain-fft-modec
+dataset_prepared_path: last_run_prepared
+val_set_size: 0.0
+
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+max_steps: 100
+optimizer: adamw_torch
+learning_rate: 5.0e-6
+lr_scheduler: cosine
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+
+bf16: true
+tf32: true
+gradient_checkpointing: false
+
+save_strategy: steps
+save_steps: 25
+```
+
+**Resume from a ProTrain optimizer checkpoint.** Same-world resume works with
+the same YAML plus `resume_from_checkpoint`. Cross-world Mode C resume is
+enabled only when `protrain_allow_online_reshard: true` is set; otherwise the
+loader fails closed and points at the offline reshard path.
+
+```yaml
+resume_from_checkpoint: ./outputs/qwen35-4b-protrain-fft-modec/checkpoint-25
+protrain_save_optimizer_state: true
+protrain_allow_online_reshard: true
+```
+
+**Accelerate launch files.** Use an explicit accelerate config for every run;
+do not rely on the user-level default config on machines with many GPUs.
+Single-GPU:
+
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: "NO"
+num_processes: 1
+mixed_precision: bf16
+use_cpu: false
+```
+
+Multi-GPU:
+
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_processes: 4
+gpu_ids: "0,1,2,3"
+mixed_precision: bf16
+use_cpu: false
+```
+
+Launch command:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+accelerate launch --config_file accelerate-4gpu.yaml -m axolotl.cli.train protrain.yaml
+```
+
+**Operational defaults.** Leave `protrain_auto_mode: true` unless reproducing
+a benchmark or deliberately selecting Mode A/B/C. Keep
+`gradient_accumulation_steps >= 4` when `micro_batch_size: 1` unless the goal is
+correctness-only validation. Use `adamw_torch`, `adamw_torch_fused`,
+`adamw_apex_fused`, `adamw_8bit`, `adamw_bnb_8bit`, or `paged_adamw_8bit`; the
+validator rejects non-AdamW optimizer families until they have chunk-manager
+adapters.
 
 ---
 
