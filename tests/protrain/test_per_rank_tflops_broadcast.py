@@ -18,7 +18,13 @@ from unittest.mock import patch
 
 import pytest
 
-from axolotl.integrations.protrain.types import HardwareProfile
+from axolotl.integrations.protrain.types import (
+    BlockId,
+    BlockMode,
+    CostConfig,
+    HardwareProfile,
+    SearchResult,
+)
 
 _DEFAULT_MEM = 24 * (1 << 30)
 
@@ -227,6 +233,58 @@ def test_broadcast_swallows_broadcast_failure(caplog):
     assert hw_out.gpu_compute_tflops == pytest.approx(40.0)
     assert any(
         "searcher-critical HW broadcast failed" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def _result(n_persist: int) -> SearchResult:
+    return SearchResult(
+        cfg=CostConfig(
+            n_persist=n_persist,
+            n_buffer=1,
+            n_swap=0,
+            n_checkpoint=1,
+            n_offload=0,
+        ),
+        block_map={BlockId(0): BlockMode.CKPT},
+        predicted_peak_bytes=123,
+        predicted_iter_s=1.0,
+    )
+
+
+def test_runtime_search_result_broadcast_overrides_nonzero_rank(caplog):
+    """The final runtime plan follows rank 0 when local searches diverge."""
+    pytest.importorskip("torch")
+    from axolotl.integrations.protrain.api import model_wrapper as mw
+
+    rank0_result = _result(130)
+    local_result = _result(99)
+
+    import torch.distributed as dist
+
+    def _fake_broadcast(object_list, src=0):  # noqa: ARG001
+        object_list[0] = rank0_result
+
+    patches = [
+        patch.object(dist, "is_available", return_value=True),
+        patch.object(dist, "is_initialized", return_value=True),
+        patch.object(dist, "get_world_size", return_value=5),
+        patch.object(dist, "get_rank", return_value=3),
+        patch.object(dist, "broadcast_object_list", side_effect=_fake_broadcast),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        with caplog.at_level("WARNING"):
+            out = mw._broadcast_runtime_search_result(local_result)
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert out is rank0_result
+    assert out.cfg.n_persist == 130
+    assert any(
+        "overriding local search result cfg=" in rec.getMessage()
         for rec in caplog.records
     )
 

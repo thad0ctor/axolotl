@@ -860,6 +860,8 @@ def protrain_optimizer_wrapper(
         if param_id in seen_persistent_ids:
             continue
         seen_persistent_ids.add(param_id)
+        if not param.requires_grad:
+            continue
         persistent_params_full_all.append(param)
 
     # Within-param shard fallback for huge persistent params (v51).
@@ -958,10 +960,14 @@ def protrain_optimizer_wrapper(
         shard_state = chunk_manager._chunk_shards.get(cid)
         if shard_state is not None and shard_state.regions:
             cpu_params_per_chunk_for_optim[cid] = [
-                r.shard_param for r in shard_state.regions
+                r.shard_param
+                for r in shard_state.regions
+                if getattr(r, "is_trainable", True)
             ]
         else:
-            cpu_params_per_chunk_for_optim[cid] = chunk_params
+            cpu_params_per_chunk_for_optim[cid] = [
+                p for p in chunk_params if p.requires_grad
+            ]
 
     if use_bnb_8bit and any(
         params for params in cpu_params_per_chunk_for_optim.values()

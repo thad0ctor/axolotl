@@ -150,6 +150,50 @@ def _minimal_trace(cpu_adam_bytes_per_sec: float = 1.0e9) -> ProfilerTrace:
     )
 
 
+def test_forward_only_trace_runs_under_no_grad(monkeypatch):
+    """Forward-only traces must not retain an autograd saved-tensor graph."""
+    import torch
+    from torch import nn
+
+    from axolotl.integrations.protrain.profiler import trace as trace_mod
+
+    monkeypatch.setattr(trace_mod, "measure_cpu_adam", lambda: 0.0)
+    monkeypatch.setattr(trace_mod, "measure_gpu_adam", lambda _dev: 0.0)
+    monkeypatch.setattr(trace_mod, "measure_compute_rate", lambda _dev: 0.0)
+    monkeypatch.setattr(trace_mod, "measure_pcie", lambda _dev: (0.0, 0.0))
+    monkeypatch.setattr(trace_mod, "measure_nccl", lambda world_size=None: ({}, {}))
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(4, 4)])
+            self.grad_enabled: list[bool] = []
+
+        def forward(self, input_ids=None, **kwargs):
+            del kwargs
+            self.grad_enabled.append(torch.is_grad_enabled())
+            x = input_ids.to(torch.float32)
+            for layer in self.layers:
+                x = layer(x)
+            return {"loss": x.sum()}
+
+    model = TinyModel()
+    batch = {"input_ids": torch.ones(2, 4)}
+    cfg = ProfilerConfig(
+        batch_size=2,
+        seq_len=4,
+        device="cpu",
+        include_backward=False,
+        on_demand=False,
+    )
+
+    trace = trace_mod.run_trace(model, batch, cfg)
+
+    assert model.grad_enabled == [False]
+    assert trace.op_order
+    assert all(op.is_forward for op in trace.op_order)
+
+
 def test_cache_roundtrip(tmp_path, monkeypatch):
     """save -> load must return an equal ProfilerTrace."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))

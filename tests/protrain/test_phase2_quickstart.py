@@ -19,17 +19,24 @@ from torch import nn
 
 from axolotl.integrations.protrain.api.model_wrapper import (
     _abort_phase2_bootstrap_runtime_without_restore,
+    _downgrade_oversized_swap_to_checkpoint,
     _phase1_measured_iter_proxy_s,
     _phase2_quickstart_post_measurement_should_skip,
     _phase2_quickstart_should_skip,
     _phase2_quickstart_should_skip_unmeasured_upfront,
     _phase2_should_skip_resident_base_adapter,
+    _profiler_trace_controls_for_model,
     _teardown_phase2_bootstrap_runtime,
 )
 from axolotl.integrations.protrain.args import ProTrainArgs
 from axolotl.integrations.protrain.block.layout_rules import assign_modes
 from axolotl.integrations.protrain.search import search
-from axolotl.integrations.protrain.types import CostConfig, SearchResult, WrappedModel
+from axolotl.integrations.protrain.types import (
+    BlockMode,
+    CostConfig,
+    SearchResult,
+    WrappedModel,
+)
 
 # Reuse the synthetic builders + fixtures from test_cost_search; pytest
 # only auto-injects fixtures defined in conftest.py or the importing
@@ -306,6 +313,69 @@ def test_phase2_skips_resident_base_adapter_training():
     )
 
 
+def test_resident_base_adapter_uses_forward_only_profiler_trace():
+    """Frozen-base adapter traces avoid backward saved-tensor CPU spill."""
+
+    class _AdapterModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.frozen_base = nn.Parameter(
+                torch.empty(1000, device="meta", dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.adapter = nn.Parameter(
+                torch.empty(1, device="meta", dtype=torch.float16),
+                requires_grad=True,
+            )
+
+    assert _profiler_trace_controls_for_model(
+        _AdapterModel(),
+        adapter="qlora",
+        load_in_4bit=True,
+        load_in_8bit=False,
+    ) == (False, False)
+
+
+def test_oversized_swap_pool_downgrades_to_checkpoint():
+    """Runtime must not allocate a SWAP pool larger than the CPU budget."""
+
+    class _Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(1024 * 1024, device="meta", dtype=torch.float16)
+            )
+
+    result = SearchResult(
+        cfg=CostConfig(
+            n_persist=0,
+            n_buffer=1,
+            n_swap=1,
+            n_checkpoint=0,
+            n_offload=0,
+        ),
+        block_map=assign_modes(n_swap=1, n_checkpoint=0, N_block=2),
+        predicted_peak_bytes=0,
+        predicted_iter_s=1.0,
+    )
+
+    adjusted = _downgrade_oversized_swap_to_checkpoint(
+        blocks=[_Block(), _Block()],
+        result=result,
+        trace=_make_trace(
+            n_block=2,
+            activation_bytes_per_block=1 << 20,
+            intra_delta_bytes=1 << 20,
+        ),
+        cpu_capacity_bytes=8 << 20,
+    )
+
+    assert adjusted.cfg.n_swap == 0
+    assert adjusted.cfg.n_checkpoint == 1
+    assert list(adjusted.block_map.values()).count(BlockMode.CKPT) == 1
+    assert BlockMode.SWAP not in adjusted.block_map.values()
+
+
 def test_phase2_does_not_skip_full_finetune_training():
     """Full-FT still gets the standard Phase-2 calibration path."""
 
@@ -323,6 +393,12 @@ def test_phase2_does_not_skip_full_finetune_training():
         load_in_4bit=False,
         load_in_8bit=False,
     )
+    assert _profiler_trace_controls_for_model(
+        _FullFtModel(),
+        adapter=None,
+        load_in_4bit=False,
+        load_in_8bit=False,
+    ) == (True, True)
 
 
 def test_phase2_abort_closes_without_restore_to_gpu():

@@ -812,6 +812,52 @@ def _broadcast_searcher_capacity(
         return capacity_bytes, cpu_capacity_bytes
 
 
+def _broadcast_runtime_search_result(result: SearchResult) -> SearchResult:
+    """Broadcast rank-0's final runtime plan to all ranks."""
+    try:
+        import torch.distributed as _dist
+    except ImportError:
+        return result
+    try:
+        if not _dist.is_initialized() or _dist.get_world_size() <= 1:
+            return result
+        rank = int(_dist.get_rank())
+    except (RuntimeError, ValueError):
+        return result
+
+    holder = [result] if rank == 0 else [None]
+    try:
+        _dist.broadcast_object_list(holder, src=0)
+    except Exception as exc:  # noqa: BLE001 - defensive
+        LOG.warning(
+            "ProTrain: runtime SearchResult broadcast failed (%s); falling "
+            "back to the local search result. Plan divergence is possible.",
+            exc,
+        )
+        return result
+
+    broadcast_result = holder[0]
+    if not isinstance(broadcast_result, SearchResult):
+        LOG.warning(
+            "ProTrain: runtime SearchResult broadcast returned %r; falling "
+            "back to the local search result.",
+            type(broadcast_result).__name__,
+        )
+        return result
+    if rank != 0 and (
+        broadcast_result.cfg != result.cfg
+        or broadcast_result.block_map != result.block_map
+    ):
+        LOG.warning(
+            "ProTrain rank=%d: overriding local search result cfg=%s with "
+            "rank-0 cfg=%s for runtime plan determinism.",
+            rank,
+            result.cfg,
+            broadcast_result.cfg,
+        )
+    return broadcast_result
+
+
 def _select_mode(
     search_result: SearchResult,
     layout,
@@ -952,8 +998,9 @@ def _construct_runtime(
 
     # CpuFusedAdamAdapter construction is deferred to AFTER materialize_offload below.
     gpu_optim: GpuFusedAdamAdapter | None = None
-    if persistent_params:
-        gpu_optim = GpuFusedAdamAdapter(params=persistent_params, lr=1e-4)
+    trainable_persistent_params = [p for p in persistent_params if p.requires_grad]
+    if trainable_persistent_params:
+        gpu_optim = GpuFusedAdamAdapter(params=trainable_persistent_params, lr=1e-4)
 
     # ChunkManager silently degrades zero3_shard to False on ws==1.
     _ws = 1
@@ -1574,6 +1621,138 @@ def _phase2_should_skip_resident_base_adapter(
     return _is_adapter_style_frozen_base(cfg, footprint)
 
 
+def _profiler_trace_controls_for_model(
+    model: nn.Module,
+    *,
+    adapter: str | None,
+    load_in_4bit: bool,
+    load_in_8bit: bool,
+) -> tuple[bool, bool]:
+    """Return ``(include_backward, on_demand)`` for the initial trace pass."""
+    if _phase2_should_skip_resident_base_adapter(
+        model,
+        adapter=adapter,
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=load_in_8bit,
+    ):
+        return False, False
+    return True, True
+
+
+def _swap_pool_required_bytes(
+    *,
+    blocks: list[nn.Module],
+    result: SearchResult,
+    trace,
+) -> tuple[int, int, int, int, int, int]:
+    """Return ``(total, n_slot, slot, max_act, max_intra, max_param)``."""
+    if int(result.cfg.n_swap) <= 0:
+        return (0, 0, 0, 0, 0, 0)
+
+    from axolotl.integrations.protrain.block.strategy import BlockMode
+    from axolotl.integrations.protrain.block.swap_pool import DEFAULT_SLOTS_PER_BLOCK
+    from axolotl.integrations.protrain.cost.memory import SWAP_PREFETCH_DEPTH
+
+    max_act_bytes = 0
+    max_intra_delta_bytes = 0
+    max_param_bytes = 0
+    swap_block_ids: set[int] = set()
+    for bid, mode in result.block_map.items():
+        if mode is BlockMode.SWAP:
+            swap_block_ids.add(int(bid))
+            max_act_bytes = max(max_act_bytes, int(trace.activation_sizes.get(bid, 0)))
+
+    if swap_block_ids:
+        for op in trace.op_order:
+            if (
+                op.is_forward
+                and op.block_id is not None
+                and int(op.block_id) in swap_block_ids
+            ):
+                max_intra_delta_bytes = max(
+                    max_intra_delta_bytes,
+                    int(trace.intra_op_delta.get(op.op_id, 0)),
+                )
+
+    for idx, block in enumerate(blocks):
+        if idx not in swap_block_ids:
+            continue
+        inner = getattr(block, "block", block)
+        for param in inner.parameters(recurse=True):
+            max_param_bytes = max(
+                max_param_bytes, int(param.numel() * param.element_size())
+            )
+
+    slot_bytes = max(1, max_act_bytes, max_intra_delta_bytes, max_param_bytes)
+    n_slot = int(result.cfg.n_swap) * DEFAULT_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH
+    return (
+        int(n_slot * slot_bytes),
+        int(n_slot),
+        int(slot_bytes),
+        int(max_act_bytes),
+        int(max_intra_delta_bytes),
+        int(max_param_bytes),
+    )
+
+
+def _downgrade_oversized_swap_to_checkpoint(
+    *,
+    blocks: list[nn.Module],
+    result: SearchResult,
+    trace,
+    cpu_capacity_bytes: int,
+) -> SearchResult:
+    """Avoid runtime SWAP-pool allocations that exceed the CPU budget."""
+    if int(result.cfg.n_swap) <= 0 or cpu_capacity_bytes <= 0:
+        return result
+
+    total, n_slot, slot_bytes, max_act, max_intra, max_param = (
+        _swap_pool_required_bytes(blocks=blocks, result=result, trace=trace)
+    )
+    if total <= int(cpu_capacity_bytes):
+        return result
+
+    n_block = max(len(blocks), len(trace.activation_sizes))
+    n_checkpoint = min(
+        n_block - int(result.cfg.n_offload),
+        int(result.cfg.n_checkpoint) + int(result.cfg.n_swap),
+    )
+    cfg = CostConfig(
+        n_persist=result.cfg.n_persist,
+        n_buffer=result.cfg.n_buffer,
+        n_swap=0,
+        n_checkpoint=n_checkpoint,
+        n_offload=result.cfg.n_offload,
+    )
+    block_map = assign_modes(
+        n_swap=0,
+        n_checkpoint=n_checkpoint,
+        N_block=n_block,
+        n_offload=result.cfg.n_offload,
+    )
+    LOG.warning(
+        "ProTrain: SWAP pool would require %.2f GiB pinned CPU "
+        "(%d slots x %.2f MiB; max act=%.2f MiB, intra=%.2f MiB, "
+        "param=%.2f MiB), exceeding the %.2f GiB CPU budget. "
+        "Downgrading %d SWAP blocks to CKPT before runtime construction.",
+        total / (1 << 30),
+        n_slot,
+        slot_bytes / (1 << 20),
+        max_act / (1 << 20),
+        max_intra / (1 << 20),
+        max_param / (1 << 20),
+        int(cpu_capacity_bytes) / (1 << 30),
+        int(result.cfg.n_swap),
+    )
+    return SearchResult(
+        cfg=cfg,
+        block_map=block_map,
+        predicted_peak_bytes=result.predicted_peak_bytes,
+        predicted_iter_s=result.predicted_iter_s,
+        predicted_init_transient_peak_bytes=result.predicted_init_transient_peak_bytes,
+    )
+
+
 def _teardown_phase2_bootstrap_runtime(
     *,
     model: nn.Module,
@@ -1823,23 +2002,36 @@ def protrain_model_wrapper(
     elif trace is None:
         import sys as _sys
 
+        profiler_include_backward, profiler_on_demand = (
+            _profiler_trace_controls_for_model(
+                model,
+                adapter=adapter,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+            )
+        )
+        if profiler_include_backward:
+            trace_kind = "backward-aware"
+        else:
+            trace_kind = "forward-only resident-base adapter"
         LOG.info(
-            "ProTrain profiler cache miss for %s — running trace (bs=%d seq=%d)",
+            "ProTrain profiler cache miss for %s — running %s trace (bs=%d seq=%d)",
             cache_key.fingerprint()[:12],
+            trace_kind,
             batch_size,
             seq_len,
         )
         _sys.stderr.write(
-            "[protrain] profiler cache miss — running backward-aware trace\n"
+            f"[protrain] profiler cache miss — running {trace_kind} trace\n"
         )
         _sys.stderr.flush()
-        # Backward-aware: peak memory typically occurs in backward; OnDemandTensorMgr guards OOM.
+        # Full-FT stays backward-aware; frozen-base adapter traces avoid saved-tensor spill.
         profiler_cfg = ProfilerConfig(
             batch_size=batch_size,
             seq_len=seq_len,
             device=str(device),
-            include_backward=True,
-            on_demand=True,
+            include_backward=profiler_include_backward,
+            on_demand=profiler_on_demand,
             force_all_persistent=bool(force_all_persistent),
             world_size=int(hardware_profile.gpu_count),
             adapter=adapter,
@@ -2132,6 +2324,8 @@ def protrain_model_wrapper(
         )
         _sys2.stderr.flush()
 
+    result = _broadcast_runtime_search_result(result)
+
     # Auto-mode selection.
     if auto_mode:
         cpu_ram = _cpu_ram_per_rank_bytes(_ws_early)
@@ -2287,6 +2481,13 @@ def protrain_model_wrapper(
                 float(phase2_quickstart_envelope) * 100.0,
             )
     use_phase2 = use_phase2_base and not quickstart_skip_phase2
+    result = _downgrade_oversized_swap_to_checkpoint(
+        blocks=blocks,
+        result=result,
+        trace=trace,
+        cpu_capacity_bytes=cpu_capacity_bytes,
+    )
+    result = _broadcast_runtime_search_result(result)
     if use_phase2:
         from axolotl.integrations.protrain.profiler.phase2 import (
             Phase2RestoreIntegrityError,
@@ -2310,6 +2511,13 @@ def protrain_model_wrapper(
             predicted_peak_bytes=result.predicted_peak_bytes,
             predicted_iter_s=result.predicted_iter_s,
         )
+        boot_result = _downgrade_oversized_swap_to_checkpoint(
+            blocks=blocks,
+            result=boot_result,
+            trace=trace,
+            cpu_capacity_bytes=cpu_capacity_bytes,
+        )
+        boot_result = _broadcast_runtime_search_result(boot_result)
         chunk_manager, scheduler, handles, boot_result = _construct_runtime(
             model=model,
             blocks=blocks,
@@ -2560,6 +2768,13 @@ def protrain_model_wrapper(
                     forbid_activation_offload=forbid_activation_offload,
                     prefer_no_offload_on_non_nvlink=prefer_no_offload_on_non_nvlink,
                 )
+                new_result = _downgrade_oversized_swap_to_checkpoint(
+                    blocks=blocks,
+                    result=new_result,
+                    trace=trace,
+                    cpu_capacity_bytes=cpu_capacity_bytes,
+                )
+                new_result = _broadcast_runtime_search_result(new_result)
 
                 # Re-pick runtime mode for the post-measurement cfg.
                 mode_changed = False

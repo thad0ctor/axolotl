@@ -46,6 +46,11 @@ high-memory RunPod host is called out explicitly; full setup in §11):
   **24.68 global sps** at 9.98 GiB/rank, loss 0.997. Mode C
   (ZeRO-3 sharded CPU-offload): 23.67 global sps at 9.87 GiB/rank, loss 1.017.
   Qwen3.5-9B Mode A: **32.53 global sps** at 9.89 GiB/rank.
+- **At-scale multimodal MoE QLoRA on 5× 3090-class GPUs.**
+  Qwen3.6-35B-A3B multimodal MoE loads across 5× 3090 / 3090 Ti cards in
+  4-bit QLoRA, auto-selects Mode B, downgrades an oversized SWAP plan to
+  CKPT before runtime allocation, and completes a finite seq=1024 train step:
+  loss **5.087**, grad_norm **17.37**, peak **20.29 GiB/rank** (§6.bb).
 - **Full-finetune Adam-state reduction on Qwen3-0.6B, single 3090.**
   `adamw_torch` baseline 5.59 GiB → `adamw_bnb_8bit` 4.81 GiB (-14%) →
   **`paged_adamw_8bit` 2.84 GiB (-49% peak)**. The 74.6% headline
@@ -1033,7 +1038,7 @@ curves descend monotonically with no discontinuities. The throughput
 gap (1.034 vs 1.12 sps, -8%) is the bs=1 hot-path overhead documented
 in §6.d / §16.B B2.
 
-### 6.bb MoE compatibility — tiny-mixtral-30m
+### 6.bb MoE compatibility
 
 `axolotl-ai-co/tiny-mixtral-30m` (4 layers, 256 hidden, 8 experts,
 top-2 routing), single 3090, BF16 LoRA, bs=1, seq=256, 25 steps:
@@ -1049,10 +1054,16 @@ DecoderLayer carries `.self_attn` (matched by `_looks_like_block`) plus
 finds the attention block, chunks the model around it, and the expert
 routing inside the block is transparent to the chunk manager. **MoE is
 supported when the DecoderLayer exposes `.self_attn`** — that covers
-Mixtral, OLMoE, and Phi-MoE. Validation here is at the tiny-mixtral-30m
-scale; larger MoE classes (Qwen3-A3B, DeepSeek-V2.5, Kimi-K2.5) were not
-locally available for testing but are expected to compose via the same
-code path.
+Mixtral, OLMoE, and Phi-MoE.
+
+At larger scale, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA validates the
+same composition on the local 5× 3090-class pool (GPUs 1,2,4,5,7), bs=1,
+seq=1024. The one-step smoke loads the multimodal model, quantizes 80 MoE
+expert params, injects LoRA, uses a forward-only resident-base adapter trace,
+auto-selects Mode B, downgrades an oversized SWAP plan to CKPT before runtime
+allocation, and completes finite training: loss **5.087**, grad_norm
+**17.37**, train_runtime **42.53 s**, peak **20.29 GiB/rank**. This is a
+loader/profiler/search/runtime compatibility smoke, not a convergence run.
 
 ### 6.cc Cross-world-size resume
 
@@ -1924,7 +1935,7 @@ The status column reflects the current validation evidence on the 4× RTX 3090 /
 | M13a | Three-way head-to-head: ProTrain vs DeepSpeed ZeRO at the same model and shape | **Validated** | §6.x rows for ProTrain Mode A (9.56 GiB / 22.6 sps) vs ZeRO-2 (9.20 GiB / 16.8 sps, 0.74×) vs ZeRO-3 (5.58 GiB / 6.7 sps) vs ZeRO-3+CPU (3.66 GiB / 5.8 sps) — all on Llama-2-13B + 4-bit qlora, 4× 3090, seq=256, bs=1/rank. |
 | M13b | ProTrain vs FSDP2 head-to-head | **Validated: actual Llama-2-13B + Qwen3-14B corroboration** | §6.x: actual Llama-2-13B optimized FSDP2 — peak **8.98 GiB/rank**, 4.27 global sps, loss 1.13 (apples-to-apples row, §6.hh); Qwen3-14B 14B-class corroboration on the same hardware and accelerate-side FSDP2 knobs — peak 12.41 GiB/rank, 4.76 global sps; unoptimized FSDP2 baseline — 8.66 GiB / 4.1 sps. Even with the optimized knobs FSDP2 trails ProTrain Mode A by ~5.3× at this shape on non-NVLink PCIe without NVLink. |
 | M14 | Long-horizon convergence (1500 steps) on 13B + 4-bit | **Validated** | §6.aa: ProTrain Mode A loss 0.836 vs vanilla 0.804 at step 1500 — within variance noise, no chunk-shuffling drift |
-| M15 | MoE compatibility (Mixtral-class) | **Validated** | §6.bb: tiny-mixtral-30m vanilla + ProTrain Mode A both rc=0; MoE supported when DecoderLayer carries `.self_attn` (Mixtral, OLMoE, Phi-MoE) |
+| M15 | MoE compatibility (Mixtral-class and A3B-class QLoRA smoke) | **Validated** | §6.bb: tiny-mixtral-30m vanilla + ProTrain Mode A both rc=0; Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA completes a finite seq=1024 train step on 5× 3090-class GPUs. MoE supported when DecoderLayer carries `.self_attn` (Mixtral, OLMoE, Phi-MoE). |
 | M16 | Mode B (replicated CPU-offload) explicit-force knob | **Validated** | §6.dd: `protrain_force_replicated_cpu_offload: true` engages Mode B; tests cover the validator and routing path. |
 | M17 | 8B BF16 LoRA ProTrain Mode A + flash_attention (extended timeout) | **Validated** | §6.w: peak 17.28 GiB, sps 2.37, loss 0.884 |
 

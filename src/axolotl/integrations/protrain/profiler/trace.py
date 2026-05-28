@@ -252,6 +252,9 @@ def run_trace(
         else contextlib.nullcontext()
     )
 
+    def _forward_grad_ctx():
+        return contextlib.nullcontext() if cfg.include_backward else torch.no_grad()
+
     # Adam microbenches BEFORE tracker so reserved-but-free bytes fold into the baseline.
     try:
         cpu_adam_bps = measure_cpu_adam()
@@ -557,7 +560,7 @@ def run_trace(
         for _i in range(N_WARMUP):
             try:
                 torch.cuda.synchronize(device)
-                with autocast_ctx:
+                with _forward_grad_ctx(), autocast_ctx:
                     warm_out = model(**batch)
                 if cfg.include_backward:
                     warm_loss = _extract_loss(warm_out)
@@ -698,7 +701,7 @@ def run_trace(
                     pre_sf = torch.cuda.Event(enable_timing=True)
                     post_sf = torch.cuda.Event(enable_timing=True)
                     pre_sf.record()
-                with autocast_ctx:
+                with _forward_grad_ctx(), autocast_ctx:
                     steady_out = model(**batch)
                 with torch.cuda.device(device_idx):
                     post_sf.record()
@@ -819,7 +822,7 @@ def run_trace(
                 with torch.cuda.device(device_idx):
                     hooked_fwd_pre_event = torch.cuda.Event(enable_timing=True)
                     hooked_fwd_pre_event.record()
-            with autocast_ctx:
+            with _forward_grad_ctx(), autocast_ctx:
                 output = model(**batch)
             if cuda_available and hooked_fwd_pre_event is not None:
                 with torch.cuda.device(device_idx):

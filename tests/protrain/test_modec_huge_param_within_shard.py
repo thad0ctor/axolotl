@@ -579,3 +579,50 @@ def test_huge_param_dim0_indivisible_raises():
             lr=1e-3,
             huge_param_threshold_bytes=16,  # forces huge path
         )
+
+
+def test_frozen_huge_param_dim0_indivisible_skips_optimizer_shard():
+    """Frozen base params do not need optimizer-state sharding."""
+    import torch
+    from torch import nn
+
+    pytest.importorskip("torch")
+
+    class _ChunkManagerStub:
+        def __init__(self, huge, small) -> None:
+            self.world_size = 5
+            self.rank = 0
+            self.layout = type(
+                "L",
+                (),
+                {"chunks": [["huge"], ["small"]], "S_chunk": 4096, "N_chunk": 2},
+            )()
+            self._persistent_ids = {0, 1}
+            self._params_by_id = {"huge": huge, "small": small}
+            self._chunk_shards: dict = {}
+            self.cpu_optim = None
+            self.gpu_optim = None
+
+    huge = nn.Parameter(torch.randn(7, 4), requires_grad=False)
+    small = nn.Parameter(torch.randn(4), requires_grad=True)
+    wrapped = type(
+        "W",
+        (),
+        {
+            "chunk_manager": _ChunkManagerStub(huge, small),
+            "module": nn.Module(),
+        },
+    )()
+
+    from axolotl.integrations.protrain.api.optim_wrapper import (
+        protrain_optimizer_wrapper,
+    )
+
+    optim = protrain_optimizer_wrapper(
+        wrapped,
+        lr=1e-3,
+        huge_param_threshold_bytes=16,
+    )
+
+    assert optim._persistent_huge_originals == []
+    assert optim._persistent_params_full == [small]
