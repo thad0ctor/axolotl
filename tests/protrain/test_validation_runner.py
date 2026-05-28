@@ -73,3 +73,72 @@ def test_validation_module_dry_run_json(tmp_path: Path) -> None:
     assert payload[0]["status"] == "DRY-RUN"
     rendered = " ".join(" ".join(cmd) for cmd in payload[0]["commands"])
     assert "axolotl.cli.train" in rendered
+
+
+def test_validation_full_dry_run_covers_core_lanes(tmp_path: Path) -> None:
+    cmd = [
+        sys.executable,
+        "-m",
+        "axolotl.integrations.protrain.validation",
+        "--suite",
+        "full",
+        "--dry-run",
+        "--json",
+        "--work-dir",
+        str(tmp_path),
+    ]
+
+    proc = subprocess.run(  # nosec B603
+        cmd,
+        cwd=runner._repo_root(),  # noqa: SLF001
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    lanes = [result["lane"] for result in payload]
+    assert lanes == [
+        "cpu-core",
+        "cpu-surface",
+        "merge-surface",
+        "cpu-full",
+        "single-gpu-edge",
+        "single-gpu",
+        "two-gpu",
+    ]
+    coverage = "\n".join("\n".join(result["coverage"]) for result in payload)
+    assert "Mode A/B/C selector" in coverage
+    assert "LoRA merge math" in coverage
+    assert "2-rank forced Mode C finite training" in coverage
+
+
+def test_validation_maintainer_text_output_is_reviewable(tmp_path: Path) -> None:
+    cmd = [
+        sys.executable,
+        "-m",
+        "axolotl.integrations.protrain.validation",
+        "--suite",
+        "maintainer",
+        "--dry-run",
+        "--work-dir",
+        str(tmp_path),
+    ]
+
+    proc = subprocess.run(  # nosec B603
+        cmd,
+        cwd=runner._repo_root(),  # noqa: SLF001
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "[DRY-RUN] cpu-core" in proc.stdout
+    assert "[DRY-RUN] cpu-surface" in proc.stdout
+    assert "[DRY-RUN] merge-surface" in proc.stdout
+    assert "covers:" in proc.stdout
+    assert "merge-lora CLI dispatch" in proc.stdout

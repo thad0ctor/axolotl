@@ -82,6 +82,15 @@ def _nvidia_smi_gpu_count() -> int:
     return sum(1 for line in out.splitlines() if line.strip())
 
 
+def _cuda_visible_for_world(world_size: int, fallback: str) -> str:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        parts = [part.strip() for part in visible.split(",") if part.strip()]
+        if len(parts) >= world_size:
+            return ",".join(parts[:world_size])
+    return fallback
+
+
 # The full worker script is kept as a heredoc string (rather than a
 # helper file) so the test is self-contained. Subprocess invokes
 # ``python -c <script>`` with CUDA_VISIBLE_DEVICES + env-driven config.
@@ -1440,6 +1449,268 @@ _MISTRAL_MODEC_WORKER_SCRIPT = textwrap.dedent(
 )
 
 
+_MISTRAL_MODEC_RESUME_WORKER_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+
+    import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+
+
+    def _worker(rank: int, world_size: int, out_dir: str,
+                bs: int, seq: int) -> None:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = os.environ.get(
+            "PROTRAIN_MASTER_PORT", "29543"
+        )
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+            device_id=torch.device("cuda", rank),
+        )
+        try:
+            _run(rank, world_size, out_dir, bs, seq)
+        finally:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            dist.destroy_process_group()
+
+
+    def _build(rank: int, world_size: int, bs: int, seq: int):
+        from transformers import MistralConfig, MistralForCausalLM
+        from peft import LoraConfig, get_peft_model
+
+        from axolotl.integrations.protrain.api import (
+            protrain_model_wrapper,
+            protrain_optimizer_wrapper,
+        )
+        from axolotl.integrations.protrain.types import HardwareProfile
+
+        torch.manual_seed(7)
+        cfg = MistralConfig(
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            intermediate_size=8192,
+            sliding_window=128,
+            vocab_size=8192,
+            max_position_embeddings=256,
+            rms_norm_eps=1e-5,
+            use_cache=False,
+        )
+
+        device = torch.device("cuda", rank)
+        model = MistralForCausalLM(cfg).to(dtype=torch.bfloat16, device=device)
+        lora_cfg = LoraConfig(
+            r=4,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_cfg)
+
+        hw = HardwareProfile(
+            gpu_sku=torch.cuda.get_device_name(rank),
+            gpu_memory_bytes=torch.cuda.get_device_properties(rank).total_memory,
+            gpu_count=world_size,
+            pcie_h2d_bps=13e9,
+            pcie_d2h_bps=13e9,
+            has_nvlink=False,
+        )
+        n_block = int(cfg.num_hidden_layers)
+        wrapped = protrain_model_wrapper(
+            model,
+            model_config=cfg,
+            hardware_profile=hw,
+            batch_size=bs,
+            seq_len=seq,
+            capacity_bytes=20 * (1 << 30),
+            force_all_persistent=False,
+            n_persist_override=1,
+            n_buffer_override=8,
+            n_swap_override=0,
+            n_checkpoint_override=0,
+            n_offload_override=n_block,
+            zero3_shard=True,
+            auto_mode=False,
+        )
+        optim = protrain_optimizer_wrapper(wrapped, lr=1e-4)
+        return cfg, wrapped, optim
+
+
+    def _step_window(cfg, wrapped, optim, rank: int, world_size: int,
+                     bs: int, seq: int, start: int, stop: int) -> list[float]:
+        device = torch.device("cuda", rank)
+        losses = []
+        for step_idx in range(start, stop):
+            cpu_gen = torch.Generator(device="cpu")
+            cpu_gen.manual_seed(1000 + step_idx)
+            input_ids = torch.randint(
+                0,
+                cfg.vocab_size,
+                (bs, seq),
+                generator=cpu_gen,
+                dtype=torch.long,
+            ).to(device)
+            labels = input_ids.clone()
+
+            torch.cuda.synchronize()
+            dist.barrier()
+            out = wrapped.module(input_ids=input_ids, labels=labels)
+            loss = out.loss
+            if not bool(torch.isfinite(loss.detach()).item()):
+                raise RuntimeError(
+                    f"rank {rank}: non-finite loss before resume at step {step_idx}"
+                )
+            loss_report = loss.detach().clone()
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            dist.all_reduce(loss_report, op=dist.ReduceOp.AVG)
+            losses.append(float(loss_report.item()))
+        return losses
+
+
+    def _gather_all(wrapped) -> None:
+        for cid in list(wrapped.chunk_manager._non_persistent_ids):
+            wrapped.chunk_manager.gather(cid)
+
+
+    def _shutdown(optim) -> None:
+        cpu_optim = getattr(optim, "_cpu_optim", None)
+        if cpu_optim is not None:
+            cpu_optim.shutdown()
+
+
+    def _run(rank: int, world_size: int, out_dir: str, bs: int, seq: int) -> None:
+        from axolotl.integrations.protrain.api.checkpoint import (
+            DEFAULT_SAVE_MAX_BYTES,
+            METADATA_FILENAME,
+            PROTRAIN_OPTIM_DIRNAME,
+            _load_protrain_optim_dir,
+            _save_protrain_optim_dir,
+        )
+
+        os.makedirs(out_dir, exist_ok=True)
+        ckpt_dir = os.path.join(out_dir, "checkpoint-2")
+        if rank == 0:
+            os.makedirs(ckpt_dir, exist_ok=True)
+        dist.barrier()
+
+        cfg, wrapped, optim = _build(rank, world_size, bs, seq)
+        pre_losses = _step_window(cfg, wrapped, optim, rank, world_size, bs, seq, 0, 2)
+        wrote = _save_protrain_optim_dir(
+            optim,
+            ckpt_dir,
+            step=2,
+            save_max_bytes=DEFAULT_SAVE_MAX_BYTES,
+            rank=rank,
+            world_size=world_size,
+        )
+        if not wrote:
+            raise RuntimeError(f"rank {rank}: optimizer save returned False")
+        dist.barrier()
+
+        _gather_all(wrapped)
+        if rank == 0:
+            state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in wrapped.module.state_dict().items()
+            }
+            torch.save(state, os.path.join(ckpt_dir, "model_state.pt"))
+        dist.barrier()
+
+        _shutdown(optim)
+        del optim, wrapped
+        torch.cuda.empty_cache()
+        dist.barrier()
+
+        cfg2, wrapped2, optim2 = _build(rank, world_size, bs, seq)
+        _gather_all(wrapped2)
+        model_state = torch.load(
+            os.path.join(ckpt_dir, "model_state.pt"),
+            map_location="cpu",
+            weights_only=True,
+        )
+        wrapped2.module.load_state_dict(model_state, strict=True)
+        loaded = _load_protrain_optim_dir(optim2, ckpt_dir)
+        if not loaded:
+            raise RuntimeError(f"rank {rank}: optimizer load returned False")
+        post_losses = _step_window(
+            cfg2, wrapped2, optim2, rank, world_size, bs, seq, 2, 4
+        )
+
+        shard_states = list(wrapped2.chunk_manager._chunk_shards.values())
+        all_sharded = bool(shard_states) and all(s.is_sharded for s in shard_states)
+        n_persist = len(wrapped2.chunk_manager._persistent_ids)
+        n_chunk = wrapped2.chunk_manager.layout.N_chunk
+        n_non_persist = n_chunk - n_persist
+
+        if rank == 0:
+            meta_path = os.path.join(ckpt_dir, PROTRAIN_OPTIM_DIRNAME, METADATA_FILENAME)
+            with open(meta_path, encoding="utf-8") as meta_f:
+                meta = json.load(meta_f)
+            with open(os.path.join(out_dir, "modec_resume_stats.out"), "w") as f:
+                f.write(
+                    f"pre_losses={pre_losses}\\n"
+                    f"post_losses={post_losses}\\n"
+                    f"save_mode={meta.get('protrain_save_mode')}\\n"
+                    f"saved_world={meta.get('protrain_world_size')}\\n"
+                    f"zero3={int(bool(meta.get('protrain_zero3_shard')))}\\n"
+                    f"all_sharded={int(all_sharded)}\\n"
+                    f"n_chunk={n_chunk}\\n"
+                    f"n_persist={n_persist}\\n"
+                    f"n_non_persist={n_non_persist}\\n"
+                )
+            print(
+                f"[rank0] modec-save-resume pre={pre_losses} post={post_losses} "
+                f"all_sharded={all_sharded} n_non_persist={n_non_persist}",
+                flush=True,
+            )
+
+        _shutdown(optim2)
+
+
+    def main() -> int:
+        world = int(os.environ["PROTRAIN_WORLD_SIZE"])
+        bs = int(os.environ["PROTRAIN_BATCH_SIZE"])
+        seq = int(os.environ["PROTRAIN_SEQ_LEN"])
+        out_dir = os.environ["PROTRAIN_OUT_DIR"]
+
+        ctx = mp.get_context("spawn")
+        procs = []
+        for rank in range(world):
+            p = ctx.Process(target=_worker, args=(rank, world, out_dir, bs, seq))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+        for p in procs:
+            if p.exitcode != 0:
+                print(f"worker pid={p.pid} exited with {p.exitcode}", flush=True)
+                return p.exitcode
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    """
+)
+
+
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
@@ -1472,9 +1743,7 @@ def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    # GPUs 1,2 (per Item 9 cell A scoping — leave 4,5 free for parallel
-    # work, never touch 0/3/6/7).
-    env["CUDA_VISIBLE_DEVICES"] = "1,2"
+    env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_for_world(2, "0,1")
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["PROTRAIN_WORLD_SIZE"] = "2"
     env["PROTRAIN_BATCH_SIZE"] = str(bs)
@@ -1553,3 +1822,99 @@ def test_protrain_2gpu_mistral_modec_smoke(tmp_path) -> None:
             "non-sharded entries; Mistral GQA / sliding-window may have "
             f"broken chunk discovery (n_non_persist={n_non_persist})"
         )
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_protrain_2gpu_modec_save_resume_smoke(tmp_path) -> None:
+    """2-rank forced Mode C writes optimizer state and resumes finite."""
+    import math
+
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+
+    gpu_count = _nvidia_smi_gpu_count()
+    if gpu_count < 2:
+        pytest.skip(f"requires >= 2 GPUs; nvidia-smi reports {gpu_count}")
+
+    bs = 1
+    seq = 64
+    out_dir = tmp_path / "modec_resume"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_for_world(2, "0,1")
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["PROTRAIN_WORLD_SIZE"] = "2"
+    env["PROTRAIN_BATCH_SIZE"] = str(bs)
+    env["PROTRAIN_SEQ_LEN"] = str(seq)
+    env["PROTRAIN_OUT_DIR"] = str(out_dir)
+    env["PROTRAIN_MASTER_PORT"] = str(_pick_free_port())
+    env.setdefault("NCCL_IB_DISABLE", "1")
+    env.setdefault("NCCL_P2P_DISABLE", "0")
+    env.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    script_path = tmp_path / "_modec_resume_worker.py"
+    script_path.write_text(_MISTRAL_MODEC_RESUME_WORKER_SCRIPT)
+    log_path = tmp_path / "modec_resume_worker.log"
+    with log_path.open("w") as log_f:
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            env=env,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=900,
+        )
+    if proc.returncode != 0:
+        tail = log_path.read_text()[-6000:]
+        raise RuntimeError(
+            f"Mode-C save/resume worker failed (exit={proc.returncode}); "
+            f"log tail:\n{tail}"
+        )
+
+    stats_path = out_dir / "modec_resume_stats.out"
+    if not stats_path.exists():
+        raise RuntimeError(
+            f"Mode-C save/resume worker did not produce stats file {stats_path}; "
+            f"log tail:\n{log_path.read_text()[-4000:]}"
+        )
+    stats: dict[str, str] = {}
+    for line in stats_path.read_text().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            stats[k.strip()] = v.strip()
+
+    def _losses(key: str) -> list[float]:
+        raw = stats.get(key, "[]").strip("[]")
+        return [float(x) for x in raw.split(",")] if raw else []
+
+    pre_losses = _losses("pre_losses")
+    post_losses = _losses("post_losses")
+    all_losses = pre_losses + post_losses
+    all_sharded = bool(int(stats.get("all_sharded", "0")))
+    n_non_persist = int(stats.get("n_non_persist", "0"))
+
+    print(
+        "\nProTrain two-GPU Mode-C save/resume:\n"
+        f"  pre-resume losses:   {pre_losses}\n"
+        f"  post-resume losses:  {post_losses}\n"
+        f"  save_mode:           {stats.get('save_mode')}\n"
+        f"  saved_world:         {stats.get('saved_world')}\n"
+        f"  zero3:               {stats.get('zero3')}\n"
+        f"  all_sharded:         {all_sharded}\n"
+        f"  n_non_persist:       {n_non_persist}"
+    )
+
+    assert len(pre_losses) == 2, pre_losses
+    assert len(post_losses) == 2, post_losses
+    for i, loss in enumerate(all_losses):
+        assert math.isfinite(loss), f"loss {i} is non-finite: {all_losses}"
+    assert stats.get("save_mode") == "sharded"
+    assert stats.get("saved_world") == "2"
+    assert stats.get("zero3") == "1"
+    assert (out_dir / "checkpoint-2" / "model_state.pt").is_file()
+    assert (out_dir / "checkpoint-2" / "protrain_optim" / "metadata.json").is_file()
+    if n_non_persist > 0:
+        assert all_sharded

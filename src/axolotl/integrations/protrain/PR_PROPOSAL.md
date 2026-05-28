@@ -968,29 +968,43 @@ follow-up work:
 
 ## 15. CI guardrails
 
+This PR does **not** require maintainers to provide GPU-backed GitHub Actions.
+Standard CI remains CPU-only. GPU coverage is supplied by the committed
+validation runner for reviewers or developers who have access to qualifying
+CUDA hardware; unavailable GPU lanes report `SKIP` and do not fail the runner.
+
 The ProTrain test suite spans three tiers, each with different runner
 requirements:
 
 | Tier | Tests | CI compatibility |
 |---|---|---|
 | Default-marker (CPU / dev) | 630 pytest cases covering chunk management, validators, cost/search math, layout rules, checkpointing, torch.compile compatibility, schema behavior, sentinel re-exports, alpha diagnostics, rsLoRA ownership, MoE/VLM ownership, and Path B LoRA grad sync. Manual bs=1 wall-clock microbenches are opt-in via `PROTRAIN_RUN_BS1_MICROBENCH=1`. | Run on standard Axolotl CI **without GPU**. Latest recorded result: **630 passed, 7 skipped, 179 deselected**. |
-| GPU-marker (single-GPU) | ~10 tests requiring CUDA + a transformer model load (alpha measurement against a real model, profiler trace round-trip, chunk-residency end-to-end) | Needs self-hosted runner with at least one 3090-class GPU. Marker: `@pytest.mark.gpu`. Recommended: dedicated runner pool or scheduled nightly job; **not blocking on default CI**. |
-| Multi-GPU regression | `test_paged_adam_offload_mgpu`, `test_cross_mode_resume` | Needs **4× 3090-class self-hosted runner**. **Intentionally excluded from default CI** with a documented manual-run procedure: `CUDA_VISIBLE_DEVICES=1,4,5,7 CUDA_DEVICE_ORDER=PCI_BUS_ID pytest tests/protrain/ -m gpu`. |
+| GPU-marker (single-GPU) | ~10 tests requiring CUDA + a transformer model load (alpha measurement against a real model, profiler trace round-trip, chunk-residency end-to-end) | Opt-in local/self-hosted validation only. Marker: `@pytest.mark.gpu`. **Not blocking on default CI**. |
+| Multi-GPU regression | `test_paged_adam_offload_mgpu`, `test_cross_mode_resume` plus the validation runner's two-GPU Mode C lane | Opt-in local/self-hosted validation only. Use the committed runner or manual pytest commands on a qualifying multi-GPU CUDA host. **Not blocking on default CI**. |
 
 Maintainer acceptance recipe:
 
 The runnable entry point is
 `PYTHONPATH=src python -m axolotl.integrations.protrain.validation`
 (`validation/README.md`). It emits PASS/FAIL/SKIP/GAP summaries and applies
-finite-loss, finite-grad-norm, no-NaN/Inf, checkpoint-artifact, and resume
-loss-continuity gates where the lane trains a model.
+finite-loss, finite logged grad-norm when present, no-NaN/Inf,
+checkpoint-artifact, and resume loss-continuity gates where the lane trains a
+model.
 
 | Lane | Run | Acceptance bar |
 |---|---|---|
-| CPU/default | `--suite cpu-core` or `--suite cpu-full` | Validators, cost/search math, checkpoint metadata, optimizer-state metadata, deterministic chunk layout, model-family ownership, and non-finite optimizer-boundary guards pass without a GPU. |
-| One GPU, 24 GiB | `--suite single-gpu` | 8B 4-bit QLoRA trains 50 steps from `validation/recipes/3090-8b-qlora-acceptance.yml`, writes `checkpoint-50`, resumes for additional steps, keeps logged losses/grad norms finite, and preserves bounded resume loss continuity. |
-| Two GPUs | `--suite two-gpu` | Forced Mode C finite-training coverage plus maintained resume and non-finite-boundary tests pass on the visible two-GPU set. |
+| CPU/default | `--suite maintainer` | Validators, cost/search math, calibrated memory gates, checkpoint metadata, deterministic chunk layout, Mode A/B/C selection, save/resume hooks, Path B LoRA ownership, merge-lora math, and non-finite fail-closed guards pass without a GPU. |
+| CPU/exhaustive | `--suite cpu-full` | The full default ProTrain pytest suite passes without requiring large-model hardware. |
+| One GPU, 24 GiB | `--suite single-gpu` | 8B 4-bit QLoRA trains 50 steps from `validation/recipes/3090-8b-qlora-acceptance.yml`, writes `checkpoint-50`, resumes for additional steps, keeps logged losses and any logged grad norms finite, and preserves bounded resume loss continuity. |
+| One GPU edge | `--suite single-gpu-edge` | DoRA, multi-adapter switching, vision-LM hybrid ownership, LoRA offload runtime, and A<->C cross-mode resume pass on tiny/cheap model shapes. |
+| Two GPUs | `--suite two-gpu` | Forced Mode C finite-training coverage, same-world optimizer save/resume, and non-finite-boundary tests pass on the visible two-GPU set. |
 | Optional four GPUs | `pytest tests/protrain/ -m gpu` on a 3090-class PCIe pool | Covers Path B / Mode C PCIe regressions and cross-mode / cross-world resume beyond the minimal maintainer lanes. |
+
+This recipe is the committed, reviewer-scale replacement for the temporary
+Desktop/local validation scripts. Historical 30B/35B/9B runs remain benchmark
+evidence for the proposal, while the recipe keeps day-to-day verification small
+enough for future maintainers and portable across any qualifying multi-GPU
+system.
 
 ### Version guardrails (load-bearing for monkey-patches)
 
