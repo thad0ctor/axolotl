@@ -221,6 +221,12 @@ class AxolotlInputConfig(
             "description": "If resume_from_checkpoint isn't set and you simply want it to start where it left off. Be careful with this being turned on between different models."
         },
     )
+    ignore_data_skip: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Forwarded to TrainingArguments.ignore_data_skip; skip dataloader fast-forward on resume."
+        },
+    )
     resize_token_embeddings_to_32x: bool | None = Field(
         default=None,
         json_schema_extra={
