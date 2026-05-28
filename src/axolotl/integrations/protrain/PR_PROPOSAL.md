@@ -1112,6 +1112,23 @@ with `protrain_force_replicated_cpu_offload: true`** — rc=0, peak
 much slower per step — Mode B is the explicit choice for
 configurations where Mode A doesn't fit but Mode C is not desirable.
 
+### 6.ee Apex FusedAdam source-built smoke
+
+NVIDIA Apex source commit `becbb77` builds successfully against the
+torch `2.11.0+cu130` validation venv when `CUDA_HOME` points at a matching
+CUDA 13.0 toolkit prefix. The local system `nvcc` is CUDA 13.2, so the
+validation used a temporary conda CUDA 13.0 compiler/library prefix for the
+build. The resulting wheel imports `apex.optimizers.FusedAdam` and completes
+a CUDA optimizer step on an RTX 3090 Ti.
+
+Axolotl integration smoke: Qwen3.5-9B 4-bit QLoRA, ProTrain Mode A
+(`protrain_force_all_persistent: true`), seq=128, `gradient_accumulation_steps=4`,
+`max_steps=2`, `optimizer: adamw_apex_fused`, single RTX 3090 Ti. Outcome:
+rc=0, finite losses **1.227 / 1.536**, grad_norm **0.4328 / 0.4288**,
+peak **7.77 GiB**, train_runtime **5.129 s**, final adapter save. This
+validates the source-build and Trainer optimizer path; it is not a throughput
+benchmark.
+
 ### 6.ff FSDP2 optimized config — at-scale comparison data
 
 **Optimized FSDP2 config** (`fsdp_forward_prefetch: true`,
@@ -1564,7 +1581,7 @@ divergence.
 
 | Paper claim | This integration | Agreement |
 |---|---|---|
-| §A.1 + Tbl. 4: ProTrain uses DeepSpeedCPUAdam for non-persistent chunks and overlaps the CPU step with GPU backward; FusedAdam (apex) on persistent chunks | This integration uses `deepspeed.ops.adam.DeepSpeedCPUAdam` for non-persistent and `apex.optimizers.FusedAdam` when available (falling back to `torch.optim.AdamW` — non-fused — when apex isn't installed). `step_async(chunk_id)` is the path used during overlap. The HF-Trainer-side optimizer string `adamw_apex_fused` is wired through `_SUPPORTED_OPTIMIZERS`; local validation exercised the fallback path because the host is not CUDA-aligned for Apex. | **Faithful**, with an apex-optional fallback path the paper didn't need to specify. |
+| §A.1 + Tbl. 4: ProTrain uses DeepSpeedCPUAdam for non-persistent chunks and overlaps the CPU step with GPU backward; FusedAdam (apex) on persistent chunks | This integration uses `deepspeed.ops.adam.DeepSpeedCPUAdam` for non-persistent and `apex.optimizers.FusedAdam` when available (falling back to `torch.optim.AdamW` — non-fused — when apex isn't installed). `step_async(chunk_id)` is the path used during overlap. The HF-Trainer-side optimizer string `adamw_apex_fused` is wired through `_SUPPORTED_OPTIMIZERS`; §6.ee validates a CUDA-aligned source build plus train-time smoke. | **Faithful**, with an apex-optional fallback path the paper didn't need to specify. |
 
 ### 7.8 Block-level forward prefetch / async backward reduce
 
@@ -1748,9 +1765,10 @@ tradeoffs.
   2-rank save → online 4-rank resume. Older persistent GPU optimizer
   checkpoints without `gpu_optim_rank_*.pt.meta.json` fail closed for cross-world
   resume.
-- **Apex `FusedAdam` is available when the environment is CUDA-aligned.**
-  This validation host has a CUDA toolkit / torch-wheel mismatch, so
-  `adamw_apex_fused` is documented as supported but not benchmarked here.
+- **Apex `FusedAdam` is source-build validated when `CUDA_HOME` is aligned.**
+  The local system toolkit is CUDA 13.2 while torch is `cu130`; pointing the
+  build at a CUDA 13.0 toolkit prefix produces a working Apex wheel, a direct
+  `FusedAdam` CUDA step, and an Axolotl `adamw_apex_fused` smoke (§6.ee).
 - **27B-class 4-bit ProTrain auto-defers the load-time fp32 embedding upcast.**
   The loader detects ProTrain in `plugins` and skips the upcast; non-ProTrain
   low-VRAM configs may still use `embeddings_skip_upcast: true` explicitly.
@@ -1900,7 +1918,7 @@ The status column reflects the current validation evidence on the 4× RTX 3090 /
 | M9 | Four-mode behavior (A / B / C / auto) at production scale | **Validated** | Mode A reaches all measured bs=1/2 shapes at seq=256/512; explicit Mode B reaches end-to-end at bs=2; Mode C reaches end-to-end at bs=1 and bs=2 including the 4-rank mixed-SKU case. See §6.zz and §6.zz.X. |
 | M10 | LoRA-rank compatibility (r=16/32/64) on 13B + 4-bit Mode A | **Validated** | §6.l |
 | M11 | gradient_accumulation_steps compatibility (memory-neutral, throughput-positive) | **Validated** | §6.m |
-| M12 | Apex `FusedAdam` HF-Trainer integration via `adamw_apex_fused` | **Supported with environment constraint** | Config accepts `adamw_apex_fused`; the local validation host has a CUDA-toolkit mismatch (system 13.2 vs torch wheel 13.0), so end-to-end Apex benchmarking is left to CUDA-aligned environments. |
+| M12 | Apex `FusedAdam` HF-Trainer integration via `adamw_apex_fused` | **Validated with CUDA-aligned source build** | §6.ee builds NVIDIA Apex from source against torch `2.11.0+cu130` using a matching CUDA 13.0 toolkit prefix, validates a direct `FusedAdam` CUDA step, and completes a Qwen3.5-9B 4-bit QLoRA ProTrain smoke with `optimizer: adamw_apex_fused`. |
 | M13a | Three-way head-to-head: ProTrain vs DeepSpeed ZeRO at the same model and shape | **Validated** | §6.x rows for ProTrain Mode A (9.56 GiB / 22.6 sps) vs ZeRO-2 (9.20 GiB / 16.8 sps, 0.74×) vs ZeRO-3 (5.58 GiB / 6.7 sps) vs ZeRO-3+CPU (3.66 GiB / 5.8 sps) — all on Llama-2-13B + 4-bit qlora, 4× 3090, seq=256, bs=1/rank. |
 | M13b | ProTrain vs FSDP2 head-to-head | **Validated: actual Llama-2-13B + Qwen3-14B corroboration** | §6.x: actual Llama-2-13B optimized FSDP2 — peak **8.98 GiB/rank**, 4.27 global sps, loss 1.13 (apples-to-apples row, §6.hh); Qwen3-14B 14B-class corroboration on the same hardware and accelerate-side FSDP2 knobs — peak 12.41 GiB/rank, 4.76 global sps; unoptimized FSDP2 baseline — 8.66 GiB / 4.1 sps. Even with the optimized knobs FSDP2 trails ProTrain Mode A by ~5.3× at this shape on non-NVLink PCIe without NVLink. |
 | M14 | Long-horizon convergence (1500 steps) on 13B + 4-bit | **Validated** | §6.aa: ProTrain Mode A loss 0.836 vs vanilla 0.804 at step 1500 — within variance noise, no chunk-shuffling drift |

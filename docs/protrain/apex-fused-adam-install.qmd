@@ -79,6 +79,20 @@ pip install -v --disable-pip-version-check --no-build-isolation \
     --config-settings "--build-option=--cuda_ext" ./
 ```
 
+If the matching toolkit lives in a conda prefix rather than `/usr/local/cuda`,
+point the build at that prefix explicitly. Some conda CUDA packages place
+library headers under `targets/x86_64-linux/include`, so expose that directory
+through `CPATH` as well:
+
+```bash
+export CUDA_HOME=/path/to/cuda-13.0-prefix
+export PATH="$CUDA_HOME/bin:$PATH"
+export CPATH="$CUDA_HOME/targets/x86_64-linux/include:$CUDA_HOME/include:$CPATH"
+export LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib:$CUDA_HOME/lib:$LIBRARY_PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib:$CUDA_HOME/lib:$LD_LIBRARY_PATH"
+APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install -v --no-build-isolation .
+```
+
 Both `--cpp_ext` and `--cuda_ext` are required for `FusedAdam`. Omitting
 `--cuda_ext` will produce a partial install that imports cleanly but raises
 `ModuleNotFoundError: No module named 'amp_C'` the first time an Apex
@@ -211,11 +225,13 @@ above is not worth the marginal speedup, use the torch fused path instead.
 
 ## Notes for the axolotl validation environment
 
-The protrain phase 2 PR was developed against torch 2.9.1 + cu130 on a
-system reporting cu13.2, so the Apex install path was not exercised
-end-to-end in this environment. The whitelist change in commit `539eff293`
-is correctness-verified through unit tests against the validator, not
-through a full train-time round-trip with `FusedAdam`.
+The protrain phase 2 PR validation environment uses a torch `cu130` wheel on a
+system whose default `/usr/local/cuda` reports CUDA 13.2. Apex was validated by
+installing a CUDA 13.0 compiler/libraries prefix, building NVIDIA Apex from
+source with `APEX_CPP_EXT=1 APEX_CUDA_EXT=1`, and running both a direct
+`FusedAdam` CUDA step and an Axolotl `optimizer: adamw_apex_fused` smoke.
+The default system toolkit still does not match torch; reproducible builds
+must set `CUDA_HOME` to the matching toolkit prefix before installing Apex.
 
 Users running in a CUDA-aligned environment who hit install or runtime
 issues should open a GitHub issue with the output of the two version-check
