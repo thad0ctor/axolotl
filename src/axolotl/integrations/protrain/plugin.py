@@ -67,20 +67,24 @@ def _bind_local_cuda_device_from_env() -> int | None:
         local_rank = int(raw_local_rank)
     except ValueError:
         LOG.warning(
-            "ProTrain: invalid LOCAL_RANK=%r; leaving current CUDA device at %s.",
+            "ProTrain: invalid LOCAL_RANK=%r; leaving current CUDA device unchanged.",
             raw_local_rank,
-            torch.cuda.current_device(),
         )
         return None
 
     visible = torch.cuda.device_count()
+    if visible <= 0:
+        LOG.warning(
+            "ProTrain: CUDA reported available but no visible CUDA devices were "
+            "enumerated; leaving current CUDA device unchanged.",
+        )
+        return None
     if not (0 <= local_rank < visible):
         LOG.warning(
             "ProTrain: LOCAL_RANK=%d is out of visible CUDA range [0, %d); "
-            "leaving current CUDA device at %s.",
+            "leaving current CUDA device unchanged.",
             local_rank,
             visible,
-            torch.cuda.current_device(),
         )
         return None
 
@@ -89,10 +93,9 @@ def _bind_local_cuda_device_from_env() -> int | None:
     except RuntimeError as exc:
         LOG.warning(
             "ProTrain: torch.cuda.set_device(LOCAL_RANK=%d) failed (%s); "
-            "continuing with current CUDA device %s.",
+            "continuing with current CUDA device unchanged.",
             local_rank,
             exc,
-            torch.cuda.current_device(),
         )
         return None
     return local_rank
