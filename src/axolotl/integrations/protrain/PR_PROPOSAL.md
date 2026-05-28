@@ -979,12 +979,12 @@ requirements:
 
 Maintainer acceptance recipe:
 
-| Lane | Command / shape | Purpose |
+| Lane | Run | Acceptance bar |
 |---|---|---|
-| CPU/default | `PYTHONPATH=src python -m pytest tests/protrain -q` | Portable validators, cost/search math, checkpoint metadata, API guards, and no-GPU runtime invariants. |
-| One GPU, 24 GiB | Small 4-bit QLoRA train/save/resume smoke with active ProTrain | Confirms loader deferral, LoRA hooks, safetensors save, and resume without requiring the local 5-GPU rig. |
-| Two GPUs | Forced Mode C small-model train/save/resume smoke | Confirms DDP bypass, chunk collectives, and ProTrain optimizer-state path on minimal multi-rank hardware. |
-| Optional four GPUs | `pytest tests/protrain/ -m gpu` on a 3090-class PCIe pool | Covers Path B / Mode C PCIe regressions and cross-mode resume. |
+| CPU/default | `PYTHONPATH=src python -m pytest tests/protrain -q` | Validators, cost/search math, checkpoint metadata, optimizer-state metadata, and deterministic chunk layout pass without a GPU. |
+| One GPU, 24 GiB | 8B 4-bit QLoRA, 50 train steps, save, resume for additional steps. Use `examples/protrain/3090-8b-lora.yml` with `adapter: qlora`, `load_in_4bit: true`, `max_steps: 50`, and `save_steps: 50`. | The run emits ProTrain wrapper/optimizer logs, writes `checkpoint-50`, resumes from it, keeps every logged loss finite, and the first resumed loss is continuous with the last pre-resume loss rather than a restart/divergence spike. |
+| Two GPUs | Small forced-Mode-C model, save, resume, and parity check. Set `protrain_auto_mode: false`, `protrain_zero3_shard: true`, and a small `protrain_n_persist_override` so at least one chunk is non-persistent. | The resumed run restores model + `protrain_optim/`, produces finite losses on both ranks, and matches the same-seed uninterrupted continuation within the test tolerance. |
+| Optional four GPUs | `pytest tests/protrain/ -m gpu` on a 3090-class PCIe pool | Covers Path B / Mode C PCIe regressions and cross-mode / cross-world resume beyond the minimal maintainer lanes. |
 
 ### Version guardrails (load-bearing for monkey-patches)
 
