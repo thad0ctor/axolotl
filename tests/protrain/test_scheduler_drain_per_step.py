@@ -267,6 +267,25 @@ def test_drain_on_cpu_only_path_is_safe() -> None:
     assert wait_cpu_optim_calls["n"] == 1
 
 
+def test_drain_inert_path_skips_stream_and_chunk_manager_drains() -> None:
+    """Inert Mode-A path has no hooks, queued transfers, deferred offloads, or CPU-Adam work."""
+    sched, drain_deferred_calls, wait_cpu_optim_calls = (
+        _make_scheduler_with_stub_streams(has_cuda=True, with_offload=True)
+    )
+    sched._is_inert = True
+    sched._first_iter_trace_enabled = True
+    sched._first_iter_t0_ns = 0
+
+    sched.drain()
+
+    assert sched._prefetch_stream.synchronize_calls == 0
+    assert sched._swap_stream.synchronize_calls == 0
+    assert sched._offload_stream.synchronize_calls == 0
+    assert drain_deferred_calls["n"] == 0
+    assert wait_cpu_optim_calls["n"] == 0
+    assert sched._first_iter_trace_enabled is False
+
+
 # ---------------------------------------------------------------------------
 # Test 3: chunk_manager._scheduler_ref is wired at runtime construction.
 # ---------------------------------------------------------------------------

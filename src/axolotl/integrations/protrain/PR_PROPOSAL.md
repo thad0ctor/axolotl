@@ -1764,10 +1764,10 @@ hardware capacity for larger full-FT shapes, bounded multimodal batch sizing on
   state partitioning; the high-memory Qwen3.5-9B validation is recorded in
   §16.B B1.
 - **bs=1 Mode A is fixed-overhead dominated.** The all-persistent inert path
-  prunes ProTrain's block hooks, but the fixed per-step runtime tax still
-  amortizes poorly at effective batch < 4. Use higher micro-batches or
-  gradient accumulation where possible; deeper launch/NCCL profiling and CUDA
-  Graphs are tracked in §16.B B2.
+  prunes ProTrain's block hooks and drain-side stream sync, but the fixed
+  per-step runtime tax still amortizes poorly at effective batch < 4. Use
+  higher micro-batches or gradient accumulation where possible; CUDA Graphs
+  remain future throughput work.
 - **27B + 4-bit on a single 3090 is validated at seq=128 in Mode A and
   seq=256 in explicit Mode B.** Higher-throughput Mode A at longer 27B
   sequence lengths still requires multi-GPU or larger-memory hardware.
@@ -2045,7 +2045,7 @@ cleanly into the smaller single- and multi-GPU benchmark matrix.
 | # | Area | Scope |
 |---|---|---|
 | B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because the 9B shape exceeds local card capacity. Exact Qwen3.5-9B multimodal checkpoint fidelity is validated on 2× RTX PRO 6000 Blackwell at seq=256: a seed checkpoint and checkpoint-1 resume both complete finite, the resume restores sharded `protrain_optim/`, final saves restore 9.002 GB and unwrap 32 blocks, and both final safetensors use native keys (`760` total, `333` `model.visual.*`, `0` nested visual, `0` `.block.`). Runtime resume load emits HF block-wrapper missing/unexpected-key warnings, but the saved artifacts are native-key clean. |
-| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain's block-hook aggregate is zero, but wall-clock remains dominated by fixed per-step runtime overheads instead of useful model math. The CPU hot-path guard passes with bs=4 only ~1.09× bs=1 in the hook-only microbench, so the batch-independent cost amortizes with accumulation. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). A Qwen3.5-9B all-linear QLoRA rerun on 4× 3090 PCIe confirms the active Path B profile: OFF completes 25 steps in **68.46 s** (`0.365` steps/s) and ON completes in **64.61 s** (`0.387` steps/s), with captured steady micro-step mean **0.648 s → 0.561 s** and peak **8.48 → 8.37 GiB**. Optional optimization track: deeper launch/NCCL profiling and CUDA Graphs capture. |
+| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain installs no block hooks; the inert scheduler drain also skips side-stream synchronization and empty chunk-manager queues. The CPU hot-path guard passes with bs=4 only ~1.09× bs=1 in the hook-only microbench, so the batch-independent cost amortizes with accumulation. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). A Qwen3.5-9B all-linear QLoRA rerun on 4× 3090 PCIe confirms the active Path B profile: OFF completes 25 steps in **68.46 s** (`0.365` steps/s) and ON completes in **64.61 s** (`0.387` steps/s), with captured steady micro-step mean **0.648 s → 0.561 s** and peak **8.48 → 8.37 GiB**. Deeper CUDA Graphs capture remains optional future throughput work, not a correctness gap. |
 | B3 | **At-scale cross-world Mode C full optimizer-state resume** | Closed for the local regression class: Qwen3.5-4B full-FT forced Mode C validates packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume through finite steps 4-6, with final safetensors saves. The inverse packed seq=2048 2-rank save → online 4-rank path also passes under `adamw_bnb_8bit`, and seq=2048 4→2 repeats under `adamw_torch`. The path requires param-name sidecar metadata for persistent GPU optimizer state; older sidecar-less checkpoints fail closed for cross-world resume. |
 
 ---

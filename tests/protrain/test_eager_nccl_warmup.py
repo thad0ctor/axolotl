@@ -62,7 +62,9 @@ def test_warmup_device_prefers_chunk_manager_device():
     from axolotl.integrations.protrain.plugin import _resolve_eager_nccl_warmup_device
 
     chunk_manager = SimpleNamespace(device=torch.device("cuda", 3))
-    trainer = SimpleNamespace(accelerator=SimpleNamespace(device=torch.device("cuda", 0)))
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(device=torch.device("cuda", 0))
+    )
 
     assert _resolve_eager_nccl_warmup_device(chunk_manager, trainer) == torch.device(
         "cuda", 3
@@ -78,7 +80,9 @@ def test_warmup_device_falls_back_to_accelerator():
     from axolotl.integrations.protrain.plugin import _resolve_eager_nccl_warmup_device
 
     chunk_manager = SimpleNamespace(device=None)
-    trainer = SimpleNamespace(accelerator=SimpleNamespace(device=torch.device("cuda", 1)))
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(device=torch.device("cuda", 1))
+    )
 
     assert _resolve_eager_nccl_warmup_device(chunk_manager, trainer) == torch.device(
         "cuda", 1

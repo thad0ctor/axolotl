@@ -23,7 +23,7 @@ class _Scheduler:
 def test_forward_nonfinite_debug_hook_raises_with_block_context(monkeypatch) -> None:
     monkeypatch.setenv("PROTRAIN_DEBUG_FORWARD_NONFINITE", "1")
     scheduler = _Scheduler()
-    hook = _make_forward_post_hook(scheduler, BlockId(7))
+    hook = _make_forward_post_hook(cast(Any, scheduler), BlockId(7))
 
     with pytest.raises(RuntimeError, match="non-finite forward output") as exc_info:
         hook(nn.Linear(2, 2), (), {"hidden": torch.tensor([1.0, float("nan")])})
@@ -38,7 +38,7 @@ def test_forward_nonfinite_debug_hook_raises_with_block_context(monkeypatch) -> 
 def test_forward_nonfinite_debug_hook_ignores_finite_outputs(monkeypatch) -> None:
     monkeypatch.setenv("PROTRAIN_DEBUG_FORWARD_NONFINITE", "1")
     scheduler = _Scheduler()
-    hook = _make_forward_post_hook(scheduler, BlockId(3))
+    hook = _make_forward_post_hook(cast(Any, scheduler), BlockId(3))
 
     hook(nn.Linear(2, 2), (), (torch.tensor([1.0, 2.0]),))
 
@@ -48,7 +48,7 @@ def test_forward_nonfinite_debug_hook_ignores_finite_outputs(monkeypatch) -> Non
 def test_forward_nonfinite_debug_hook_is_env_gated(monkeypatch) -> None:
     monkeypatch.delenv("PROTRAIN_DEBUG_FORWARD_NONFINITE", raising=False)
     scheduler = _Scheduler()
-    hook = _make_forward_post_hook(scheduler, BlockId(5))
+    hook = _make_forward_post_hook(cast(Any, scheduler), BlockId(5))
 
     hook(nn.Linear(2, 2), (), cast(Any, torch.tensor([float("nan")])))
 

@@ -816,9 +816,7 @@ class ChunkManager:
                     if not chunk_is_shardable:
                         assert chunk_grad_view is not None
                         assert grad_off is not None
-                        grad_byte_view = chunk_grad_view.narrow(
-                            0, grad_off, nbytes
-                        )
+                        grad_byte_view = chunk_grad_view.narrow(0, grad_off, nbytes)
                         cpu_grad = grad_byte_view.view(dtype).view(shape)
                         # Pre-zero for tests / first accumulate-grad consumers.
                         cpu_grad.zero_()

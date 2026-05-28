@@ -825,7 +825,7 @@ def _broadcast_runtime_search_result(result: SearchResult) -> SearchResult:
     except (RuntimeError, ValueError):
         return result
 
-    holder = [result] if rank == 0 else [None]
+    holder: list[SearchResult | None] = [result if rank == 0 else None]
     try:
         _dist.broadcast_object_list(holder, src=0)
     except Exception as exc:  # noqa: BLE001 - defensive
@@ -1700,10 +1700,14 @@ def _downgrade_oversized_swap_to_checkpoint(
     blocks: list[nn.Module],
     result: SearchResult,
     trace,
-    cpu_capacity_bytes: int,
+    cpu_capacity_bytes: int | None,
 ) -> SearchResult:
     """Avoid runtime SWAP-pool allocations that exceed the CPU budget."""
-    if int(result.cfg.n_swap) <= 0 or cpu_capacity_bytes <= 0:
+    if (
+        int(result.cfg.n_swap) <= 0
+        or cpu_capacity_bytes is None
+        or cpu_capacity_bytes <= 0
+    ):
         return result
 
     total, n_slot, slot_bytes, max_act, max_intra, max_param = (

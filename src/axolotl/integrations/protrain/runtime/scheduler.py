@@ -911,6 +911,17 @@ class Scheduler:
         if self._first_iter_trace_enabled:
             self._first_iter_log("drain enter (stream sync + cpu_optim drain)")
 
+        if self._is_inert:
+            # No hooks are installed, so no side-stream or deferred chunk work can be pending.
+            if self._first_iter_trace_enabled:
+                self._first_iter_log("drain inert fast-path; trace auto-disabled")
+                self._first_iter_trace_enabled = False
+            if self._step_timing_enabled:
+                self._step_timing_step_idx += 1
+                if self._step_timing_step_idx % self._step_timing_emit_every == 0:
+                    self._emit_step_timing()
+            return
+
         # Drain in-flight prefetch/swap/offload traffic for stable peak-memory stats.
         if self._has_cuda:
             if self._prefetch_stream is not None:
