@@ -49,8 +49,9 @@ high-memory RunPod host is called out explicitly; full setup in §11):
 - **At-scale multimodal MoE QLoRA on 5× 3090-class GPUs.**
   Qwen3.6-35B-A3B multimodal MoE loads across 5× 3090 / 3090 Ti cards in
   4-bit QLoRA, auto-selects Mode B, downgrades an oversized SWAP plan to
-  CKPT before runtime allocation, and completes a finite seq=1024 train step:
-  loss **5.087**, grad_norm **17.37**, peak **20.29 GiB/rank** (§6.bb).
+  CKPT before runtime allocation, and completes a bounded-image seq=1024
+  10-step run: train_runtime **85.66 s**, train_loss **3.264**, peak
+  **20.29 GiB/rank** (§6.bb).
 - **Full-finetune Adam-state reduction on Qwen3-0.6B, single 3090.**
   `adamw_torch` baseline 5.59 GiB → `adamw_bnb_8bit` 4.81 GiB (-14%) →
   **`paged_adamw_8bit` 2.84 GiB (-49% peak)**. The 74.6% headline
@@ -95,6 +96,12 @@ high-memory RunPod host is called out explicitly; full setup in §11):
   `adamw_bnb_8bit` completes 25/25 finite steps in **144.3 s** (`0.173`
   steps/s), peak active **85.76 GiB/rank** and reserved **90.09 GiB/rank**,
   with `ddp_find_unused_parameters: true` required by this Qwen3.5 topology.
+- **Qwen3.5-9B multimodal full-FT checkpoint fidelity.** On 2× RTX PRO
+  6000 Blackwell, forced Mode C at seq=256 completes a one-step seed
+  checkpoint and a checkpoint-1 resume to step 2. Both final safetensors use
+  native checkpoint keys: **760** total keys, **333** `model.visual.*` keys,
+  **0** nested `model.language_model.visual.*` keys, and **0** `.block.`
+  wrapper keys (§16.B B1).
 - **27B + 4-bit Mode C sharded on 2× 3090 (multi-GPU).** ProTrain Mode C
   with `protrain_zero3_shard: true` at seq=128, world_size=2 holds at
   **20.25 GiB/rank**, 4.564 global sps, loss 0.811 — the first
@@ -1047,12 +1054,16 @@ Mixtral, OLMoE, and Phi-MoE.
 
 At larger scale, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA validates the
 same composition on the local 5× 3090-class pool (GPUs 1,2,4,5,7), bs=1,
-seq=1024. The one-step smoke loads the multimodal model, quantizes 80 MoE
-expert params, injects LoRA, uses a forward-only resident-base adapter trace,
-auto-selects Mode B, downgrades an oversized SWAP plan to CKPT before runtime
-allocation, and completes finite training: loss **5.087**, grad_norm
-**17.37**, train_runtime **42.53 s**, peak **20.29 GiB/rank**. This is a
-loader/profiler/search/runtime compatibility smoke, not a convergence run.
+seq=1024. The model loads, quantizes 80 MoE expert params, injects LoRA, uses
+a forward-only resident-base adapter trace, auto-selects Mode B, and
+downgrades an oversized SWAP plan to CKPT before runtime allocation. With
+bounded image preprocessing (`image_size: 224`), the run completes 10/10
+finite steps: train_runtime **85.66 s**, train_loss **3.264**, final loss
+**2.242**, final grad_norm **4.902**, peak **20.29 GiB/rank**. This validates
+larger MoE loader/profiler/search/runtime compatibility beyond a single-step
+smoke. Unbounded multimodal batches can exceed the 24 GiB cards during the
+Transformers fp32 logits-loss allocation, so long-run 35B-A3B training on this
+hardware should use bounded image sizes.
 
 ### 6.cc Cross-world-size resume
 
@@ -1744,8 +1755,8 @@ construction-time NCCL measurement unavailable; this integration adapts.
 
 The current implementation is feature-complete for LoRA / QLoRA ProTrain
 training on the validated 3090-class topologies. The remaining limits are
-hardware coverage, exact multimodal checkpoint fidelity, and known throughput
-tradeoffs.
+larger-shape hardware coverage, unbounded multimodal batch sizing on 24 GiB
+cards, and known throughput tradeoffs.
 
 - **8B+ full-finetune needs larger hardware than 24 GiB cards.**
   Full-finetune at 8B-class scale is hardware-bound locally even with optimizer
@@ -1922,7 +1933,7 @@ The status column reflects the current validation evidence on the 4× RTX 3090 /
 | M13a | Three-way head-to-head: ProTrain vs DeepSpeed ZeRO at the same model and shape | **Validated** | §6.x rows for ProTrain Mode A (9.56 GiB / 22.6 sps) vs ZeRO-2 (9.20 GiB / 16.8 sps, 0.74×) vs ZeRO-3 (5.58 GiB / 6.7 sps) vs ZeRO-3+CPU (3.66 GiB / 5.8 sps) — all on Llama-2-13B + 4-bit qlora, 4× 3090, seq=256, bs=1/rank. |
 | M13b | ProTrain vs FSDP2 head-to-head | **Validated: actual Llama-2-13B + Qwen3-14B corroboration** | §6.x: actual Llama-2-13B optimized FSDP2 — peak **8.98 GiB/rank**, 4.27 global sps, loss 1.13 (apples-to-apples row, §6.hh); Qwen3-14B 14B-class corroboration on the same hardware and accelerate-side FSDP2 knobs — peak 12.41 GiB/rank, 4.76 global sps; unoptimized FSDP2 baseline — 8.66 GiB / 4.1 sps. Even with the optimized knobs FSDP2 trails ProTrain Mode A by ~5.3× at this shape on non-NVLink PCIe without NVLink. |
 | M14 | Long-horizon convergence (1500 steps) on 13B + 4-bit | **Validated** | §6.aa: ProTrain Mode A loss 0.836 vs vanilla 0.804 at step 1500 — within variance noise, no chunk-shuffling drift |
-| M15 | MoE compatibility (Mixtral-class and A3B-class QLoRA smoke) | **Validated** | §6.bb: tiny-mixtral-30m vanilla + ProTrain Mode A both rc=0; Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA completes a finite seq=1024 train step on 5× 3090-class GPUs. MoE supported when DecoderLayer carries `.self_attn` (Mixtral, OLMoE, Phi-MoE). |
+| M15 | MoE compatibility (Mixtral-class and A3B-class QLoRA) | **Validated** | §6.bb: tiny-mixtral-30m vanilla + ProTrain Mode A both rc=0; Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA completes a bounded-image seq=1024 10-step run on 5× 3090-class GPUs. MoE supported when DecoderLayer carries `.self_attn` (Mixtral, OLMoE, Phi-MoE). |
 | M16 | Mode B (replicated CPU-offload) explicit-force knob | **Validated** | §6.dd: `protrain_force_replicated_cpu_offload: true` engages Mode B; tests cover the validator and routing path. |
 | M17 | 8B BF16 LoRA ProTrain Mode A + flash_attention (extended timeout) | **Validated** | §6.w: peak 17.28 GiB, sps 2.37, loss 0.884 |
 
@@ -2031,8 +2042,8 @@ cleanly into the smaller single- and multi-GPU benchmark matrix.
 
 | # | Area | Scope |
 |---|---|---|
-| B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because the 9B shape exceeds local card capacity; the same 4B local shape also validates Qwen3.5 multimodal visual-key checkpoint fidelity at the final save boundary. |
-| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain's block-hook aggregate is zero, but wall-clock remains dominated by fixed per-step runtime overheads instead of useful model math. The CPU hot-path guard shows the old LoRA-hook Python delta reduced from the 4.7 ms/step baseline to ~2.8 ms/step, and bs=4 is only 1.07× bs=1 in that hook-only microbench, so the remaining cost is batch-independent and should be amortized. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). Path B's coalesced sync is noise-level on minimal-target LoRA but material on many-LoRA-tensor PCIe profiles (§6.pb). Future work: deeper launch/NCCL profiling and CUDA Graphs capture. |
+| B1 | **9B full-FT Mode C: finite high-memory train/save/resume** | Validated on 2× H100 NVL RunPod (`NODE` fabric) with Qwen3.5-9B full-FT, bf16, seq=256, bs=1, forced Mode C. The branch completes finite training, safetensors save, full sharded `protrain_optim/` save, full-state resume to step 100, and second resume to step 105. Local 24 GiB regression coverage uses Qwen3.5-4B forced Mode C because the 9B shape exceeds local card capacity. Exact Qwen3.5-9B multimodal checkpoint fidelity is validated on 2× RTX PRO 6000 Blackwell at seq=256: a seed checkpoint and checkpoint-1 resume both complete finite, restore 9.002 GB before final save, unwrap 32 blocks, and write native safetensors keys (`760` total, `333` `model.visual.*`, `0` nested visual, `0` `.block.`). Runtime resume load emits HF block-wrapper missing/unexpected-key warnings, but the saved artifacts are native-key clean. |
+| B2 | **bs=1 throughput is fixed-overhead-bound; use `gradient_accumulation_steps >= 4`** | At bs=1 on Llama-3-8B 4-bit qlora Mode A, the all-persistent inert predicate fires and ProTrain's block-hook aggregate is zero, but wall-clock remains dominated by fixed per-step runtime overheads instead of useful model math. The CPU hot-path guard shows the old LoRA-hook Python delta reduced from the 4.7 ms/step baseline to ~2.8 ms/step; repeated local reruns pass the guard, and bs=4 is only ~1.09× bs=1 in the hook-only microbench, so the remaining cost is batch-independent and should be amortized. Recommended config: `gradient_accumulation_steps: 4`; measured per-rank bs=1 = 0.229 sps → bs=4 via grad-accum = 0.738 sps (3.22×/sample). Path B's coalesced sync is noise-level on minimal-target LoRA but material on many-LoRA-tensor PCIe profiles (§6.pb). Future work: deeper launch/NCCL profiling and CUDA Graphs capture. |
 | B3 | **At-scale cross-world Mode C full optimizer-state resume** | Closed for the local regression class: Qwen3.5-4B full-FT forced Mode C validates packed seq=1024 and seq=2048 4-rank save → online 2-rank full optimizer-state resume through finite steps 4-6, with final safetensors saves. The inverse packed seq=2048 2-rank save → online 4-rank path also passes under `adamw_bnb_8bit`, and seq=2048 4→2 repeats under `adamw_torch`. The path requires param-name sidecar metadata for persistent GPU optimizer state; older sidecar-less checkpoints fail closed for cross-world resume. |
 
 ---
