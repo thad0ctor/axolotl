@@ -30,7 +30,10 @@ class _ConfigSpy:
     attribute access. Only the attributes it touches need to be present.
     """
 
+    _defaults = {"attn_needs_dtype_cast": False}
+
     def __init__(self, **kwargs):
+        self.__dict__.update(self._defaults)
         self.__dict__.update(kwargs)
 
 
