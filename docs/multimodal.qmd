@@ -368,9 +368,8 @@ Here is an example of a multi-modal dataset:
 
 Raw image+text continued pretraining — no chat template, no conversational
 scaffolding. The model learns to emit raw text conditioned on visual patches.
-Intended for use cases like OCR/transcription corpora where every row is a
-tight `(image, target_text)` pair and any user/assistant framing would pollute
-the learned signal.
+This is intended for corpora where every row is a tight `(image, target_text)`
+pair and any user/assistant framing would pollute the learned signal.
 
 ::: {.callout-note}
 MM CPT supports two raw image+text routes:
@@ -440,6 +439,25 @@ micro_batch_size: 1
 gradient_accumulation_steps: 8
 ```
 
+For large streaming runs that need cheap checkpoint resume, set
+`dataset_prepared_path` so Axolotl can cache the tokenized MM CPT rows, and use
+`ignore_data_skip: true` when you prefer resuming optimizer/scheduler state
+without Trainer fast-forwarding through already-seen multimodal batches:
+
+```yaml
+pretraining_dataset:
+  - path: /path/to/shards/*.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+    text_column: text
+    image_column: images
+
+streaming: true
+dataset_prepared_path: ./data/mm-cpt-stream-cache
+ignore_data_skip: true
+max_steps: 10000
+```
+
 ### Non-streaming prepared YAML example
 
 ```yaml
@@ -463,6 +481,35 @@ remove_unused_columns: false           # auto-set by validator
 
 micro_batch_size: 1
 gradient_accumulation_steps: 8
+```
+
+### Already-tokenized MM CPT rows
+
+The non-streaming `datasets:` path also accepts rows that have already been
+tokenized, as long as they still include `_mm_text` and `images` for the
+collator. The collator re-tokenizes `_mm_text` with the processor at batch time
+so image placeholders expand consistently with the loaded model; the stored
+token columns are used by the prepared dataset pipeline and should match the raw
+text.
+
+```yaml
+base_model: HuggingFaceTB/SmolVLM-500M-Instruct
+processor_type: AutoProcessor
+
+datasets:
+  - path: /path/to/pretokenized_mm_cpt.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+
+streaming: false
+skip_prepare_dataset: true
+sequence_len: 2048
+sample_packing: false
+remove_unused_columns: false
+```
+
+```json
+{"_mm_text": "<image>\nText target.", "images": ["/dataset/image.png"], "input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]}
 ```
 
 ### Eval datasets
