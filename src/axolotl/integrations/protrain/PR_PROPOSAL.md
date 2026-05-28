@@ -41,9 +41,9 @@ Current boundaries are explicit rather than hidden:
 - ProTrain is mutually exclusive with DeepSpeed/FSDP in the same Axolotl run.
 - Mode A full-FT at 8B+ can exceed 24 GiB cards because DDP reducer and frozen
   base load order still matter; Mode C is the intended full-FT path.
-- bs=1 correctness is validated, but throughput remains fixed-overhead-bound;
-  gradient accumulation is the recommended path until CUDA Graphs / deeper
-  launch profiling is implemented.
+- bs=1 correctness and cost attribution are validated. Throughput is
+  fixed-overhead-bound, so gradient accumulation is the recommended production
+  path; CUDA Graphs remains optional future optimization work.
 - 9B text full-FT train/save/resume is validated; exact multimodal visual-key
   checkpoint fidelity is validated on the local 4B/9B fidelity-specific paths
   called out in §16.B, not generalized beyond those shapes.
@@ -542,7 +542,7 @@ this proposal while removing per-run log detail.
 |---|---|---|
 | §6.t | Qwen3.5-27B 4-bit on 4× 3090 | Out of reach on 24 GiB cards in this validation; validated alternatives are single-3090 Mode A and 2× 3090 Mode C. |
 | §16.B B1 | 8B+ full-FT on 24 GiB cards | Mode A can OOM because DDP reducer and base-weight load order exceed 24 GiB; Mode C is the validated full-FT path. |
-| §16.B B2 | bs=1 performance | Correctness is validated; bs=1 remains fixed-overhead-bound, and gradient accumulation is the recommended production path until CUDA Graphs / deeper launch profiling are implemented. |
+| §16.B B2 | bs=1 performance | Correctness and cost attribution are validated; bs=1 remains fixed-overhead-bound, gradient accumulation is the recommended production path, and CUDA Graphs remains optional future optimization work. |
 | §6.nv | NVLink LoRA workloads that already fit | Vanilla DDP QLoRA can be faster than ProTrain when memory is not the binding constraint; ProTrain is intended for capacity-bound or Mode C/offload-bound cases. |
 
 ---
@@ -768,10 +768,10 @@ hardware capacity for larger full-FT shapes, bounded multimodal batch sizing on
   state partitioning; the high-memory Qwen3.5-9B validation is recorded in
   §16.B B1.
 - **bs=1 Mode A is fixed-overhead dominated.** The all-persistent inert path
-  prunes ProTrain's block hooks and drain-side stream sync, but the fixed
-  per-step runtime tax still amortizes poorly at effective batch < 4. Use
-  higher micro-batches or gradient accumulation where possible; CUDA Graphs
-  remain future throughput work.
+  prunes ProTrain's block hooks and drain-side stream sync, and the remaining
+  batch-independent cost has been profiled in §16.B B2. Use higher
+  micro-batches or gradient accumulation where possible; CUDA Graphs remain
+  optional future throughput work.
 - **27B + 4-bit on a single 3090 is validated at seq=128 in Mode A and
   seq=256 in explicit Mode B.** Higher-throughput Mode A at longer 27B
   sequence lengths still requires multi-GPU or larger-memory hardware.
