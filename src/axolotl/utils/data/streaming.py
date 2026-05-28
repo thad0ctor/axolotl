@@ -185,75 +185,20 @@ def encode_streaming_multimodal(
     text_column: str = "text",
     image_column: str = "images",
 ) -> Dict[str, List]:
-    texts: List[str] = examples[text_column]
-    imgs_list: List[List[str]] = examples[image_column]
+    from axolotl.prompt_strategies.multimodal_pretrain import (
+        encode_multimodal_pretrain,
+    )
 
-    if len(texts) != len(imgs_list):
-        raise ValueError(
-            f"encode_streaming_multimodal: text column has {len(texts)} rows "
-            f"but image column has {len(imgs_list)}"
-        )
-
-    input_ids: List[List[int]] = []
-    labels: List[List[int]] = []
-    attention_mask: List[List[int]] = []
-    keep_images: List[List[str]] = []
-    keep_text: List[str] = []
-
-    for text, imgs in zip(texts, imgs_list, strict=True):
-        if not isinstance(text, str):
-            raise TypeError(
-                f"encode_streaming_multimodal: `{text_column}` must be str, "
-                f"got {type(text).__name__}."
-            )
-        if imgs is None:
-            imgs = []
-        if not isinstance(imgs, (list, tuple)):
-            raise ValueError(
-                f"encode_streaming_multimodal: row's `{image_column}` must be "
-                f"a list; got {type(imgs).__name__}"
-            )
-        for j, ip in enumerate(imgs):
-            if not isinstance(ip, str):
-                raise TypeError(
-                    f"encode_streaming_multimodal: image {j} in row must be "
-                    f"str, got {type(ip).__name__}."
-                )
-        # No truncation: counting on truncated ids and storing untruncated text
-        # (which the collator re-tokenizes without truncation) silently produces
-        # oversize batches and confusing placeholder/image-count mismatches.
-        enc = tokenizer(text, add_special_tokens=True)
-        ids = list(enc["input_ids"]) + [tokenizer.eos_token_id]
-        mask = list(enc["attention_mask"]) + [1]
-        # Count by id — `text.count` substring-matches `<image>` in `<image_soft_token>`.
-        n_placeholders = sum(1 for t in ids if t == image_token_id)
-        if n_placeholders != len(imgs):
-            raise ValueError(
-                f"Multimodal CPT row has {n_placeholders} occurrence(s) of "
-                f"{image_token!r} in text but {len(imgs)} image path(s). "
-                f"Text and image count must match (one placeholder per image)."
-            )
-        if len(ids) > max_tokens:
-            raise ValueError(
-                f"Multimodal CPT row tokenizes to {len(ids)} tokens which "
-                f"exceeds sequence_len={max_tokens}. Pre-chunk your text or "
-                f"raise sequence_len (image patch expansion at the processor "
-                f"may push the final length even higher)."
-            )
-        # Labels = ids; collator masks image-family ids after re-tokenization.
-        input_ids.append(ids)
-        labels.append(list(ids))
-        attention_mask.append(mask)
-        keep_images.append(list(imgs))
-        keep_text.append(text)
-
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "attention_mask": attention_mask,
-        "images": keep_images,
-        "_mm_text": keep_text,
-    }
+    return encode_multimodal_pretrain(
+        examples,
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        image_token=image_token,
+        image_token_id=image_token_id,
+        text_column=text_column,
+        image_column=image_column,
+        enforce_max_length=True,
+    )
 
 
 def wrap_streaming_dataset(

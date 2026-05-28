@@ -43,6 +43,28 @@ def _datasets():
     ]
 
 
+def _mm_datasets(**overrides):
+    return [
+        DictDefault(
+            {
+                "path": "local/mm.jsonl",
+                "type": "multimodal_pretrain",
+                "shards": None,
+                "conversation": None,
+                "split": "train",
+                "temperature": None,
+                "text_column": "text",
+                "image_column": "images",
+                "image_base_dir": "/images",
+                "image_token": "<image>",
+                "data_files": None,
+                "ds_type": "json",
+                **overrides,
+            }
+        )
+    ]
+
+
 class TestGenerateDatasetHashFromConfig:
     def test_same_config_same_hash(self):
         """Identical configs produce identical hashes."""
@@ -136,6 +158,24 @@ class TestGenerateDatasetHashFromConfig:
         h2 = generate_dataset_hash_from_config(cfg, _datasets(), "some/other-model")
 
         assert h1 != h2
+
+    def test_multimodal_dataset_fields_affect_hash(self):
+        """MM prepared caches must change when MM column/token settings change."""
+        cfg = _base_cfg()
+        base_hash = generate_dataset_hash_from_config(cfg, _mm_datasets(), "tok")
+
+        for key, value in (
+            ("text_column", "caption"),
+            ("image_column", "image_paths"),
+            ("image_base_dir", "/other/images"),
+            ("image_token", "<|image_pad|>"),
+            ("data_files", "train-0001.jsonl"),
+            ("ds_type", "parquet"),
+        ):
+            changed_hash = generate_dataset_hash_from_config(
+                cfg, _mm_datasets(**{key: value}), "tok"
+            )
+            assert changed_hash != base_hash
 
 
 def _mm_pretrain_cfg(**kwargs):

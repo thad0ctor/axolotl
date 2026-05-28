@@ -10,6 +10,11 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor
 
+from axolotl.core.builders.causal import (
+    HFCausalTrainerBuilder,
+    _get_mm_cpt_config,
+    _is_multimodal_cpt,
+)
 from axolotl.prompt_strategies.multimodal_pretrain import build_image_token_spec
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.streaming import (
@@ -373,6 +378,53 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
         is_eval=True,
     )
     assert captured["kwargs"]["max_tokens"] == 4096
+
+
+def test_mm_cpt_detection_includes_nonstreaming_datasets():
+    cfg = DictDefault(
+        {
+            "pretraining_dataset": None,
+            "datasets": [
+                {
+                    "path": "train/ds",
+                    "type": "multimodal_pretrain",
+                    "image_base_dir": "/train/images",
+                }
+            ],
+        }
+    )
+
+    assert _is_multimodal_cpt(cfg)
+    assert _get_mm_cpt_config(cfg)["image_base_dir"] == "/train/images"
+
+
+def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
+    tok = _StubTokenizer({"<image>": 42})
+    processor = _StubProcessor(tok, image_token="<image>")
+    builder = object.__new__(HFCausalTrainerBuilder)
+    builder.tokenizer = tok
+    builder.processor = processor
+    builder.cfg = DictDefault(
+        {
+            "pretraining_dataset": None,
+            "datasets": [
+                {
+                    "path": "train/ds",
+                    "type": "multimodal_pretrain",
+                    "image_base_dir": "/train/images",
+                    "image_token": "<image>",
+                }
+            ],
+            "test_datasets": None,
+            "sequence_len": 128,
+            "eval_sequence_len": None,
+        }
+    )
+
+    collator = HFCausalTrainerBuilder._build_mm_pretrain_collator(builder)
+
+    assert isinstance(collator, MultiModalPretrainDataCollator)
+    assert collator.image_base_dir == "/train/images"
 
 
 # ---- MultiModalPretrainDataCollator ---------------------------------------

@@ -373,12 +373,14 @@ tight `(image, target_text)` pair and any user/assistant framing would pollute
 the learned signal.
 
 ::: {.callout-note}
-**Currently supported via the streaming `pretraining_dataset` route only.**
-A non-streaming `datasets:` route (`type: multimodal_pretrain` under
-`datasets:`) is intentionally not wired — the collator selection inside
-`build_collator` only routes MM CPT batches under the pretraining branch.
-Configure MM CPT under `pretraining_dataset:` with `streaming: true` as
-shown below.
+MM CPT supports two raw image+text routes:
+
+- `pretraining_dataset:` with `streaming: true` for iterable streaming.
+- `datasets:` with `type: multimodal_pretrain` for the standard non-streaming
+  prepared dataset pipeline.
+
+The non-streaming path stores token metadata plus image paths in the prepared
+dataset; decoded image tensors are loaded by the collator at batch time.
 :::
 
 ### Dataset format (JSONL)
@@ -413,7 +415,7 @@ Notes:
 Axolotl autodetects the placeholder from the loaded processor. If autodetection
 fails, supply `image_token: <your token>` on the dataset entry.
 
-### YAML example
+### Streaming YAML example
 
 ```yaml
 base_model: HuggingFaceTB/SmolVLM-500M-Instruct
@@ -434,6 +436,31 @@ sample_packing: false                  # REQUIRED — see below
 remove_unused_columns: false           # auto-set by validator
 
 max_steps: 10000
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+```
+
+### Non-streaming prepared YAML example
+
+```yaml
+base_model: HuggingFaceTB/SmolVLM-500M-Instruct
+processor_type: AutoProcessor
+
+datasets:
+  - path: /path/to/train.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+    text_column: text
+    image_column: images
+    image_base_dir: /path/to/images   # optional, for relative paths
+    # image_token: "<image>"           # optional override; autodetect by default
+
+streaming: false
+dataset_prepared_path: ./data/prepared
+sequence_len: 2048
+sample_packing: false                  # REQUIRED — see below
+remove_unused_columns: false           # auto-set by validator
+
 micro_batch_size: 1
 gradient_accumulation_steps: 8
 ```
@@ -473,6 +500,12 @@ The following combinations are rejected at config-load time with a clear error:
 - `chat_template` set to anything — defeats the purpose of the CPT path.
 - `processor_type` unset — no processor means no image tensors.
 - Multiple MM `test_datasets` entries with mismatched `image_base_dir` or `image_token`.
+- Multiple MM training entries under `datasets:` or `pretraining_dataset:`.
+- `datasets:` MM CPT with `streaming: true` — use `pretraining_dataset:` for
+  streaming and `datasets:` for the non-streaming prepared path.
+- `datasets:` MM CPT with `excess_length_strategy: truncate` — the collator
+  re-tokenizes `_mm_text` at batch time, so truncating only prepared token ids
+  would not truncate the actual model inputs.
 
 In addition, the following model families are **not supported** in v1 and will
 be rejected when their processor is loaded:

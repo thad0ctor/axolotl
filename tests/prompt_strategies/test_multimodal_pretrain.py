@@ -1,26 +1,52 @@
-"""Multimodal CPT helpers + safety gate tests.
-
-The non-streaming strategy class and ``load()`` factory are deferred to a
-follow-on PR (along with the matching ``build_collator`` routing for
-``datasets:`` MM CPT batches), so only the helper-level surface is exercised
-here in v1.
-"""
+"""Multimodal CPT strategy helper tests."""
 
 from __future__ import annotations
 
 import pytest
+from datasets import Dataset
 from transformers import AutoProcessor
 
 from axolotl.prompt_strategies.multimodal_pretrain import (
     _INCOMPATIBLE_PROCESSOR_REASONS,
     ImageTokenSpec,
+    MultiModalPretrainDatasetWrappingStrategy,
     build_image_token_spec,
     check_processor_compatibility,
+    load,
 )
+from axolotl.utils.dict import DictDefault
 
 from tests.hf_offline_utils import enable_hf_offline
 
 _SMOLVLM = "HuggingFaceTB/SmolVLM-500M-Instruct"
+
+
+class _StubTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+    unk_token_id = 1
+    all_special_tokens = ["<image>"]
+    additional_special_tokens = ["<image>"]
+    name_or_path = "stub-tokenizer"
+
+    def get_added_vocab(self):
+        return {"<image>": 42}
+
+    def convert_tokens_to_ids(self, tok):
+        return {"<image>": 42}.get(tok, self.unk_token_id)
+
+    def __call__(self, text, add_special_tokens=True):
+        ids = []
+        for token in text.split():
+            ids.append(42 if token == "<image>" else 100 + len(token))
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
+class _StubProcessor:
+    image_token = "<image>"
+
+    def __init__(self):
+        self.tokenizer = _StubTokenizer()
 
 
 @pytest.fixture(scope="module", name="smolvlm_processor")
@@ -113,3 +139,56 @@ def test_check_processor_compatibility_rejects_subclass():
 
 def test_check_processor_compatibility_accepts_supported(smolvlm_processor):
     check_processor_compatibility(smolvlm_processor)
+
+
+# ---- non-streaming dataset strategy ---------------------------------------
+
+
+def test_load_returns_nonstreaming_dataset_strategy():
+    processor = _StubProcessor()
+    strategy = load(
+        processor.tokenizer,
+        DictDefault({"sequence_len": 128}),
+        ds_cfg={"text_column": "caption", "image_column": "image_paths"},
+        processor=processor,
+    )
+    assert isinstance(strategy, MultiModalPretrainDatasetWrappingStrategy)
+    assert strategy.text_column == "caption"
+    assert strategy.image_column == "image_paths"
+
+
+def test_load_requires_processor_for_nonstreaming_strategy():
+    tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="requires a processor"):
+        load(tokenizer, DictDefault({"sequence_len": 128}), ds_cfg={}, processor=None)
+
+
+def test_nonstreaming_strategy_wraps_dataset_without_loading_pixels():
+    processor = _StubProcessor()
+    strategy = load(
+        processor.tokenizer,
+        DictDefault({"sequence_len": 128}),
+        ds_cfg={"text_column": "caption", "image_column": "image_paths"},
+        processor=processor,
+    )
+    dataset = Dataset.from_dict(
+        {
+            "caption": ["<image>\nfirst row", "text only row"],
+            "image_paths": [["relative/a.png"], []],
+            "metadata": ["dropped", "dropped"],
+        }
+    )
+
+    wrapped = strategy.wrap_dataset(dataset, process_count=None)
+
+    assert set(wrapped.column_names) == {
+        "input_ids",
+        "labels",
+        "attention_mask",
+        "images",
+        "_mm_text",
+    }
+    assert wrapped[0]["images"] == ["relative/a.png"]
+    assert wrapped[0]["_mm_text"] == "<image>\nfirst row"
+    assert wrapped[1]["images"] == []
+    assert wrapped[1]["labels"] == wrapped[1]["input_ids"]

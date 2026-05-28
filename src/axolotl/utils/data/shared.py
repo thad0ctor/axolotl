@@ -505,6 +505,28 @@ def try_load_from_hub(
         return None
 
 
+def _dataset_hash_component(dataset_config) -> str:
+    def _get(key: str, default=None):
+        if hasattr(dataset_config, "get"):
+            try:
+                return dataset_config.get(key, default)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        return getattr(dataset_config, key, default)
+
+    component = (
+        f"{_get('path')}:{_get('type')}:{_get('shards')}:"
+        f"{_get('conversation')}:{_get('split')}:{_get('temperature') or 1.0}"
+    )
+    if _get("type") == "multimodal_pretrain" or bool(_get("multimodal")):
+        component += (
+            f":{_get('text_column')}:{_get('image_column')}:"
+            f"{_get('image_base_dir')}:{_get('image_token')}:"
+            f"{_get('data_files')}:{_get('ds_type')}"
+        )
+    return component
+
+
 def generate_pretraining_dataset_hash(
     cfg: DictDefault,
     pretraining_config: DictDefault,
@@ -569,7 +591,7 @@ def generate_dataset_hash_from_config(
         f"{cfg.sequence_len}@{cfg.sample_packing}@{cfg.eval_sample_packing}@"
         f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}@"
         f"{cfg.dataset_exact_deduplication or False}|"
-        f"{'|'.join(sorted([f'{d.path}:{d.type}:{d.shards}:{d.conversation}:{d.split}:{d.temperature or 1.0}' for d in cfg_datasets]))}"
+        f"{'|'.join(sorted(_dataset_hash_component(d) for d in cfg_datasets))}"
         f"|{tokenizer_fingerprint}"
     )
     return str(md5(config_str))
