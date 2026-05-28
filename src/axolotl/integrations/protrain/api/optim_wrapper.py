@@ -377,7 +377,12 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
             return
         targets = list(self._iter_optimizer_targets())
         world_size = self._distributed_world_size()
-        reduce_partitioned = world_size > 1 and self._expects_partitioned_grad_norm()
+        has_partitioned_targets = any(
+            self._target_is_partitioned_for_norm(target) for target in targets
+        )
+        reduce_partitioned = world_size > 1 and (
+            self._expects_partitioned_grad_norm() or has_partitioned_targets
+        )
         if not targets:
             if reduce_partitioned:
                 total_norm = self._all_reduce_partitioned_grad_sq(0.0) ** 0.5
