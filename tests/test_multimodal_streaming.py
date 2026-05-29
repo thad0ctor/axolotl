@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
-from transformers import AutoProcessor
+from transformers import AutoProcessor, TrainerControl, TrainerState, TrainingArguments
 
 from axolotl.core.builders.causal import (
     HFCausalTrainerBuilder,
     _get_mm_cpt_config,
     _is_multimodal_cpt,
 )
+from axolotl.core.trainers.constants import TOKENS_STATE_FILE
 from axolotl.prompt_strategies.multimodal_pretrain import build_image_token_spec
+from axolotl.utils.callbacks.tokens_per_second import TokensPerSecondCallback
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.streaming import (
     encode_streaming_multimodal,
@@ -491,6 +494,47 @@ def test_collator_raises_on_missing_columns(smolvlm_processor):
     )
     with pytest.raises(KeyError, match="encode_streaming_multimodal"):
         collator.torch_call([{"input_ids": [1, 2, 3]}])  # no _mm_text / images
+
+
+def test_collator_resolves_relative_image_base_dir(smolvlm_processor, tmp_path):
+    spec = build_image_token_spec(smolvlm_processor)
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        image_base_dir=str(tmp_path),
+    )
+
+    assert collator._resolve_image_source("rel/img.png") == str(
+        tmp_path / "rel/img.png"
+    )
+    assert collator._resolve_image_source("/abs/img.png") == "/abs/img.png"
+    assert (
+        collator._resolve_image_source("https://host/img.png") == "https://host/img.png"
+    )
+
+
+def test_tokens_per_second_callback_restores_checkpoint_token_state(tmp_path):
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / TOKENS_STATE_FILE).write_text(
+        json.dumps({"total": 123, "trainable": 45})
+    )
+    callback = TokensPerSecondCallback(
+        tensor_parallel_size=None,
+        context_parallel_size=None,
+        resume_from_checkpoint=str(checkpoint),
+    )
+    state = TrainerState()
+
+    callback.on_train_begin(
+        TrainingArguments(output_dir=str(tmp_path / "out")),
+        state,
+        TrainerControl(),
+    )
+
+    assert int(state.tokens["total"].item()) == 123
+    assert int(state.tokens["trainable"].item()) == 45
 
 
 # ---- input validation -----------------------------------------------------

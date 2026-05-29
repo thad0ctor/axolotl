@@ -311,6 +311,9 @@ class MultiModalEvalDataset(PretrainingDataset):
                 "MultiModalEvalDataset requires type='multimodal_pretrain' "
                 "or multimodal=True"
             )
+        if data.get("type") != "multimodal_pretrain":
+            data = dict(data)
+            data["type"] = "multimodal_pretrain"
         return data
 
 

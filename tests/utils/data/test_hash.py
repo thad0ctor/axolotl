@@ -176,6 +176,24 @@ class TestGenerateDatasetHashFromConfig:
             )
             assert changed_hash != base_hash
 
+    def test_multimodal_processor_affects_hash(self):
+        cfg = _base_cfg()
+        h1 = generate_dataset_hash_from_config(
+            cfg, _mm_datasets(image_token=None), "tok", "ProcessorA"
+        )
+        h2 = generate_dataset_hash_from_config(
+            cfg, _mm_datasets(image_token=None), "tok", "ProcessorB"
+        )
+
+        assert h1 != h2
+
+    def test_text_processor_does_not_affect_hash(self):
+        cfg = _base_cfg()
+        h1 = generate_dataset_hash_from_config(cfg, _datasets(), "tok", "ProcessorA")
+        h2 = generate_dataset_hash_from_config(cfg, _datasets(), "tok", "ProcessorB")
+
+        assert h1 == h2
+
     def test_dataset_order_affects_hash(self):
         cfg = _base_cfg()
         dataset_a = _datasets()[0]

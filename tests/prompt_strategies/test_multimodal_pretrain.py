@@ -12,6 +12,7 @@ from axolotl.prompt_strategies.multimodal_pretrain import (
     check_processor_compatibility,
     load,
 )
+from axolotl.utils.data.utils import handle_long_seq_in_dataset
 from axolotl.utils.dict import DictDefault
 
 from tests.hf_offline_utils import enable_hf_offline
@@ -150,7 +151,7 @@ def test_load_requires_processor_for_nonstreaming_strategy():
 
 def test_load_rejects_processor_tokenizer_mismatch():
     processor = _StubProcessor()
-    with pytest.raises(ValueError, match="processor.tokenizer"):
+    with pytest.raises(ValueError, match=r"processor\.tokenizer"):
         load(_StubTokenizer(), DictDefault({"sequence_len": 128}), processor=processor)
 
 
@@ -185,7 +186,7 @@ def test_nonstreaming_strategy_wraps_dataset_without_loading_pixels():
     assert wrapped[1]["labels"] == wrapped[1]["input_ids"]
 
 
-def test_nonstreaming_strategy_rejects_oversized_rows():
+def test_nonstreaming_strategy_defers_oversized_rows_to_standard_handler():
     processor = _StubProcessor()
     strategy = load(
         processor.tokenizer,
@@ -200,5 +201,38 @@ def test_nonstreaming_strategy_rejects_oversized_rows():
         }
     )
 
-    with pytest.raises(ValueError, match="exceeds sequence_len=2"):
-        strategy.wrap_dataset(dataset, process_count=None)
+    wrapped = strategy.wrap_dataset(dataset, process_count=None)
+
+    assert len(wrapped[0]["input_ids"]) > 2
+
+
+def test_standard_length_handler_drops_nonstreaming_mm_oversized_rows():
+    processor = _StubProcessor()
+    strategy = load(
+        processor.tokenizer,
+        DictDefault({"sequence_len": 2}),
+        ds_cfg={"text_column": "caption", "image_column": "image_paths"},
+        processor=processor,
+    )
+    dataset = Dataset.from_dict(
+        {
+            "caption": ["<image> too-long"],
+            "image_paths": [["relative/a.png"]],
+        }
+    )
+
+    wrapped = strategy.wrap_dataset(dataset, process_count=None)
+    filtered = handle_long_seq_in_dataset(
+        wrapped,
+        2,
+        DictDefault(
+            {
+                "dataset_num_proc": None,
+                "is_preprocess": False,
+                "excess_length_strategy": "drop",
+                "min_sample_len": 1,
+            }
+        ),
+    )
+
+    assert len(filtered) == 0

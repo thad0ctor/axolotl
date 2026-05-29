@@ -38,6 +38,7 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
             image_token_id=self.image_token_spec.image_token_id,
             text_column=self.text_column,
             image_column=self.image_column,
+            enforce_max_length=False,
         )
 
     def wrap_dataset(

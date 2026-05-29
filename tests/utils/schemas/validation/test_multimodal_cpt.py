@@ -229,6 +229,7 @@ class TestMultimodalCPTGates:
         )
         validated = validate_config(cfg)
         td = validated.test_datasets[0]
+        assert td["type"] == "multimodal_pretrain"
         assert td["image_column"] == "imgs2"
         assert td["multimodal"] is True
 

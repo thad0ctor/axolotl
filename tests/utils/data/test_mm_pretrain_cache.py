@@ -90,10 +90,6 @@ class _FakeProc:
     pass
 
 
-class _FakeImageProc:
-    pass
-
-
 class TestProcessorFingerprint:
     def test_none_returns_none(self):
         assert _processor_fingerprint(None) is None
@@ -106,6 +102,11 @@ class TestProcessorFingerprint:
     def test_image_token_distinguishes(self):
         a = SimpleNamespace(image_token="<image>")
         b = SimpleNamespace(image_token="<|image_pad|>")
+        assert _processor_fingerprint(a) != _processor_fingerprint(b)
+
+    def test_boi_token_distinguishes(self):
+        a = SimpleNamespace(boi_token="<start_of_image>")
+        b = SimpleNamespace(boi_token="<image>")
         assert _processor_fingerprint(a) != _processor_fingerprint(b)
 
     def test_image_processor_settings_distinguish(self):

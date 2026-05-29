@@ -505,24 +505,34 @@ def try_load_from_hub(
         return None
 
 
-def _dataset_hash_component(dataset_config) -> str:
-    def _get(key: str, default=None):
-        if hasattr(dataset_config, "get"):
-            try:
-                return dataset_config.get(key, default)
-            except (AttributeError, KeyError, TypeError):
-                pass
-        return getattr(dataset_config, key, default)
+def _dataset_hash_get(dataset_config, key: str, default=None):
+    if hasattr(dataset_config, "get"):
+        try:
+            return dataset_config.get(key, default)
+        except (AttributeError, KeyError, TypeError):
+            pass
+    return getattr(dataset_config, key, default)
 
+
+def _dataset_hash_component(dataset_config) -> str:
     component = (
-        f"{_get('path')}:{_get('type')}:{_get('shards')}:"
-        f"{_get('conversation')}:{_get('split')}:{_get('temperature') or 1.0}"
+        f"{_dataset_hash_get(dataset_config, 'path')}:"
+        f"{_dataset_hash_get(dataset_config, 'type')}:"
+        f"{_dataset_hash_get(dataset_config, 'shards')}:"
+        f"{_dataset_hash_get(dataset_config, 'conversation')}:"
+        f"{_dataset_hash_get(dataset_config, 'split')}:"
+        f"{_dataset_hash_get(dataset_config, 'temperature') or 1.0}"
     )
-    if _get("type") == "multimodal_pretrain" or bool(_get("multimodal")):
+    if _dataset_hash_get(dataset_config, "type") == "multimodal_pretrain" or bool(
+        _dataset_hash_get(dataset_config, "multimodal")
+    ):
         component += (
-            f":{_get('text_column')}:{_get('image_column')}:"
-            f"{_get('image_base_dir')}:{_get('image_token')}:"
-            f"{_get('data_files')}:{_get('ds_type')}"
+            f":{_dataset_hash_get(dataset_config, 'text_column')}:"
+            f"{_dataset_hash_get(dataset_config, 'image_column')}:"
+            f"{_dataset_hash_get(dataset_config, 'image_base_dir')}:"
+            f"{_dataset_hash_get(dataset_config, 'image_token')}:"
+            f"{_dataset_hash_get(dataset_config, 'data_files')}:"
+            f"{_dataset_hash_get(dataset_config, 'ds_type')}"
         )
     return component
 
@@ -566,7 +576,10 @@ def generate_pretraining_dataset_hash(
 
 
 def generate_dataset_hash_from_config(
-    cfg: DictDefault, cfg_datasets: list, tokenizer_name: str
+    cfg: DictDefault,
+    cfg_datasets: list,
+    tokenizer_name: str,
+    processor_name: str | None = None,
 ) -> str:
     """Generate a hash to uniquely identify a dataset configuration for SFT.
 
@@ -587,12 +600,19 @@ def generate_dataset_hash_from_config(
     else:
         tokenizer_fingerprint = tokenizer_name
 
+    has_mm = any(
+        _dataset_hash_get(d, "type") == "multimodal_pretrain"
+        or bool(_dataset_hash_get(d, "multimodal"))
+        for d in cfg_datasets
+    )
+    processor_fingerprint = f"|processor={processor_name}" if has_mm else ""
+
     config_str = (
         f"{cfg.sequence_len}@{cfg.sample_packing}@{cfg.eval_sample_packing}@"
         f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}@"
         f"{cfg.dataset_exact_deduplication or False}|"
         f"{'|'.join(_dataset_hash_component(d) for d in cfg_datasets)}"
-        f"|{tokenizer_fingerprint}"
+        f"|{tokenizer_fingerprint}{processor_fingerprint}"
     )
     return str(md5(config_str))
 

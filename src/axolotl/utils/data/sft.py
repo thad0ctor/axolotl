@@ -324,7 +324,7 @@ def _processor_fingerprint(processor: ProcessorMixin | None) -> str | None:
     # Module-qualified identity so same-named classes in different modules don't collide.
     proc_cls = type(processor)
     parts = [f"{proc_cls.__module__}.{proc_cls.__qualname__}"]
-    for attr in ("image_token", "video_token", "image_seq_length"):
+    for attr in ("image_token", "boi_token", "video_token", "image_seq_length"):
         if hasattr(processor, attr):
             parts.append(f"{attr}={getattr(processor, attr)!r}")
     image_processor = getattr(processor, "image_processor", None)
@@ -492,7 +492,10 @@ def _load_tokenized_prepared_datasets(
 
     # Generate dataset hash for caching
     dataset_hash = generate_dataset_hash_from_config(
-        cfg, datasets_configs, tokenizer.name_or_path
+        cfg,
+        datasets_configs,
+        tokenizer.name_or_path,
+        _processor_fingerprint(processor),
     )
 
     # Try loading from hub if push_dataset_to_hub is configured
@@ -570,7 +573,10 @@ def _load_raw_datasets(
 
         # Save the prepared dataset
         dataset_hash = generate_dataset_hash_from_config(
-            cfg, datasets_configs, tokenizer.name_or_path
+            cfg,
+            datasets_configs,
+            tokenizer.name_or_path,
+            _processor_fingerprint(processor),
         )
         save_preprocessed_dataset(cfg, dataset, dataset_hash, split)
 
