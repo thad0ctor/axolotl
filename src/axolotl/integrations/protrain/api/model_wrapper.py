@@ -328,7 +328,11 @@ def _calibrate_peak_with_actual_chunk_bytes(
         persistent_factor = 1.0
     buffer_factor = 2.0  # fp16 params (gathered) + fp16 grads (accumulated)
     if hw is not None:
-        alpha = alpha_fragmentation_for_cfg(hw.dominant_param_bytes_per_element, cfg)
+        alpha = alpha_fragmentation_for_cfg(
+            hw.dominant_param_bytes_per_element,
+            cfg,
+            bool(getattr(hw, "zero3_shard", False)),
+        )
     else:
         alpha = ALPHA_FRAGMENTATION
 
@@ -2363,13 +2367,15 @@ def protrain_model_wrapper(
 
     result = _broadcast_runtime_search_result(result)
     if LOG.isEnabledFor(logging.DEBUG):
+        _is_mode_c = bool(getattr(hardware_profile, "zero3_shard", False))
         _alpha = alpha_fragmentation_for_cfg(
             hardware_profile.dominant_param_bytes_per_element,
             result.cfg,
+            _is_mode_c,
         )
         if hardware_profile.dominant_param_bytes_per_element >= 1.0:
             _alpha_regime = "non-4bit"
-        elif int(result.cfg.n_checkpoint) > 0:
+        elif int(result.cfg.n_checkpoint) > 0 and _is_mode_c:
             _alpha_regime = "4bit-mode-c-ckpt"
         else:
             _alpha_regime = "4bit-mode-a"

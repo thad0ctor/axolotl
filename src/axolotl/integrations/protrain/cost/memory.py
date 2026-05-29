@@ -76,6 +76,19 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
     return deltas
 
 
+def _normalized_activation_sizes(trace: ProfilerTrace) -> dict[BlockId, int]:
+    """Re-key ``trace.activation_sizes`` to canonical ``BlockId``.
+
+    Persisted (JSON/pickle) traces stringify dict keys, so ``.get(BlockId)``
+    lookups miss and undercount. Normalize once so all BlockId-keyed lookups
+    hit the right entries.
+    """
+    return {
+        BlockId(int(bid)): int(sz)
+        for bid, sz in (trace.activation_sizes or {}).items()
+    }
+
+
 # Eq. 11 fragmentation factor; fp16/bf16/8-bit default. Per-dtype override in alpha_fragmentation_for_dtype.
 ALPHA_FRAGMENTATION: float = 1.10
 
@@ -108,7 +121,7 @@ def alpha_fragmentation_for_dtype(bytes_per_element: float) -> float:
 
 
 def alpha_fragmentation_for_cfg(
-    bytes_per_element: float, cfg: CostConfig | None
+    bytes_per_element: float, cfg: CostConfig | None, is_mode_c: bool = False
 ) -> float:
     """Pick the fragmentation factor for ``(dtype, mode)``.
 
@@ -117,11 +130,16 @@ def alpha_fragmentation_for_cfg(
     0.95 because activation churn fragments differently. Non-4-bit dtypes
     keep the unconditional ``ALPHA_FRAGMENTATION`` (1.10) regardless of
     mode.
+
+    ``is_mode_c`` reflects ZeRO-3 chunk sharding (``HardwareProfile.zero3_shard``);
+    the 0.95 factor only applies under Mode C, so checkpointed Mode-A
+    candidates are NOT over-predicted with it. Defaults to ``False``
+    (Mode A) so callers without a hardware profile keep the 0.75 baseline.
     """
     if bytes_per_element >= 1.0:
         return ALPHA_FRAGMENTATION
     is_ckpt = bool(cfg is not None and int(getattr(cfg, "n_checkpoint", 0)) > 0)
-    if is_ckpt:
+    if is_ckpt and is_mode_c:
         return ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT
     return ALPHA_FRAGMENTATION_4BIT_MODE_A
 
@@ -293,7 +311,7 @@ def cross_attn_persist_bytes(
     if last_enc_mode is BlockMode.CKPT:
         # ckpt_chain_bytes already covers residual.
         return 0
-    return int(trace.activation_sizes.get(last_enc_bid, 0))
+    return int(_normalized_activation_sizes(trace).get(last_enc_bid, 0))
 
 
 def cross_attn_handoff_bytes(
@@ -312,7 +330,7 @@ def cross_attn_handoff_bytes(
     # NONE/OFFLOAD already retain the full block bytes on GPU so the cap need not preserve them again.
     if last_enc_mode is BlockMode.NONE or last_enc_mode is BlockMode.OFFLOAD:
         return 0
-    return int(trace.activation_sizes.get(last_enc_bid, 0))
+    return int(_normalized_activation_sizes(trace).get(last_enc_bid, 0))
 
 
 def op_cross_attn_surcharge(
@@ -525,6 +543,9 @@ def estimate_peak(
     # Delegated so searcher inline fast-path and this validator share Eq. 11 accounting.
     model_state_present = model_state_present_bytes(cfg, layout, trace)
 
+    # Persisted traces stringify keys; normalize once for all BlockId lookups.
+    activation_sizes = _normalized_activation_sizes(trace)
+
     forward_ops_by_block = _group_ops_by_block(trace)
     tree_index_map = block_tree_index_map(trace)
     cross_attn_bytes = cross_attn_persist_bytes(trace, block_map, tree_index_map)
@@ -547,8 +568,7 @@ def estimate_peak(
     # CKPT chain term factored to ``_compute_ckpt_chain_bytes`` so the wrapper-side
     # ``_reconstruct_f_bm`` shares the same chain-sum semantics.
     ckpt_chain_bytes = _compute_ckpt_chain_bytes(trace, block_map)
-    for block_id_raw, act_sz in trace.activation_sizes.items():
-        bid = BlockId(int(block_id_raw))
+    for bid, act_sz in activation_sizes.items():
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
             retained_none_bytes += act_sz
@@ -589,7 +609,7 @@ def estimate_peak(
             # the same bytes as a NONE block would; the backward-window
             # chunk gather bump is a separate per-op bump landed via
             # ``offload_bump_op`` below.
-            running += trace.activation_sizes.get(bid, 0)
+            running += activation_sizes.get(bid, 0)
         cumulative_none.append((first_idx, running))
 
     def _none_live_at(op_idx: int) -> int:
@@ -616,7 +636,7 @@ def estimate_peak(
         ckpt_extra = 0
         if i in ckpt_bump_op:
             bid = BlockId(ckpt_bump_op[i])
-            block_act = trace.activation_sizes.get(bid, 0)
+            block_act = activation_sizes.get(bid, 0)
             block_saved = int(saved_bytes_proxy_for_op_walk.get(bid, block_act))
             ckpt_extra = max(0, block_saved - block_act)
 
@@ -648,7 +668,9 @@ def estimate_peak(
     measured_cap = hot_iter_peak_cap(trace, block_map, cfg, layout)
     raw_peak = apply_hot_iter_cap(raw_peak, model_state_present, measured_cap, layout)
 
-    alpha = alpha_fragmentation_for_cfg(hw.dominant_param_bytes_per_element, cfg)
+    alpha = alpha_fragmentation_for_cfg(
+        hw.dominant_param_bytes_per_element, cfg, bool(getattr(hw, "zero3_shard", False))
+    )
     scaled = int(alpha * raw_peak)
     if LOG.isEnabledFor(logging.DEBUG):
         LOG.debug(

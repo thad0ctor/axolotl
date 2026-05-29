@@ -536,10 +536,14 @@ def _estimate_runtime_components(
             )
 
     # NCCL gather + reduce both charged per Eq. 6; reduce is uniform across cached/uncached.
-    # Fail-closed on world-mismatched ZeRO-3 traces — silently zeroing under-prices candidates.
-    if hw.zero3_shard and hw.gpu_count > 1 and trace.world != hw.gpu_count:
+    # trace.world is the global world size at profile time; multi-node ZeRO-3
+    # shards across all global ranks, so use it (not the per-node gpu_count) for
+    # both the >1 gate below and the shard divisor in the optimizer math.
+    # Fail-closed when a multi-rank ZeRO-3 run reuses a single-rank trace —
+    # its zeroed NCCL tables would silently under-price candidates.
+    if hw.zero3_shard and hw.gpu_count > 1 and trace.world <= 1:
         return _INF_COMPONENTS
-    if not hw.zero3_shard or hw.gpu_count <= 1 or trace.world <= 1:
+    if not hw.zero3_shard or trace.world <= 1:
         nccl_gather = 0.0
         nccl_reduce = 0.0
     else:
@@ -917,8 +921,10 @@ def _estimate_runtime_components(
         gpu_adam_bps = _GPU_ADAM_FALLBACK
 
     t_gpu_optim = n_persist_eff * ms_per_chunk / gpu_adam_bps
-    # ZeRO-3 divides per-chunk CPU-Adam by world_size; replicated DDP doesn't.
-    cpu_shard_divisor = max(1, hw.gpu_count) if hw.zero3_shard else 1
+    # ZeRO-3 divides per-chunk CPU-Adam by the global world size; replicated DDP
+    # doesn't. trace.world is the global world (per-node gpu_count undercounts
+    # the shard divisor on multi-node, overestimating t_cpu_optim).
+    cpu_shard_divisor = max(1, int(trace.world)) if hw.zero3_shard else 1
     if cpu_adam_bps <= 0.0:
         # CPU Adam unavailable: mark configs that offload as infeasible.
         if n_nonpersist > 0:

@@ -52,10 +52,21 @@ def test_alpha_fragmentation_dispatch_mode_a():
 
 
 def test_alpha_fragmentation_dispatch_mode_c_ckpt():
-    """4-bit + n_checkpoint>0 picks the Mode-C-CKPT 0.95 factor."""
+    """4-bit + n_checkpoint>0 picks the Mode-C-CKPT 0.95 factor under ZeRO-3 sharding."""
     cfg_mode_c = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=4)
-    alpha = alpha_fragmentation_for_cfg(0.5, cfg_mode_c)
+    alpha = alpha_fragmentation_for_cfg(0.5, cfg_mode_c, is_mode_c=True)
     assert alpha == pytest.approx(ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT)
+
+
+def test_alpha_fragmentation_dispatch_mode_a_with_ckpt_keeps_mode_a():
+    """4-bit + n_checkpoint>0 WITHOUT Mode-C sharding stays on the 0.75 factor.
+
+    Guards the bug where checkpointed Mode-A candidates were over-predicted with
+    the 0.95 Mode-C-CKPT factor and wrongly rejected as over-capacity.
+    """
+    cfg_ckpt = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=4)
+    alpha = alpha_fragmentation_for_cfg(0.5, cfg_ckpt, is_mode_c=False)
+    assert alpha == pytest.approx(ALPHA_FRAGMENTATION_4BIT_MODE_A)
 
 
 def test_alpha_fragmentation_dispatch_mode_c_without_ckpt_keeps_mode_a():

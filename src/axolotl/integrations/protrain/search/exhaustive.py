@@ -436,6 +436,7 @@ def search(
             CostConfig(
                 n_persist=0, n_buffer=0, n_swap=0, n_checkpoint=n_ckpt, n_offload=0
             ),
+            bool(getattr(hw, "zero3_shard", False)),
         )
         for n_offload in range(0, bounds.N_block - n_ckpt + 1):
             if forbid_activation_offload and n_offload > 0:

@@ -52,7 +52,7 @@ _SUPPORTED_OPTIMIZERS: frozenset[str] = frozenset(
 # `max_grad_norm: 1.0` autofill below is a general defensive default for any
 # large-model training with these optimizers under ProTrain. NOTE: this
 # autofill does NOT prevent the Mode C 9B full-FT NaN-collapse observed on
-# 2× A100-SXM4 (May 2026) — that failure mode reproduces with `adamw_torch`
+# 2x A100-SXM4 (May 2026) — that failure mode reproduces with `adamw_torch`
 # (fp32 moments) too, so the root cause lives elsewhere (likely in the
 # split-optimizer / chunk-grad-sync path) and is tracked as a Phase-3
 # follow-up. The autofill is still useful as a general guard.
@@ -499,7 +499,7 @@ class ProTrainArgs(BaseModel):
                 "non-NVLink topologies (where it nets +15% sps/rank on "
                 "3090 PCIe 4-rank, §6.pb) and disabled on NVLink topologies "
                 "(where NCCL allreduce over NV-class fabric is faster than "
-                "coalesced sync; measured -55% sps/rank on 2× A100-SXM4 "
+                "coalesced sync; measured -55% sps/rank on 2x A100-SXM4 "
                 "NVLink). Explicit True/False overrides the auto-decision. "
                 "Skipped when Mode C bypass fired (chunk_manager owns sync "
                 "there) or when world_size == 1."

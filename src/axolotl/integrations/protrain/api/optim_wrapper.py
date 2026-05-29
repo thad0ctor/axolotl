@@ -1128,29 +1128,36 @@ def protrain_optimizer_wrapper(
                 "config so no CPU optimizer is needed."
             ) from err
 
-    # Preserve HF Trainer's bias/norm no-decay split per inner optim's param_groups.
-    no_decay_param_ids = _collect_no_decay_param_ids(wrapped.module)
-    if no_decay_param_ids:
-        if gpu_optim is not None:
-            _split_optim_param_groups(gpu_optim.underlying, no_decay_param_ids)
-        if cpu_optim is not None:
-            sharded_no_decay_ids = _collect_sharded_no_decay_shard_param_ids(
-                chunk_manager,
-                cpu_params_per_chunk,
-                no_decay_param_ids,
-            )
-            # Union covers replicated (orig param ids) and sharded (shard_param ids); disjoint per inner.
-            cpu_no_decay_ids = no_decay_param_ids | sharded_no_decay_ids
-            inner_optims = getattr(cpu_optim, "_optims", {}) or {}
-            for inner in inner_optims.values():
-                _split_optim_param_groups(inner, cpu_no_decay_ids)
+    # The fresh cpu_optim already owns a worker thread + DeepSpeed C state; if any
+    # setup below raises we must shut it down explicitly rather than leak it to __del__.
+    try:
+        # Preserve HF Trainer's bias/norm no-decay split per inner optim's param_groups.
+        no_decay_param_ids = _collect_no_decay_param_ids(wrapped.module)
+        if no_decay_param_ids:
+            if gpu_optim is not None:
+                _split_optim_param_groups(gpu_optim.underlying, no_decay_param_ids)
+            if cpu_optim is not None:
+                sharded_no_decay_ids = _collect_sharded_no_decay_shard_param_ids(
+                    chunk_manager,
+                    cpu_params_per_chunk,
+                    no_decay_param_ids,
+                )
+                # Union covers replicated (orig param ids) and sharded (shard_param ids); disjoint per inner.
+                cpu_no_decay_ids = no_decay_param_ids | sharded_no_decay_ids
+                inner_optims = getattr(cpu_optim, "_optims", {}) or {}
+                for inner in inner_optims.values():
+                    _split_optim_param_groups(inner, cpu_no_decay_ids)
 
-    # Shutdown-before-swap: previous CpuFusedAdamAdapter owns thread pool + DeepSpeed C state.
-    _old_cpu_optim = getattr(chunk_manager, "cpu_optim", None)
-    if _old_cpu_optim is not None and _old_cpu_optim is not cpu_optim:
-        _old_cpu_optim.shutdown()
-    chunk_manager.cpu_optim = cpu_optim
-    chunk_manager.gpu_optim = cast("GpuFusedAdamAdapter | None", gpu_optim)
+        # Shutdown-before-swap: previous CpuFusedAdamAdapter owns thread pool + DeepSpeed C state.
+        _old_cpu_optim = getattr(chunk_manager, "cpu_optim", None)
+        if _old_cpu_optim is not None and _old_cpu_optim is not cpu_optim:
+            _old_cpu_optim.shutdown()
+        chunk_manager.cpu_optim = cpu_optim
+        chunk_manager.gpu_optim = cast("GpuFusedAdamAdapter | None", gpu_optim)
+    except Exception:
+        if cpu_optim is not None:
+            cpu_optim.shutdown()
+        raise
 
     # Build the flat param list for the Optimizer base class.
     all_params: list["nn.Parameter"] = list(persistent_params)
