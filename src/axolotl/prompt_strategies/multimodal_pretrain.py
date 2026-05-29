@@ -38,7 +38,6 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
             image_token_id=self.image_token_spec.image_token_id,
             text_column=self.text_column,
             image_column=self.image_column,
-            enforce_max_length=False,
         )
 
     def wrap_dataset(
@@ -83,6 +82,12 @@ def load(
             "class) in your config."
         )
     check_processor_compatibility(processor)
+    processor_tokenizer = getattr(processor, "tokenizer", None)
+    if processor_tokenizer is not None and processor_tokenizer is not tokenizer:
+        raise ValueError(
+            "Multimodal CPT requires `tokenizer` to be `processor.tokenizer` "
+            "so image placeholder ids stay aligned during encoding."
+        )
 
     text_column = ds_cfg.get("text_column") or "text"
     image_column = ds_cfg.get("image_column") or "images"

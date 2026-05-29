@@ -148,6 +148,12 @@ def test_load_requires_processor_for_nonstreaming_strategy():
         load(tokenizer, DictDefault({"sequence_len": 128}), ds_cfg={}, processor=None)
 
 
+def test_load_rejects_processor_tokenizer_mismatch():
+    processor = _StubProcessor()
+    with pytest.raises(ValueError, match="processor.tokenizer"):
+        load(_StubTokenizer(), DictDefault({"sequence_len": 128}), processor=processor)
+
+
 def test_nonstreaming_strategy_wraps_dataset_without_loading_pixels():
     processor = _StubProcessor()
     strategy = load(
@@ -177,3 +183,22 @@ def test_nonstreaming_strategy_wraps_dataset_without_loading_pixels():
     assert wrapped[0]["_mm_text"] == "<image>\nfirst row"
     assert wrapped[1]["images"] == []
     assert wrapped[1]["labels"] == wrapped[1]["input_ids"]
+
+
+def test_nonstreaming_strategy_rejects_oversized_rows():
+    processor = _StubProcessor()
+    strategy = load(
+        processor.tokenizer,
+        DictDefault({"sequence_len": 2}),
+        ds_cfg={"text_column": "caption", "image_column": "image_paths"},
+        processor=processor,
+    )
+    dataset = Dataset.from_dict(
+        {
+            "caption": ["<image> too-long"],
+            "image_paths": [["relative/a.png"]],
+        }
+    )
+
+    with pytest.raises(ValueError, match="exceeds sequence_len=2"):
+        strategy.wrap_dataset(dataset, process_count=None)
