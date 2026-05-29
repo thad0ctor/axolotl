@@ -177,6 +177,21 @@ class TestGenerateDatasetHashFromConfig:
             )
             assert changed_hash != base_hash
 
+    def test_dataset_order_affects_hash(self):
+        cfg = _base_cfg()
+        dataset_a = _datasets()[0]
+        dataset_b = DictDefault(
+            {
+                **dataset_a,
+                "path": "mhenrichsen/alpaca_2k_test_b",
+            }
+        )
+
+        h1 = generate_dataset_hash_from_config(cfg, [dataset_a, dataset_b], "tok")
+        h2 = generate_dataset_hash_from_config(cfg, [dataset_b, dataset_a], "tok")
+
+        assert h1 != h2
+
 
 def _mm_pretrain_cfg(**kwargs):
     return DictDefault(

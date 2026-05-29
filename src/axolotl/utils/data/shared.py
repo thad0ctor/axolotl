@@ -591,7 +591,7 @@ def generate_dataset_hash_from_config(
         f"{cfg.sequence_len}@{cfg.sample_packing}@{cfg.eval_sample_packing}@"
         f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}@"
         f"{cfg.dataset_exact_deduplication or False}|"
-        f"{'|'.join(sorted(_dataset_hash_component(d) for d in cfg_datasets))}"
+        f"{'|'.join(_dataset_hash_component(d) for d in cfg_datasets)}"
         f"|{tokenizer_fingerprint}"
     )
     return str(md5(config_str))
