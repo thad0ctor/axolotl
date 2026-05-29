@@ -1009,8 +1009,7 @@ class ChunkManager:
         if not self._cpu_slots:
             self._restore_protrain_ddp_ignore_snapshot()
             LOG.debug(
-                "ChunkManager.restore_to_gpu: nothing offloaded "
-                "(no _cpu_slots), no-op"
+                "ChunkManager.restore_to_gpu: nothing offloaded (no _cpu_slots), no-op"
             )
             return 0
 
@@ -2372,5 +2371,6 @@ class ChunkManager:
         if self.buffer_pool is not None and restored_cids:
             for cid in restored_cids:
                 self.buffer_pool.invalidate_tag(cid)
+
 
 __all__ = ["BackwardHandle", "ChunkManager"]
