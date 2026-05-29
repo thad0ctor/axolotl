@@ -911,7 +911,6 @@ def test_restore_to_gpu_round_trip_preserves_param_values() -> None:
 
     # Internal state cleared so a new manager can rebuild from scratch.
     assert not mgr._cpu_slots, "restore_to_gpu must clear _cpu_slots"
-    assert not mgr._persistent_buffers, "restore_to_gpu must clear _persistent_buffers"
     assert not mgr._grad_hook_handles, (
         "restore_to_gpu must remove all grad hook handles"
     )

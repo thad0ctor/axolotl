@@ -223,12 +223,6 @@ def _looks_like_block(m: nn.Module) -> bool:
     return False
 
 
-def _iter_module_lists(root: nn.Module) -> Iterable[nn.ModuleList]:
-    for m in root.modules():
-        if isinstance(m, nn.ModuleList):
-            yield m
-
-
 def _iter_module_lists_with_path(
     root: nn.Module,
 ) -> Iterable[tuple[str, nn.ModuleList]]:

@@ -6,14 +6,11 @@ from collections import deque
 from typing import TYPE_CHECKING, Deque
 
 from axolotl.integrations.protrain.types import ChunkId
-from axolotl.utils.logging import get_logger
 
 if TYPE_CHECKING:
     import torch
 
     from axolotl.integrations.protrain.chunk.pinned_alloc import PinnedHostMemory
-
-LOG = get_logger(__name__)
 
 
 class BufferPool:

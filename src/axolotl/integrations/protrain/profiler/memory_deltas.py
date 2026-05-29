@@ -5,12 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from axolotl.utils.logging import get_logger
-
 if TYPE_CHECKING:
     import torch
-
-LOG = get_logger(__name__)
 
 
 def intra_op_delta(before_bytes: int, peak_bytes: int) -> int:

@@ -28,8 +28,8 @@ is now mostly a variance guard; the canonical v15 run lands around
 1% runtime error on this 3090 lane.
 
 Marked ``slow`` — excluded from the default pytest suite by the
-``-m 'not slow'`` addopts clause in ``pyproject.toml``. Requires a free
-RTX 3090 reachable via ``CUDA_VISIBLE_DEVICES``.
+``-m 'not slow and not gpu'`` addopts clause in ``pyproject.toml``.
+Requires a free RTX 3090 reachable via ``CUDA_VISIBLE_DEVICES``.
 """
 
 from __future__ import annotations

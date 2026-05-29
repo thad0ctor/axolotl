@@ -9,9 +9,6 @@ import torch.utils.checkpoint as torch_checkpoint
 from torch import nn
 
 from axolotl.integrations.protrain.block.strategy import BlockMode
-from axolotl.utils.logging import get_logger
-
-LOG = get_logger(__name__)
 
 
 class CheckpointedBlock(nn.Module):

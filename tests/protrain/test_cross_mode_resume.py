@@ -297,11 +297,6 @@ def _nvidia_smi_gpu_indices() -> list[int]:
     return indices
 
 
-def _nvidia_smi_gpu_count() -> int:
-    """Return the GPU count from nvidia-smi."""
-    return len(_nvidia_smi_gpu_indices())
-
-
 # Indices ``_launch_axolotl`` pins via ``CUDA_VISIBLE_DEVICES``. The
 # corresponding precheck must verify these specific indices actually
 # exist on the host — a count-based >=4 check passes on any 4-GPU box

@@ -574,8 +574,8 @@ class ProTrainArgs(BaseModel):
             if tp_size_int is not None and tp_size_int > 1:
                 raise ValueError(
                     "ProTrain is incompatible with tensor_parallel_size > 1 "
-                    "(scope-excluded per plan.md — the chunk layout does not shard "
-                    "across TP ranks in this milestone). Set tensor_parallel_size=1 "
+                    "(scope-excluded for this integration — the chunk layout does "
+                    "not shard across TP ranks). Set tensor_parallel_size=1 "
                     "or remove the ProTrain plugin."
                 )
         cp_size = data.get("context_parallel_size")
@@ -587,7 +587,7 @@ class ProTrainArgs(BaseModel):
             if cp_size_int is not None and cp_size_int > 1:
                 raise ValueError(
                     "ProTrain is incompatible with context_parallel_size > 1 "
-                    "(scope-excluded per plan.md — single-3090 target). Set "
+                    "(scope-excluded for this integration). Set "
                     "context_parallel_size=1 or remove the ProTrain plugin."
                 )
         sp_degree = data.get("sequence_parallel_degree")
@@ -599,7 +599,7 @@ class ProTrainArgs(BaseModel):
             if sp_degree_int is not None and sp_degree_int > 1:
                 raise ValueError(
                     "ProTrain is incompatible with sequence_parallel_degree > 1 "
-                    "(scope-excluded per plan.md — single-3090 target). Set "
+                    "(scope-excluded for this integration). Set "
                     "sequence_parallel_degree=1 or remove the ProTrain plugin."
                 )
         # bnb 8-bit / 4-bit composes with ProTrain in both Mode A and offload paths.

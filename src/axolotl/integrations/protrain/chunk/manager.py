@@ -432,8 +432,6 @@ class ChunkManager:
             cast(ChunkId, i) for i in range(layout.N_chunk)
         )
 
-        self._persistent_buffers: dict[ChunkId, "torch.Tensor"] = {}
-
         self._cpu_slots: dict[ChunkId, list[_CpuParamSlot]] = {}
 
         # Custom pinned-memory pools (precise-size, no power-of-2 rounding waste).
@@ -491,7 +489,7 @@ class ChunkManager:
             if cast(ChunkId, i) not in new_persistent_ids
         }
         # After materialization the residency split is baked in; flipping it would silently corrupt weights since gather/offload paths skip already-resident chunks.
-        if (self._cpu_slots or self._persistent_buffers) and (
+        if self._cpu_slots and (
             new_persistent_ids != self._persistent_ids
             or new_non_persistent_ids != self._non_persistent_ids
         ):
@@ -1008,11 +1006,11 @@ class ChunkManager:
         # Drain in-flight async CPU Adam so we snapshot a consistent post-step state.
         self.wait_cpu_optim()
 
-        if not self._cpu_slots and not self._persistent_buffers:
+        if not self._cpu_slots:
             self._restore_protrain_ddp_ignore_snapshot()
             LOG.debug(
                 "ChunkManager.restore_to_gpu: nothing offloaded "
-                "(no _cpu_slots, no _persistent_buffers), no-op"
+                "(no _cpu_slots), no-op"
             )
             return 0
 
@@ -1119,37 +1117,11 @@ class ChunkManager:
                 if _watchdog_on:
                     _maybe_warn_slow_restore(cid, time.perf_counter() - t0)
 
-        # Persistent chunks: extract from resident pool buffer into standalone GPU storage.
-        for cid, buf in self._persistent_buffers.items():
-            t0 = time.perf_counter() if _watchdog_on else 0.0
-            # Recompute the same aligned offsets materialize_offload used.
-            param_ids = self.layout.chunks[int(cid)]
-            offset = 0
-            for pid in param_ids:
-                param = self._params_by_id.get(pid)
-                if param is None:
-                    continue
-                nbytes = int(param.numel()) * int(param.element_size())
-                if nbytes == 0:
-                    continue
-                esz = int(param.element_size())
-                offset = ((offset + esz - 1) // esz) * esz
-                byte_view = buf.narrow(0, offset, nbytes)
-                typed = byte_view.view(param.data.dtype).view(param.shape)
-                gpu_tensor = _alloc_empty(param.shape, param.data.dtype)
-                gpu_tensor.copy_(typed)
-                param.data = gpu_tensor
-                moved += nbytes
-                offset += nbytes
-            if _watchdog_on:
-                _maybe_warn_slow_restore(cid, time.perf_counter() - t0)
-
         self.uninstall()
 
         # Drop view-holding state BEFORE closing pinned pools to avoid dangling pointers.
         self._cpu_slots.clear()
         self._chunk_shards.clear()
-        self._persistent_buffers.clear()
         self._grad_initial.clear()
         self._grad_remaining.clear()
         self._chunk_bytes_by_id.clear()
@@ -2119,12 +2091,6 @@ class ChunkManager:
 
     # ---- optimizer driver ---------------------------------------------
 
-    def persistent_step(self) -> None:
-        """Run the synchronous GPU FusedAdam step over persistent chunks."""
-        if self.gpu_optim is None:
-            return
-        self.gpu_optim.step()
-
     def wait_cpu_optim(self) -> None:
         """Block until every in-flight CPU Adam step has finished."""
         if self.cpu_optim is not None:
@@ -2212,7 +2178,6 @@ class ChunkManager:
 
         self._cpu_slots.clear()
         self._chunk_shards.clear()
-        self._persistent_buffers.clear()
         self._storage_ptr_to_chunk.clear()
         self._active_chunks.clear()
         self._backward_refcount.clear()
@@ -2407,38 +2372,5 @@ class ChunkManager:
         if self.buffer_pool is not None and restored_cids:
             for cid in restored_cids:
                 self.buffer_pool.invalidate_tag(cid)
-
-    # ---- internals -----------------------------------------------------
-
-    def _ensure_persistent_buffer(self, chunk_id: ChunkId) -> "torch.Tensor":
-        """Lazily materialize the resident GPU buffer for a persistent chunk."""
-        existing = self._persistent_buffers.get(chunk_id)
-        if existing is not None:
-            return existing
-        import torch
-
-        from axolotl.integrations.protrain.runtime.streams import (
-            SingleStreamAllocator,
-        )
-
-        # Size for oversize chunks: use max(S_chunk, chunk_bytes) so narrow() never overflows.
-        chunk_bytes = self._compute_chunk_bytes(chunk_id)
-        buf_bytes = max(int(self.layout.S_chunk), int(chunk_bytes))
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            with SingleStreamAllocator():
-                buf = torch.empty(
-                    buf_bytes,
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
-        else:
-            buf = torch.empty(
-                buf_bytes,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-        self._persistent_buffers[chunk_id] = buf
-        return buf
-
 
 __all__ = ["BackwardHandle", "ChunkManager"]

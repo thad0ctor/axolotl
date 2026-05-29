@@ -9,8 +9,6 @@ op-walk seeded per block so the peak estimator has something to walk.
 
 from __future__ import annotations
 
-from typing import Iterable
-
 import pytest
 
 from axolotl.integrations.protrain.block.layout_rules import assign_modes
@@ -3867,12 +3865,3 @@ def test_calibrate_peak_with_actual_chunk_bytes_same_cfg_preserves_behaviour():
         f"same-cfg under-predict was not raised to phase2_floor: "
         f"under={under} measured={measured_peak}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Helper for debugging tests if they fail
-# ---------------------------------------------------------------------------
-
-
-def _iterable_repr(x: Iterable) -> str:  # pragma: no cover - debug helper
-    return ",".join(str(v) for v in x)

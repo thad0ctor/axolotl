@@ -71,7 +71,6 @@ class CpuFusedAdamAdapter:
                 "install via `pip install axolotl[deepspeed]`."
             ) from err
 
-        self._DeepSpeedCPUAdam = DeepSpeedCPUAdam
         self._params_per_chunk = dict(params_per_chunk)
         self.lr = float(lr)
         self.betas = (float(betas[0]), float(betas[1]))

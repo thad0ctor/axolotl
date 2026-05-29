@@ -188,16 +188,6 @@ def _param_bytes(model: "nn.Module") -> dict[ParamId, int]:
     return sizes
 
 
-def _block_of(
-    pid: ParamId, block_spans: Mapping[BlockId, Sequence[ParamId]]
-) -> BlockId | None:
-    """Find BlockId owning pid via linear scan (block_spans is small)."""
-    for block_id, params in block_spans.items():
-        if pid in params:
-            return block_id
-    return None
-
-
 def build_layout(
     model: "nn.Module",
     exec_order: list[ParamId],

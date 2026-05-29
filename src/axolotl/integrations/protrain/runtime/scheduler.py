@@ -100,11 +100,6 @@ class Scheduler:
 
         # Forward-order block list; encoder ids before decoder ids by construction.
         self._block_order: list[BlockId] = sorted(block_map.keys())
-        # O(1) reverse lookup for next/prev_block_of on deep models.
-        self._block_index_map: dict[BlockId, int] = {
-            block_id: idx for idx, block_id in enumerate(self._block_order)
-        }
-
         # Earliest-forward owner = last in backward; defer reduce until then for shared-chunk blocks.
         chunk_last_bwd_owner: dict[ChunkId, BlockId] = {}
         for bid, cids in self.layout.block_to_chunks.items():

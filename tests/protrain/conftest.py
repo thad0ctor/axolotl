@@ -13,8 +13,8 @@ contention.
 Recommended invocation:
 
 * Default CI: ``pytest tests/protrain/`` — slow tests are deselected by
-  the ``-m 'not slow'`` addopts, so no cross-test contamination is
-  possible.
+  the ``-m 'not slow and not gpu'`` addopts, so no cross-test
+  contamination is possible.
 * Slow suite: ``pytest tests/protrain/ -m 'slow or not slow' -p no:xdist``
   — run sequentially (no xdist) and prefer running the 7B-class tests as
   a separate ``pytest`` invocation so each gets a fresh CUDA context.

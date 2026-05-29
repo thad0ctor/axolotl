@@ -2,7 +2,7 @@
 
 This package is a from-scratch Python implementation of the ProTrain memory manager (MLSys 2026, arXiv 2406.08334), shipped as an **Axolotl plugin** (`BasePlugin` subclass). It owns per-rank memory policy on top of ZeRO-3: hierarchical chunk management for model states (params / grads / optim states), interleaved block management for activations, a memory-aware profiler, a 5-axis cost model (`n_persist`, `n_buffer`, `n_swap`, `n_checkpoint`, `n_offload` — the OFFLOAD axis was added by Option B / `BLOCK_MODE_OFFLOAD_DESIGN.md`), and an automatic searcher. It does NOT own data parallelism collectives (delegates to `torch.distributed`), training-loop control flow, trainer orchestration, TP/PP, FP8, or any changes to Axolotl core files. Activation requires BOTH `plugins: [axolotl.integrations.protrain.ProTrainPlugin]` in the user YAML (the only spelling the pydantic validator in `args.py` accepts — see `_PROTRAIN_PLUGIN_KEYS`) AND `protrain_auto_memory: true` (default `false` in `ProTrainArgs`); listing the plugin alone registers the args schema but leaves the runtime hooks dormant, so a config that omits `protrain_auto_memory: true` is a no-op. Mutual exclusion with `deepspeed:` and `fsdp:` is enforced by the same validator.
 
-## Workstream-shape ratifications (drift from `plan.md`)
+## Workstream-shape ratifications
 
 Two intentional deviations from the original plan, both ratified after M5 review:
 
@@ -406,7 +406,6 @@ App B.2 of the paper has **two distinct components**, each addressing a differen
 
 - **Wired call sites.**
   - `chunk/buffer_pool.py::BufferPool.__init__` — pre-allocates every pool slot (n_buffer x S_chunk bytes) on the default-stream heap. **Highest-leverage single change** — pool slots are the dominant sustained GPU allocation in ProTrain. No `record_stream` needed: pool slots' lifetimes are owned by the pool and only return to the allocator at teardown.
-  - `chunk/manager.py::_ensure_persistent_buffer` — long-lived persistent-chunk GPU buffers. No `record_stream` (long-lived).
   - `chunk/manager.py::_empty_placeholder` — cached zero-element `param.data` sentinel. No `record_stream` (process-lived, not a kernel consumer).
   - `chunk/manager.py::_gather_sharded` — per-region `my_shard_gpu` and `gather_scratch` scratch tensors. **Critical wrap** — this method is called from `Scheduler._gather_on_prefetch_stream` inside `with torch.cuda.stream(self._prefetch_stream):`. Without the wrap, scratch tensors would land on the prefetch-stream heap and fragment the allocator. `record_stream(current_stream)` discipline applied: the scratch buffers are tied to whichever stream is actually consuming them (the prefetch stream in steady-state, the default stream in synchronous fallback).
   - `chunk/manager.py::_reduce_scatter_and_offload_shard` — per-region `region_grad` and `my_shard_grad_gpu` scratch tensors. Defensively wrapped with `record_stream`-when-needed: today this method runs on the default stream (called from `Scheduler.post_block_backward` which does not establish a stream context), so the wrap is a no-op there. Wrap kept so a future caller from a non-default stream stays correct without changes.

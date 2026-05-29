@@ -1,13 +1,14 @@
 """M6 Mode-C external baseline — ProTrain Mode-C vs DeepSpeed ZeRO-3.
 
-The plan.md M6 Mode-C acceptance bar calls for an EXTERNAL comparison
-against ZeRO-3 baselines (DeepSpeed and/or PyTorch FSDP). The existing
-``test_protrain_4gpu_zero3_sharding`` (M7) compares ProTrain ZeRO-3
-sharded against ProTrain replicated — an internal A/B that proves the
-sharded path doesn't lose money vs. the replicated path, but does NOT
-prove ProTrain Mode-C is competitive against the well-known
-ZeRO-3-with-CPU-offload reference implementation. This test closes
-that gap.
+The Mode-C acceptance lane documented in
+``src/axolotl/integrations/protrain/PR_PROPOSAL.md`` calls for an
+EXTERNAL comparison against ZeRO-3 baselines (DeepSpeed and/or PyTorch
+FSDP). The existing ``test_protrain_4gpu_zero3_sharding`` (M7) compares
+ProTrain ZeRO-3 sharded against ProTrain replicated — an internal A/B
+that proves the sharded path doesn't lose money vs. the replicated path,
+but does NOT prove ProTrain Mode-C is competitive against the well-known
+ZeRO-3-with-CPU-offload reference implementation. This test closes that
+gap.
 
 Choice: DeepSpeed Stage 3 with CPU offload (offload_optimizer + offload_param)
 is the closer architectural match to Mode-C than FSDP. ProTrain Mode-C
@@ -78,13 +79,12 @@ Acceptance bars (HARD unless marked SOFT):
    models >5B params on this hardware, where DS's max_live_parameters
    buffer grows but Mode-C's stays chunk-local).
 
-3. THROUGHPUT (SOFT, defensible): ProTrain Mode-C throughput is
-   within 0.5x of DeepSpeed Stage 3's. Derivation: PCIe 3.0 x16 ceiling
-   is ~13 GB/s and the 2026-04-30 profiling note in plan.md confirmed
-   the 4x3090 workload is fundamentally PCIe-bound (comm:compute ≈
-   13:1, ~78% of iter time is collective comm on serialized PCIe).
-   Both systems hit the same PCIe ceiling, so absolute throughput is
-   gated by:
+3. THROUGHPUT (SOFT, defensible): ProTrain Mode-C throughput is within
+   0.5x of DeepSpeed Stage 3's. Derivation: PCIe 3.0 x16 ceiling is
+   ~13 GB/s, and the validation evidence summarized in
+   ``src/axolotl/integrations/protrain/PR_SUMMARY.md`` shows the 4x3090
+   workload is fundamentally PCIe-bound. Both systems hit the same PCIe
+   ceiling, so absolute throughput is gated by:
    * collective-launch overhead (DeepSpeed has years of optimization
      here; ProTrain's ZeRO-3 path is ~year-1 maturity),
    * Python-side hook overhead per chunk transition,
@@ -723,9 +723,8 @@ def _launch(
 def test_modec_vs_deepspeed_stage3_4gpu(tmp_path) -> None:
     """ProTrain Mode-C vs DeepSpeed Stage 3 + CPU offload on 4x3090.
 
-    Closes the M6 Mode-C external-baseline gap from plan.md. See the
-    module docstring for workload sizing rationale and the three
-    acceptance bars.
+    Closes the Mode-C external-baseline gap. See the module docstring
+    for workload sizing rationale and the three acceptance bars.
 
     Apples-to-apples comparison (re-enabled in M5 of the Option B
     rollout, see ``BLOCK_MODE_OFFLOAD_DESIGN.md`` §3.7 / §5.1): both

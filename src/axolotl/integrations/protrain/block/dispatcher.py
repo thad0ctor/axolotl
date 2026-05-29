@@ -8,10 +8,6 @@ from axolotl.integrations.protrain.block.checkpoint import CheckpointedBlock
 from axolotl.integrations.protrain.block.offload import OffloadedBlock
 from axolotl.integrations.protrain.block.strategy import BlockMode, StrategyError
 from axolotl.integrations.protrain.block.swap import SwappedBlock
-from axolotl.utils.logging import get_logger
-
-LOG = get_logger(__name__)
-
 
 _MARKER_ATTR = "_protrain_wrapped_mode"
 

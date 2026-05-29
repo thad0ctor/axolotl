@@ -30,9 +30,6 @@ LOG = get_logger(__name__)
 # Fallback compute throughput proxy used only when op_latencies are missing.
 _COMPUTE_BYTES_PER_SEC: float = 3.0e11  # ~300 GB/s, rough 3090 effective
 
-# CPU-Adam throughput fallback when hw_bench measurement returned 0.0.
-_CPU_ADAM_FALLBACK: float = 8.0e9
-
 # GPU FusedAdam throughput fallback; ~3090 HBM sustained.
 _GPU_ADAM_FALLBACK: float = 5.0e11
 
@@ -113,16 +110,6 @@ def _hook_scale_factor(trace: ProfilerTrace) -> float:
 def _compute_time(activation_bytes: int) -> float:
     """Rough compute time proxy — fallback when op_latencies missing."""
     return activation_bytes / _COMPUTE_BYTES_PER_SEC
-
-
-def _block_compute_time(trace: ProfilerTrace, block_id: BlockId) -> float:
-    """Wall-clock forward compute for one block; sum of measured op latencies."""
-    total_s = 0.0
-    for op in trace.op_order:
-        if op.block_id != block_id or not op.is_forward:
-            continue
-        total_s += trace.op_latencies.get(op.op_id, 0.0)
-    return total_s
 
 
 def _fwd_compute_time_from_trace(

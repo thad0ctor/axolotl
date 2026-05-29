@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""M5 acceptance — end-to-end ``axolotl train`` CLI smoke test.
+"""M5 acceptance — end-to-end ``axolotl.cli.train`` smoke test.
 
-Mirrors plan.md M5: single 3090 ``axolotl train
+Mirrors the single-3090 acceptance lane in
+``src/axolotl/integrations/protrain/PR_PROPOSAL.md``: ``axolotl train
 examples/protrain/3090-8b-lora.yml --max-steps 20`` must (a) not OOM,
 (b) produce a decreasing loss across the 20 steps, (c) write a
 checkpoint to the configured ``output_dir``.
@@ -27,8 +28,9 @@ hook coverage but does NOT validate the actual subprocess
 :func:`test_plugin_e2e_7b_lora_smoke` runs the 7B YAML in-process
 (``do_train``) but skips the ``accelerate launch -m
 axolotl.cli.train`` shell-out that the user-facing CLI takes. This
-test closes that gap: it shells out to the venv-installed ``axolotl``
-binary just like the plan.md acceptance command does.
+test closes that gap: it shells out to ``sys.executable -m
+axolotl.cli.train`` so it exercises the CLI entry point from this
+worktree's Python environment.
 
 Why opt-in rather than ``slow``?
 The 7B Llama-3 8B-Instruct download is ~16 GB of safetensors and the
@@ -114,11 +116,11 @@ def _has_24gb_gpu() -> bool:
 def _model_cached(model_id: str) -> bool:
     """Return True iff the HF hub cache has the model's weight shards.
 
-    The plan.md M5 acceptance criterion targets a fresh-laptop install,
-    but inside CI / repeated test runs we should not pay the ~16 GB
-    download. Checks for at least one ``model-*.safetensors`` blob in
-    the snapshot directory; a shard-index-only state (post-init,
-    pre-download) is treated as not cached.
+    The M5 acceptance criterion targets a fresh-laptop install, but
+    inside CI / repeated test runs we should not pay the ~16 GB download.
+    Checks for at least one ``model-*.safetensors`` blob in the snapshot
+    directory; a shard-index-only state (post-init, pre-download) is
+    treated as not cached.
     """
     cache_root = Path.home() / ".cache" / "huggingface" / "hub"
     repo_dir = cache_root / f"models--{model_id.replace('/', '--')}"
@@ -230,9 +232,9 @@ def _is_decreasing(losses: list[float], slack: float = 1.5) -> bool:
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_m5_cli_axolotl_train_7b_lora(tmp_path: Path) -> None:
-    """End-to-end ``axolotl train`` CLI on the M5 YAML.
+    """End-to-end ``axolotl.cli.train`` CLI on the M5 YAML.
 
-    Validates the plan.md M5 acceptance criteria:
+    Validates the M5 acceptance criteria:
 
     1. Subprocess exits 0 (no OOM, no plugin wiring crash).
     2. The HF Trainer log shows a window-mean-decreasing loss across
@@ -255,10 +257,9 @@ def test_m5_cli_axolotl_train_7b_lora(tmp_path: Path) -> None:
 
     # CUDA visibility — the test can't proceed without a 24 GB card on
     # the visible subset. We do not enforce a specific GPU index here
-    # (the launcher's CUDA_VISIBLE_DEVICES decides); plan.md mandates
-    # GPU 7 for THIS workstation but the durable test should accept
-    # any 24 GB card so a future contributor on a different rig can
-    # run it.
+    # (the launcher's CUDA_VISIBLE_DEVICES decides); the durable test
+    # should accept any 24 GB card so a future contributor on a different
+    # rig can run it.
     if not _has_24gb_gpu():
         pytest.skip(
             "no 24 GB-class GPU visible (CUDA_VISIBLE_DEVICES). M5 needs a "
@@ -275,18 +276,6 @@ def test_m5_cli_axolotl_train_7b_lora(tmp_path: Path) -> None:
     if not _YAML.exists():
         pytest.fail(f"M5 YAML missing at {_YAML}")
 
-    # Resolve the axolotl CLI binary. The venv editable install points
-    # at the wrong worktree's ``src/`` — relying on PYTHONPATH to
-    # override is the documented pattern (memory: protrain_branch_state).
-    venv_axolotl = Path("/home/rgilbreth/Desktop/AI-Software/axolotl/.venv/bin/axolotl")
-    if venv_axolotl.exists():
-        cli = str(venv_axolotl)
-    else:
-        # Fall back to whatever ``axolotl`` is on PATH — useful when
-        # this test is shipped to a contributor who has their own
-        # editable install set up.
-        cli = "axolotl"
-
     output_dir = tmp_path / "protrain-m5-cli-out"
 
     # Build the env. PYTHONPATH must point at THIS worktree's src/ so
@@ -296,17 +285,17 @@ def test_m5_cli_axolotl_train_7b_lora(tmp_path: Path) -> None:
     env["PYTHONPATH"] = (
         f"{_SRC_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(_SRC_DIR)
     )
-    # Ensure CUDA_DEVICE_ORDER matches the canonical PCI_BUS_ID layout
-    # the plan.md command uses; without it nvidia-smi indices and
-    # CUDA runtime indices can drift.
+    # Ensure CUDA_DEVICE_ORDER matches the canonical PCI_BUS_ID layout;
+    # without it nvidia-smi indices and CUDA runtime indices can drift.
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     # Silence the HF tokenizers parallel-worker warning that adds noise
     # to the captured output without affecting the assertions.
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     cmd = [
-        cli,
-        "train",
+        sys.executable,
+        "-m",
+        "axolotl.cli.train",
         str(_YAML),
         "--max-steps",
         "20",

@@ -536,6 +536,9 @@ def run_single_gpu(
     train_steps = int(args.single_steps)
     resume_steps = int(args.single_resume_steps)
     checkpoint_dir = output_dir / f"checkpoint-{train_steps}"
+    train_coverage = f"8B QLoRA {train_steps}-step train"
+    checkpoint_coverage = f"checkpoint-{train_steps} artifact"
+    train_resume_coverage = f"8B QLoRA {train_steps}-step train/save/resume"
     gpu_devices = _lane_gpu_devices(args.gpu_devices, 1)
     dataset_prepared_path = lane_dir / "prepared"
     cache_dir = _resolved_cache_dir(args)
@@ -550,7 +553,7 @@ def run_single_gpu(
             seconds=time.monotonic() - start,
             summary="no visible 24 GiB GPU for 8B QLoRA acceptance",
             gaps=["1x 24 GiB hardware lane not executed"],
-            coverage=["8B QLoRA 50-step train/save/resume"],
+            coverage=[train_resume_coverage],
         )
 
     write_single_gpu_yaml(
@@ -593,8 +596,8 @@ def run_single_gpu(
             ],
             logs=[str(train_log), str(resume_log)],
             coverage=[
-                "8B QLoRA 50-step train",
-                "checkpoint-50 artifact",
+                train_coverage,
+                checkpoint_coverage,
                 "resume continuation",
                 "finite logged losses and any logged grad norms",
                 "bounded resume loss continuity",
@@ -609,7 +612,7 @@ def run_single_gpu(
             commands=[cmd_train],
             logs=[str(train_log)],
             gaps=gaps,
-            coverage=["8B QLoRA 50-step train/save/resume"],
+            coverage=[train_resume_coverage],
         )
     if not checkpoint_dir.is_dir():
         return LaneResult(
@@ -619,7 +622,7 @@ def run_single_gpu(
             summary=f"expected checkpoint missing: {checkpoint_dir}",
             commands=[cmd_train],
             logs=[str(train_log)],
-            coverage=["8B QLoRA 50-step train/save/resume"],
+            coverage=[train_resume_coverage],
         )
 
     cmd_resume = [sys.executable, "-m", "axolotl.cli.train", str(resume_yaml)]
@@ -670,8 +673,8 @@ def run_single_gpu(
         logs=[str(train_log), str(resume_log)],
         gaps=gaps,
         coverage=[
-            "8B QLoRA 50-step train",
-            "checkpoint-50 artifact",
+            train_coverage,
+            checkpoint_coverage,
             "resume continuation",
             "finite logged losses and any logged grad norms",
             "bounded resume loss continuity",

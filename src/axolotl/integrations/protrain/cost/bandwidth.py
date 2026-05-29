@@ -45,15 +45,6 @@ def effective_bw(cfg: CostConfig, hw: HardwareProfile) -> tuple[float, float]:
     return eff_h2d, eff_d2h
 
 
-def n_affected_chunks(cfg: CostConfig, layout: ChunkLayout) -> int:
-    """Legacy count heuristic: min(n_swap+1, N_chunk - n_persist); 0 when n_swap<=0."""
-    if cfg.n_swap <= 0:
-        return 0
-    n_persist_eff = len(layout.effective_persistent_ids(cfg.n_persist))
-    n_nonpersist = max(0, layout.N_chunk - n_persist_eff)
-    return min(cfg.n_swap + 1, n_nonpersist)
-
-
 # Per-layout chunk→owners cache; weakref.finalize evicts on layout GC to avoid id-recycle stale hits.
 _CHUNK_TO_OWNERS_CACHE: dict[int, dict[int, list[BlockId]]] = {}
 
@@ -151,5 +142,4 @@ __all__ = [
     "chunk_swap_overlap_count",
     "effective_bw",
     "effective_bw_for_chunk",
-    "n_affected_chunks",
 ]

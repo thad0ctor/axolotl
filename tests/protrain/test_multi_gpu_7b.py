@@ -1,7 +1,8 @@
 """M6 headline test — multi-GPU ProTrain throughput scaling on 4x RTX 3090.
 
 Launches two separate training runs and asserts that the 4-GPU run
-clears the ``>= 2.5x`` scaling bar specified in M6 of the plan:
+clears the ``>= 2.5x`` scaling bar documented for the multi-GPU
+validation lane in ``src/axolotl/integrations/protrain/PR_PROPOSAL.md``:
 
 * single-rank baseline: 1 worker on one 3090 (logical device 0 under
   ``CUDA_VISIBLE_DEVICES=1``).
@@ -20,17 +21,18 @@ Throughput is measured as ``world_size * batch_size / avg_iter_s``
 
     throughput_4gpu / throughput_1gpu >= 2.5
 
-matching the ``plan.md`` M6 criterion.
+matching the multi-GPU acceptance criterion.
 
 The two runs are executed in **separate subprocesses** because
 ``CUDA_VISIBLE_DEVICES`` has to be baked in before any CUDA call is
 made in the process; the pytest host process has usually already
 touched CUDA by the time this test runs.
 
-Marked ``slow`` + ``gpu`` so the default ``pytest -m 'not slow'`` lane
-still skips it. Auto-skips when fewer than 4 physical GPUs are visible
-to the pytest host — the launcher env masks visibility below, so the
-check is done via ``nvidia-smi`` at test time.
+Marked ``slow`` + ``gpu`` so the default
+``pytest -m 'not slow and not gpu'`` lane still skips it. Auto-skips
+when fewer than 4 physical GPUs are visible to the pytest host — the
+launcher env masks visibility below, so the check is done via
+``nvidia-smi`` at test time.
 """
 
 from __future__ import annotations

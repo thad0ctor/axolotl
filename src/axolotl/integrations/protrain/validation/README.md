@@ -75,7 +75,7 @@ Coverage map:
 
 | Historical/local validation theme | Durable lane |
 |---|---|
-| P0/P1 blockers from `FinalReview.md` | `maintainer` |
+| P0/P1 maintainer blockers | `maintainer` |
 | Mode A/B/C selector and force-mode safety | `cpu-surface` |
 | Save/resume, optimizer metadata, safetensors save hooks | `cpu-core`, `cpu-surface`, `single-gpu` |
 | Path B LoRA sync and ownership | `cpu-surface` |

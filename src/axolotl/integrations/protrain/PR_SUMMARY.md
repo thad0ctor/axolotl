@@ -72,7 +72,7 @@ Latest recorded validation:
 
 | Lane | Result | Coverage |
 |---|---|---|
-| Default ProTrain pytest | `630 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
+| Default ProTrain pytest | `632 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
 | `cpu-core` | PASS | Validators, cost/search math, calibrated memory gate, metadata, layout determinism, non-finite guard. |
 | `cpu-surface` | PASS | Mode selection, force-mode safety, save/resume hooks, Path B LoRA ownership, debug/watchdog hooks. |
 | `merge-surface` | PASS | `merge-lora` CLI and LoRA/QLoRA/rsLoRA/DoRA/MoE merge math. |

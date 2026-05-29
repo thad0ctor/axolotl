@@ -36,7 +36,7 @@ Reviewer-facing validation summary:
 | Checkpointing and resume | LoRA save/resume/merge, ProTrain optimizer sidecars, safetensors final save, full-FT chunk restoration, same-world optimizer resume when enabled, fail-closed cross-world behavior by default, and explicitly enabled 4→2 / 2→4 optimizer-state resharding are covered (§6.o, §6.cc, §6.gg, §6.jj, §16.B). |
 | LoRA sync and topology | Path B LoRA grad sync is default-on for PCIe and default-off for NVLink-class fabric. PCIe all-linear LoRA improves steady-state throughput by 15.1%; NVLink validation shows native NCCL buckets are faster, justifying the topology-aware default (§6.pb, §6.nv). |
 | Compatibility | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA, torch.compile, Apex FusedAdam with the documented CUDA/toolkit constraint, LoRA-rank sweeps, gradient accumulation, and merge-lora command/reload paths are validated at the levels claimed in §6 and §12. |
-| CI and tests | The default ProTrain suite is 630 passed, 17 skipped, 180 deselected on the rebased branch; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on the latest local full run (§6.n, §11, §15). |
+| CI and tests | The default ProTrain suite is 632 passed, 17 skipped, 180 deselected on the rebased branch; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on the latest local full run (§6.n, §11, §15). |
 
 Current boundaries are explicit rather than hidden:
 
@@ -533,7 +533,7 @@ this proposal while removing per-run log detail.
 
 | Ref | Area | Result |
 |---|---|---|
-| §6.n | Tests | Rebased branch default ProTrain suite: 630 passed, 17 skipped, 180 deselected; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on 3090-class local hardware. |
+| §6.n | Tests | Rebased branch default ProTrain suite: 632 passed, 17 skipped, 180 deselected; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on 3090-class local hardware. |
 | §6.w | FlashAttention | 8B BF16 LoRA + ProTrain Mode A + `flash_attention: true` validates under the extended search timeout. |
 | §6.y, §6.ss | torch.compile | ProTrain hook bodies are compile-disabled where needed, NF4 dequant uses a custom op, and end-to-end torch.compile runs pass. On bs=1 QLoRA Mode A, compile gives no throughput benefit after warmup, so it is compatibility coverage rather than a speed recommendation. |
 | §6.ee | Apex FusedAdam | Source-built Apex FusedAdam validates in the supported local environment; proposal claims support with the documented environment constraint. |
@@ -904,7 +904,7 @@ Reviewer-facing support status:
 | LoRA / QLoRA compatibility | **Validated at claimed scope** | PEFT LoRA container hooks, DoRA/extended-target ownership, Path B LoRA grad sync, LoRA-rank sweep, gradient accumulation, and torch.compile guardrails (§6.l, §6.m, §6.pb, §6.y, §6.ss). Numerical parity evidence is scoped to the stated LoRA Path B runs. |
 | Model-family coverage | **Validated at claimed scope** | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, and Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA (§6.bb, §16.B). MoE/multimodal rows are finite-run and checkpoint-fidelity coverage, not broad numerical-parity claims. |
 | Framework comparisons | **Measured, not overclaimed** | ProTrain, FSDP2, DeepSpeed ZeRO-2/3, ZeRO-3+CPU, vanilla DDP, PCIe, and NVLink-class behavior are separated by hardware/regime (§6.x, §6.nv). |
-| CI and regression coverage | **Validated** | Default ProTrain suite result is 630 passed, 17 skipped, 180 deselected; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on 3090-class local hardware (§6.n, §15). |
+| CI and regression coverage | **Validated** | Default ProTrain suite result is 632 passed, 17 skipped, 180 deselected; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on 3090-class local hardware (§6.n, §15). |
 
 ---
 
@@ -982,7 +982,7 @@ requirements:
 
 | Tier | Tests | CI compatibility |
 |---|---|---|
-| Default-marker (CPU / dev) | Default ProTrain pytest coverage spans chunk management, validators, cost/search math, layout rules, checkpointing, torch.compile compatibility, schema behavior, sentinel re-exports, alpha diagnostics, rsLoRA ownership, MoE/VLM ownership, and Path B LoRA grad sync. Manual bs=1 wall-clock microbenches are opt-in via `PROTRAIN_RUN_BS1_MICROBENCH=1`. | Run on standard Axolotl CI **without GPU**. Latest recorded result: **630 passed, 17 skipped, 180 deselected**. |
+| Default-marker (CPU / dev) | Default ProTrain pytest coverage spans chunk management, validators, cost/search math, layout rules, checkpointing, torch.compile compatibility, schema behavior, sentinel re-exports, alpha diagnostics, rsLoRA ownership, MoE/VLM ownership, and Path B LoRA grad sync. Manual bs=1 wall-clock microbenches are opt-in via `PROTRAIN_RUN_BS1_MICROBENCH=1`. | Run on standard Axolotl CI **without GPU**. Latest recorded result: **632 passed, 17 skipped, 180 deselected**. |
 | GPU-marker (single-GPU) | ~10 tests requiring CUDA + a transformer model load (alpha measurement against a real model, profiler trace round-trip, chunk-residency end-to-end) | Opt-in local/self-hosted validation only. Marker: `@pytest.mark.gpu`. **Not blocking on default CI**. |
 | Multi-GPU regression | `test_paged_adam_offload_mgpu`, `test_cross_mode_resume` plus the validation runner's two-GPU Mode C lane | Opt-in local/self-hosted validation only. Use the committed runner or manual pytest commands on a qualifying multi-GPU CUDA host. **Not blocking on default CI**. |
 
@@ -1030,7 +1030,7 @@ reusable validation cache can be removed after inspection.
 
 The plugin monkey-patches `transformers.Trainer._load_from_checkpoint`
 and depends on PEFT's `LoraLayer` internals via the container hook
-quartet (`chunk/lora_container_hooks.py`). Current validated bounds in
+quartet (`runtime/hooks.py`). Current validated bounds in
 `src/axolotl/integrations/protrain/check.py`:
 
 - `VALIDATED_TRANSFORMERS_MAX = "5.9"`; current pyproject pin:

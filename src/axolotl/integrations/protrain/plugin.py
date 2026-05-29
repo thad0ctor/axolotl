@@ -1138,6 +1138,8 @@ def _resolve_optimizer_name(args, cfg) -> str | None:
 
 def _is_plugin_active(cfg) -> bool:
     """Return True iff plugin is registered and protrain_auto_memory is on."""
+    if getattr(cfg, "merge_lora", False):
+        return False
     if not getattr(cfg, "protrain_auto_memory", False):
         return False
     plugins = getattr(cfg, "plugins", None) or []
@@ -1232,9 +1234,6 @@ def _has_fullft_offload(cfg, wrapped) -> bool:
 
     if getattr(chunk_manager, "_cpu_slots", None):
         return True
-    if getattr(chunk_manager, "_persistent_buffers", None):
-        return True
-
     non_persistent_ids = getattr(chunk_manager, "_non_persistent_ids", None)
     has_non_persistent_chunks = bool(non_persistent_ids)
     if not has_non_persistent_chunks:
@@ -2098,6 +2097,17 @@ class ProTrainPlugin(BasePlugin):
                     )
 
         trainer._protrain_post_trainer_create_done = True  # type: ignore[attr-defined]
+
+    def post_train_unload(self, cfg) -> None:
+        """Release the ProTrain wrapper after the model has been unloaded."""
+        wrapped = getattr(cfg, "_protrain_wrapped", None)
+        if wrapped is None:
+            return
+
+        try:
+            wrapped.close()
+        finally:
+            cfg._protrain_wrapped = None  # type: ignore[attr-defined]
 
 
 __all__ = ["ProTrainPlugin"]

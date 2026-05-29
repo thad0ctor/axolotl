@@ -487,3 +487,65 @@ def test_post_model_load_skips_when_plugin_inactive():
         _stop_all(patches)
 
     assert early_init_calls == []
+
+
+def test_post_model_load_skips_for_legacy_merge_lora():
+    """Merge-only loads must not activate the ProTrain runtime."""
+    pytest.importorskip("torch")
+
+    import torch
+
+    from axolotl.integrations.protrain import plugin as plugin_mod
+
+    cfg = _FakeCfg(
+        protrain_auto_memory=True,
+        plugins=["axolotl.integrations.protrain.ProTrainPlugin"],
+        merge_lora=True,
+        merge_method="legacy",
+    )
+    fake_model = torch.nn.Linear(4, 4)
+
+    early_init_calls = []
+    wrapper_calls = []
+    patches = [
+        patch.object(
+            plugin_mod,
+            "_early_init_dist_for_nccl",
+            side_effect=lambda c: early_init_calls.append(c) or 1,
+        ),
+        patch(
+            "axolotl.integrations.protrain.api.protrain_model_wrapper",
+            side_effect=lambda *a, **kw: wrapper_calls.append((a, kw)),
+        ),
+    ]
+    _start_all(patches)
+    try:
+        plugin_mod.ProTrainPlugin().post_model_load(cfg, fake_model)
+    finally:
+        _stop_all(patches)
+
+    assert early_init_calls == []
+    assert wrapper_calls == []
+    assert getattr(cfg, "_protrain_wrapped", None) is None
+
+
+def test_post_train_unload_closes_wrapper_and_clears_sentinel():
+    """The unload hook closes the runtime and removes the cfg sentinel."""
+    from axolotl.integrations.protrain import plugin as plugin_mod
+
+    class Wrapped:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    wrapped = Wrapped()
+    cfg = _FakeCfg(_protrain_wrapped=wrapped)
+
+    plugin = plugin_mod.ProTrainPlugin()
+    plugin.post_train_unload(cfg)
+    plugin.post_train_unload(cfg)
+
+    assert wrapped.close_calls == 1
+    assert cfg._protrain_wrapped is None
