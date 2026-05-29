@@ -43,17 +43,6 @@ The main resume contract is intentionally conservative:
 | Same-world optimizer resume | Supported when `protrain_save_optimizer_state: true`. |
 | Cross-world optimizer resume | Advanced opt-in via `protrain_allow_online_reshard: true`; fails closed without required sidecar metadata. |
 
-### Current blocker status
-
-| Prior concern | Current status |
-|---|---|
-| Plugin-only listing changes loader behavior | Resolved. |
-| Cost model raw underprediction can mislead users | Resolved by calibrated runtime gate wording and tests. |
-| Trainer monkey-patch brittleness | Mitigated by version guardrails and lifecycle tests. |
-| Mode C / DDP ownership ambiguity | Mitigated by explicit bypass validation. |
-| Optimizer resume reorder risk | Mitigated by sidecars and focused tests. |
-| Overclaiming multimodal/MoE support | Mitigated by scoped validation language. |
-
 ### Fail-closed behavior
 
 ProTrain prefers explicit failure over silent fallback. These cases raise at
