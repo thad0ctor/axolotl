@@ -7,7 +7,9 @@ This PR adds an opt-in ProTrain integration for Axolotl under
 
 ProTrain provides automatic chunked parameter residency, CPU offload, Mode A/B/C
 execution, block-level activation checkpoint/offload policy, and
-checkpoint/resume support for Axolotl LoRA/QLoRA and bounded full-FT workloads.
+checkpoint/resume support for Axolotl LoRA/QLoRA and bounded full-FT workloads,
+meaning full fine-tune shapes validated within the documented hardware and
+sequence-length limits.
 
 It is disabled by default. Runtime behavior requires both:
 
@@ -19,6 +21,7 @@ protrain_auto_memory: true
 
 Listing the plugin alone only registers schema. It does not alter model loading,
 optimizer creation, embedding dtype conversion, checkpointing, or runtime hooks.
+Existing Axolotl configs that do not enable this plugin should behave unchanged.
 
 The integration deliberately rejects conflicting memory backends and unsafe
 settings rather than silently composing them.
@@ -34,9 +37,9 @@ keeps the normal config-driven training flow while choosing between:
 
 | Mode | Purpose |
 |---|---|
-| Mode A | GPU-resident execution when the model fits. |
-| Mode B | Replicated CPU offload when GPU memory is binding and host RAM is sufficient. |
-| Mode C | ZeRO-3-style sharded CPU offload when replicated CPU offload is too large. |
+| Mode A | GPU-resident execution when the selected model/training shape fits. |
+| Mode B | Replicated CPU offload when GPU memory is binding and each rank has enough host RAM for the non-persistent chunks. |
+| Mode C | ZeRO-3-style sharded CPU offload when replicated CPU offload would exceed per-rank host RAM or a sharded layout is explicitly requested. |
 
 The main resume contract is intentionally conservative:
 
@@ -70,6 +73,8 @@ PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite full -
 
 Latest recorded validation:
 
+GPU lanes are opt-in/self-hosted; standard CI remains CPU-only.
+
 | Lane | Result | Coverage |
 |---|---|---|
 | Default ProTrain pytest | `632 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
@@ -93,7 +98,7 @@ Critical regression coverage:
 | Same-world optimizer resume | `two-gpu`. |
 | Cross-world fail-closed behavior without sidecars | CPU/default focused tests. |
 
-Key hardware validation already captured in the proposal:
+Representative hardware validation summarized from `PR_PROPOSAL.md`:
 
 | Shape | Result |
 |---|---|
