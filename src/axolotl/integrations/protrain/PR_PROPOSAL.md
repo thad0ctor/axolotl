@@ -51,6 +51,21 @@ Current boundaries are explicit rather than hidden:
   checkpoint fidelity is validated on the local 4B/9B fidelity-specific paths
   called out in §16.B, not generalized beyond those shapes.
 
+### Fail-closed behavior
+
+ProTrain prefers explicit failure over silent fallback. The following cases
+raise at config, startup, search, or resume time:
+
+- `protrain_auto_memory: true` without the ProTrain plugin.
+- DeepSpeed, FSDP, or Axolotl-level `gradient_checkpointing` combined with
+  ProTrain.
+- More than one forced mode enabled.
+- Unsupported optimizer family.
+- Cross-world optimizer resume without sidecar metadata or without
+  `protrain_allow_online_reshard: true`.
+- PEFT or Transformers API surfaces outside the validated guardrails.
+- Calibrated runtime memory prediction exceeding the configured device budget.
+
 > **Cost-model note.** Raw `estimate_peak` values are lower-bound search gates.
 > Runtime-visible predictions are calibrated with actual chunk bytes before
 > budget checks; users tuning near the 24 GiB ceiling should rely on the
@@ -78,9 +93,10 @@ on a single A100.
 **This integration.** A from-scratch Python port implemented as an Axolotl
 `BasePlugin`, designed to compose with the Axolotl + HF Trainer training
 loop, PEFT-LoRA adapters, and bitsandbytes weight quantization. The
-plugin owns per-rank memory policy only — it does not own distributed
-collectives (`torch.distributed`), training-loop control flow, TP, PP, or
-FP8. Three notable deltas vs the paper's reference design, expanded in §8:
+plugin owns memory policy and the collectives required by that policy, but it
+does not own process-group lifecycle, training-loop control flow, tensor
+parallelism, pipeline parallelism, or FP8. Three notable deltas vs the paper's
+reference design, expanded in §8:
 
 1. A fifth search axis (`n_offload`) for block-level chunk-offload-without-
    recompute (Option B); the paper's design has four axes.
