@@ -15,6 +15,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from pydantic import ValidationError
 from torch import nn
 
 from axolotl.integrations.protrain.api.model_wrapper import (
@@ -516,6 +517,20 @@ def test_protrain_args_quickstart_defaults():
     )
     assert args_opt_in.protrain_phase2_quickstart is True
     assert args_opt_in.protrain_phase2_quickstart_envelope == pytest.approx(0.15)
+
+
+def test_protrain_args_quickstart_rejects_negative_envelope():
+    """Negative quickstart envelopes fail validation instead of disabling the guard."""
+    with pytest.raises(ValidationError):
+        ProTrainArgs.model_validate(
+            {
+                "plugins": ["axolotl.integrations.protrain.ProTrainPlugin"],
+                "protrain_auto_memory": True,
+                "base_model": "HuggingFaceTB/SmolLM2-135M",
+                "protrain_phase2_quickstart": True,
+                "protrain_phase2_quickstart_envelope": -0.01,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------

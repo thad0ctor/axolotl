@@ -37,6 +37,11 @@ def unwrap_block(block: nn.Module) -> nn.Module:
 def wrap_block(block: nn.Module, mode: BlockMode) -> nn.Module:
     """Dispatch block to NONE / CKPT / SWAP / OFFLOAD wrapper; idempotent (unwrap-then-rewrap)."""
     if _is_wrapped(block):
+        teardown = getattr(block, "close", None)
+        if teardown is None:
+            teardown = getattr(block, "detach_runtime", None)
+        if teardown is not None:
+            teardown()
         block = unwrap_block(block)
 
     if mode is BlockMode.NONE:

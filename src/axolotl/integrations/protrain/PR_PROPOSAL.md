@@ -188,7 +188,7 @@ registers the args schema but leaves the runtime hooks dormant.
 
 ### 3.5 Runtime data path
 
-```
+```text
             ┌─────────────────────┐
  YAML       │ protrain_auto_memory│
    ─────►   │ + plugin in plugins │

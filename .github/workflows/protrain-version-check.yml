@@ -61,8 +61,9 @@ jobs:
               print(f"{pkg}: pin spec = {spec!r}")
 
               # Exact pins ("==") set both lower and upper to the same value.
-              # Otherwise prefer the explicit "<" / "<=" upper, then the lower bound.
+              # Otherwise require an explicit "<" / "<=" upper bound.
               effective_upper = None
+              upper_op = None
               eq_match = eq_re.search(spec)
               lt_match = lt_re.search(spec)
               le_match = le_re.search(spec)
@@ -70,27 +71,39 @@ jobs:
               gt_match = gt_re.search(spec)
               if eq_match is not None:
                   effective_upper = eq_match.group(1)
+                  upper_op = "=="
               elif lt_match is not None:
                   effective_upper = lt_match.group(1)
+                  upper_op = "<"
               elif le_match is not None:
                   effective_upper = le_match.group(1)
-              elif ge_match is not None:
-                  effective_upper = ge_match.group(1)
-              elif gt_match is not None:
-                  effective_upper = gt_match.group(1)
+                  upper_op = "<="
 
               if effective_upper is None:
                   print(
-                      f"INFO: {pkg} pin spec has no parseable version; skipping check."
+                      f"::warning file=pyproject.toml::{pkg} pin spec "
+                      f"{spec!r} has no explicit upper bound."
                   )
+                  if ge_match is not None or gt_match is not None:
+                      print(
+                          f"ERROR: {pkg} lower-bound-only spec is unbounded "
+                          "for ProTrain validation."
+                      )
+                  failed = True
                   continue
 
               validated_v = Version(validated_max)
               effective_v = Version(effective_upper)
-              if effective_v >= validated_v:
+              violates = (
+                  effective_v > validated_v
+                  if upper_op == "<"
+                  else effective_v >= validated_v
+              )
+              if violates:
                   print(
                       f"::warning file=pyproject.toml::{pkg} effective upper "
-                      f"{effective_upper} >= validated max {validated_max}. "
+                      f"{upper_op}{effective_upper} exceeds validated max "
+                      f"<{validated_max}. "
                       f"Re-run protrain validation suite (PEFT-LoRA-container hooks + "
                       f"Trainer._load_from_checkpoint resume) and bump "
                       f"VALIDATED_{pkg.upper()}_MAX in "

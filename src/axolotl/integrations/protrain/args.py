@@ -466,6 +466,7 @@ class ProTrainArgs(BaseModel):
 
     protrain_phase2_quickstart_envelope: float | None = Field(
         default=0.30,
+        ge=0.0,
         json_schema_extra={
             "description": (
                 "Noise envelope for `protrain_phase2_quickstart`: when "

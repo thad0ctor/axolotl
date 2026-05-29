@@ -932,9 +932,11 @@ satisfied prior to the M5 ship listed in the header.
 ## 9. Glossary
 
 * **Persistent chunk** — chunk whose params live on GPU for the entire
-  iteration; `chunk_id < n_persist` by index assignment.
-* **Non-persistent chunk** — chunk whose params live on CPU between
-  block visits and are gathered to GPU on demand.
+  iteration, either by the searcher's `n_persist` budget or because the
+  layout marks it `mandatory_persistent`.
+* **Non-persistent chunk** — chunk not selected by either persistence
+  rule; its params live on CPU between block visits and are gathered to
+  GPU on demand.
 * **Block mode** — per-block activation strategy
   (`NONE | CKPT | SWAP | OFFLOAD`).
 * **OFFLOAD** (this doc) — new mode: param chunks may be non-persistent,

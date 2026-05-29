@@ -14,16 +14,15 @@ ProTrain save/load hook rather than relying on HF's stock path.
 
 ## 0. Where we stand today
 
-`_ProTrainOptimizer.state_dict` and `.load_state_dict` raise
-`NotImplementedError` (`api/optim_wrapper.py:116-126`). At runtime
-those methods are silently overridden by the plugin
-(`plugin.py:491-520`):
+`_ProTrainOptimizer.state_dict` and `.load_state_dict` now implement the
+Accelerate-safe hollow-shell behavior directly in `api/optim_wrapper.py`:
 
-- `state_dict` is patched to return a hollow `{"state": {},
-  "param_groups": [...]}` shell.
-- `load_state_dict` is patched to a no-op.
+- `state_dict` returns a hollow `{"state": {}, "param_groups": [...]}`
+  shell with a ProTrain marker.
+- `load_state_dict` accepts that marked hollow shell and raises loudly for
+  foreign optimizer payloads.
 
-The patch comment explicitly names two callers — both are unconditional:
+The implementation explicitly supports two callers — both are unconditional:
 1. **HF Trainer** at checkpoint save (silenced today via
    `save_only_model=True` from `get_training_args`, plugin.py:302-314).
 2. **Accelerate at `prepare` time** for device-placement
@@ -341,16 +340,18 @@ Three changes to `plugin.py`:
    `{"save_only_model": False}` so HF tries to save (our callback
    then takes over the actual write). Keep `save_only_model=True` as
    the default.
-2. **`post_trainer_create`** (lines 491-520): keep the no-op patches
-   for `state_dict` / `load_state_dict`. These remain correct for the
-   Accelerate `prepare` round-trip (§1.7, Option P). Real save/load
-   does NOT go through these methods; it goes through the callback.
+2. **`post_trainer_create`**: keep optimizer checkpoint save/load on the
+   callback path. The public `state_dict` / `load_state_dict` hollow-shell
+   behavior lives in `_ProTrainOptimizer` and remains correct for the
+   Accelerate `prepare` round-trip (§1.7, Option P). Real save/load does
+   NOT go through these methods; it goes through the callback.
 3. **Register `ProTrainOptimizerCheckpointCallback`** via
    `trainer.add_callback(...)` after the optimizer is installed.
 
 The `_ProTrainOptimizer.state_dict` / `load_state_dict` in
-`api/optim_wrapper.py` continue to raise `NotImplementedError` — they
-are NEVER the right path. Document this in the docstring.
+`api/optim_wrapper.py` are NEVER the right path for real ProTrain optimizer
+checkpoint persistence. They only provide the hollow-shell public optimizer
+contract; real checkpoint persistence goes through `api/checkpoint.py`.
 
 ### 2.6 New YAML flag
 

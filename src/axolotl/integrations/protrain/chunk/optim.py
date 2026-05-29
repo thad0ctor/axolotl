@@ -99,7 +99,10 @@ class CpuFusedAdamAdapter:
                 try:
                     opt.ds_opt_adam = _NoopDsAdam()  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001 — best-effort cleanup
-                    pass
+                    LOG.debug(
+                        "CpuFusedAdamAdapter: failed to install ds_opt_adam noop stub",
+                        exc_info=True,
+                    )
                 raise RuntimeError(
                     "DeepSpeedCPUAdam C++ extension (adam_bindings) is not "
                     "loaded — the constructed object is missing "
@@ -241,7 +244,11 @@ class CpuFusedAdamAdapter:
             try:
                 opt.ds_opt_adam = _DestroyedDsAdam()  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+                LOG.debug(
+                    "CpuFusedAdamAdapter: failed to replace ds_opt_adam with "
+                    "destroyed stub",
+                    exc_info=True,
+                )
 
     def __del__(self) -> None:  # noqa: D401
         try:

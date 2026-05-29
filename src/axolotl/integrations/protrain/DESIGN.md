@@ -314,71 +314,68 @@ DeepSpeed/FSDP/Unsloth execution paths outside the ProTrain plugin contract.
 
 ### Per-mode alpha-fragmentation calibration
 
-    `ALPHA_FRAGMENTATION_4BIT` was historically a single constant (0.75) calibrated
-    against Mode-A peaks where frozen 4-bit weights dominate per-rank residency.
-    Under Mode-C with gradient checkpointing, activation churn becomes the
-    dominant moving term and the 0.75 factor structurally under-predicts the raw
-    peak. Splitting into `ALPHA_FRAGMENTATION_4BIT_MODE_A = 0.75` and
-    `ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT = 0.95` tightens the raw predictor
-    without changing the wrapper-side `_calibrate_peak_with_actual_chunk_bytes`
-    safety semantics. The audit table (Decision 1) shows residual
-    `alpha_steady = 1.43 / 1.25 / 1.08` at seq=512/1024/2048 on 30B-Llama Mode-C;
-    the mode split narrows the raw predictor and the wrapper-side calibrated
-    budget gate remains the final fit decision. Dispatch is centralized in
-    `alpha_fragmentation_for_cfg(bpe, cfg)`, called by `estimate_peak`, the
-    exhaustive searcher (`search/exhaustive.py`), and the wrapper-side
-    calibrator. The dtype-only `alpha_fragmentation_for_dtype` path is preserved
-    for call sites that lack a `CostConfig` (e.g. `predict_init_transient_peak_bytes`).
-    `_reconstruct_f_bm` in the wrapper now uses the shared
-    `_compute_ckpt_chain_bytes` helper so the wrapper-side reconstruction
-    matches `estimate_peak`'s chain-sum semantics instead of the prior
-    single-block max. Tests: `tests/protrain/test_cost_model.py`.
+`ALPHA_FRAGMENTATION_4BIT` was historically a single constant (0.75) calibrated
+against Mode-A peaks where frozen 4-bit weights dominate per-rank residency.
+Under Mode-C with gradient checkpointing, activation churn becomes the
+dominant moving term and the 0.75 factor structurally under-predicts the raw
+peak. Splitting into `ALPHA_FRAGMENTATION_4BIT_MODE_A = 0.75` and
+`ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT = 0.95` tightens the raw predictor
+without changing the wrapper-side `_calibrate_peak_with_actual_chunk_bytes`
+safety semantics. The audit table (Decision 1) shows residual
+`alpha_steady = 1.43 / 1.25 / 1.08` at seq=512/1024/2048 on 30B-Llama Mode-C;
+the mode split narrows the raw predictor and the wrapper-side calibrated
+budget gate remains the final fit decision. Dispatch is centralized in
+`alpha_fragmentation_for_cfg(bpe, cfg)`, called by `estimate_peak`, the
+exhaustive searcher (`search/exhaustive.py`), and the wrapper-side
+calibrator. The dtype-only `alpha_fragmentation_for_dtype` path is preserved
+for call sites that lack a `CostConfig` (e.g. `predict_init_transient_peak_bytes`).
+`_reconstruct_f_bm` in the wrapper now uses the shared
+`_compute_ckpt_chain_bytes` helper so the wrapper-side reconstruction
+matches `estimate_peak`'s chain-sum semantics instead of the prior
+single-block max. Tests: `tests/protrain/test_cost_model.py`.
 
 ### Per-block internal saved-tensor proxy
 
-    The `_compute_ckpt_chain_bytes` helper sums the block-output proxy
-    (`trace.activation_sizes[bid]`) across CKPT blocks. This proxy
-    under-estimates the per-block saved tensors that include FFN-intermediate
-    (`bs * seq * intermediate_size`), attention scores
-    (`bs * heads * seq * seq`), and Q/K/V projections
-    (`3 * bs * seq * hidden`). At low seq these block-internal tensors
-    dominate the residual.
+The `_compute_ckpt_chain_bytes` helper sums the block-output proxy
+(`trace.activation_sizes[bid]`) across CKPT blocks. This proxy under-estimates
+the per-block saved tensors that include FFN-intermediate
+(`bs * seq * intermediate_size`), attention scores (`bs * heads * seq * seq`),
+and Q/K/V projections (`3 * bs * seq * hidden`). At low seq these
+block-internal tensors dominate the residual.
 
-    The new `_block_internal_saved_bytes` helper estimates these analytically
-    per block. Under non-reentrant CKPT only one block's internal saved
-    tensors are live at a time (the current recompute window), so the chain
-    helper adds ONE block's worth of internal residual (per-block max, not
-    N_block worth) — chaining 60x would over-correct catastrophically at
-    high seq because the attention-score term scales O(seq^2). The
-    `protrain_ckpt_internal_residual_factor` config field (default 1.0)
-    scales the contribution; 0.0 disables and reproduces pre-fix behavior;
-    fractional values give conservative tuning.
+The new `_block_internal_saved_bytes` helper estimates these analytically per
+block. Under non-reentrant CKPT only one block's internal saved tensors are live
+at a time (the current recompute window), so the chain helper adds ONE block's
+worth of internal residual (per-block max, not N_block worth) — chaining 60x
+would over-correct catastrophically at high seq because the attention-score
+term scales O(seq^2). The `protrain_ckpt_internal_residual_factor` config field
+(default 1.0) scales the contribution; 0.0 disables and reproduces pre-fix
+behavior; fractional values give conservative tuning.
 
-    The cost-model's free signature now reads `hidden_size`,
-    `num_attention_heads`, and `intermediate_size` from the `ProfilerTrace`;
-    `run_trace` and `synth_trace_from_overrides` populate these from the
-    model's HF config via `_infer_hidden_size`, `_infer_num_attention_heads`,
-    and `_infer_intermediate_size`. `TRACE_VERSION` is bumped from 22 to 23
-    so legacy cached traces re-profile rather than silently degrade to a
-    zero residual. Tests:
-    `tests/protrain/test_cost_model.py::test_block_internal_saved_bytes_quadratic_in_seq`,
-    `test_ckpt_chain_includes_internal_residual_when_enabled`,
-    `test_disable_via_factor_zero`,
-    `test_estimate_peak_seq_512_30b_llama_alpha_steady_after_residual`.
+The cost-model's free signature now reads `hidden_size`, `num_attention_heads`,
+and `intermediate_size` from the `ProfilerTrace`; `run_trace` and
+`synth_trace_from_overrides` populate these from the model's HF config via
+`_infer_hidden_size`, `_infer_num_attention_heads`, and
+`_infer_intermediate_size`. `TRACE_VERSION` is bumped from 22 to 23 so legacy
+cached traces re-profile rather than silently degrade to a zero residual. Tests:
+`tests/protrain/test_cost_model.py::test_block_internal_saved_bytes_quadratic_in_seq`,
+`test_ckpt_chain_includes_internal_residual_when_enabled`,
+`test_disable_via_factor_zero`,
+`test_estimate_peak_seq_512_30b_llama_alpha_steady_after_residual`.
 
-    Estimated `alpha_steady` after the residual + the alpha-split lands at
-    ~1.18 / 0.99 / 0.80 at seq=512/1024/2048 on 30B-Llama Mode-C against
-    audit measurements 2.91 / 3.50 / 4.68 GiB. The seq=512 case narrows
-    under-prediction; seq=1024 lands near 1.0; seq=2048 slightly over-
-    predicts (safer for the budget gate). At-scale re-profiling on
-    >24 GiB hardware is the §16 follow-up scope; this PR ships the
-    analytical model.
+Estimated `alpha_steady` after the residual + the alpha-split lands at
+~1.18 / 0.99 / 0.80 at seq=512/1024/2048 on 30B-Llama Mode-C against audit
+measurements 2.91 / 3.50 / 4.68 GiB. The seq=512 case narrows
+under-prediction; seq=1024 lands near 1.0; seq=2048 slightly over-predicts
+(safer for the budget gate). At-scale re-profiling on >24 GiB hardware is the
+§16 follow-up scope; this PR ships the analytical model.
 
-    The iter-1 transient observed at bnb-4-bit Mode-C is an init-time
-    chunk-residency phenomenon, not a fragmentation or activation-accounting
-    term. It is modeled by `predict_init_transient_peak_bytes` and tested in
-    `tests/protrain/test_init_transient_peak.py`, while steady-state alpha
-    remains scoped to the runtime predictor.
+The iter-1 transient observed at bnb-4-bit Mode-C is an init-time
+chunk-residency phenomenon, not a fragmentation or activation-accounting term.
+It is modeled by `predict_init_transient_peak_bytes` and tested in
+`tests/protrain/test_init_transient_peak.py`, while steady-state alpha remains
+scoped to the runtime predictor.
+
 2. **Pinned-memory allocator:** `ctypes` → `cudaHostAlloc` directly. ~50 LOC, zero new deps, matches App B.2 precisely (avoids `CUDAHostAllocator` pow-2 rounding). DeepSpeed's `PinnedMemoryAllocator` rejected: may inherit same wart, adds import-graph weight.
 3. **CPU FusedAdam source:** `deepspeed.ops.adam.DeepSpeedCPUAdam`. Paper builds directly on ZeRO-Offload's CPU Adam. Pure-Python reimpl is >10x slower and would collapse the T_bwd / T_cpu_optim overlap window the cost model assumes. DeepSpeed is already in Axolotl's env.
 4. **S_chunk grid:** `{32, 64, 128, 256} MB`. 7B Llama blocks are ~200 MB fp16 → chunks want to be block-scale. 16 MB is too fine-grained; per-chunk sync overhead dominates. M2 agent extends the grid if optimum lands at an endpoint.

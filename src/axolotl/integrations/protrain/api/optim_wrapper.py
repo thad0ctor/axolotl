@@ -529,7 +529,6 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
         if not self._persistent_params_full and not self._persistent_huge_originals:
             return
         import torch.distributed as dist
-        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
         if not (dist.is_available() and dist.is_initialized()):
             return
@@ -538,31 +537,36 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
 
         # Small-param round-robin sync.
         if self._persistent_params_full:
-            # Zero non-owned param.data BEFORE the collective so the SUM lands the owner's value.
-            for i, param in enumerate(self._persistent_params_full):
-                if self._persistent_owner_rank[i] != rank:
-                    param.data.zero_()
-
             # Bucket by (dtype, device) so a single collective covers each homogeneous group.
-            buckets: dict[tuple[Any, Any], list["nn.Parameter"]] = {}
-            for param in self._persistent_params_full:
+            buckets: dict[tuple[Any, Any], list[tuple["nn.Parameter", int]]] = {}
+            for i, param in enumerate(self._persistent_params_full):
                 key = (param.data.dtype, param.data.device)
-                buckets.setdefault(key, []).append(param)
+                buckets.setdefault(key, []).append(
+                    (param, self._persistent_owner_rank[i])
+                )
 
-            for params in buckets.values():
-                if len(params) == 1:
-                    dist.all_reduce(params[0].data, op=dist.ReduceOp.SUM)
-                    continue
-                tensors = [p.data for p in params]
-                flat = _flatten_dense_tensors(tensors)
+            for entries in buckets.values():
+                first = entries[0][0].data
+                total_numel = sum(param.data.numel() for param, _owner in entries)
+                flat = torch.zeros(
+                    total_numel,
+                    dtype=first.dtype,
+                    device=first.device,
+                )
+                offset = 0
+                staged: list[tuple["nn.Parameter", torch.Tensor]] = []
+                for param, owner in entries:
+                    numel = param.data.numel()
+                    view = flat.narrow(0, offset, numel).view_as(param.data)
+                    if owner == rank:
+                        view.copy_(param.data)
+                    staged.append((param, view))
+                    offset += numel
                 dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                for orig, synced in zip(
-                    tensors, _unflatten_dense_tensors(flat, tensors), strict=True
-                ):
-                    orig.copy_(synced)
+                for orig, synced in staged:
+                    orig.data.copy_(synced)
 
-        # Huge-param within-shard sync: each rank's shard is a narrow into
-        # orig.data, so the gather lands directly in-place across all ranks.
+        # Huge-param within-shard sync: gather into scratch, then publish.
         if self._persistent_huge_originals:
             for orig, shard in zip(
                 self._persistent_huge_originals,
@@ -580,10 +584,9 @@ class _ProTrainOptimizer(torch.optim.Optimizer):
                         "contiguous; within-shard all_gather requires "
                         "a contiguous destination storage."
                     )
-                dist.all_gather_into_tensor(dst, src)
-                # If we had to materialize a contiguous copy, the shard's
-                # data view now points at the correct slice of dst again
-                # (still a narrow into orig.data); no rewrite needed.
+                gathered = torch.empty_like(dst)
+                dist.all_gather_into_tensor(gathered, src)
+                dst.copy_(gathered)
 
     # ---- LR-scheduler hyperparam forwarding -----------------------------
 

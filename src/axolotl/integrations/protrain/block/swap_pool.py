@@ -31,7 +31,8 @@ class ActivationSwapPool:
     the SWAP wrapper's chosen stream (typically the scheduler's
     ``_swap_stream``). Slot ownership is tracked by Python-side ID
     only; CUDA never sees the pool's free-list state. Callers MUST
-    synchronize the swap stream with their consumer before
+    synchronize the swap stream with their consumer before releasing
+    the slot back to the pool.
     """
 
     def __init__(
