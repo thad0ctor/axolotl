@@ -20,7 +20,8 @@ The PR adds:
   choices for PCIe vs NVLink-class systems.
 - Axolotl integration for LoRA/QLoRA, full fine-tune, torch.compile guardrails,
   optimizer wrapping, safetensors save, optimizer-state checkpointing, and
-  cross-world resume.
+  resume. Cross-world optimizer-state resume is an explicit advanced path, not
+  the default user flow.
 - Config validation that rejects known-conflicting stacks rather than silently
   composing with DeepSpeed/FSDP, in-training adapter merges, or unsupported
   lazy-load paths. Post-training `merge-lora` is validated separately.
@@ -32,7 +33,7 @@ Reviewer-facing validation summary:
 | 24 GiB consumer-GPU fit | 8B BF16 LoRA memory drops from 15.83 GiB to 3.08 GiB resident (§6.a). Llama-13B 4-bit LoRA fits on one 3090 through seq=2048 (§6.h). Qwen3.5-27B 4-bit LoRA fits on one 3090 at seq=128 and Mode B reaches seq=256 under the 24 GiB ceiling (§6.j, §6.dd). |
 | Multi-GPU consumer rigs | 13B/9B 4-bit LoRA validates on 4× 3090 in Mode A and Mode C (§6.e). Mode A/B/C shape coverage includes bs=1/2, seq=256/512, mixed-SKU determinism, and non-NVLink Mode C DDP bypass (§6.zz, §6.zz.X, §6.uu). |
 | Full fine-tune | Qwen3-0.6B full-FT validates Adam-state memory reduction across torch, bnb 8-bit, and paged Adam (§6.g). Qwen3.5-4B full-FT forced Mode C validates locally on 5× 3090-class cards with both `adamw_bnb_8bit` and `adamw_torch` (§6.z). Qwen3.5-9B full-FT forced Mode C validates train/save/resume on a high-memory 2-rank host (§6.nw). |
-| Checkpointing and resume | LoRA save/resume/merge, ProTrain optimizer sidecars, safetensors final save, full-FT chunk restoration, same-world resume, cross-world 4→2 and 2→4 optimizer-state resume, and checkpoint fidelity for visual keys are covered (§6.o, §6.cc, §6.gg, §6.jj, §16.B). |
+| Checkpointing and resume | LoRA save/resume/merge, ProTrain optimizer sidecars, safetensors final save, full-FT chunk restoration, same-world optimizer resume when enabled, fail-closed cross-world behavior by default, and explicitly enabled 4→2 / 2→4 optimizer-state resharding are covered (§6.o, §6.cc, §6.gg, §6.jj, §16.B). |
 | LoRA sync and topology | Path B LoRA grad sync is default-on for PCIe and default-off for NVLink-class fabric. PCIe all-linear LoRA improves steady-state throughput by 15.1%; NVLink validation shows native NCCL buckets are faster, justifying the topology-aware default (§6.pb, §6.nv). |
 | Compatibility | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA, torch.compile, Apex FusedAdam with the documented CUDA/toolkit constraint, LoRA-rank sweeps, gradient accumulation, and merge-lora command/reload paths are validated at the levels claimed in §6 and §12. |
 | CI and tests | The default ProTrain suite is 630 passed, 17 skipped, 180 deselected on the rebased branch; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on the latest local full run (§6.n, §11, §15). |
@@ -525,7 +526,7 @@ this proposal while removing per-run log detail.
 | §6.z | Local full-FT Mode C | Qwen3.5-4B bf16 full-FT forced Mode C validates on 5× 3090-class cards with both `adamw_bnb_8bit` and `adamw_torch`, final safetensors save, and chunk-managed param restoration. |
 | §6.nw | 9B full-FT capacity validation | Qwen3.5-9B bf16 full-FT forced Mode C validates 30/30 finite train steps, final safetensors save, full optimizer-state checkpoint/resume to step 100, and second resume to step 105 on a high-memory 2-rank host. Vanilla Axolotl full-FT is faster on the same high-memory host but uses about twice the active memory. |
 | §6.o, §6.gg, §6.jj | Save, merge, reload | LoRA save/resume/merge passes for standard-attention and linear-attention models; 13B/27B merge-lora command/reload paths return successfully with expected memory ceilings. No serving throughput or merged-model quality claim is made. |
-| §6.cc, §6.kk-oo | Cross-world optimizer resume | Full optimizer-state sidecars validate same-world resume plus 4→2 and 2→4 cross-world online resharding on Qwen3.5-4B full-FT packed seq=1024/2048 shapes. Param-group identity and reorder defenses are covered by the focused tests. |
+| §6.cc, §6.kk-oo | Advanced optimizer resume | Full optimizer-state sidecars validate same-world resume plus explicitly enabled 4→2 and 2→4 cross-world online resharding on Qwen3.5-4B full-FT packed seq=1024/2048 shapes. Param-group identity, reorder defenses, and fail-closed sidecar checks are covered by focused tests. |
 | §16.B | Multimodal checkpoint fidelity | Qwen3.5 visual-key checkpoint fidelity is validated on the local fidelity-specific paths: saved keys remain native `model.visual.*` keys with no nested `model.language_model.visual.*` or wrapper-key leakage. |
 
 ### 6.4 Compatibility and guardrails
@@ -887,7 +888,7 @@ Reviewer-facing support status:
 
 | Status | Scope |
 |---|---|
-| Supported and validated | LoRA/QLoRA Mode A/B/C at stated 3090-class shapes; same-world resume; cross-world Mode C optimizer resume at stated Qwen3.5-4B full-FT shapes; final safetensors save; Path B LoRA sync with topology-aware default; active-ProTrain 4-bit embedding-upcast deferral. |
+| Supported and validated | LoRA/QLoRA Mode A/B/C at stated 3090-class shapes; same-world resume; final safetensors save; Path B LoRA sync with topology-aware default; active-ProTrain 4-bit embedding-upcast deferral. Advanced cross-world Mode C optimizer resume is validated for stated Qwen3.5-4B full-FT shapes and remains opt-in. |
 | Supported with environment constraint | Apex FusedAdam requires a CUDA/toolkit-aligned source build; GPU and multi-GPU regression lanes require suitable local/self-hosted hardware. |
 | Future optimization, not correctness gap | bs=1 CUDA Graphs / deeper launch capture work. Correctness and cost attribution are validated for the stated Mode A inert and Path B rerun shapes; production guidance is higher micro-batch or gradient accumulation. |
 | Rejected by validator | DeepSpeed/FSDP composition, Axolotl-level `gradient_checkpointing`, unsafe force-mode combinations, unsupported optimizer families, and `protrain_auto_memory: true` without the ProTrain plugin. |
