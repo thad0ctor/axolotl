@@ -10,6 +10,9 @@ This is not a request for mandatory GPU CI in upstream GitHub Actions. The CPU
 lanes are suitable for ordinary CI; the GPU lanes are an opt-in validation
 command for reviewers or developers with qualifying CUDA hardware. Missing GPU
 hardware is reported as `SKIP`, not hidden and not treated as a failure.
+CPU lanes run with `CUDA_VISIBLE_DEVICES=""`; when `--gpu-devices` is passed,
+single-GPU lanes use the first selected device and two-GPU lanes use the first
+two selected devices.
 
 Suites:
 
@@ -32,12 +35,35 @@ PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite full -
 PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite maintainer --work-dir /tmp/protrain-validation
 PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite single-gpu --gpu-devices 0 --work-dir /tmp/protrain-validation
 PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite two-gpu --gpu-devices 0,1 --work-dir /tmp/protrain-validation
+PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite full --work-dir /tmp/protrain-validation --keep-cache --cleanup
+PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite full --cache-dir ~/.cache/axolotl/protrain-validation
 PYTHONPATH=src python -m axolotl.integrations.protrain.validation --suite full --json
+PYTHONPATH=src python -m axolotl.integrations.protrain.validation --work-dir /tmp/protrain-validation --clean
 ```
 
 For a private/self-hosted CI loop, run `--suite full --json` on any qualifying
 machine and archive the log directory. The process exits non-zero only on a
 failed lane; unavailable hardware remains an explicit `SKIP`.
+
+By default, artifacts are kept under `--work-dir` for inspection. Add
+`--cleanup` to remove that directory after the run, or run `--clean` later to
+delete an existing validation work directory without executing tests.
+`--clean` requires an explicit `--work-dir`.
+
+Downloaded validation models and datasets use the normal Hugging Face cache
+unless `--cache-dir` or `--keep-cache` is passed. `--cache-dir PATH` points the
+runner at a reusable cache for model, dataset, and asset downloads. `--keep-cache`
+uses `--cache-dir` when provided; otherwise it creates a sibling directory named
+`<work-dir>-cache`, or `~/.cache/axolotl/protrain-validation` when no
+`--work-dir` is provided. The single-GPU acceptance recipe stores Axolotl's
+prepared dataset under that reusable cache when one is configured; otherwise it
+keeps prepared data inside the validation work directory. Cleanup commands remove
+run logs/checkpoints/configs, but they do not remove that reusable cache.
+
+The runner is environment-native by default: it executes the current checkout
+with `PYTHONPATH=src` instead of building a Docker image. It can be run from
+inside the repository's existing Docker or `docker compose` environment if a
+pinned container is preferred.
 
 Acceptance gates are intentionally mechanical: process exit status, expected
 checkpoint artifacts, finite logged losses, finite logged grad norms when

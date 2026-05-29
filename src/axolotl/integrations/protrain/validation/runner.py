@@ -78,6 +78,16 @@ _TWO_GPU_TESTS = (
     "tests/protrain/test_modec_optimizer_boundary.py::test_optimizer_rejects_nonfinite_hidden_cpu_grad_before_step",
 )
 
+_LANE_HARDWARE = {
+    "cpu-core": "CPU",
+    "cpu-surface": "CPU",
+    "merge-surface": "CPU",
+    "cpu-full": "CPU",
+    "single-gpu-edge": "1 GPU",
+    "single-gpu": "1 GPU",
+    "two-gpu": "2 GPUs",
+}
+
 _LOSS_RE = re.compile(
     r"['\"]loss['\"]\s*:\s*['\"]?([+-]?(?:nan|inf|[0-9.eE+-]+))", re.I
 )
@@ -117,7 +127,11 @@ def _repo_root() -> Path:
     return _REPO_ROOT
 
 
-def _base_env(repo_root: Path, gpu_devices: str | None = None) -> dict[str, str]:
+def _base_env(
+    repo_root: Path,
+    gpu_devices: str | None = None,
+    cache_dir: Path | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     src = str(repo_root / "src")
     existing = env.get("PYTHONPATH")
@@ -126,8 +140,13 @@ def _base_env(repo_root: Path, gpu_devices: str | None = None) -> dict[str, str]
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     env.setdefault("DS_SKIP_CUDA_CHECK", "1")
     env.setdefault("PYTHONUNBUFFERED", "1")
-    if gpu_devices:
+    if gpu_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = gpu_devices
+    if cache_dir is not None:
+        env["HF_HOME"] = str(cache_dir)
+        env["HF_HUB_CACHE"] = str(cache_dir / "hub")
+        env["HF_DATASETS_CACHE"] = str(cache_dir / "datasets")
+        env["HF_ASSETS_CACHE"] = str(cache_dir / "assets")
     return env
 
 
@@ -165,6 +184,40 @@ def _visible_gpu_count(gpu_devices: str | None) -> int:
     if gpu_devices:
         return len([part for part in gpu_devices.split(",") if part.strip()])
     return len(_gpu_memories_mib())
+
+
+def _lane_gpu_devices(gpu_devices: str | None, count: int) -> str | None:
+    if not gpu_devices:
+        return None
+    parts = [part.strip() for part in gpu_devices.split(",") if part.strip()]
+    if len(parts) < count:
+        return gpu_devices
+    return ",".join(parts[:count])
+
+
+def _resolved_cache_dir(args: argparse.Namespace) -> Path | None:
+    raw = getattr(args, "_resolved_cache_dir", None)
+    return Path(raw) if raw else None
+
+
+def _resolve_cache_dir(args: argparse.Namespace, work_dir: Path) -> Path | None:
+    if args.cache_dir:
+        return Path(args.cache_dir).resolve()
+    if not args.keep_cache:
+        return None
+    if args.work_dir:
+        return work_dir.with_name(f"{work_dir.name}-cache")
+    return Path.home() / ".cache" / "axolotl" / "protrain-validation"
+
+
+def _prepare_cache_dir(cache_dir: Path) -> None:
+    for path in (
+        cache_dir,
+        cache_dir / "hub",
+        cache_dir / "datasets",
+        cache_dir / "assets",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
 
 
 def _has_24g_gpu(gpu_devices: str | None) -> bool:
@@ -273,6 +326,7 @@ def write_single_gpu_yaml(
     recipe_path: Path,
     dest_path: Path,
     output_dir: Path,
+    dataset_prepared_path: Path,
     max_steps: int,
     save_steps: int,
     resume_from_checkpoint: Path | None = None,
@@ -281,6 +335,7 @@ def write_single_gpu_yaml(
         cfg = yaml.safe_load(f)
 
     cfg["output_dir"] = str(output_dir)
+    cfg["dataset_prepared_path"] = str(dataset_prepared_path)
     cfg["max_steps"] = int(max_steps)
     cfg["save_steps"] = int(save_steps)
     if resume_from_checkpoint is None:
@@ -315,7 +370,7 @@ def run_cpu_core(
     rc = _run_subprocess(
         cmd,
         cwd=repo_root,
-        env=_base_env(repo_root),
+        env=_base_env(repo_root, "", _resolved_cache_dir(args)),
         log_path=log_path,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
@@ -355,7 +410,7 @@ def run_cpu_surface(
     rc = _run_subprocess(
         cmd,
         cwd=repo_root,
-        env=_base_env(repo_root),
+        env=_base_env(repo_root, "", _resolved_cache_dir(args)),
         log_path=log_path,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
@@ -401,7 +456,7 @@ def run_merge_surface(
     rc = _run_subprocess(
         cmd,
         cwd=repo_root,
-        env=_base_env(repo_root),
+        env=_base_env(repo_root, "", _resolved_cache_dir(args)),
         log_path=log_path,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
@@ -442,7 +497,7 @@ def run_cpu_full(
     rc = _run_subprocess(
         cmd,
         cwd=repo_root,
-        env=_base_env(repo_root),
+        env=_base_env(repo_root, "", _resolved_cache_dir(args)),
         log_path=log_path,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
@@ -481,9 +536,14 @@ def run_single_gpu(
     train_steps = int(args.single_steps)
     resume_steps = int(args.single_resume_steps)
     checkpoint_dir = output_dir / f"checkpoint-{train_steps}"
+    gpu_devices = _lane_gpu_devices(args.gpu_devices, 1)
+    dataset_prepared_path = lane_dir / "prepared"
+    cache_dir = _resolved_cache_dir(args)
+    if cache_dir is not None:
+        dataset_prepared_path = cache_dir / "prepared" / "single-gpu"
 
     gaps: list[str] = []
-    if not args.dry_run and not _has_24g_gpu(args.gpu_devices):
+    if not args.dry_run and not _has_24g_gpu(gpu_devices):
         return LaneResult(
             lane="single-gpu",
             status="SKIP",
@@ -497,6 +557,7 @@ def run_single_gpu(
         recipe_path=Path(args.single_recipe),
         dest_path=train_yaml,
         output_dir=output_dir,
+        dataset_prepared_path=dataset_prepared_path,
         max_steps=train_steps,
         save_steps=train_steps,
     )
@@ -504,12 +565,13 @@ def run_single_gpu(
         recipe_path=Path(args.single_recipe),
         dest_path=resume_yaml,
         output_dir=output_dir,
+        dataset_prepared_path=dataset_prepared_path,
         max_steps=resume_steps,
         save_steps=resume_steps,
         resume_from_checkpoint=checkpoint_dir,
     )
 
-    env = _base_env(repo_root, args.gpu_devices)
+    env = _base_env(repo_root, gpu_devices, _resolved_cache_dir(args))
     cmd_train = [sys.executable, "-m", "axolotl.cli.train", str(train_yaml)]
     rc_train = _run_subprocess(
         cmd_train,
@@ -628,7 +690,8 @@ def run_single_gpu_edge(
 ) -> LaneResult:
     start = time.monotonic()
     log_path = work_dir / "single-gpu-edge.log"
-    if not args.dry_run and not _has_24g_gpu(args.gpu_devices):
+    gpu_devices = _lane_gpu_devices(args.gpu_devices, 1)
+    if not args.dry_run and not _has_24g_gpu(gpu_devices):
         return LaneResult(
             lane="single-gpu-edge",
             status="SKIP",
@@ -648,7 +711,7 @@ def run_single_gpu_edge(
     rc = _run_subprocess(
         cmd,
         cwd=repo_root,
-        env=_base_env(repo_root, args.gpu_devices),
+        env=_base_env(repo_root, gpu_devices, _resolved_cache_dir(args)),
         log_path=log_path,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
@@ -702,7 +765,8 @@ def run_two_gpu(
 ) -> LaneResult:
     start = time.monotonic()
     log_path = work_dir / "two-gpu.log"
-    if not args.dry_run and _visible_gpu_count(args.gpu_devices) < 2:
+    gpu_devices = _lane_gpu_devices(args.gpu_devices, 2)
+    if not args.dry_run and _visible_gpu_count(gpu_devices) < 2:
         return LaneResult(
             lane="two-gpu",
             status="SKIP",
@@ -716,7 +780,7 @@ def run_two_gpu(
     rc = _run_subprocess(
         cmd,
         cwd=repo_root,
-        env=_base_env(repo_root, args.gpu_devices),
+        env=_base_env(repo_root, gpu_devices, _resolved_cache_dir(args)),
         log_path=log_path,
         timeout_s=args.timeout_s,
         dry_run=args.dry_run,
@@ -795,11 +859,30 @@ def _suite_lanes(suite: str) -> tuple[str, ...]:
 
 def run_validation(args: argparse.Namespace) -> list[LaneResult]:
     repo_root = Path(args.repo_root).resolve()
+    if args.clean:
+        work_dir = Path(args.work_dir).resolve()
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return [
+            LaneResult(
+                lane="cleanup",
+                status="PASS",
+                seconds=0.0,
+                summary=f"removed validation work directory {work_dir}",
+            )
+        ]
+
     if args.work_dir:
         work_dir = Path(args.work_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
     else:
         work_dir = Path(tempfile.mkdtemp(prefix="protrain-validation-")).resolve()
+
+    cache_dir = _resolve_cache_dir(args, work_dir)
+    if cache_dir is not None:
+        _prepare_cache_dir(cache_dir)
+        args._resolved_cache_dir = str(cache_dir)
+    else:
+        args._resolved_cache_dir = None
 
     runners = {
         "cpu-core": run_cpu_core,
@@ -811,13 +894,52 @@ def run_validation(args: argparse.Namespace) -> list[LaneResult]:
         "two-gpu": run_two_gpu,
     }
     results: list[LaneResult] = []
-    for lane in _suite_lanes(args.suite):
-        results.append(runners[lane](args, work_dir, repo_root))
-    return results
+    try:
+        for lane in _suite_lanes(args.suite):
+            result = runners[lane](args, work_dir, repo_root)
+            if cache_dir is not None:
+                result.metrics.setdefault("cache_dir", str(cache_dir))
+            results.append(result)
+        return results
+    finally:
+        if args.cleanup and not args.dry_run and not args.clean:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _print_text(results: list[LaneResult]) -> None:
-    print("ProTrain validation results")
+    print("ProTrain validation matrix")
+    rows = [
+        ["Lane", "Hardware", "Status", "Summary"],
+        *[
+            [
+                result.lane,
+                _LANE_HARDWARE.get(result.lane, ""),
+                result.status,
+                result.summary,
+            ]
+            for result in results
+        ],
+    ]
+    widths = [max(len(str(row[col])) for row in rows) for col in range(len(rows[0]))]
+    for idx, row in enumerate(rows):
+        print(
+            "  "
+            + " | ".join(str(cell).ljust(widths[col]) for col, cell in enumerate(row))
+        )
+        if idx == 0:
+            print("  " + "-+-".join("-" * width for width in widths))
+
+    cache_dirs = sorted(
+        {
+            str(result.metrics["cache_dir"])
+            for result in results
+            if result.metrics.get("cache_dir")
+        }
+    )
+    if cache_dirs:
+        print(f"\nReusable cache: {cache_dirs[0]}")
+
+    print("\nProTrain validation details")
     for result in results:
         print(f"[{result.status}] {result.lane}: {result.summary}")
         if result.coverage:
@@ -857,6 +979,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", default=str(_repo_root()))
     parser.add_argument("--work-dir", default=None)
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Reusable Hugging Face cache for validation models, datasets, and assets.",
+    )
+    parser.add_argument(
+        "--keep-cache",
+        action="store_true",
+        help=(
+            "Use a reusable validation cache and keep it when --cleanup or --clean "
+            "removes run artifacts."
+        ),
+    )
     parser.add_argument("--gpu-devices", default=None)
     parser.add_argument("--single-recipe", default=str(_DEFAULT_RECIPE))
     parser.add_argument("--single-steps", type=int, default=50)
@@ -864,6 +999,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-s", type=int, default=1800)
     parser.add_argument("--train-timeout-s", type=int, default=3600)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Remove the validation work directory after a successful or failed run.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove the validation work directory and exit without running lanes.",
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
@@ -871,6 +1016,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.clean and not args.work_dir:
+        parser.error("--clean requires --work-dir")
     results = run_validation(args)
     if args.as_json:
         print(json.dumps([result.to_dict() for result in results], indent=2))
