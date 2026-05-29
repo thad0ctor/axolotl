@@ -23,6 +23,9 @@ optimizer creation, embedding dtype conversion, checkpointing, or runtime hooks.
 The integration deliberately rejects conflicting memory backends and unsafe
 settings rather than silently composing them.
 
+Detailed implementation notes, feature scope, and benchmark evidence are in
+[`PR_PROPOSAL.md`](PR_PROPOSAL.md).
+
 ## Motivation and Context
 
 Axolotl users can hit 24 GiB GPU limits when fine-tuning larger LoRA/QLoRA or
