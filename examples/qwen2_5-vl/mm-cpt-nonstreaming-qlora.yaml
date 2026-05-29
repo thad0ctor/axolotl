@@ -4,9 +4,7 @@ trust_remote_code: true
 
 load_in_4bit: true
 
-# Multimodal CPT uses raw image+text rows, not chat-template messages.
-# Expected JSONL row:
-# {"text": "<|image_pad|>\nText target.", "images": ["image_0001.png"]}
+# Raw JSONL row: {"text": "<|image_pad|>\nText target.", "images": ["image.png"]}
 datasets:
   - path: /path/to/mm_cpt_train.jsonl
     ds_type: json
@@ -15,7 +13,7 @@ datasets:
     text_column: text
     image_column: images
     image_base_dir: /path/to/images
-    # image_token: "<|image_pad|>"  # optional override; autodetect by default
+    # image_token: "<|image_pad|>"
 
 streaming: false
 dataset_prepared_path: last_run_prepared/qwen2_5_vl_mm_cpt
@@ -62,5 +60,3 @@ warmup_ratio: 0.1
 evals_per_epoch: 1
 saves_per_epoch: 1
 weight_decay: 0.0
-
-# save_first_step: true  # uncomment this to validate checkpoint saving works with your config

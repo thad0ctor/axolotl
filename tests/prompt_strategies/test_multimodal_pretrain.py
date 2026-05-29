@@ -1,5 +1,3 @@
-"""Multimodal CPT strategy helper tests."""
-
 from __future__ import annotations
 
 import pytest
@@ -57,9 +55,6 @@ def fixture_smolvlm_processor(
     return AutoProcessor.from_pretrained(_SMOLVLM)
 
 
-# ---- build_image_token_spec ------------------------------------------------
-
-
 def test_build_image_token_spec_autodetects_smolvlm(smolvlm_processor):
     spec = build_image_token_spec(smolvlm_processor)
     assert isinstance(spec, ImageTokenSpec)
@@ -87,10 +82,6 @@ def test_build_image_token_spec_rejects_plain_word_override(smolvlm_processor):
 def test_build_image_token_spec_keeps_image_token_when_no_soft_token_in_name(
     smolvlm_processor,
 ):
-    """Non-Gemma-3 processors: the boi-swap heuristic only fires when
-    `image_token` name contains "soft_token" (Gemma-3 convention). Otherwise
-    `image_token` IS the user-facing placeholder (Gemma-4 convention) and
-    must not be silently replaced by `boi_token`."""
     tok = smolvlm_processor.tokenizer
     image_id = tok.convert_tokens_to_ids("<image>")
     boi_id = tok.convert_tokens_to_ids("<fake_token_around_image>")
@@ -99,7 +90,7 @@ def test_build_image_token_spec_keeps_image_token_when_no_soft_token_in_name(
     )
 
     class _FakeGemma4Like:
-        image_token = "<image>"  # no 'soft_token' in name → must not swap
+        image_token = "<image>"
         boi_token = "<fake_token_around_image>"
         tokenizer = tok
 
@@ -107,9 +98,6 @@ def test_build_image_token_spec_keeps_image_token_when_no_soft_token_in_name(
     assert spec.image_token == "<image>"
     assert spec.image_token_id == image_id
     assert spec.image_token_id != boi_id
-
-
-# ---- check_processor_compatibility (startup-time gate) ---------------------
 
 
 @pytest.mark.parametrize("cls_name", list(_INCOMPATIBLE_PROCESSOR_REASONS.keys()))
@@ -139,9 +127,6 @@ def test_check_processor_compatibility_rejects_subclass():
 
 def test_check_processor_compatibility_accepts_supported(smolvlm_processor):
     check_processor_compatibility(smolvlm_processor)
-
-
-# ---- non-streaming dataset strategy ---------------------------------------
 
 
 def test_load_returns_nonstreaming_dataset_strategy():

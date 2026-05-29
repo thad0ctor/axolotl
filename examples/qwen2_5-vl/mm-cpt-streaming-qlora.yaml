@@ -4,9 +4,7 @@ trust_remote_code: true
 
 load_in_4bit: true
 
-# Streaming MM CPT is useful for large shard sets. Use dataset_prepared_path
-# plus ignore_data_skip to resume checkpoint state without replaying image
-# preprocessing for already-seen batches.
+# Cache prepared shards to resume without replaying image preprocessing.
 pretraining_dataset:
   - path: /path/to/mm_cpt_shards/*.jsonl
     ds_type: json
@@ -15,7 +13,7 @@ pretraining_dataset:
     text_column: text
     image_column: images
     image_base_dir: /path/to/images
-    # image_token: "<|image_pad|>"  # optional override; autodetect by default
+    # image_token: "<|image_pad|>"
 
 streaming: true
 dataset_prepared_path: last_run_prepared/qwen2_5_vl_mm_cpt_stream_cache
@@ -63,5 +61,3 @@ warmup_ratio: 0.1
 save_steps: 1000
 eval_steps: 1000
 weight_decay: 0.0
-
-# save_first_step: true  # uncomment this to validate checkpoint saving works with your config

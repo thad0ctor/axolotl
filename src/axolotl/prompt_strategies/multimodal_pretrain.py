@@ -1,5 +1,3 @@
-"""Multimodal CPT prompt strategy and helpers."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,13 +13,6 @@ LOG = get_logger(__name__)
 
 
 class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
-    """Tokenize raw image+text rows for the non-streaming MM CPT path.
-
-    The prepared dataset keeps image sources as strings and stores the raw text
-    in `_mm_text`; the collator loads images and re-tokenizes with the processor
-    at batch time so Arrow caches do not contain decoded pixel tensors.
-    """
-
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
@@ -154,12 +145,11 @@ def encode_multimodal_pretrain(
                     f"encode_multimodal_pretrain: image {j} in row must be "
                     f"str, got {type(ip).__name__}."
                 )
-        # No truncation: truncated ids plus untruncated text (which the collator
-        # re-tokenizes) can hide placeholder/image-count mismatches.
+        # Avoid truncation before processor re-tokenization.
         enc = tokenizer(text, add_special_tokens=True)
         ids = list(enc["input_ids"]) + [tokenizer.eos_token_id]
         mask = list(enc["attention_mask"]) + [1]
-        # Count by id — `text.count` substring-matches `<image>` in `<image_soft_token>`.
+        # Count by id; text.count can match <image> inside <image_soft_token>.
         n_placeholders = sum(1 for t in ids if t == image_token_id)
         if n_placeholders != len(imgs):
             raise ValueError(

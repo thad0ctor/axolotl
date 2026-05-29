@@ -160,7 +160,6 @@ class TestGenerateDatasetHashFromConfig:
         assert h1 != h2
 
     def test_multimodal_dataset_fields_affect_hash(self):
-        """MM prepared caches must change when MM column/token settings change."""
         cfg = _base_cfg()
         base_hash = generate_dataset_hash_from_config(cfg, _mm_datasets(), "tok")
 

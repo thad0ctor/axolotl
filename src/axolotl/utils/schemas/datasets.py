@@ -273,8 +273,6 @@ class PretrainingDataset(BaseModel):
 
 
 class MultiModalPretrainDataset(PretrainingDataset):
-    """Multimodal CPT dataset configuration for the non-streaming datasets path."""
-
     type: str | None = None
 
     @model_validator(mode="before")
