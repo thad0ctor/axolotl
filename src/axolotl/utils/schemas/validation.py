@@ -1453,14 +1453,27 @@ class PretrainingValidationMixin:
                 "Without a processor, images in the dataset cannot be turned "
                 "into pixel tensors."
             )
-        if data.get("sample_packing"):
+        if (
+            data.get("sample_packing")
+            and pd_is_mm
+            and data.get("dataset_prepared_path")
+        ):
             raise ValueError(
-                "Multimodal CPT is incompatible with `sample_packing: true`. "
-                "Each image's placeholder token expands to a variable number "
-                "of patch tokens at the processor, so cross-row packing would "
-                "break the 1-to-1 alignment between text placeholders and "
-                "pixel_values. Set `sample_packing: false`."
+                "Multimodal CPT `sample_packing: true` cannot currently build "
+                "a prepared dataset cache from the streaming `pretraining_dataset` "
+                "path. Disable `dataset_prepared_path` for online lookahead "
+                "packing, set `multimodal_sample_packing_cache_path` for the "
+                "SSD metadata cache, or use the non-streaming `datasets` path."
             )
+        for key in (
+            "multimodal_sample_packing_ram_budget_mb",
+            "multimodal_sample_packing_visual_capacity",
+            "multimodal_sample_packing_dataloader_num_workers",
+            "multimodal_sample_packing_dataloader_prefetch_factor",
+        ):
+            value = data.get(key)
+            if value is not None and value < 0:
+                raise ValueError(f"`{key}` must be >= 0")
         if data.get("chat_template"):
             raise ValueError(
                 "Multimodal CPT (raw image+text pretraining) is incompatible "

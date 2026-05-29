@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from datasets import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase, ProcessorMixin
+from transformers.image_utils import load_image
 
 from axolotl.prompt_tokenizers import DatasetWrappingStrategy
+from axolotl.utils.data.mm_image import resize_image_for_processor
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -21,12 +24,26 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
         text_column: str = "text",
         image_column: str = "images",
         image_token: str | None = None,
+        image_base_dir: str | None = None,
+        add_processor_lengths: bool = False,
+        image_size: int | tuple[int, int] | None = None,
+        image_resize_algorithm: Any | None = None,
+        image_resize_buckets: list[tuple[int, int]] | None = None,
+        image_resize_no_upscale: bool = False,
+        image_resize_pad_color: Any | None = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
         self.sequence_len = sequence_len
         self.text_column = text_column
         self.image_column = image_column
+        self.image_base_dir = image_base_dir
+        self.add_processor_lengths = add_processor_lengths
+        self.image_size = image_size
+        self.image_resize_algorithm = image_resize_algorithm
+        self.image_resize_buckets = image_resize_buckets
+        self.image_resize_no_upscale = image_resize_no_upscale
+        self.image_resize_pad_color = image_resize_pad_color
         self.image_token_spec = build_image_token_spec(processor, override=image_token)
 
     def _encode_batch(self, examples: dict[str, list]) -> dict[str, list]:
@@ -38,6 +55,14 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
             image_token_id=self.image_token_spec.image_token_id,
             text_column=self.text_column,
             image_column=self.image_column,
+            processor=self.processor,
+            image_base_dir=self.image_base_dir,
+            add_processor_lengths=self.add_processor_lengths,
+            image_size=self.image_size,
+            image_resize_algorithm=self.image_resize_algorithm,
+            image_resize_buckets=self.image_resize_buckets,
+            image_resize_no_upscale=self.image_resize_no_upscale,
+            image_resize_pad_color=self.image_resize_pad_color,
         )
 
     def wrap_dataset(
@@ -103,6 +128,13 @@ def load(
         text_column=text_column,
         image_column=image_column,
         image_token=ds_cfg.get("image_token"),
+        image_base_dir=ds_cfg.get("image_base_dir"),
+        add_processor_lengths=bool(cfg.sample_packing),
+        image_size=cfg.image_size,
+        image_resize_algorithm=cfg.image_resize_algorithm,
+        image_resize_buckets=cfg.image_resize_buckets,
+        image_resize_no_upscale=bool(cfg.image_resize_no_upscale),
+        image_resize_pad_color=cfg.image_resize_pad_color,
     )
 
 
@@ -115,6 +147,15 @@ def encode_multimodal_pretrain(
     text_column: str = "text",
     image_column: str = "images",
     enforce_max_length: bool = True,
+    processor: ProcessorMixin | None = None,
+    image_base_dir: str | None = None,
+    add_processor_lengths: bool = False,
+    add_eos_token: bool = True,
+    image_size: int | tuple[int, int] | None = None,
+    image_resize_algorithm: Any | None = None,
+    image_resize_buckets: list[tuple[int, int]] | None = None,
+    image_resize_no_upscale: bool = False,
+    image_resize_pad_color: Any | None = None,
 ) -> dict[str, list]:
     texts: list[str] = examples[text_column]
     imgs_list: list[list[str]] = examples[image_column]
@@ -130,6 +171,7 @@ def encode_multimodal_pretrain(
     attention_mask: list[list[int]] = []
     keep_images: list[list[str]] = []
     keep_text: list[str] = []
+    lengths: list[int] = []
 
     for text, imgs in zip(texts, imgs_list, strict=True):
         if not isinstance(text, str):
@@ -145,10 +187,10 @@ def encode_multimodal_pretrain(
                 f"a list; got {type(imgs).__name__}"
             )
         for j, ip in enumerate(imgs):
-            if not isinstance(ip, str):
+            if not isinstance(ip, str) and not hasattr(ip, "resize"):
                 raise TypeError(
                     f"encode_multimodal_pretrain: image {j} in row must be "
-                    f"str, got {type(ip).__name__}."
+                    f"a path/URL string or PIL image, got {type(ip).__name__}."
                 )
         # Avoid truncation before processor re-tokenization.
         enc = tokenizer(text, add_special_tokens=True)
@@ -176,13 +218,211 @@ def encode_multimodal_pretrain(
         keep_images.append(list(imgs))
         keep_text.append(text)
 
-    return {
+    if add_processor_lengths:
+        if processor is None:
+            raise ValueError(
+                "encode_multimodal_pretrain: processor is required when "
+                "add_processor_lengths=True."
+            )
+        lengths = compute_multimodal_processor_lengths(
+            keep_text,
+            keep_images,
+            tokenizer=tokenizer,
+            processor=processor,
+            image_base_dir=image_base_dir,
+            add_eos_token=add_eos_token,
+            image_size=image_size,
+            image_resize_algorithm=image_resize_algorithm,
+            image_resize_buckets=image_resize_buckets,
+            image_resize_no_upscale=image_resize_no_upscale,
+            image_resize_pad_color=image_resize_pad_color,
+        )
+
+    out = {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": attention_mask,
         "images": keep_images,
         "_mm_text": keep_text,
     }
+    if add_processor_lengths:
+        out["length"] = lengths
+    return out
+
+
+def append_eos_for_processor(
+    text: str,
+    tokenizer: PreTrainedTokenizerBase,
+    add_eos_token: bool = True,
+) -> str:
+    eos = getattr(tokenizer, "eos_token", None)
+    if add_eos_token and eos and not text.endswith(eos):
+        return text + eos
+    return text
+
+
+def row_starts_with_bos(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizerBase,
+) -> bool:
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is None or "input_ids" not in row:
+        return False
+    input_ids = row["input_ids"]
+    try:
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        return bool(input_ids) and int(input_ids[0]) == int(bos_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def prepare_text_for_packed_boundary(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    is_first: bool,
+    add_eos_token: bool = True,
+) -> str:
+    text = row["_mm_text"]
+    if not isinstance(text, str):
+        raise TypeError(
+            f"`_mm_text` must be str, got {type(text).__name__}. "
+            "Check dataset encoding."
+        )
+    text = append_eos_for_processor(text, tokenizer, add_eos_token=add_eos_token)
+    bos = getattr(tokenizer, "bos_token", None)
+    if not is_first and bos and row_starts_with_bos(row, tokenizer):
+        return bos + text
+    return text
+
+
+def _resolve_image_source(image_base_dir: str | None, src: Any) -> Any:
+    if (
+        image_base_dir
+        and isinstance(src, str)
+        and not os.path.isabs(src)
+        and "://" not in src
+    ):
+        return os.path.join(image_base_dir, src)
+    return src
+
+
+def _load_images_for_lengths(
+    imgs_list: list[list[Any]],
+    image_base_dir: str | None,
+    image_size: int | tuple[int, int] | None = None,
+    image_resize_algorithm: Any | None = None,
+    image_resize_buckets: list[tuple[int, int]] | None = None,
+    image_resize_no_upscale: bool = False,
+    image_resize_pad_color: Any | None = None,
+) -> list[list[Any]]:
+    loaded: list[list[Any]] = []
+    for row_idx, sources in enumerate(imgs_list):
+        row: list[Any] = []
+        for raw in sources:
+            try:
+                image = load_image(_resolve_image_source(image_base_dir, raw))
+                row.append(
+                    resize_image_for_processor(
+                        image,
+                        image_size,
+                        image_resize_algorithm,
+                        image_resize_buckets,
+                        image_resize_no_upscale,
+                        image_resize_pad_color,
+                    )
+                )
+            except Exception as exc:
+                label = (
+                    os.path.basename(raw)
+                    if isinstance(raw, str)
+                    else type(raw).__name__
+                )
+                raise RuntimeError(
+                    f"Row {row_idx}: failed to load image {label!r} while "
+                    "estimating multimodal processor length "
+                    f"({type(exc).__name__})."
+                ) from exc
+        loaded.append(row)
+    return loaded
+
+
+def _batch_lengths_from_processor_output(batch: Any) -> list[int]:
+    if "attention_mask" in batch:
+        attn = batch["attention_mask"]
+        lengths = (
+            attn.sum(dim=-1) if hasattr(attn, "sum") else [sum(row) for row in attn]
+        )
+        if hasattr(lengths, "tolist"):
+            return [int(x) for x in lengths.tolist()]
+        return [int(x) for x in lengths]
+    input_ids = batch["input_ids"]
+    if hasattr(input_ids, "shape"):
+        return [int(input_ids.shape[-1])] * int(input_ids.shape[0])
+    return [len(row) for row in input_ids]
+
+
+def compute_multimodal_processor_lengths(
+    texts: list[str],
+    imgs_list: list[list[Any]],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    processor: ProcessorMixin,
+    image_base_dir: str | None = None,
+    add_eos_token: bool = True,
+    image_size: int | tuple[int, int] | None = None,
+    image_resize_algorithm: Any | None = None,
+    image_resize_buckets: list[tuple[int, int]] | None = None,
+    image_resize_no_upscale: bool = False,
+    image_resize_pad_color: Any | None = None,
+) -> list[int]:
+    if len(texts) != len(imgs_list):
+        raise ValueError(
+            "compute_multimodal_processor_lengths: text/image row count mismatch "
+            f"({len(texts)} text row(s), {len(imgs_list)} image row(s))."
+        )
+
+    processor_texts = [
+        append_eos_for_processor(text, tokenizer, add_eos_token=add_eos_token)
+        for text in texts
+    ]
+    if all(len(imgs) == 0 for imgs in imgs_list):
+        return _batch_lengths_from_processor_output(
+            tokenizer(text=processor_texts, return_tensors="pt", padding=True)
+        )
+
+    loaded_images = _load_images_for_lengths(
+        imgs_list,
+        image_base_dir,
+        image_size=image_size,
+        image_resize_algorithm=image_resize_algorithm,
+        image_resize_buckets=image_resize_buckets,
+        image_resize_no_upscale=image_resize_no_upscale,
+        image_resize_pad_color=image_resize_pad_color,
+    )
+    try:
+        batch = processor(
+            text=processor_texts,
+            images=loaded_images,
+            return_tensors="pt",
+            padding=True,
+        )
+        return _batch_lengths_from_processor_output(batch)
+    except Exception:
+        lengths: list[int] = []
+        for text, row_images in zip(processor_texts, loaded_images, strict=True):
+            if row_images:
+                batch = processor(
+                    text=[text],
+                    images=[row_images],
+                    return_tensors="pt",
+                    padding=True,
+                )
+            else:
+                batch = tokenizer(text=[text], return_tensors="pt", padding=True)
+            lengths.extend(_batch_lengths_from_processor_output(batch))
+        return lengths
 
 
 def _get_incompatible_processor_classes() -> tuple[type, ...]:

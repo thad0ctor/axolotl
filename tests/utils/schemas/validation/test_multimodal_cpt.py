@@ -64,10 +64,57 @@ class TestMultimodalCPTGates:
         with pytest.raises(ValueError, match="processor_type"):
             validate_config(cfg)
 
-    def test_sample_packing_rejected(self, min_base_cfg):
-        cfg = _mm_cpt_cfg(min_base_cfg, sample_packing=True)
-        with pytest.raises(ValueError, match="sample_packing"):
+    def test_sample_packing_with_streaming_cache_rejected(self, min_base_cfg):
+        cfg = _mm_cpt_cfg(
+            min_base_cfg,
+            sample_packing=True,
+            dataset_prepared_path="/tmp/mm-cpt-cache",
+        )
+        with pytest.raises(ValueError, match="dataset_prepared_path"):
             validate_config(cfg)
+
+    def test_sample_packing_allowed_for_streaming_pretraining(self, min_base_cfg):
+        cfg = _mm_cpt_cfg(min_base_cfg, sample_packing=True)
+        validated = validate_config(cfg)
+        assert validated.sample_packing is True
+
+    def test_multimodal_sample_packing_cache_and_dataloader_flags(
+        self, min_base_cfg
+    ):
+        cfg = _mm_cpt_cfg(
+            min_base_cfg,
+            sample_packing=True,
+            multimodal_sample_packing=True,
+            multimodal_sample_packing_cache_path="/tmp/mm-pack-cache",
+            multimodal_sample_packing_ram_budget_mb=512,
+            multimodal_sample_packing_split_ram_budget_by_worker=True,
+            multimodal_sample_packing_visual_capacity=8192,
+            multimodal_sample_packing_group_by_visual_signature=True,
+            multimodal_sample_packing_dataloader=True,
+            multimodal_sample_packing_dataloader_num_workers=4,
+            multimodal_sample_packing_dataloader_prefetch_factor=6,
+            image_resize_buckets=[[1024, 1536], [1536, 1536]],
+            image_resize_no_upscale=True,
+            image_resize_pad_color=[255, 255, 255],
+        )
+        validated = validate_config(cfg)
+        assert validated.multimodal_sample_packing is True
+        assert validated.multimodal_sample_packing_cache_path == "/tmp/mm-pack-cache"
+        assert validated.multimodal_sample_packing_ram_budget_mb == 512
+        assert validated.multimodal_sample_packing_split_ram_budget_by_worker is True
+        assert validated.multimodal_sample_packing_visual_capacity == 8192
+        assert validated.multimodal_sample_packing_group_by_visual_signature is True
+        assert validated.multimodal_sample_packing_dataloader is True
+        assert validated.multimodal_sample_packing_dataloader_num_workers == 4
+        assert validated.multimodal_sample_packing_dataloader_prefetch_factor == 6
+        assert validated.image_resize_buckets == [(1024, 1536), (1536, 1536)]
+        assert validated.image_resize_no_upscale is True
+        assert validated.image_resize_pad_color == (255, 255, 255)
+
+    def test_sample_packing_allowed_for_nonstreaming_datasets(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg, sample_packing=True)
+        validated = validate_config(cfg)
+        assert validated.sample_packing is True
 
     def test_chat_template_rejected(self, min_base_cfg):
         cfg = _mm_cpt_cfg(min_base_cfg, chat_template="tokenizer_default")

@@ -767,6 +767,72 @@ class AxolotlInputConfig(
             "description": "Buffer size for multipack streaming datasets"
         },
     )
+    multimodal_sample_packing: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Use the multimodal-aware streaming sample packer for multimodal CPT. Set false to fall back to token-only MM packing."
+        },
+    )
+    multimodal_sample_packing_cache_path: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Optional SSD path for multimodal packing metadata cache. Stores processor lengths and visual budgets, not processed image tensors."
+        },
+    )
+    multimodal_sample_packing_ram_budget_mb: int | None = Field(
+        default=0,
+        json_schema_extra={
+            "description": "RAM budget in MiB for the multimodal packing metadata LRU cache. Set with multimodal_sample_packing_cache_path for SSD+RAM caching."
+        },
+    )
+    multimodal_sample_packing_split_ram_budget_by_worker: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Divide multimodal_sample_packing_ram_budget_mb across local ranks and DataLoader workers so the host-wide metadata LRU budget stays bounded."
+        },
+    )
+    multimodal_sample_packing_visual_capacity: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Optional per-packed-row visual token budget for multimodal CPT sample packing."
+        },
+    )
+    multimodal_sample_packing_group_by_visual_signature: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Only pack multimodal CPT samples with matching processor visual signatures together. Helps torch.compile shape stability at the cost of packing density."
+        },
+    )
+    multimodal_sample_packing_dataloader: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Use dedicated DataLoader worker settings for multimodal CPT/SFT collators."
+        },
+    )
+    multimodal_sample_packing_dataloader_num_workers: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override dataloader_num_workers when multimodal_sample_packing_dataloader is enabled."
+        },
+    )
+    multimodal_sample_packing_dataloader_prefetch_factor: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override dataloader_prefetch_factor when multimodal_sample_packing_dataloader is enabled."
+        },
+    )
+    multimodal_sample_packing_dataloader_pin_memory: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override dataloader_pin_memory when multimodal_sample_packing_dataloader is enabled."
+        },
+    )
+    multimodal_sample_packing_dataloader_persistent_workers: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override dataloader_persistent_workers when multimodal_sample_packing_dataloader is enabled."
+        },
+    )
 
     xformers_attention: bool | None = Field(
         default=None,

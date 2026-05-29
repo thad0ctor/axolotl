@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Optional
 
-from PIL import Image, ImageOps
+from PIL import Image
 from PIL.Image import Resampling
 from torch import Tensor, zeros_like
 from transformers import ProcessorMixin
@@ -13,6 +13,7 @@ from transformers.models.internvl import InternVLProcessor
 from transformers.models.smolvlm import SmolVLMProcessor
 from transformers.models.voxtral import VoxtralProcessor
 
+from axolotl.utils.data.mm_image import resize_image_for_processor
 from axolotl.utils.dict import remove_none_values
 from axolotl.utils.logging import get_logger
 
@@ -70,6 +71,9 @@ class ProcessingStrategy:
         self.image_resize_algorithm = (
             image_resize_algorithm or Image.Resampling.BILINEAR
         )
+        self.image_resize_buckets = None
+        self.image_resize_no_upscale = False
+        self.image_resize_pad_color = None
 
         # Defaults mirror the text-only ChatTemplateStrategy. An explicit
         # empty list is honored as "no trainable roles" (masks everything);
@@ -278,24 +282,14 @@ class ProcessingStrategy:
 
                 image_value = load_image(image_value)
 
-                if self.image_size is not None:
-                    assert hasattr(image_value, "resize"), (
-                        "Image does not have a resize method"
-                    )
-
-                    if isinstance(self.image_size, tuple):
-                        image_value = image_value.resize(
-                            self.image_size, self.image_resize_algorithm
-                        )
-                    else:
-                        # Int image_size: preserve aspect ratio then pad to square (black) to avoid distortion.
-                        padding_color = (0, 0, 0)
-                        image_value = ImageOps.pad(
-                            image_value,
-                            (self.image_size, self.image_size),
-                            method=self.image_resize_algorithm,
-                            color=padding_color,
-                        )
+                image_value = resize_image_for_processor(
+                    image_value,
+                    self.image_size,
+                    self.image_resize_algorithm,
+                    self.image_resize_buckets,
+                    self.image_resize_no_upscale,
+                    self.image_resize_pad_color,
+                )
 
                 msg_ind_to_add = None
                 ind_to_add = None
@@ -1188,6 +1182,9 @@ def get_processing_strategy(
     chat_template_type,
     image_size: int | tuple[int, int] | None = None,
     image_resize_algorithm: Resampling | None = None,
+    image_resize_buckets: list[tuple[int, int]] | None = None,
+    image_resize_no_upscale: bool = False,
+    image_resize_pad_color=None,
     train_on_inputs: bool = False,
     roles_to_train: Optional[list[str]] = None,
     train_on_eos: Optional[str] = None,
@@ -1206,42 +1203,48 @@ def get_processing_strategy(
         "field_messages": field_messages,
     }
 
+    def with_resize_policy(strategy):
+        strategy.image_resize_buckets = image_resize_buckets
+        strategy.image_resize_no_upscale = bool(image_resize_no_upscale)
+        strategy.image_resize_pad_color = image_resize_pad_color
+        return strategy
+
     if chat_template_type in [None, "tokenizer_default"]:
         tokenizer = getattr(processor, "tokenizer", processor)
         if hasattr(tokenizer, "chat_template"):
             processing_kwargs["chat_template"] = tokenizer.chat_template
 
     if chat_template_type == "qwen2_vl":
-        return Qwen2VLProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Qwen2VLProcessingStrategy(**processing_kwargs))
     if chat_template_type == "qwen3_5":
-        return Qwen3_5ProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Qwen3_5ProcessingStrategy(**processing_kwargs))
     if chat_template_type == "gemma3":
-        return Gemma3ProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Gemma3ProcessingStrategy(**processing_kwargs))
     if chat_template_type == "gemma3n":
-        return Gemma3nProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Gemma3nProcessingStrategy(**processing_kwargs))
     if chat_template_type == "gemma4":
-        return Gemma4ProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Gemma4ProcessingStrategy(**processing_kwargs))
     if chat_template_type == "llama3_2_vision":
-        return Llama3_2VisionProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Llama3_2VisionProcessingStrategy(**processing_kwargs))
     if chat_template_type == "llama4":
-        return Llama4ProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(Llama4ProcessingStrategy(**processing_kwargs))
     if chat_template_type == "pixtral":
-        return PixtralProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(PixtralProcessingStrategy(**processing_kwargs))
     if chat_template_type == "mistral_v7_tekken":
-        return MistralV7TekkenProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(MistralV7TekkenProcessingStrategy(**processing_kwargs))
 
     if isinstance(processor, VoxtralProcessor):
-        return VoxtralProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(VoxtralProcessingStrategy(**processing_kwargs))
 
     if isinstance(processor, SmolVLMProcessor):
-        return SmolVLM2ProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(SmolVLM2ProcessingStrategy(**processing_kwargs))
 
     # Lazy import: mistral_common is optional. Mirrors the Glm46V pattern below.
     try:
         from axolotl.utils.mistral.mistral3_processor import Mistral3Processor
 
         if isinstance(processor, Mistral3Processor):
-            return Mistral3ProcessingStrategy(**processing_kwargs)
+            return with_resize_policy(Mistral3ProcessingStrategy(**processing_kwargs))
     except (ImportError, ModuleNotFoundError) as exc:
         LOG.debug(
             "Mistral3Processor import failed; Mistral3 strategy will be unavailable: %r",
@@ -1254,7 +1257,7 @@ def get_processing_strategy(
         from transformers.models.glm4v.processing_glm4v import Glm4vProcessor
 
         if isinstance(processor, Glm4vProcessor):
-            return Glm4vProcessingStrategy(**processing_kwargs)
+            return with_resize_policy(Glm4vProcessingStrategy(**processing_kwargs))
     except (ImportError, ModuleNotFoundError) as exc:
         LOG.debug("Glm4vProcessor import failed: %r", exc)
 
@@ -1262,13 +1265,13 @@ def get_processing_strategy(
         from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
 
         if isinstance(processor, Glm46VProcessor):
-            return Glm4vProcessingStrategy(**processing_kwargs)
+            return with_resize_policy(Glm4vProcessingStrategy(**processing_kwargs))
     except (ImportError, ModuleNotFoundError) as exc:
         LOG.debug("Glm46VProcessor import failed: %r", exc)
 
     if isinstance(processor, InternVLProcessor):
-        return InternVLProcessingStrategy(**processing_kwargs)
+        return with_resize_policy(InternVLProcessingStrategy(**processing_kwargs))
 
     # Unregistered templates (llava, lfm2vl, mistral_v3_tekken, ...) use the
     # base strategy; it warns once when train_on_inputs=False.
-    return ProcessingStrategy(**processing_kwargs)
+    return with_resize_policy(ProcessingStrategy(**processing_kwargs))

@@ -75,6 +75,28 @@ class AxolotlTrainingMixins:
             "help": "The number of samples to group together for packing. Increase for better packing."
         },
     )
+    multimodal_sample_packing_dataloader: bool = field(
+        default=False,
+        metadata={
+            "help": "Use dedicated DataLoader worker settings for multimodal CPT/SFT collators."
+        },
+    )
+    multimodal_sample_packing_dataloader_num_workers: int | None = field(
+        default=None,
+        metadata={"help": "num_workers override for multimodal CPT/SFT collators."},
+    )
+    multimodal_sample_packing_dataloader_prefetch_factor: int | None = field(
+        default=None,
+        metadata={"help": "prefetch_factor override for multimodal CPT/SFT collators."},
+    )
+    multimodal_sample_packing_dataloader_pin_memory: bool | None = field(
+        default=None,
+        metadata={"help": "pin_memory override for multimodal CPT/SFT collators."},
+    )
+    multimodal_sample_packing_dataloader_persistent_workers: bool | None = field(
+        default=None,
+        metadata={"help": "persistent_workers override for multimodal CPT/SFT collators."},
+    )
     max_seq_length: int = field(
         default=2048,
         metadata={"help": "The maximum sequence length the model can handle"},
@@ -257,6 +279,21 @@ class AxolotlTrainingMixins:
     image_resize_algorithm: Resampling | None = field(
         default=None,
         metadata={"help": "The algorithm to use for image resizing"},
+    )
+
+    image_resize_buckets: list[tuple[int, int]] | None = field(
+        default=None,
+        metadata={"help": "Fixed image canvas buckets as (width, height) pairs"},
+    )
+
+    image_resize_no_upscale: bool | None = field(
+        default=False,
+        metadata={"help": "Do not enlarge images for padded square/bucket resizing"},
+    )
+
+    image_resize_pad_color: int | tuple[int, int, int] | str | None = field(
+        default=None,
+        metadata={"help": "Padding color for padded square/bucket resizing"},
     )
 
     # end of multi-modal section

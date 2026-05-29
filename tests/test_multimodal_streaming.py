@@ -15,9 +15,15 @@ from axolotl.core.builders.causal import (
     _get_mm_cpt_config,
     _is_multimodal_cpt,
 )
-from axolotl.prompt_strategies.multimodal_pretrain import build_image_token_spec
+from axolotl.prompt_strategies.multimodal_pretrain import (
+    build_image_token_spec,
+    encode_multimodal_pretrain,
+)
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
+from axolotl.utils.data.mm_packing import MultimodalPackingMetadata
 from axolotl.utils.data.streaming import (
+    _multimodal_metadata_ram_budget_mb,
+    encode_packed_streaming_multimodal,
     encode_streaming_multimodal,
     wrap_streaming_dataset,
 )
@@ -132,6 +138,167 @@ def test_encode_counts_placeholders_on_full_text(smolvlm_processor, two_tiny_ima
     # have to cut into it to drop the last placeholder.
     assert len(ids) > 2000
     assert sum(1 for t in ids if t == spec.image_token_id) == 3
+
+
+def test_encode_can_add_exact_processor_lengths(smolvlm_processor, two_tiny_images):
+    spec = build_image_token_spec(smolvlm_processor)
+    text = f"{spec.image_token}\nrow one"
+    out = encode_multimodal_pretrain(
+        {"text": [text], "images": [[str(two_tiny_images[0])]]},
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        add_processor_lengths=True,
+    )
+    manual = smolvlm_processor(
+        text=[text + smolvlm_processor.tokenizer.eos_token],
+        images=[[Image.open(two_tiny_images[0])]],
+        return_tensors="pt",
+        padding=True,
+    )
+    assert out["length"] == [int(manual["attention_mask"].sum().item())]
+
+
+def test_encode_packed_streaming_multimodal_emits_prepacked_rows(
+    smolvlm_processor, two_tiny_images
+):
+    spec = build_image_token_spec(smolvlm_processor)
+    out = encode_packed_streaming_multimodal(
+        {
+            "text": [
+                f"{spec.image_token}\nrow one",
+                f"{spec.image_token}\nrow two",
+            ],
+            "images": [[str(two_tiny_images[0])], [str(two_tiny_images[1])]],
+        },
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        batch_size=2,
+        bin_size=200,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+    )
+
+    assert len(out["_mm_text"]) == 1
+    assert len(out["images"][0]) == 2
+    assert len(out["_mm_sample_lengths"][0]) == 2
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        sample_packing=True,
+    )
+    batch = collator.torch_call([{key: out[key][0] for key in out}])
+    assert batch["input_ids"].shape[0] == 1
+    assert "position_ids" in batch
+
+
+def test_encode_packed_streaming_multimodal_uses_metadata_cache(
+    smolvlm_processor, two_tiny_images, tmp_path
+):
+    spec = build_image_token_spec(smolvlm_processor)
+    cache_dir = tmp_path / "mm-pack-cache"
+    out = encode_packed_streaming_multimodal(
+        {
+            "text": [
+                f"{spec.image_token}\nrow one",
+                f"{spec.image_token}\nrow two",
+            ],
+            "images": [[str(two_tiny_images[0])], [str(two_tiny_images[1])]],
+        },
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        batch_size=2,
+        bin_size=200,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        metadata_cache_path=str(cache_dir),
+        metadata_cache_ram_budget_mb=1,
+    )
+
+    assert out["_mm_visual_tokens"]
+    assert out["_mm_visual_signature"]
+    assert list(cache_dir.rglob("*.json"))
+
+
+def test_encode_packed_streaming_multimodal_respects_visual_capacity(
+    smolvlm_processor, two_tiny_images
+):
+    spec = build_image_token_spec(smolvlm_processor)
+    examples = {
+        "text": [
+            f"{spec.image_token}\nrow one",
+            f"{spec.image_token}\nrow two",
+        ],
+        "images": [[str(two_tiny_images[0])], [str(two_tiny_images[1])]],
+    }
+    individual = encode_packed_streaming_multimodal(
+        examples,
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        batch_size=1,
+        bin_size=200,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+    )
+    visual_capacity = max(v[0] for v in individual["_mm_visual_tokens"])
+
+    packed = encode_packed_streaming_multimodal(
+        examples,
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        batch_size=2,
+        bin_size=200,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        visual_capacity=visual_capacity,
+    )
+
+    assert len(packed["_mm_text"]) == 2
+    assert all(len(v) == 1 for v in packed["_mm_visual_tokens"])
+
+
+def test_encode_packed_streaming_multimodal_can_group_by_visual_signature(
+    smolvlm_processor, two_tiny_images, monkeypatch
+):
+    import axolotl.utils.data.mm_packing as mm_packing
+
+    spec = build_image_token_spec(smolvlm_processor)
+
+    def fake_metadata(*_args, **_kwargs):
+        return [
+            MultimodalPackingMetadata(10, 10, 1, "grid-a"),
+            MultimodalPackingMetadata(10, 10, 1, "grid-b"),
+        ]
+
+    monkeypatch.setattr(mm_packing, "compute_multimodal_packing_metadata", fake_metadata)
+
+    packed = encode_packed_streaming_multimodal(
+        {
+            "text": [
+                f"{spec.image_token}\nrow one",
+                f"{spec.image_token}\nrow two",
+            ],
+            "images": [[str(two_tiny_images[0])], [str(two_tiny_images[1])]],
+        },
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        batch_size=1,
+        bin_size=200,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        group_by_visual_signature=True,
+    )
+
+    assert len(packed["_mm_text"]) == 2
+    assert packed["_mm_visual_signature"] == [["grid-a"], ["grid-b"]]
 
 
 def test_encode_rejects_row_exceeding_max_tokens(smolvlm_processor, two_tiny_images):
@@ -389,6 +556,89 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
     assert captured["kwargs"]["max_tokens"] == 4096
 
 
+def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkeypatch):
+    captured = {}
+
+    def fake_partial(fn, **kwargs):
+        captured["encode_fn"] = fn
+        captured["kwargs"] = kwargs
+        return lambda batch: batch
+
+    _patch_streaming_partial(monkeypatch, fake_partial)
+
+    class _Dataset:
+        features = {"text": None, "images": None}
+
+        def shuffle(self, **_):
+            return self
+
+        def map(self, *_args, **_kwargs):
+            return self
+
+    cfg = DictDefault(
+        {
+            "sample_packing": True,
+            "pretraining_dataset": [
+                {"path": "train/ds", "type": "multimodal_pretrain"}
+            ],
+            "sequence_len": 2048,
+            "micro_batch_size": 2,
+            "sample_packing_bin_size": 200,
+            "shuffle_merged_datasets": False,
+            "streaming_multipack_buffer_size": 1000,
+            "multimodal_sample_packing_cache_path": "/tmp/mm-cache",
+            "multimodal_sample_packing_ram_budget_mb": 128,
+            "multimodal_sample_packing_visual_capacity": 4096,
+            "multimodal_sample_packing_group_by_visual_signature": True,
+            "image_size": 512,
+            "image_resize_algorithm": Image.Resampling.BICUBIC,
+            "image_resize_buckets": [(1024, 1536), (1536, 1536)],
+            "image_resize_no_upscale": True,
+            "image_resize_pad_color": "white",
+            "seed": 42,
+        }
+    )
+    wrap_streaming_dataset(
+        _Dataset(),
+        smolvlm_processor.tokenizer,
+        cfg,
+        ds_wrapper_fn=None,
+        processor=smolvlm_processor,
+        pretraining_config=DictDefault(
+            {"path": "train/ds", "type": "multimodal_pretrain"}
+        ),
+    )
+
+    assert captured["encode_fn"] is encode_packed_streaming_multimodal
+    assert captured["kwargs"]["batch_size"] == 2
+    assert captured["kwargs"]["metadata_cache_path"] == "/tmp/mm-cache"
+    assert captured["kwargs"]["metadata_cache_ram_budget_mb"] == 128
+    assert captured["kwargs"]["visual_capacity"] == 4096
+    assert captured["kwargs"]["group_by_visual_signature"] is True
+    assert captured["kwargs"]["use_multimodal_sample_packing"] is True
+    assert captured["kwargs"]["image_size"] == 512
+    assert captured["kwargs"]["image_resize_algorithm"] == Image.Resampling.BICUBIC
+    assert captured["kwargs"]["image_resize_buckets"] == [(1024, 1536), (1536, 1536)]
+    assert captured["kwargs"]["image_resize_no_upscale"] is True
+    assert captured["kwargs"]["image_resize_pad_color"] == "white"
+    assert cfg.micro_batch_size == 1
+
+
+def test_multimodal_metadata_ram_budget_can_split_by_worker(monkeypatch):
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    cfg = DictDefault(
+        {
+            "multimodal_sample_packing_ram_budget_mb": 1024,
+            "multimodal_sample_packing_split_ram_budget_by_worker": True,
+            "multimodal_sample_packing_dataloader": True,
+            "multimodal_sample_packing_dataloader_num_workers": 4,
+            "dataloader_num_workers": 8,
+        }
+    )
+
+    assert _multimodal_metadata_ram_budget_mb(cfg) == 128
+
+
 def test_mm_cpt_detection_includes_nonstreaming_datasets():
     cfg = DictDefault(
         {
@@ -427,6 +677,11 @@ def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
             "test_datasets": None,
             "sequence_len": 128,
             "eval_sequence_len": None,
+            "image_size": 512,
+            "image_resize_algorithm": Image.Resampling.BICUBIC,
+            "image_resize_buckets": [(1024, 1536), (1536, 1536)],
+            "image_resize_no_upscale": True,
+            "image_resize_pad_color": "white",
         }
     )
 
@@ -434,6 +689,41 @@ def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
 
     assert isinstance(collator, MultiModalPretrainDataCollator)
     assert collator.image_base_dir == "/train/images"
+    assert collator.image_size == 512
+    assert collator.image_resize_algorithm == Image.Resampling.BICUBIC
+    assert collator.image_resize_buckets == [(1024, 1536), (1536, 1536)]
+    assert collator.image_resize_no_upscale is True
+    assert collator.image_resize_pad_color == "white"
+
+
+def test_mm_cpt_packed_collator_pads_to_full_pack_capacity():
+    tok = _StubTokenizer({"<image>": 42})
+    processor = _StubProcessor(tok, image_token="<image>")
+    builder = object.__new__(HFCausalTrainerBuilder)
+    builder.tokenizer = tok
+    builder.processor = processor
+    builder.cfg = DictDefault(
+        {
+            "pretraining_dataset": None,
+            "datasets": [{"path": "train/ds", "type": "multimodal_pretrain"}],
+            "test_datasets": None,
+            "sequence_len": 128,
+            "eval_sequence_len": None,
+            "sample_packing": True,
+            "eval_sample_packing": True,
+            "multipack_real_batches": False,
+            "micro_batch_size": 4,
+            "pad_to_sequence_len": True,
+        }
+    )
+
+    collator = HFCausalTrainerBuilder._build_mm_pretrain_collator(
+        builder,
+        pad_to_multiple_of=128,
+    )
+
+    assert collator.max_length == 512
+    assert collator.pad_to_multiple_of == 512
 
 
 # ---- MultiModalPretrainDataCollator ---------------------------------------
@@ -480,6 +770,75 @@ def test_collator_builds_batch_and_masks_labels(smolvlm_processor, two_tiny_imag
     pad_id = smolvlm_processor.tokenizer.pad_token_id
     if pad_id is not None:
         assert int((batch["labels"] == pad_id).sum().item()) == 0
+
+
+def test_collator_resizes_images_before_processor(smolvlm_processor, two_tiny_images):
+    spec = build_image_token_spec(smolvlm_processor)
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        image_size=32,
+        image_resize_algorithm=Image.Resampling.BICUBIC,
+        image_resize_pad_color="white",
+    )
+
+    loaded = collator._load_images_for_row([str(two_tiny_images[0])], row_index=0)
+
+    assert loaded[0].size == (32, 32)
+
+
+def test_packed_collator_builds_boundary_masks(smolvlm_processor, two_tiny_images):
+    spec = build_image_token_spec(smolvlm_processor)
+    encoded = encode_multimodal_pretrain(
+        {
+            "text": [
+                f"{spec.image_token}\nrow one",
+                f"{spec.image_token}\nrow two slightly longer",
+            ],
+            "images": [[str(two_tiny_images[0])], [str(two_tiny_images[1])]],
+        },
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        add_processor_lengths=True,
+    )
+    rows = [
+        {
+            k: encoded[k][i]
+            for k in (
+                "input_ids",
+                "labels",
+                "attention_mask",
+                "images",
+                "_mm_text",
+                "length",
+            )
+        }
+        for i in range(2)
+    ]
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        sample_packing=True,
+    )
+
+    batch = collator.torch_call([rows])
+
+    assert batch["input_ids"].shape[0] == 1
+    assert "position_ids" in batch
+    lengths = encoded["length"]
+    total_len = sum(lengths)
+    pos = batch["position_ids"][0, :total_len].tolist()
+    mask = batch["attention_mask"][0, :total_len].tolist()
+    assert pos[0] == 0
+    assert pos[lengths[0]] == 0
+    assert pos[lengths[0] - 1] == lengths[0] - 1
+    assert set(mask[: lengths[0]]) == {1}
+    assert set(mask[lengths[0] : total_len]) == {2}
 
 
 def test_collator_raises_on_missing_columns(smolvlm_processor):
