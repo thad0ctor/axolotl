@@ -903,7 +903,7 @@ Reviewer-facing support status:
 | LoRA / QLoRA compatibility | **Validated at claimed scope** | PEFT LoRA container hooks, DoRA/extended-target ownership, Path B LoRA grad sync, LoRA-rank sweep, gradient accumulation, and torch.compile guardrails (§6.l, §6.m, §6.pb, §6.y, §6.ss). Numerical parity evidence is scoped to the stated LoRA Path B runs. |
 | Model-family coverage | **Validated at claimed scope** | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, and Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA (§6.bb, §16.B). MoE/multimodal rows are finite-run and checkpoint-fidelity coverage, not broad numerical-parity claims. |
 | Framework comparisons | **Measured, not overclaimed** | ProTrain, FSDP2, DeepSpeed ZeRO-2/3, ZeRO-3+CPU, vanilla DDP, PCIe, and NVLink-class behavior are separated by hardware/regime (§6.x, §6.nv). |
-| CI and regression coverage | **Validated** | 630 default ProTrain tests plus targeted GPU and multi-GPU runs cover portable and hardware-bound behavior (§6.n, §15). |
+| CI and regression coverage | **Validated** | Default ProTrain suite result is 629 passed, 17 skipped, 180 deselected; targeted GPU and multi-GPU validation lanes cover portable and hardware-bound behavior (§6.n, §15). |
 
 ---
 
