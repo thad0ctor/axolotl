@@ -44,6 +44,26 @@ _WARNED_APPROXIMATE_COMPUTE_PROXY: bool = False
 # Backward-vs-forward compute ratio when the trace has no per-block backward split.
 _BWD_FWD_COMPUTE_RATIO: float = 2.0
 
+# Adapter (LoRA/QLoRA) trainable-fraction signature. A positive-but-tiny
+# fraction means the offloaded/non-persistent chunks are the FROZEN base
+# weights (no grad, no optimizer state, never stepped). Mirrors
+# profiler.trace.ADAPTER_TRAINABLE_PARAM_FRACTION. Exactly 0.0 is the legacy/
+# unknown sentinel and is NOT treated as frozen-base.
+_ADAPTER_TRAINABLE_PARAM_FRACTION: float = 0.05
+
+
+def _offloaded_chunks_are_frozen(trace: ProfilerTrace) -> bool:
+    """Whether the non-persistent (offloaded) chunks carry no trainable optimizer state.
+
+    True for adapter-style training (LoRA/QLoRA): the offloaded chunks are the
+    frozen base weights, so no CPU-Adam step is ever required for them. A
+    positive-but-tiny ``trainable_param_fraction`` is the adapter signature;
+    exactly 0.0 (legacy/unknown) is treated as full-FT to stay fail-safe.
+    """
+    frac = float(getattr(trace, "trainable_param_fraction", 0.0) or 0.0)
+    return 0.0 < frac < _ADAPTER_TRAINABLE_PARAM_FRACTION
+
+
 # Hook-less/hooked forward wall-time scale clamp; <0.3 over-corrects, >1.0 indicates measurement glitch.
 _HOOK_SCALE_MIN: float = 0.3
 _HOOK_SCALE_MAX: float = 1.0
@@ -925,8 +945,17 @@ def _estimate_runtime_components(
     # doesn't. trace.world is the global world (per-node gpu_count undercounts
     # the shard divisor on multi-node, overestimating t_cpu_optim).
     cpu_shard_divisor = max(1, int(trace.world)) if hw.zero3_shard else 1
-    if cpu_adam_bps <= 0.0:
-        # CPU Adam unavailable: mark configs that offload as infeasible.
+    offloaded_frozen = _offloaded_chunks_are_frozen(trace)
+    if offloaded_frozen:
+        # Adapter-style (QLoRA/LoRA): offloaded chunks are the frozen base
+        # weights — no grad, no optimizer state, never stepped by any
+        # optimizer. No CPU Adam step is required regardless of whether
+        # DeepSpeedCPUAdam is available, so t_cpu_optim is genuinely 0.
+        t_cpu_optim = 0.0
+    elif cpu_adam_bps <= 0.0:
+        # CPU Adam unavailable and the offloaded chunks ARE trainable
+        # (full-FT offload): a CPU step is truly required but can't run, so
+        # the config can't train correctly — reject as infeasible.
         if n_nonpersist > 0:
             return _INF_COMPONENTS
         t_cpu_optim = 0.0

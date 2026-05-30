@@ -40,6 +40,49 @@ LOG = get_logger(__name__)
 DEFAULT_OPTIM_STATE_BYTES_PER_PARAM = 12
 DEFAULT_PARAM_GRAD_BYTES_PER_PARAM = 4  # fp16 param + fp16 grad
 
+# Per-trainable-param grad + optimizer-state bytes, keyed by configured optimizer.
+# These size the trainable training-state term that the calibrated peak must
+# include on top of the resident weights (under-counting it OOMs the fit-gate).
+# grad bytes assume bf16 trainable params (2 B). optim bytes:
+#   bnb 8-bit Adam → m+v ≈ 2 B/param (1 B each, plus tiny block-wise quant stats).
+#   fp32 Adam (adamw_torch / fused) → m+v ≈ 8 B/param. bf16-param LoRA carries no
+#   fp32 master copy, so the 4 B master of the full-mixed-precision default drops.
+_BF16_GRAD_BYTES_PER_PARAM = 2
+_BNB_8BIT_OPTIM_STATE_BYTES_PER_PARAM = 2
+_FP32_ADAM_OPTIM_STATE_BYTES_PER_PARAM = 8
+
+# Optimizer-name strings (normalized) routing through bitsandbytes 8-bit Adam.
+_BNB_8BIT_OPTIMIZER_NAMES: frozenset[str] = frozenset(
+    {"adamw_8bit", "adamw_bnb_8bit", "paged_adamw_8bit", "adamw_8bit_bnb"}
+)
+
+
+def trainable_state_bytes_per_param(optimizer_name: str | None) -> tuple[int, int]:
+    """Return ``(grad_bytes, optim_state_bytes)`` per trainable param for ``optimizer_name``.
+
+    Conservative default (full fp32 Adam) when the optimizer is unknown so the
+    calibrated peak never under-predicts the trainable grad + optimizer state.
+    """
+    name = ""
+    if optimizer_name is not None:
+        name = str(getattr(optimizer_name, "value", optimizer_name)).strip().lower()
+    if name in _BNB_8BIT_OPTIMIZER_NAMES:
+        return _BF16_GRAD_BYTES_PER_PARAM, _BNB_8BIT_OPTIM_STATE_BYTES_PER_PARAM
+    return _BF16_GRAD_BYTES_PER_PARAM, _FP32_ADAM_OPTIM_STATE_BYTES_PER_PARAM
+
+
+def trainable_training_state_bytes_for_optimizer(
+    model: "nn.Module", optimizer_name: str | None
+) -> int:
+    """Trainable grad + optimizer-state bytes for ``model`` under ``optimizer_name``."""
+    grad_bpp, optim_bpp = trainable_state_bytes_per_param(optimizer_name)
+    trainable_params = 0
+    for _, p in model.named_parameters():
+        if p.requires_grad:
+            trainable_params += int(p.numel())
+    return trainable_params * (grad_bpp + optim_bpp)
+
+
 # Auto-engage on-demand mode when full model state exceeds 60% of device memory.
 ON_DEMAND_STATE_BYTES_FRACTION: float = 0.60
 ADAPTER_TRAINABLE_PARAM_FRACTION: float = 0.05
@@ -792,11 +835,13 @@ def run_trace(
         handles.append(sub.register_forward_pre_hook(_pre_forward))
         handles.append(sub.register_forward_hook(_post_forward))
 
-    model_state_bytes = _count_model_state_bytes(
+    _state_footprint = _model_state_footprint(
         model,
         param_grad_bytes_per_param=param_grad_bytes_per_param,
         optim_state_bytes_per_param=optim_state_bytes_per_param,
     )
+    model_state_bytes = _state_footprint.total_model_state_bytes
+    trainable_training_state_bytes = _state_footprint.trainable_training_state_bytes
 
     # Wrapper honours engage decision; fast path stays a no-op context.
     on_demand_mgr = OnDemandTensorMgr(
@@ -810,6 +855,13 @@ def run_trace(
     hooked_fwd_wall_s = 0.0
     hooked_fwd_pre_event = None
     hooked_fwd_post_event = None
+
+    # Trace in train() mode: the loss path is gated on self.training (e.g. Liger
+    # fused-linear-cross-entropy fuses the LM head + CE only under training). An
+    # eval-mode forward instead materializes full fp32 logits — an O(vocab*seq)
+    # allocation that OOMs the trace at long sequence length.
+    _prev_training_mode = model.training
+    model.train()
 
     try:
         if cuda_available:
@@ -882,6 +934,7 @@ def run_trace(
     finally:
         for h in handles:
             h.remove()
+        model.train(_prev_training_mode)
 
     # Resolve event pairs to exclusive self-time (parent elapsed minus child rollup).
     op_latencies: dict[OpId, float] = {}
@@ -984,6 +1037,7 @@ def run_trace(
     arch_hidden_size = _infer_hidden_size(model)
     arch_intermediate_size = _infer_intermediate_size(model, arch_hidden_size)
     arch_num_attention_heads = _infer_num_attention_heads(model, arch_hidden_size)
+    arch_extras = _infer_attn_arch_extras(model)
 
     return ProfilerTrace(
         op_order=tuple(op_records),
@@ -1012,10 +1066,12 @@ def run_trace(
         steady_bwd_block_peak_bytes=steady_bwd_block_peak_bytes,
         compute_rate_tflops=compute_rate_tflops,
         trainable_param_fraction=trainable_param_fraction,
+        trainable_training_state_bytes=trainable_training_state_bytes,
         block_tree_index=block_tree_index,
         hidden_size=arch_hidden_size,
         num_attention_heads=arch_num_attention_heads,
         intermediate_size=arch_intermediate_size,
+        **arch_extras,
     )
 
 
@@ -1077,6 +1133,59 @@ def _infer_num_attention_heads(model: "nn.Module", hidden_size: int) -> int:
     return max(1, int(hidden_size) // 128)
 
 
+def _text_config(model: "nn.Module") -> Any:
+    """Return the text sub-config for multimodal wrappers, else the top config."""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return None
+    # Multimodal configs (gemma3, qwen-vl) nest the LLM fields under text_config.
+    sub = getattr(cfg, "text_config", None)
+    if sub is not None and getattr(sub, "num_hidden_layers", None):
+        return sub
+    return cfg
+
+
+def _cfg_int(cfg: Any, *attrs: str) -> int:
+    """First positive int attribute among ``attrs`` on ``cfg``, else 0."""
+    if cfg is None:
+        return 0
+    for attr in attrs:
+        v = getattr(cfg, attr, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    return 0
+
+
+def _infer_attn_arch_extras(model: "nn.Module") -> dict[str, Any]:
+    """Extract GQA / sliding-window / MoE / backend metadata for the cost model.
+
+    Reads from the text sub-config when present (multimodal wrappers). The
+    attention backend comes from HF's resolved ``_attn_implementation``, which
+    is what actually decides whether the O(seq^2) score matrix is allocated.
+    """
+    tcfg = _text_config(model)
+    extras: dict[str, Any] = {
+        "num_key_value_heads": _cfg_int(tcfg, "num_key_value_heads"),
+        "head_dim": _cfg_int(tcfg, "head_dim"),
+        "sliding_window": _cfg_int(tcfg, "sliding_window"),
+        "num_experts_per_tok": _cfg_int(tcfg, "num_experts_per_tok"),
+        "moe_intermediate_size": _cfg_int(tcfg, "moe_intermediate_size"),
+    }
+    top = getattr(model, "config", None)
+    backend = ""
+    for src in (tcfg, top):
+        if src is None:
+            continue
+        impl = getattr(src, "_attn_implementation", None) or getattr(
+            src, "attn_implementation", None
+        )
+        if isinstance(impl, str) and impl:
+            backend = impl
+            break
+    extras["attn_implementation"] = backend
+    return extras
+
+
 def synth_trace_from_overrides(
     model: "nn.Module",
     *,
@@ -1124,17 +1233,20 @@ def synth_trace_from_overrides(
     hidden_size = _infer_hidden_size(model)
     intermediate_size = _infer_intermediate_size(model, hidden_size)
     num_attention_heads = _infer_num_attention_heads(model, hidden_size)
+    arch_extras = _infer_attn_arch_extras(model)
     # Size off FFN intermediate: dominates block-output for autograd's saved tensors.
     per_block_act_bytes = int(batch_size) * int(seq_len) * int(intermediate_size) * 2
     activation_sizes: dict[BlockId, int] = {
         BlockId(i): per_block_act_bytes for i in range(block_count)
     }
 
-    model_state_bytes = _count_model_state_bytes(
+    _state_footprint = _model_state_footprint(
         model,
         param_grad_bytes_per_param=param_grad_bytes_per_param,
         optim_state_bytes_per_param=optim_state_bytes_per_param,
     )
+    model_state_bytes = _state_footprint.total_model_state_bytes
+    trainable_training_state_bytes = _state_footprint.trainable_training_state_bytes
 
     # Conservative PCIe inter-rank bandwidth fallback prior.
     pcie_h2d_bps = 13e9
@@ -1170,10 +1282,12 @@ def synth_trace_from_overrides(
         op_latencies={},
         cpu_adam_bytes_per_sec=0.0,
         gpu_adam_bytes_per_sec=0.0,
+        trainable_training_state_bytes=trainable_training_state_bytes,
         block_tree_index=block_tree_index,
         hidden_size=int(hidden_size),
         num_attention_heads=int(num_attention_heads),
         intermediate_size=int(intermediate_size),
+        **arch_extras,
     )
 
 

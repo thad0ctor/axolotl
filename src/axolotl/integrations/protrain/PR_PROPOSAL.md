@@ -37,6 +37,7 @@ Reviewer-facing validation summary:
 | LoRA sync and topology | Path B LoRA grad sync is default-on for PCIe and default-off for NVLink-class fabric. PCIe all-linear LoRA improves steady-state throughput by 15.1%; NVLink validation shows native NCCL buckets are faster, justifying the topology-aware default (§6.pb, §6.nv). |
 | Compatibility | Standard attention, Qwen3.5 linear attention, tiny Mixtral-class MoE, Qwen3.6-35B-A3B multimodal MoE 4-bit QLoRA, torch.compile, Apex FusedAdam with the documented CUDA/toolkit constraint, LoRA-rank sweeps, gradient accumulation, and merge-lora command/reload paths are validated at the levels claimed in §6 and §12. |
 | CI and tests | The default ProTrain suite is 632 passed, 17 skipped, 180 deselected on the rebased branch; the committed validation runner passes CPU, single-GPU, and two-GPU lanes on the latest local full run (§6.n, §11, §15). |
+| Single-card efficiency vs Unsloth | Qwen3-14B QLoRA on one RTX 3090 Ti, Mode A composed with the full Axolotl + Liger fused-kernel stack + torch.compile reaches memory parity with Unsloth (12.71 vs 12.75 GiB reserved) at ~5% lower throughput (8.07 vs 7.69 s/it), FA2-vs-FA2 / compiled-vs-compiled / same card, both `adamw_8bit`. No new ProTrain code; Mode A is inert (§6.6). |
 
 Current boundaries are explicit rather than hidden:
 
@@ -565,6 +566,79 @@ this proposal while removing per-run log detail.
 | §16.B B1 | 8B+ full-FT on 24 GiB cards | Mode A can OOM because DDP reducer and base-weight load order exceed 24 GiB; Mode C is the validated full-FT path. |
 | §16.B B2 | bs=1 performance | Correctness and cost attribution are validated; bs=1 remains fixed-overhead-bound, gradient accumulation is the recommended production path, and CUDA Graphs remains optional future optimization work. |
 | §6.nv | NVLink LoRA workloads that already fit | Vanilla DDP QLoRA can be faster than ProTrain when memory is not the binding constraint; ProTrain is intended for capacity-bound or Mode C/offload-bound cases. |
+
+### 6.6 Single-card efficiency: Mode A under the full Axolotl + Liger kernel stack
+
+Forced Mode A is runtime-inert: `_is_runtime_inert` short-circuits hook
+installation (no per-step gather/offload; only the optimizer-step wrapper runs),
+so steady-state per-step cost equals vanilla Axolotl + gradient checkpointing.
+That makes Mode A a zero-overhead substrate for Axolotl's and Liger's fused
+kernels plus `torch.compile`. This was benchmarked head-to-head against Unsloth
+on identical hardware.
+
+Shape: Qwen3-14B, QLoRA `r=64 alpha=64`, dense targets
+(`q,k,v,o,gate,up,down`), `sequence_len=1024`, micro-batch 1, grad-accum 4,
+`optimizer: adamw_8bit` (bnb 8-bit AdamW), bf16. Hardware: one RTX 3090 Ti
+(sm_86, 24 GiB), `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Both frameworks ran Flash
+Attention 2 and their respective `torch.compile` paths; memory is
+`torch.cuda.max_memory_*` (directly comparable between the two).
+
+| Stack | s/it (steady) | reserved | active |
+|---|---:|---:|---:|
+| ProTrain Mode A + `lora_mlp/qkv/o_kernel` + `fused_attn_kernel` + Liger FLCE/RMSNorm + `torch.compile` | 8.07 | 12.71 GiB | 12.42 GiB |
+| Unsloth optimized path + FA2 + compile | 7.69 | 12.75 GiB | 12.50 GiB |
+
+Result: under the full stack, ProTrain Mode A is at **memory parity** with
+Unsloth (marginally lower reserved and active) and **~5% lower throughput**,
+while keeping activations GPU-resident — Unsloth reaches its footprint via
+CPU-offloaded activation checkpointing. Memory progression on the same card:
+baseline Mode A (no fused kernels) reserves 14.83 GiB; adding the fused LoRA
+kernels + cut-cross-entropy drops it to 12.79 GiB; layering Liger
+FLCE/RMSNorm + `fused_attn_kernel` and enabling `torch.compile` reaches the
+12.71 GiB / 8.07 s/it line above.
+
+No new ProTrain code is required for this result: Mode A here is byte-identical
+to this PR's branch. The stack composes existing Axolotl features (fused LoRA
+kernels, Liger fused-linear-cross-entropy + RMSNorm, `torch.compile` with
+compile-safe 4-bit dequant) with the upstream Qwen3 fused RMSNorm+RoPE kernel
+(`fused_attn_kernel`, upstream Axolotl).
+
+Recommended single-card QLoRA config (sm_86):
+
+```yaml
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+  - axolotl.integrations.liger.LigerPlugin
+protrain_auto_memory: true
+protrain_force_all_persistent: true      # Mode A: all-resident, runtime inert
+load_in_4bit: true
+adapter: qlora
+lora_mlp_kernel: true                     # Axolotl LoRA-aware fused MLP
+lora_qkv_kernel: true
+lora_o_kernel: true
+fused_attn_kernel: true                   # upstream Qwen3 fused RMSNorm+RoPE
+liger_fused_linear_cross_entropy: true    # Liger LM-head loss fusion
+liger_rms_norm: true                      # Liger block-level RMSNorm
+torch_compile: true                       # 4-bit dequant is compile-safe
+flash_attention: true
+gradient_checkpointing: false             # ProTrain owns checkpointing
+trust_remote_code: false                  # required alongside lora_*_kernel
+optimizer: adamw_8bit
+```
+
+Kernel-stack compatibility (what can and cannot be combined):
+
+- `fused_attn_kernel` (q/k-norm + RoPE) is mutually exclusive with `liger_rope`
+  — both fuse RoPE; enable only one.
+- `lora_mlp_kernel` (LoRA-aware) is mutually exclusive with
+  `liger_glu_activation`; keep `lora_mlp_kernel` for QLoRA-MLP correctness.
+- `liger_fused_linear_cross_entropy` replaces `cut_cross_entropy`; use one.
+- `liger_rms_norm` composes with `fused_attn_kernel`: the fused kernel owns the
+  attention-internal q/k-norm, so Liger's RMSNorm swap lands on the block-level
+  norms.
+- `fused_attn_kernel`'s throughput win scales with sequence length; at
+  `seq=1024` it is approximately break-even on the q/k-norm+RoPE path and
+  contributes more at longer context.
 
 ---
 

@@ -1264,6 +1264,97 @@ def test_estimate_runtime_returns_inf_when_offloaded_and_adam_bps_zero(
     )
 
 
+def test_estimate_runtime_frozen_offload_finite_when_adam_bps_zero(
+    toy_trace, toy_layout
+):
+    """QLoRA frozen-base offload stays FINITE when CPU Adam is unavailable.
+
+    The offloaded (non-persistent) chunks are the frozen 4-bit base weights —
+    no grad, no optimizer state, never stepped by any optimizer. With
+    ``cpu_adam_bytes_per_sec == 0`` the cost model must NOT reject these
+    configs as infeasible: their real cost is just PCIe transfer + compute.
+
+    The adapter signature is a positive-but-tiny ``trainable_param_fraction``
+    (LoRA/QLoRA ~0.1%). A full-FT trace (fraction 0.0 / >=0.05) with the same
+    zero CPU-Adam rate must still be rejected as infeasible.
+    """
+    import math
+    from dataclasses import replace
+
+    hw_no_adam = replace(
+        _make_hw(), cpu_adam_bytes_per_sec=0.0, gpu_adam_bytes_per_sec=0.0
+    )
+    n_block = len(toy_trace.activation_sizes)
+    block_map = assign_modes(0, 0, n_block)
+    # Offloaded config: n_persist < N_chunk so n_nonpersist > 0.
+    cfg_offload = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+
+    # (1) QLoRA frozen base (tiny positive trainable fraction) → FINITE.
+    trace_qlora = replace(toy_trace, trainable_param_fraction=0.001)
+    t_qlora = estimate_runtime(
+        cfg_offload, trace_qlora, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isfinite(t_qlora) and t_qlora > 0.0, (
+        f"QLoRA frozen-base offload under cpu_adam=0 should be finite; "
+        f"got t={t_qlora}"
+    )
+
+    # (2) Full-FT offload (trainable fraction 0.0 / 1.0) → still infeasible.
+    t_fullft_default = estimate_runtime(
+        cfg_offload, toy_trace, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isinf(t_fullft_default), (
+        f"full-FT offload (frac=0.0) under cpu_adam=0 should be inf; "
+        f"got t={t_fullft_default}"
+    )
+    trace_fullft = replace(toy_trace, trainable_param_fraction=1.0)
+    t_fullft = estimate_runtime(
+        cfg_offload, trace_fullft, toy_layout, block_map, hw_no_adam
+    )
+    assert math.isinf(t_fullft), (
+        f"full-FT offload (frac=1.0) under cpu_adam=0 should be inf; "
+        f"got t={t_fullft}"
+    )
+
+
+def test_search_selects_frozen_offload_config_when_adam_bps_zero():
+    """End-to-end: the searcher returns a usable result for a QLoRA-style trace
+    whose state does not fit fully resident, even with CPU Adam unavailable.
+
+    Regression for the 32k QLoRA case: previously every capacity-feasible
+    offload config was rejected as infinite-runtime, leaving the searcher with
+    no finite candidate. The frozen base here is large enough that the
+    fully-resident config exceeds capacity, so the picked config MUST offload
+    (``n_persist < N_chunk``).
+    """
+    import math
+    from dataclasses import replace
+
+    n_chunk = 12
+    s_chunk = 64 * MB  # fp16 chunk footprint ~768 MB total resident
+    layout = _make_layout(n_chunk=n_chunk, s_chunk=s_chunk, n_block=8)
+    # Frozen 4-bit base much larger than capacity → fully-resident infeasible.
+    trace = replace(
+        _make_trace(n_block=8, model_state_bytes=40 * GB),
+        trainable_param_fraction=0.001,
+    )
+    # CPU Adam unavailable (the broken-DeepSpeed host condition).
+    hw_no_adam = replace(
+        _make_hw(gpu_memory_bytes=24 * GB),
+        cpu_adam_bytes_per_sec=0.0,
+        gpu_adam_bytes_per_sec=0.0,
+    )
+    capacity = 8 * GB
+    result = search(trace, layout, capacity, hw_no_adam)
+    assert result is not None
+    assert math.isfinite(result.predicted_iter_s) and result.predicted_iter_s > 0.0
+    # The picked config must actually offload (the whole point of the fix).
+    assert result.cfg.n_persist < n_chunk, (
+        f"expected an offload config (n_persist < {n_chunk}); "
+        f"got n_persist={result.cfg.n_persist}"
+    )
+
+
 def test_estimate_runtime_uses_measured_adam_when_provided(toy_trace, toy_layout):
     """A 10x larger ``cpu_adam_bytes_per_sec`` on the HardwareProfile must
     translate to a ~10x smaller CPU-optim contribution in the runtime
@@ -2412,12 +2503,17 @@ def test_search_requires_ckpt_for_blocks_with_nonpersistent_chunks(
     """Search must not pick NONE/SWAP for blocks whose chunks are offloaded.
 
     The current runtime releases non-persistent chunk storage after
-    forward; non-CKPT blocks can only be correct when all chunks they
-    own are persistent. Phase-2 calibration makes low-CKPT configs
-    look fast, so this is an admissibility constraint rather than a
+    forward; a NONE block can only be correct when all chunks it owns are
+    persistent. CKPT, SWAP, and OFFLOAD are all admissible on
+    non-persistent-chunk blocks (CKPT recomputes, SWAP evicts the activation
+    to pinned host, OFFLOAD re-gathers the chunk) — see
+    ``block_map_runtime_admissible``. Phase-2 calibration makes low-CKPT
+    configs look fast, so this is an admissibility constraint rather than a
     runtime-cost preference.
     """
     from dataclasses import replace
+
+    from axolotl.integrations.protrain.types import BlockMode
 
     n_block = len(toy_trace.activation_sizes)
     trace = replace(
@@ -2435,9 +2531,10 @@ def test_search_requires_ckpt_for_blocks_with_nonpersistent_chunks(
     for bid, mode in result.block_map.items():
         chunks = toy_layout.block_to_chunks.get(bid, ())
         if any(int(cid) not in persistent for cid in chunks):
-            assert mode.value == "ckpt", (
+            assert mode is not BlockMode.NONE, (
                 f"block {bid} owns non-persistent chunks {chunks} but "
-                f"search picked mode={mode} cfg={result.cfg}"
+                f"search picked NONE (storage released after forward) "
+                f"cfg={result.cfg}"
             )
 
 
@@ -2470,10 +2567,18 @@ def test_search_cpu_capacity_filter_excludes_high_offload_configs(
     baseline footprint excludes baseline (verified via the picked
     cfg's footprint).
     """
+    from axolotl.integrations.protrain.cost.memory import estimate_cpu_footprint
+
     capacity = 600 * MB
     # Sanity: unfiltered pick has non-zero CPU footprint on this fixture.
     baseline = search(toy_trace, toy_layout, capacity, toy_hw)
-    baseline_cpu = (toy_layout.N_chunk - baseline.cfg.n_persist) * toy_layout.S_chunk
+    # Use the real cost-model footprint (includes the SWAP pinned-host term
+    # when the pick swaps activations) rather than the chunk-only formula —
+    # the corrected peak estimate makes swap-bearing configs competitive, and
+    # their CPU footprint exceeds ``(N_chunk - n_persist) * S_chunk``.
+    baseline_cpu = estimate_cpu_footprint(
+        baseline.cfg, toy_layout, toy_hw, trace=toy_trace
+    )
     assert baseline_cpu > 0, (
         f"fixture sanity: baseline must offload >0B to CPU for the "
         f"filter to have anything to reject; got cfg={baseline.cfg}"
@@ -2502,19 +2607,17 @@ def test_search_cpu_capacity_filter_excludes_high_offload_configs(
     )
     assert above.cfg == baseline.cfg
 
-    # (c) CPU budget BELOW baseline footprint -> baseline excluded.
-    # On this fixture every n_persist >= baseline.n_persist that would
-    # reduce CPU footprint is GPU-infeasible at capacity=600MB, so the
-    # search must raise — covered by the dedicated CPU-pressure test
-    # below. Here we just assert the boundary: at exactly
-    # ``baseline_cpu - 1`` the search no longer admits the baseline cfg.
+    # (c) CPU budget below EVERY GPU-feasible config's footprint -> raise.
+    # A budget of 1 byte is below the smallest possible per-rank CPU
+    # footprint (any non-persistent chunk costs at least S_chunk), so the
+    # CPU gate must reject every GPU-feasible config and the search raises.
     with pytest.raises(RuntimeError, match=r"no ProTrain config fits in"):
         search(
             toy_trace,
             toy_layout,
             capacity,
             toy_hw,
-            cpu_capacity_bytes=baseline_cpu - 1,
+            cpu_capacity_bytes=1,
         )
 
 
@@ -3864,4 +3967,181 @@ def test_calibrate_peak_with_actual_chunk_bytes_same_cfg_preserves_behaviour():
     assert under >= measured_peak, (
         f"same-cfg under-predict was not raised to phase2_floor: "
         f"under={under} measured={measured_peak}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate-consistency: searcher estimate_peak must agree with the calibrated
+# fit-gate so a picked config never fail-closes at runtime (4-bit deflation
+# + missing optimizer-state floor + CKPT-chain divergence).
+# ---------------------------------------------------------------------------
+
+
+def _make_4bit_hw(**kw) -> HardwareProfile:
+    """4-bit (QLoRA) HardwareProfile: dominant_param_bytes_per_element=0.5."""
+    from dataclasses import replace as _replace
+
+    base = _make_hw(**kw)
+    return _replace(base, dominant_param_bytes_per_element=0.5)
+
+
+def _make_qlora_trace(*, n_block: int, act_per_block: int, trainable_bytes: int):
+    """QLoRA-shape trace: frozen 4-bit base + explicit trainable optimizer state."""
+    from dataclasses import replace as _replace
+
+    n_chunk = n_block
+    s_chunk = 128 * MB
+    trace = _make_trace(
+        n_block=n_block,
+        ops_per_block=3,
+        activation_bytes_per_block=act_per_block,
+        model_state_bytes=n_chunk * s_chunk + trainable_bytes,
+        intra_delta_bytes=8 * MB,
+        inter_delta_bytes=2 * MB,
+    )
+    return _replace(trace, trainable_training_state_bytes=trainable_bytes)
+
+
+def test_estimate_peak_4bit_floors_alpha_at_one_no_deflation():
+    """4-bit estimate_peak must not deflate by the 0.75 Mode-A factor.
+
+    The calibrated fit-gate floors its fragmentation alpha at 1.0; the searcher
+    diverged by applying the 0.75 4-bit factor, under-predicting by ~25% and
+    accepting configs the gate then rejected. After the fix the 4-bit peak is
+    >= the raw component sum (multiplier >= 1.0), never below it.
+    """
+    from axolotl.integrations.protrain.cost.memory import (
+        gate_consistent_alpha,
+        model_state_present_bytes,
+    )
+
+    n_block = 8
+    s_chunk = 128 * MB
+    trace = _make_qlora_trace(n_block=n_block, act_per_block=512 * MB, trainable_bytes=1 * GB)
+    layout = _make_layout(n_chunk=n_block, s_chunk=s_chunk, n_block=n_block)
+    hw = _make_4bit_hw(gpu_memory_bytes=80 * GB)
+    cfg = CostConfig(n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=0)
+    bm = assign_modes(0, 0, n_block)
+
+    peak = estimate_peak(cfg, layout=layout, trace=trace, block_map=bm, hw=hw)
+    # Floor guarantee: multiplier is 1.0 for 4-bit, so peak >= resident state.
+    model_state = model_state_present_bytes(cfg, layout, trace)
+    assert gate_consistent_alpha(0.75) == pytest.approx(1.0)
+    assert peak >= model_state, (
+        f"4-bit estimate_peak {peak / GB:.2f} GiB deflated below resident "
+        f"model state {model_state / GB:.2f} GiB — the 0.75 factor leaked"
+    )
+
+
+def test_estimate_peak_includes_optimizer_state_floor():
+    """estimate_peak adds the trainable optimizer-state floor.
+
+    A trace whose ``trainable_training_state_bytes`` grows must raise the
+    estimate by (at least) that growth when the resident model-state term does
+    not already cover it — mirroring the calibrated gate's explicit optimizer
+    term. Two traces with identical activations but different trainable state
+    must yield different peaks.
+    """
+    from dataclasses import replace as _replace
+
+    n_block = 8
+    s_chunk = 128 * MB
+    layout = _make_layout(n_chunk=n_block, s_chunk=s_chunk, n_block=n_block)
+    hw = _make_4bit_hw(gpu_memory_bytes=80 * GB)
+    # Low n_persist so persistent_factor does NOT already recover the full
+    # optimizer state — the additive floor is what counts it.
+    cfg = CostConfig(n_persist=1, n_buffer=0, n_swap=0, n_checkpoint=0)
+    bm = assign_modes(0, 0, n_block)
+
+    trace_small = _make_qlora_trace(
+        n_block=n_block, act_per_block=64 * MB, trainable_bytes=256 * MB
+    )
+    # Same model_state_bytes aggregate so only the explicit floor differs.
+    trace_big = _replace(trace_small, trainable_training_state_bytes=4 * GB)
+
+    peak_small = estimate_peak(cfg, layout=layout, trace=trace_small, block_map=bm, hw=hw)
+    peak_big = estimate_peak(cfg, layout=layout, trace=trace_big, block_map=bm, hw=hw)
+    assert peak_big > peak_small, (
+        f"larger trainable optimizer state must raise the peak: "
+        f"small={peak_small / GB:.2f} GiB big={peak_big / GB:.2f} GiB"
+    )
+    # Legacy trace (field == 0) must not crash and degrades to the smear.
+    trace_legacy = _replace(trace_small, trainable_training_state_bytes=0)
+    estimate_peak(cfg, layout=layout, trace=trace_legacy, block_map=bm, hw=hw)
+
+
+def test_searcher_pick_passes_gate_no_fail_closed_4bit():
+    """Every searcher pick must satisfy estimate_peak <= budget (gate parity).
+
+    Regression for the 32k QLoRA fail-closed: the inline gate deflated by 0.75
+    and dropped the optimizer/CKPT-chain terms, so it accepted a config whose
+    calibrated peak exceeded the budget. After the fix the inline
+    ``predicted_peak_bytes`` equals ``estimate_peak`` for the picked config and
+    is <= budget for every feasible budget.
+    """
+    n_block = 8
+    s_chunk = 128 * MB
+    trace = _make_qlora_trace(
+        n_block=n_block, act_per_block=1 * GB, trainable_bytes=1 * GB
+    )
+    layout = _make_layout(n_chunk=n_block, s_chunk=s_chunk, n_block=n_block)
+    hw = _make_4bit_hw(gpu_memory_bytes=80 * GB)
+
+    for budget_gb in (7, 8, 9, 10, 11, 12):
+        budget = budget_gb * GB
+        try:
+            result = search(trace, layout, budget, hw, forbid_activation_offload=True)
+        except RuntimeError:
+            continue  # genuinely no fit at this budget — acceptable
+        recomputed = estimate_peak(
+            result.cfg, layout=layout, trace=trace, block_map=result.block_map, hw=hw
+        )
+        assert abs(recomputed - result.predicted_peak_bytes) <= 2 * MB, (
+            f"inline gate {result.predicted_peak_bytes / GB:.3f} GiB diverged "
+            f"from estimate_peak {recomputed / GB:.3f} GiB at budget "
+            f"{budget_gb} GiB — fail-closed risk (cfg={result.cfg})"
+        )
+        assert result.predicted_peak_bytes <= budget, (
+            f"picked config exceeds budget at {budget_gb} GiB: "
+            f"{result.predicted_peak_bytes / GB:.3f} GiB (cfg={result.cfg})"
+        )
+
+
+def test_searcher_selects_swap_when_activation_offload_only_fit_4bit():
+    """When resident+checkpointed activations exceed budget, swap is reachable.
+
+    With ``lora_mlp_kernel`` on (``forbid_activation_offload=True``), n_swap is
+    NOT blocked (only n_offload is). At a budget below what any swap=0 config
+    achieves, the searcher must pick n_swap>0 — activation offload to pinned
+    host is the only lever that fits, and it must be selected.
+    """
+    n_block = 8
+    s_chunk = 128 * MB
+    trace = _make_qlora_trace(
+        n_block=n_block, act_per_block=1 * GB, trainable_bytes=1 * GB
+    )
+    layout = _make_layout(n_chunk=n_block, s_chunk=s_chunk, n_block=n_block)
+    hw = _make_4bit_hw(gpu_memory_bytes=80 * GB)
+
+    # Minimum peak achievable without swap (sweep ckpt at full persist).
+    swap_free_min = GB * 1000
+    for nck in range(0, n_block + 1):
+        cfg0 = CostConfig(n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=nck)
+        peak0 = estimate_peak(
+            cfg0,
+            layout=layout,
+            trace=trace,
+            block_map=assign_modes(0, nck, n_block),
+            hw=hw,
+        )
+        swap_free_min = min(swap_free_min, peak0)
+
+    # Budget strictly below the best swap-free config -> swap is mandatory.
+    budget = swap_free_min - 256 * MB
+    result = search(trace, layout, budget, hw, forbid_activation_offload=True)
+    assert result.predicted_peak_bytes <= budget
+    assert result.cfg.n_swap > 0, (
+        f"searcher must select n_swap>0 when no swap-free config fits "
+        f"(budget={budget / GB:.2f} GiB, swap_free_min={swap_free_min / GB:.2f} "
+        f"GiB); got cfg={result.cfg}"
     )

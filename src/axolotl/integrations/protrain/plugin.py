@@ -1722,6 +1722,7 @@ class ProTrainPlugin(BasePlugin):
             adapter=getattr(cfg, "adapter", None),
             load_in_4bit=bool(getattr(cfg, "load_in_4bit", False)),
             load_in_8bit=bool(getattr(cfg, "load_in_8bit", False)),
+            optimizer_name=_resolve_optimizer_name(None, cfg),
         )
 
         cfg._protrain_wrapped = wrapped  # type: ignore[attr-defined]

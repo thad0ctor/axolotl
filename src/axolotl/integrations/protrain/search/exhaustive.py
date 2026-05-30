@@ -244,9 +244,20 @@ def _build_block_map_skeleton(
     constant ``s_chunk`` per block at a specific op_idx.
     """
     from axolotl.integrations.protrain.cost.memory import (
+        _compute_ckpt_chain_bytes,
+        _saved_tensor_bytes_per_block,
         cross_attn_persist_bytes,
         op_cross_attn_surcharge,
     )
+
+    # CKPT chain: bytes retained across the full backward window (block-input
+    # boundary tensors of every CKPT block) — mirrors estimate_peak so the
+    # inline gate and the validator agree. Without it the inline path only saw a
+    # single block's ckpt_extra and under-predicted multi-CKPT configs, letting
+    # the searcher pick a high-ckpt config estimate_peak / the calibrated gate
+    # then reject (fail-closed at runtime).
+    ckpt_chain_bytes = _compute_ckpt_chain_bytes(trace, block_map)
+    saved_bytes_proxy = _saved_tensor_bytes_per_block(trace)
 
     ckpt_bump_op: dict[int, int] = {}
     offload_block_ops: list[tuple[int, tuple[int, ...]]] = []
@@ -291,11 +302,18 @@ def _build_block_map_skeleton(
         intra = trace.intra_op_delta.get(op.op_id, 0)
         inter = trace.inter_op_delta.get(op.op_id, 0)
         live_none = _none_live_at(i)
+        # Mirror estimate_peak: per-op ckpt_extra is the INTERNAL recompute
+        # residual (saved-tensor proxy minus the block-output already carried by
+        # ckpt_chain_bytes), not the full block. The block-input boundary lives
+        # in the chain term added to base_max below.
         ckpt_extra = 0
         if i in ckpt_bump_op:
-            ckpt_extra = trace.activation_sizes.get(BlockId(ckpt_bump_op[i]), 0)
+            bid = BlockId(ckpt_bump_op[i])
+            block_act = trace.activation_sizes.get(bid, 0)
+            block_saved = int(saved_bytes_proxy.get(bid, block_act))
+            ckpt_extra = max(0, block_saved - block_act)
         op_cross_attn = op_cross_attn_surcharge(op, cross_attn_bytes, tree_index_map)
-        v = live_none + ckpt_extra + op_cross_attn + intra + inter
+        v = live_none + ckpt_chain_bytes + ckpt_extra + op_cross_attn + intra + inter
         per_op_base_by_idx[i] = v
         if v > base_max:
             base_max = v
@@ -311,6 +329,8 @@ def _build_block_map_skeleton(
             mode = block_map.get(bid, BlockMode.NONE)
             if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
                 degenerate_total += act_sz
+        # estimate_peak's degenerate branch adds ckpt_chain_bytes too.
+        degenerate_total += ckpt_chain_bytes
 
     return _BlockMapSkeleton(
         base_max=base_max,
@@ -412,13 +432,19 @@ def search(
     from axolotl.integrations.protrain.cost.memory import (
         ALPHA_FRAGMENTATION,  # noqa: F401
         alpha_fragmentation_for_cfg,
+        apply_gate_consistent_scaling,
         apply_hot_iter_cap,
         block_tree_index_map,
         hot_iter_peak_cap,
         model_state_present_bytes,
+        trainable_state_floor_bytes,
     )
 
     s_chunk = layout.S_chunk
+    # Trainable optimizer-state floor, applied identically by estimate_peak so
+    # the inline gate and the validator agree (and agree with the calibrated
+    # fit-gate). 0 for legacy traces → degrades to the persistent_factor smear.
+    trainable_floor = trainable_state_floor_bytes(trace)
 
     # Hoist trace-only maps; depend on trace only, not block_map.
     forward_ops_by_block: dict[BlockId, list[int]] = defaultdict(list)
@@ -472,7 +498,12 @@ def search(
                         _hot_cap,
                         layout,
                     )
-                    _cap_dominates = int(alpha * _probe_raw) <= capacity_bytes
+                    _cap_dominates = (
+                        apply_gate_consistent_scaling(
+                            _probe_raw, _probe_model_state, trainable_floor, alpha
+                        )
+                        <= capacity_bytes
+                    )
                 else:
                     _cap_dominates = False
 
@@ -603,7 +634,20 @@ def search(
                         raw_peak = apply_hot_iter_cap(
                             raw_peak, model_state_present, _hot_cap, layout
                         )
-                        predicted_peak = int(alpha * raw_peak) if raw_peak > 0 else 0
+                        # Gate-consistent scaling: floor/cap alpha at [1.0, 1.05]
+                        # and add the trainable optimizer-state top-up so the
+                        # inline gate matches estimate_peak and the calibrated
+                        # fit-gate. The old ``int(alpha * raw_peak)`` deflated by
+                        # the 0.75 4-bit factor and dropped the optimizer state,
+                        # so it accepted low-checkpoint/no-swap configs the gate
+                        # then rejected (fail-closed at 32k+).
+                        predicted_peak = (
+                            apply_gate_consistent_scaling(
+                                raw_peak, model_state_present, trainable_floor, alpha
+                            )
+                            if raw_peak > 0
+                            else 0
+                        )
                         if predicted_peak > capacity_bytes:
                             deficit = predicted_peak - capacity_bytes
                             if closest_cfg is None or deficit < closest_deficit:

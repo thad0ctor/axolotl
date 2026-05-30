@@ -349,6 +349,84 @@ def test_block_internal_saved_bytes_zero_when_arch_fields_missing():
     assert _block_internal_saved_bytes(trace, BlockId(0)) == 0
 
 
+def _attn_trace(seq: int, backend: str, **over) -> ProfilerTrace:
+    """Qwen3-14B-shaped GQA trace for backend-aware attention-term tests."""
+    fields = dict(
+        hidden_size=5120,
+        num_attention_heads=40,
+        intermediate_size=17408,
+        num_key_value_heads=8,
+        head_dim=128,
+        attn_implementation=backend,
+    )
+    fields.update(over)
+    return ProfilerTrace(
+        op_order=(),
+        intra_op_delta={},
+        inter_op_delta={},
+        activation_sizes={BlockId(0): 1},
+        model_state_bytes=0,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        nccl_gather_s={},
+        nccl_reduce_s={},
+        arch_hash="test",
+        bs=1,
+        seq=seq,
+        sku="test",
+        world=1,
+        **fields,
+    )
+
+
+def test_attn_activation_flash_is_linear_in_seq():
+    """Flash-Attention-2 retains no score matrix → term scales ~O(seq)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    r8k = attn_activation_bytes(_attn_trace(8192, "flash_attention_2"))
+    r16k = attn_activation_bytes(_attn_trace(16384, "flash_attention_2"))
+    # Linear: doubling seq roughly doubles the term (small LSE keeps it ~2x).
+    assert 1.9 < r16k / r8k < 2.2
+
+
+def test_attn_activation_eager_is_quadratic_in_seq():
+    """eager materializes the score matrix → term scales O(seq^2)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    r8k = attn_activation_bytes(_attn_trace(8192, "eager"))
+    r16k = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert r16k / r8k > 3.0  # super-linear
+
+
+def test_attn_activation_flash_never_underpredicts_eager_lower_bounds():
+    """Flash term must stay >= the genuine projection/MLP floor (never 0 with arch)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    flash = attn_activation_bytes(_attn_trace(16384, "flash_attention_2"))
+    eager = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert 0 < flash < eager  # flash is tight; eager stays conservative
+
+
+def test_attn_activation_sliding_window_caps_eager_span():
+    """Sliding-window attention bounds the eager O(seq^2) term to O(seq*window)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    full = attn_activation_bytes(_attn_trace(16384, "eager", sliding_window=0))
+    windowed = attn_activation_bytes(
+        _attn_trace(16384, "eager", sliding_window=1024)
+    )
+    assert windowed < full
+
+
+def test_attn_activation_unknown_backend_is_eager_safe():
+    """Empty/unknown backend (legacy traces) keeps the conservative O(seq^2) path."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    unknown = attn_activation_bytes(_attn_trace(16384, ""))
+    eager = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert unknown == eager
+
+
 def test_ckpt_chain_includes_internal_residual_when_enabled():
     """factor=1.0 raises chain bytes strictly above the legacy block-output-only sum."""
     n_blocks = 4

@@ -38,6 +38,7 @@ from axolotl.integrations.protrain.profiler.trace import (
     _is_adapter_style_frozen_base,
     _model_state_footprint,
     synth_trace_from_overrides,
+    trainable_training_state_bytes_for_optimizer,
 )
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
 from axolotl.integrations.protrain.runtime.scheduler import Scheduler
@@ -307,8 +308,18 @@ def _calibrate_peak_with_actual_chunk_bytes(
     trace=None,
     block_map=None,
     hw=None,
+    optimizer_name: str | None = None,
 ) -> int:
-    """Recompute ``predicted_peak_bytes`` using actual chunk bytes + CKPT correction."""
+    """Recompute ``predicted_peak_bytes`` using actual chunk bytes + CKPT correction.
+
+    The ``calibrated_persistent`` term recovers only RESIDENT param bytes
+    (frozen base + adapter weights). The trainable grad + optimizer state is a
+    SEPARATE allocation the resident snapshot never sees, so it is added back
+    explicitly and optimizer-aware via ``optimizer_name``. Folding it into the
+    resident-bytes ``persistent_factor`` ratio under-counted it (the ratio
+    rounds toward 1.0 when a large frozen base dominates), which let the
+    fit-gate accept configs that then OOM on the optimizer step.
+    """
     from axolotl.integrations.protrain.cost.memory import (
         ALPHA_FRAGMENTATION,
         _compute_ckpt_chain_bytes,
@@ -410,7 +421,8 @@ def _calibrate_peak_with_actual_chunk_bytes(
                 f_bm_local = max(f_bm_local, reconstructed_local)
         buffer_bytes_local = int(n_buffer_local * S * buffer_factor)
         persistent_bytes_local = int(actual_persistent_local * persistent_factor)
-        calibration_alpha_local = min(alpha, 1.05)
+        # Floor at 1.0: never deflate a realistic component sum (see body note).
+        calibration_alpha_local = max(1.0, min(alpha, 1.05))
         calibrated_local = int(
             calibration_alpha_local
             * (persistent_bytes_local + buffer_bytes_local + f_bm_local)
@@ -426,6 +438,34 @@ def _calibrate_peak_with_actual_chunk_bytes(
 
     # Actual persistent param bytes; scaled by persistent_factor to recover full state.
     actual_persistent = sum(cb.get(cid, 0) for cid in persistent_ids)
+
+    # Trainable grad + optimizer state — a live steady-state allocation the
+    # resident-weight snapshot (actual_persistent) does NOT include. Optimizer-
+    # aware so adamw_8bit (~4 B/param) and adamw_torch (~10 B/param) differ.
+    #
+    # persistent_factor already smears trace.model_state_bytes (frozen +
+    # trainable@default-16B) across ALL resident bytes; re-adding the explicit
+    # trainable term on top of that double-counts. To stay exact we strip the
+    # trainable share back out of the smear (frozen_factor) and re-add the
+    # optimizer-aware value. Failure to recompute the footprint falls back to a
+    # purely-additive term (conservative: never under-predicts).
+    trainable_state_bytes = 0
+    frozen_factor = persistent_factor
+    try:
+        footprint = _model_state_footprint(chunk_manager.model)
+        trainable_state_bytes = trainable_training_state_bytes_for_optimizer(
+            chunk_manager.model, optimizer_name
+        )
+        if fp16_total_bytes > 0 and footprint.frozen_param_bytes > 0:
+            frozen_factor = max(
+                1.0, footprint.frozen_param_bytes / fp16_total_bytes
+            )
+    except Exception as exc:  # noqa: BLE001 — defensive over stub managers
+        LOG.debug(
+            "calibrate: model-state footprint recompute failed (%s); using "
+            "persistent_factor and additive trainable term.",
+            exc,
+        )
 
     # Mirror cost.memory.model_state_present_bytes so reverse-out uses what the cost model added.
     n_persist_eff = len(persistent_ids)
@@ -447,17 +487,27 @@ def _calibrate_peak_with_actual_chunk_bytes(
         else:
             f_bm = max(f_bm, reconstructed_f_bm)
 
-    # Two independent alphas (NOT stacked): paper 1.10 for feasibility, 1.05 post-hoc reporting.
-    calibration_alpha = min(alpha, 1.05)
+    # calibrated_raw is a sum of REAL components (measured resident weights +
+    # optimizer/grad state + reconstructed activation working set), not a
+    # worst-case. The fragmentation alpha (e.g. 0.75 for 4-bit Mode A) was a
+    # phantom-compensating DISCOUNT for the old O(seq^2) attention over-estimate;
+    # applying it to a realistic sum under-predicts (drops below resident bytes).
+    # Floor at 1.0 so it can add fragmentation headroom but never deflate.
+    calibration_alpha = max(1.0, min(alpha, 1.05))
     # BufferPool pre-allocates all n_buffer slots up front; footprint is constant.
     buffer_bytes_eff = int(n_buffer * S * buffer_factor)
-    calibrated_persistent = int(actual_persistent * persistent_factor)
-    calibrated_raw = calibrated_persistent + buffer_bytes_eff + f_bm
+    # Resident weights at frozen_factor (trainable smear stripped out), then the
+    # trainable grad+optimizer state re-added explicitly and optimizer-aware.
+    calibrated_persistent = int(actual_persistent * frozen_factor)
+    calibrated_raw = (
+        calibrated_persistent + buffer_bytes_eff + f_bm + trainable_state_bytes
+    )
     calibrated = int(calibration_alpha * calibrated_raw)
     LOG.debug(
         "ProTrain calibrate body: cfg=(np=%d nb=%d ns=%d nck=%d nof=%d) "
         "S_chunk=%.3fGiB N_chunk=%d n_persist_eff=%d n_buffer=%d "
-        "actual_persistent=%.3fGiB persistent_factor=%.3f buffer_factor=%.2f "
+        "actual_persistent=%.3fGiB persistent_factor=%.3f frozen_factor=%.3f "
+        "buffer_factor=%.2f trainable_state=%.3fGiB "
         "f_bm=%.3fGiB calibrated_persistent=%.3fGiB buffer_bytes_eff=%.3fGiB "
         "calibrated_raw=%.3fGiB calibration_alpha=%.3f -> calibrated=%.3fGiB "
         "(original_peak=%.3fGiB original_model_state=%.3fGiB)",
@@ -472,7 +522,9 @@ def _calibrate_peak_with_actual_chunk_bytes(
         n_buffer,
         actual_persistent / (1 << 30),
         persistent_factor,
+        frozen_factor,
         buffer_factor,
+        trainable_state_bytes / (1 << 30),
         f_bm / (1 << 30),
         calibrated_persistent / (1 << 30),
         buffer_bytes_eff / (1 << 30),
@@ -582,6 +634,20 @@ def _calibrate_peak_with_actual_chunk_bytes(
                     calibrated_floor = int(phase2_peak + delta)
                 # Anchor as LOWER bound only — structural body's cfg-specific terms survive above.
                 calibrated = max(calibrated, calibrated_floor)
+
+    # Hard steady-state floor: resident weights + trainable grad/optimizer state
+    # are ALWAYS co-resident during the optimizer step. The phase-2 override
+    # branches above anchor on a measured peak that can be captured BEFORE the
+    # optimizer step allocates m/v, silently dropping the trainable term and
+    # under-predicting. This floor re-asserts that minimum regardless of which
+    # branch produced ``calibrated``. Activations (f_bm) are deliberately NOT in
+    # the floor: the structural body already adds them, and a trusted phase-2
+    # measured peak already reflects them — folding them in here would fight the
+    # phase-2 over-predict cap. Priority: never under-predict and OOM the gate.
+    steady_state_floor = int(
+        calibration_alpha * (actual_persistent + trainable_state_bytes)
+    )
+    calibrated = max(calibrated, steady_state_floor)
     return calibrated
 
 
@@ -976,6 +1042,7 @@ def _construct_runtime(
     trace,
     zero3_shard,
     device,
+    optimizer_name: str | None = None,
 ) -> tuple["ChunkManager", "Scheduler", list[Any], SearchResult]:
     """Build chunk_manager + scheduler + hooks under a given ``result``."""
     import sys as _sys2
@@ -1101,6 +1168,7 @@ def _construct_runtime(
         trace=trace,
         block_map=result.block_map,
         hw=hardware_profile,
+        optimizer_name=optimizer_name,
     )
     init_transient_peak = predict_init_transient_peak_bytes(
         layout, hardware_profile, chunk_manager
@@ -1894,6 +1962,7 @@ def protrain_model_wrapper(
     adapter: str | None = None,
     load_in_4bit: bool = False,
     load_in_8bit: bool = False,
+    optimizer_name: str | None = None,
 ) -> WrappedModel:
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
@@ -2590,6 +2659,7 @@ def protrain_model_wrapper(
             trace=trace,
             zero3_shard=zero3_shard,
             device=device,
+            optimizer_name=optimizer_name,
         )
         boot_wrapped = WrappedModel(
             module=model,
@@ -2667,6 +2737,7 @@ def protrain_model_wrapper(
                 trace=trace,
                 zero3_shard=zero3_shard,
                 device=device,
+                optimizer_name=optimizer_name,
             )
         if not measurement_failed:
             # Pre-splice ordering mirrors v10; per_block is the same shape pre/post.
@@ -2888,6 +2959,7 @@ def protrain_model_wrapper(
                         trace=trace,
                         block_map=new_result.block_map,
                         hw=hardware_profile,
+                        optimizer_name=optimizer_name,
                     )
                     # Reuse bootstrap-time init transient — post-offload _chunk_bytes sees placeholders.
                     init_transient_peak = (
@@ -2948,6 +3020,7 @@ def protrain_model_wrapper(
                         trace=trace,
                         zero3_shard=zero3_shard,
                         device=device,
+                        optimizer_name=optimizer_name,
                     )
     else:
         chunk_manager, scheduler, handles, result = _construct_runtime(
@@ -2960,6 +3033,7 @@ def protrain_model_wrapper(
             trace=trace,
             zero3_shard=zero3_shard,
             device=device,
+            optimizer_name=optimizer_name,
         )
 
     LOG.info(
