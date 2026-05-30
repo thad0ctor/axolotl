@@ -33,15 +33,36 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
         for block_id, peak_bytes in persisted_per_block_peak.items()
     }
     activation_sizes = trace.activation_sizes or {}
+    # When the profiler skipped per-block peak capture — on-demand mode at high
+    # seq leaves ``steady_fwd_block_peak_bytes`` empty (all steady-state fields
+    # zero) — ``activation_sizes`` carries only the block-OUTPUT boundary
+    # tensor. A NONE/OFFLOAD block recomputes nothing, so its FULL forward saved
+    # set (Q/K/V/O projections, FA softmax-LSE, FFN intermediate) stays resident
+    # across the backward window. The block-output proxy alone misses that
+    # internal residency, so no-checkpoint configs look ~order-of-magnitude
+    # cheaper than reality and the searcher picks n_checkpoint=0 the gate then
+    # fail-closes at long seq. Backfill the internal term analytically (arch +
+    # backend aware) so the fallback proxies full per-block residency.
+    internal_saved = attn_activation_bytes(trace)
+
+    def _full_residency(sz: int) -> int:
+        return int(sz) + internal_saved
+
     if not per_block_peak:
-        return {BlockId(int(bid)): int(sz) for bid, sz in activation_sizes.items()}
+        return {
+            BlockId(int(bid)): _full_residency(sz)
+            for bid, sz in activation_sizes.items()
+        }
 
     # Sort by block id to walk in forward order. Keys are already
     # canonical ``BlockId`` after the normalization above, so sorted()
     # operates on int-equivalent NewType values without further coercion.
     sorted_bids = sorted(per_block_peak.keys())
     if not sorted_bids:
-        return {BlockId(int(bid)): int(sz) for bid, sz in activation_sizes.items()}
+        return {
+            BlockId(int(bid)): _full_residency(sz)
+            for bid, sz in activation_sizes.items()
+        }
 
     forward_diffs: list[int] = []
     for prev_bid, cur_bid in zip(sorted_bids, sorted_bids[1:], strict=False):
@@ -67,11 +88,13 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
         if last_bid not in deltas:
             deltas[last_bid] = median_diff
 
-    # Fill gaps from activation_sizes for blocks missing or zero in the per-block peaks.
+    # Fill gaps for blocks missing or zero in the per-block peaks. Measured
+    # forward diffs already include internal saved tensors, so a gap-filled
+    # block must match that basis (output + internal), not output alone.
     for bid_raw, act_sz in activation_sizes.items():
         bid = BlockId(int(bid_raw))
         if bid not in deltas:
-            deltas[bid] = int(act_sz)
+            deltas[bid] = _full_residency(act_sz)
 
     return deltas
 
@@ -694,7 +717,16 @@ def estimate_peak(
     for bid, act_sz in activation_sizes.items():
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
-            retained_none_bytes += act_sz
+            # A NONE/OFFLOAD block recomputes nothing, so ALL its forward
+            # saved-for-backward tensors (block input/output + FFN
+            # intermediate + attention working set) stay resident across the
+            # whole backward window. ``activation_sizes[bid]`` proxies only the
+            # block-output boundary tensor; the saved-tensor proxy captures the
+            # full per-block residency. Mirrors the calibrated gate's
+            # ``_reconstruct_f_bm`` live-NONE term — using the block output
+            # alone under-counts ~Σ(internal saved bytes) and let the searcher
+            # accept n_checkpoint=0 configs the gate then fail-closes at long seq.
+            retained_none_bytes += int(saved_bytes_proxy_for_op_walk.get(bid, act_sz))
         # SWAP: live only during the block's forward compute; assumed
         #       to overlap free GPU memory (§3.3). The CKPT-chain term
         #       does NOT apply because SWAP evicts the block-output
@@ -731,8 +763,12 @@ def estimate_peak(
             # the NONE running total so the live_none-at-op-i view sees
             # the same bytes as a NONE block would; the backward-window
             # chunk gather bump is a separate per-op bump landed via
-            # ``offload_bump_op`` below.
-            running += activation_sizes.get(bid, 0)
+            # ``offload_bump_op`` below. Use the saved-tensor proxy (full
+            # per-block forward residency), not the block-output-only
+            # ``activation_sizes``, so the live-NONE set matches the gate.
+            running += int(
+                saved_bytes_proxy_for_op_walk.get(bid, activation_sizes.get(bid, 0))
+            )
         cumulative_none.append((first_idx, running))
 
     def _none_live_at(op_idx: int) -> int:

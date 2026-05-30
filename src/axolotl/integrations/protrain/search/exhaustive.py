@@ -133,10 +133,13 @@ def _block_map_peak_contribution(
 ) -> int:
     """Compute the block-map-dependent part of the raw peak (excluding n_persist/n_buffer)."""
     from axolotl.integrations.protrain.cost.memory import (
+        _saved_tensor_bytes_per_block,
         block_tree_index_map,
         cross_attn_persist_bytes,
         op_cross_attn_surcharge,
     )
+
+    saved_bytes_proxy = _saved_tensor_bytes_per_block(trace)
 
     if forward_ops_by_block is None:
         forward_ops_by_block = defaultdict(list)
@@ -174,7 +177,11 @@ def _block_map_peak_contribution(
     for bid, first_idx in blocks_in_fwd_order:
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
-            running += trace.activation_sizes.get(bid, 0)
+            # Full per-block forward residency (saved-tensor proxy), matching
+            # estimate_peak / the gate's live-NONE accounting.
+            running += int(
+                saved_bytes_proxy.get(bid, trace.activation_sizes.get(bid, 0))
+            )
         cumulative_none.append((first_idx, running))
 
     def _none_live_at(op_idx: int) -> int:
@@ -220,7 +227,7 @@ def _block_map_peak_contribution(
             bid = BlockId(int(bid_raw))
             mode = block_map.get(bid, BlockMode.NONE)
             if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
-                total_none += act_sz
+                total_none += int(saved_bytes_proxy.get(bid, act_sz))
         return total_none
 
     return best
@@ -278,7 +285,14 @@ def _build_block_map_skeleton(
     for bid, first_idx in blocks_in_fwd_order:
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
-            running += trace.activation_sizes.get(bid, 0)
+            # NONE/OFFLOAD blocks recompute nothing, so the FULL forward
+            # saved-for-backward residency stays live — use the saved-tensor
+            # proxy, not the block-output-only ``activation_sizes``. Mirrors
+            # estimate_peak / the calibrated gate's live-NONE term so the
+            # searcher doesn't accept n_checkpoint=0 configs the gate rejects.
+            running += int(
+                saved_bytes_proxy.get(bid, trace.activation_sizes.get(bid, 0))
+            )
         cumulative_none.append((first_idx, running))
 
     def _none_live_at(op_idx: int) -> int:
@@ -328,7 +342,9 @@ def _build_block_map_skeleton(
             bid = BlockId(int(bid_raw))
             mode = block_map.get(bid, BlockMode.NONE)
             if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
-                degenerate_total += act_sz
+                # Full per-block residency for NONE/OFFLOAD (saved-tensor proxy),
+                # matching estimate_peak's degenerate branch and the gate.
+                degenerate_total += int(saved_bytes_proxy.get(bid, act_sz))
         # estimate_peak's degenerate branch adds ckpt_chain_bytes too.
         degenerate_total += ckpt_chain_bytes
 

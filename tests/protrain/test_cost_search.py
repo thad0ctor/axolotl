@@ -562,6 +562,113 @@ def test_estimate_peak_uses_saved_tensor_proxy_for_savings(toy_layout, toy_hw):
     )
 
 
+def test_estimate_peak_counts_full_live_none_activations_long_seq():
+    """Regression: zero/low-checkpoint configs must count the FULL live-NONE
+    saved-activation set (saved-tensor proxy), matching the calibrated gate.
+
+    Bug (seq 32768, Qwen3-14B QLoRA, single GPU, auto_mode): the searcher
+    picked n_checkpoint=0 because ``estimate_peak`` counted only the
+    block-OUTPUT bytes (``activation_sizes``) for the retained NONE/OFFLOAD
+    blocks, under-predicting peak as ~21.5 GiB. With no checkpointing every
+    block keeps its full forward saved-for-backward residency simultaneously
+    (O(n_block * seq * hidden)), so the calibrated gate reconstructed ~30 GiB
+    and fail-closed at runtime. The fix sums the saved-tensor proxy (full
+    per-block residency) over NONE/OFFLOAD blocks the same way the gate's
+    ``_reconstruct_f_bm`` does, so:
+
+      - estimate_peak(n_checkpoint=0) is now ~the gate value and EXCEEDS budget;
+      - search() therefore selects a high-checkpoint config that fits and that
+        the gate accepts.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.memory import (
+        _saved_tensor_bytes_per_block,
+    )
+
+    n_block = 40
+    # Block-output boundary is small (seq*hidden); full saved residency is ~7x
+    # larger (adds QKV/attn/FFN intermediates). The gap is what the old code
+    # missed across all 40 NONE blocks.
+    block_output = 320 * MB
+    saved_per_block = 2200 * MB
+
+    layout = _make_layout(n_chunk=n_block, s_chunk=225 * MB, n_block=n_block)
+    # 4-bit dominant dtype routes alpha through the Mode-A 0.75 path.
+    hw = replace(
+        _make_hw(gpu_memory_bytes=24 * GB), dominant_param_bytes_per_element=0.5
+    )
+
+    trace = _make_trace(
+        n_block=n_block,
+        ops_per_block=1,
+        activation_bytes_per_block=block_output,
+        model_state_bytes=9 * GB,
+        intra_delta_bytes=16 * MB,
+        inter_delta_bytes=4 * MB,
+    )
+    base = 4 * GB
+    per_block_peaks = {
+        BlockId(b): base + (b + 1) * saved_per_block for b in range(n_block)
+    }
+    trace = replace(
+        trace,
+        steady_fwd_block_peak_bytes=per_block_peaks,
+        trainable_training_state_bytes=512 * MB,
+    )
+
+    # The proxy must recover the FULL per-block residency, not the small output.
+    proxy = _saved_tensor_bytes_per_block(trace)
+    assert proxy[BlockId(0)] == saved_per_block
+    assert proxy[BlockId(0)] > 5 * block_output
+
+    budget = int(21.55 * GB)
+
+    # n_checkpoint=0, all-OFFLOAD (the config the searcher wrongly picked).
+    cfg0 = CostConfig(
+        n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=0, n_offload=n_block
+    )
+    bm0 = assign_modes(0, 0, n_block, n_offload=n_block)
+    peak0 = estimate_peak(cfg0, trace, layout, bm0, hw)
+
+    # If the live-NONE term still used block-output bytes, the 40 NONE blocks
+    # would contribute only 40 * 320 MB ~= 12.5 GiB and peak0 would sit under
+    # budget. With the saved proxy it counts ~40 * 2200 MB ~= 86 GiB.
+    block_output_only_total = n_block * block_output
+    saved_total = sum(proxy.values())
+    assert peak0 > saved_total, (
+        f"estimate_peak(n_ckpt=0)={peak0 / GB:.2f}GiB must reflect the full "
+        f"live-NONE saved set ({saved_total / GB:.2f}GiB), not the "
+        f"block-output-only {block_output_only_total / GB:.2f}GiB"
+    )
+    assert peak0 > budget, (
+        f"n_checkpoint=0 must now exceed the {budget / GB:.2f}GiB budget; "
+        f"got {peak0 / GB:.2f}GiB"
+    )
+
+    # A high-checkpoint config fits the budget.
+    cfg_hi = CostConfig(
+        n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=n_block, n_offload=0
+    )
+    bm_hi = assign_modes(0, n_block, n_block, n_offload=0)
+    peak_hi = estimate_peak(cfg_hi, trace, layout, bm_hi, hw)
+    assert peak_hi <= budget, (
+        f"all-CKPT config should fit budget; got {peak_hi / GB:.2f}GiB"
+    )
+
+    # search() must pick a high-checkpoint config (not the n_checkpoint=0 one)
+    # and its own estimate_peak must clear the budget (no pick-then-fail-closed).
+    result = search(trace, layout, budget, hw, cpu_capacity_bytes=512 * GB)
+    assert result.cfg.n_checkpoint > 0, (
+        f"search must reject the zero-checkpoint config; picked {result.cfg}"
+    )
+    picked_peak = estimate_peak(result.cfg, trace, layout, result.block_map, hw)
+    assert picked_peak <= budget, (
+        f"picked config {result.cfg} estimate {picked_peak / GB:.2f}GiB must "
+        f"fit budget {budget / GB:.2f}GiB"
+    )
+
+
 def test_estimate_peak_per_block_cap_respects_under_predict_floor(toy_layout, toy_hw):
     """Per-block cap must not under-predict when the op-walk is tighter.
 
@@ -1349,6 +1456,95 @@ def test_search_selects_frozen_offload_config_when_adam_bps_zero():
     assert result is not None
     assert math.isfinite(result.predicted_iter_s) and result.predicted_iter_s > 0.0
     # The picked config must actually offload (the whole point of the fix).
+    assert result.cfg.n_persist < n_chunk, (
+        f"expected an offload config (n_persist < {n_chunk}); "
+        f"got n_persist={result.cfg.n_persist}"
+    )
+
+
+def test_estimate_runtime_single_card_offload_finite_without_nccl(toy_layout):
+    """Single-card (world<=1) offload must NOT be rejected for absent NCCL timings.
+
+    On one rank there are no collectives: the non-persistent chunks are gathered
+    from / offloaded to host over PCIe, not via NCCL. The NCCL gather/reduce
+    tables are legitimately empty (``world <= 1``), so the cost model must zero
+    those communication terms rather than reject the config. The runtime is then
+    compute + PCIe transfer (+ frozen base ⇒ no CPU-Adam step), all finite.
+
+    Complementary multi-GPU contract: a ZeRO-3 (``zero3_shard=True``,
+    ``gpu_count>1``) trace with absent NCCL timings genuinely needs collectives
+    it cannot price, so it must still return ``inf``.
+    """
+    import math
+    from dataclasses import replace
+
+    n_block = 8
+    block_map = assign_modes(0, 0, n_block)
+    # Offloaded config: n_persist < N_chunk so n_nonpersist > 0.
+    cfg_offload = CostConfig(n_persist=2, n_buffer=2, n_swap=0, n_checkpoint=0)
+
+    # (1) Single card, world=1, empty NCCL tables, frozen QLoRA base, CPU Adam
+    # unavailable — the exact 32k single-GPU QLoRA-offload state. Must be FINITE.
+    trace_single = replace(
+        _make_trace(n_block=n_block, world=1), trainable_param_fraction=0.001
+    )
+    assert not trace_single.nccl_gather_s and not trace_single.nccl_reduce_s
+    hw_single = replace(
+        _make_hw(gpu_count=1, zero3_shard=False),
+        cpu_adam_bytes_per_sec=0.0,
+        gpu_adam_bytes_per_sec=0.0,
+    )
+    t_single = estimate_runtime(
+        cfg_offload, trace_single, toy_layout, block_map, hw_single
+    )
+    assert math.isfinite(t_single) and t_single > 0.0, (
+        f"single-card offload with absent NCCL timings should be finite; "
+        f"got t={t_single}"
+    )
+
+    # (2) Multi-GPU ZeRO-3, absent NCCL tables → genuinely unpriceable ⇒ inf.
+    trace_multi = replace(
+        _make_trace(n_block=n_block, world=4),
+        nccl_gather_s={},
+        nccl_reduce_s={},
+    )
+    hw_multi = _make_hw(gpu_count=4, zero3_shard=True)
+    t_multi = estimate_runtime(
+        cfg_offload, trace_multi, toy_layout, block_map, hw_multi
+    )
+    assert math.isinf(t_multi), (
+        f"multi-GPU ZeRO-3 with absent NCCL timings must still reject (inf); "
+        f"got t={t_multi}"
+    )
+
+
+def test_search_selects_single_card_offload_without_nccl():
+    """End-to-end single-card searcher selection with no NCCL timings.
+
+    Mirrors the 32k single-GPU QLoRA case: world=1, frozen base too large to
+    sit fully resident, CPU Adam unavailable, and empty NCCL tables. The search
+    must still return a finite-runtime offloading config (``n_persist < N_chunk``)
+    instead of failing with "no ProTrain config has a finite runtime estimate".
+    """
+    import math
+    from dataclasses import replace
+
+    n_chunk = 12
+    s_chunk = 64 * MB
+    layout = _make_layout(n_chunk=n_chunk, s_chunk=s_chunk, n_block=8)
+    trace = replace(
+        _make_trace(n_block=8, model_state_bytes=40 * GB, world=1),
+        trainable_param_fraction=0.001,
+    )
+    assert not trace.nccl_gather_s and not trace.nccl_reduce_s
+    hw = replace(
+        _make_hw(gpu_memory_bytes=24 * GB, gpu_count=1, zero3_shard=False),
+        cpu_adam_bytes_per_sec=0.0,
+        gpu_adam_bytes_per_sec=0.0,
+    )
+    result = search(trace, layout, 8 * GB, hw)
+    assert result is not None
+    assert math.isfinite(result.predicted_iter_s) and result.predicted_iter_s > 0.0
     assert result.cfg.n_persist < n_chunk, (
         f"expected an offload config (n_persist < {n_chunk}); "
         f"got n_persist={result.cfg.n_persist}"

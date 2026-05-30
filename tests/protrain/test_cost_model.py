@@ -427,6 +427,30 @@ def test_attn_activation_unknown_backend_is_eager_safe():
     assert unknown == eager
 
 
+def test_saved_tensor_proxy_backfills_internal_when_peaks_empty():
+    """Empty steady_fwd_block_peak_bytes → proxy = block-output + internal saved.
+
+    On-demand profiling at high seq leaves the per-block peaks empty; the proxy
+    must fall back to full per-block residency (output + arch-aware internal),
+    not the block-output boundary alone, or the searcher under-counts
+    no-checkpoint configs the gate then fail-closes.
+    """
+    from axolotl.integrations.protrain.cost.memory import (
+        _saved_tensor_bytes_per_block,
+        attn_activation_bytes,
+    )
+
+    trace = _attn_trace(32768, "flash_attention_2")  # steady_fwd_block_peak_bytes empty
+    assert not trace.steady_fwd_block_peak_bytes
+    internal = attn_activation_bytes(trace)
+    assert internal > 0
+    proxy = _saved_tensor_bytes_per_block(trace)
+    block_output = int(trace.activation_sizes[BlockId(0)])
+    assert proxy[BlockId(0)] == block_output + internal
+    # The internal term dominates: full residency is far above block-output alone.
+    assert proxy[BlockId(0)] > 100 * block_output
+
+
 def test_ckpt_chain_includes_internal_residual_when_enabled():
     """factor=1.0 raises chain bytes strictly above the legacy block-output-only sum."""
     n_blocks = 4
