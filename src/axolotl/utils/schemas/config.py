@@ -1614,6 +1614,16 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "the FP4-GEMM module swap). Use FSDP or single-GPU."
             )
 
+        # torchao's NVFP4 quantizer rejects fp16 ("torch.float16 not supported"),
+        # and a swapped layer feeds its activation through it. Refuse early with a
+        # clear message instead of a deep torchao assert. bf16 is the right choice
+        # on Blackwell regardless.
+        if self.fp16 or self.float16:
+            raise ValueError(
+                "nvfp4_training does not support fp16 (torchao NVFP4 quantization "
+                "requires bf16/fp32). Set bf16: true."
+            )
+
         # NVFP4-QLoRA stores the frozen base as an NVFP4Tensor attribute (not an
         # nn.Parameter); FSDP can't shard it, so it would replicate and lose the
         # memory win. Refuse rather than silently waste it. (FP4-compute LoRA

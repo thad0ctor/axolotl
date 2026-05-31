@@ -107,6 +107,18 @@ def test_gate_refuses_deepspeed(monkeypatch):
         )
 
 
+def test_gate_refuses_fp16(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="does not support fp16"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            fp16=True,
+            bf16=False,
+            nvfp4_training={"enabled": True},
+        )
+
+
 def test_disabled_nvfp4_skips_gate(monkeypatch):
     _supported(monkeypatch, False, "should not be raised")
     cfg = AxolotlConfigWCapabilities(
