@@ -5,6 +5,7 @@ Applies pre- and post-model load patches for various fixes and optimizations.
 
 import importlib.util
 import os
+import re
 from functools import cached_property
 
 import addict
@@ -166,6 +167,7 @@ class PatchManager:
         self._apply_lora_kernel_patch(model)
         self._apply_scaling_softmax_patch(model)
         self._apply_fp8_attention_patches(model)
+        self._apply_nvfp4_training(model)
 
     def _apply_gemma_hybrid_attention(self, model: PreTrainedModel):
         """Apply hybrid attention: FA2 for sliding window layers, SDPA for global layers.
@@ -268,6 +270,63 @@ class PatchManager:
             from axolotl.monkeypatch.attention.fp8_attn import patch_fp8_attention
 
             patch_fp8_attention(model)
+
+    def _apply_nvfp4_training(self, model: PreTrainedModel):
+        """Swap eligible nn.Linear for NVFP4-GEMM linears (Blackwell FP4 compute).
+
+        Runs in post-load (after weights + any merge, before the trainer/FSDP
+        wrap) so the swap sees real linear modules in their final tree position.
+        """
+        nvfp4 = self.cfg.nvfp4_training
+        if not (nvfp4 and nvfp4.enabled):
+            return
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            convert_to_nvfp4_training,
+        )
+
+        recipe = NVFP4Recipe(
+            stochastic_rounding=nvfp4.stochastic_rounding,
+            hadamard=nvfp4.hadamard,
+        )
+        exclude = tuple(nvfp4.exclude_modules or ()) + self._nvfp4_block_exclusions(
+            model, nvfp4.skip_first_n_blocks, nvfp4.skip_last_n_blocks
+        )
+        count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
+        if count == 0:
+            LOG.warning(
+                "nvfp4_training enabled but no eligible nn.Linear layers were swapped"
+            )
+
+    @staticmethod
+    def _nvfp4_block_exclusions(
+        model: PreTrainedModel, skip_first: int, skip_last: int
+    ) -> tuple[str, ...]:
+        """Translate skip_first/last_n_blocks into ``layers.<i>.`` name fragments.
+
+        Block count is only known here (the model is built), so the block-range
+        policy is resolved in the integration layer and passed to the swap as
+        explicit ``exclude`` fragments.
+        """
+        if skip_first <= 0 and skip_last <= 0:
+            return ()
+
+        block_re = re.compile(r"(.*\blayers)\.(\d+)\.")
+        prefixes: dict[str, set[int]] = {}
+        for name, _ in model.named_modules():
+            m = block_re.match(name)
+            if m:
+                prefixes.setdefault(m.group(1), set()).add(int(m.group(2)))
+
+        fragments: list[str] = []
+        for prefix, indices in prefixes.items():
+            ordered = sorted(indices)
+            skip = set(ordered[:skip_first])
+            if skip_last > 0:
+                skip |= set(ordered[len(ordered) - skip_last :])
+            fragments.extend(f"{prefix}.{i}." for i in sorted(skip))
+        return tuple(fragments)
 
     def _apply_chunked_cross_entropy_patch(self):
         if self.cfg.chunked_cross_entropy:

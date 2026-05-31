@@ -1,0 +1,47 @@
+base_model: Qwen/Qwen2.5-0.5B
+
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+
+# nvfp4_training is full fine-tune only: no `adapter:` here.
+
+datasets:
+  - path: yahma/alpaca-cleaned
+    type: alpaca
+
+output_dir: ./outputs/nvfp4_out/
+
+sequence_len: 1024
+sample_packing: true
+pad_to_sequence_len: true
+
+bf16: true
+
+# Real FP4 forward/backward GEMMs on Blackwell. The 2.9-3.6x speedup over bf16
+# ONLY materializes under torch.compile — keep it on.
+torch_compile: true
+
+nvfp4_training:
+  enabled: true
+  stochastic_rounding: true
+  hadamard: true
+  exclude_modules: [lm_head, embed_tokens]
+  skip_first_n_blocks: 0
+  skip_last_n_blocks: 0
+
+gradient_accumulation_steps: 1
+micro_batch_size: 8
+num_epochs: 1
+optimizer: adamw_torch_fused
+learning_rate: 2e-5
+
+logging_steps: 1
+warmup_steps: 10
+weight_decay: 0.0
+
+evals_per_epoch: 1
+saves_per_epoch: 1
+save_only_model: true
+
+special_tokens:

@@ -58,6 +58,7 @@ from axolotl.utils.schemas.model import (
     SpecialTokensConfig,
 )
 from axolotl.utils.schemas.multimodal import MultiModalConfig
+from axolotl.utils.schemas.nvfp4 import NVFP4TrainingConfig
 from axolotl.utils.schemas.peft import LoraConfig, ReLoRAConfig
 from axolotl.utils.schemas.quantization import PTQConfig, QATConfig
 from axolotl.utils.schemas.training import HyperparametersConfig, JaggedLRConfig
@@ -572,6 +573,13 @@ class AxolotlInputConfig(
         json_schema_extra={
             "description": "Enable FSDP float8 all-gather optimization for FP8 training. Can "
             "improve training speed by 10-15% when FSDP is enabled."
+        },
+    )
+    nvfp4_training: NVFP4TrainingConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "NVFP4-GEMM training (real FP4 compute on Blackwell). Full "
+            "fine-tune only; the speedup requires torch.compile."
         },
     )
     bfloat16: bool | None = Field(
@@ -1571,6 +1579,30 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             raise ValueError(
                 "fp8 requested, but missing one of ms-amp, transformers-engine or torchao."
             )
+        return self
+
+    @model_validator(mode="after")
+    def check_nvfp4_training(self):
+        if not (self.nvfp4_training and self.nvfp4_training.enabled):
+            return self
+
+        if self.adapter:
+            raise ValueError(
+                "nvfp4_training is full-fine-tune only (it swaps base nn.Linear "
+                "for FP4-GEMM linears); it cannot extend a LoRA/QLoRA adapter. "
+                "Remove `adapter`."
+            )
+        if self.deepspeed:
+            raise ValueError(
+                "nvfp4_training is not compatible with DeepSpeed (no ZeRO path for "
+                "the FP4-GEMM module swap). Use FSDP or single-GPU."
+            )
+
+        from axolotl.utils.nvfp4_training import nvfp4_supported
+
+        ok, reason = nvfp4_supported()
+        if not ok:
+            raise ValueError(f"nvfp4_training requested, but {reason}")
         return self
 
     @model_validator(mode="after")
