@@ -238,23 +238,31 @@ def test_swap_forward_backward_correctness() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
+    from axolotl.integrations.protrain.block.swap import (  # noqa: E402
+        SIZE_THRESHOLD_BYTES,
+    )
     from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
         ActivationSwapPool,
     )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    block = nn.Linear(16, 16).to(device)
-    ref_block = nn.Linear(16, 16).to(device)
+    # Dims chosen so the saved input activation (2048 x 256 fp32 = 2 MiB) clears
+    # SIZE_THRESHOLD_BYTES and routes through pack_to_pool, while the 256x256
+    # weight (256 KiB) stays below it — a clean single-tensor swap that actually
+    # exercises acquire()/view()/release() instead of the pass-through path.
+    block = nn.Linear(256, 256).to(device)
+    ref_block = nn.Linear(256, 256).to(device)
     ref_block.load_state_dict(block.state_dict())
 
     wrapped = SwappedBlock(block)
-    pool = ActivationSwapPool(capacity_bytes=4 * 16 * 4 * 16)  # batch * features * fp32
+    pool = ActivationSwapPool(capacity_bytes=4 << 20)
     swap_stream = torch.cuda.Stream()
     wrapped.attach_runtime(pool, swap_stream)
 
-    x_a = torch.randn(4, 16, device=device, requires_grad=True)
+    x_a = torch.randn(2048, 256, device=device, requires_grad=True)
     x_b = x_a.detach().clone().requires_grad_(True)
+    assert x_a.numel() * x_a.element_size() >= SIZE_THRESHOLD_BYTES
 
     out_wrapped = wrapped(x_a)
     out_ref = ref_block(x_b)
@@ -279,6 +287,11 @@ def test_swap_forward_backward_correctness() -> None:
     )
     # Input grads match as well.
     assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
+
+    # The activation must have actually been swapped through the pool, not
+    # silently passed through — otherwise acquire()/view()/release() regressions
+    # would go undetected.
+    assert pool.peak_used_bytes > 0, "activation never routed through the swap pool"
 
     # Pool slots must be returned to free list after backward completes.
     torch.cuda.synchronize()

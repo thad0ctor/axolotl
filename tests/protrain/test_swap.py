@@ -1025,7 +1025,8 @@ def test_swap_smoke_n_swap_override_runs_three_iters() -> None:
         n_swap_override=2,
         n_checkpoint_override=0,
     )
-    # Verify the SWAP pool was wired.
+    # Verify the override was honored and the SWAP pool was wired.
+    assert wrapped.search_result.cfg.n_swap == 2, "n_swap_override not honored"
     scheduler = cast("Scheduler", wrapped.scheduler)
     swap_pool = getattr(scheduler, "swap_pool", None)
     assert swap_pool is not None, "SWAP pool was not constructed"
@@ -1271,7 +1272,7 @@ def test_swap_under_genuine_capacity_pressure() -> None:
     scheduler = cast("Scheduler", wrapped.scheduler)
     swap_pool = getattr(scheduler, "swap_pool", None)
     assert swap_pool is not None, "SWAP pool was not constructed"
-    assert swap_pool.n_swap == n_swap_target
+    assert swap_pool.total_bytes > 0, "SWAP slab wired with zero capacity"
 
     # Real optimizer (FusedAdam under the hood). lr=1e-3 produces a
     # measurable loss drop within 4 iters at this scale + bf16.

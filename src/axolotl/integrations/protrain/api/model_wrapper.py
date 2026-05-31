@@ -1491,23 +1491,30 @@ def _construct_runtime(
 
         capacity_bytes = swap_pool_capacity_bytes(trace, swap_block_count)
         if capacity_bytes <= 0:
-            LOG.warning(
-                "ProTrain: result.cfg.n_swap=%d but computed swap capacity is 0 "
-                "(missing arch/activation sizes); skipping swap-slab construction",
-                result.cfg.n_swap,
+            # Fail fast rather than skip: leaving the blocks in BlockMode.SWAP
+            # with no pool attached makes their wrappers run as identity, so
+            # activations stay GPU-resident while the search result still
+            # assumed they would stream to CPU — turning a "fits" plan into a
+            # runtime OOM. A zero capacity means the trace is missing both
+            # seq/hidden and activation sizes (degenerate / broken trace).
+            raise RuntimeError(
+                f"ProTrain: result.cfg.n_swap={result.cfg.n_swap} selected "
+                f"{swap_block_count} SWAP block(s) but swap_pool_capacity_bytes "
+                "resolved to 0 (trace missing seq/hidden and activation sizes); "
+                "cannot size the activation-swap slab. Re-run the searcher with "
+                "n_swap=0 or repair the profiler trace."
             )
-        else:
-            swap_pool = ActivationSwapPool(capacity_bytes=capacity_bytes)
-            scheduler.swap_pool = swap_pool
-            for block in blocks:
-                if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
-                    block.attach_runtime(swap_pool, scheduler.swap_stream)
-            LOG.info(
-                "ProTrain: SWAP slab wired — %.2f GiB pinned for %d SWAP blocks "
-                "(variable-size, per-tensor)",
-                capacity_bytes / (1 << 30),
-                swap_block_count,
-            )
+        swap_pool = ActivationSwapPool(capacity_bytes=capacity_bytes)
+        scheduler.swap_pool = swap_pool
+        for block in blocks:
+            if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
+                block.attach_runtime(swap_pool, scheduler.swap_stream)
+        LOG.info(
+            "ProTrain: SWAP slab wired — %.2f GiB pinned for %d SWAP blocks "
+            "(variable-size, per-tensor)",
+            capacity_bytes / (1 << 30),
+            swap_block_count,
+        )
 
     handles = install_hooks(
         model=model,
@@ -1716,6 +1723,8 @@ def _downgrade_oversized_swap_to_checkpoint(
     blocks: list[nn.Module],
     result: SearchResult,
     trace,
+    layout,
+    hw,
     cpu_capacity_bytes: int | None,
 ) -> SearchResult:
     """Avoid runtime SWAP-pool allocations that exceed the CPU budget."""
@@ -1748,21 +1757,33 @@ def _downgrade_oversized_swap_to_checkpoint(
         N_block=n_block,
         n_offload=result.cfg.n_offload,
     )
+    # The downgraded all-CKPT plan has a DIFFERENT (higher) GPU peak than the
+    # SWAP plan it replaces — SWAP kept activations off-GPU. Carrying the SWAP
+    # plan's predicted_peak_bytes / predicted_iter_s forward would make runtime
+    # calibration, phase-2, and reporting gate and log against a plan no longer
+    # being executed (and under-predict the peak). Recompute both for the new
+    # cfg/block_map.
+    from axolotl.integrations.protrain.cost.memory import estimate_peak
+    from axolotl.integrations.protrain.cost.runtime import estimate_runtime
+
+    recomputed_peak = int(estimate_peak(cfg, trace, layout, block_map, hw))
+    recomputed_iter_s = float(estimate_runtime(cfg, trace, layout, block_map, hw))
     LOG.warning(
         "ProTrain: SWAP slab would require %.2f GiB pinned CPU "
         "(%d SWAP blocks, per-tensor variable-size), exceeding the %.2f GiB "
-        "CPU budget. Downgrading %d SWAP blocks to CKPT before runtime "
-        "construction.",
+        "CPU budget. Downgrading %d SWAP blocks to CKPT (recomputed peak "
+        "%.2f GiB) before runtime construction.",
         total / (1 << 30),
         n_swap_blocks,
         int(cpu_capacity_bytes) / (1 << 30),
         int(result.cfg.n_swap),
+        recomputed_peak / (1 << 30),
     )
     return SearchResult(
         cfg=cfg,
         block_map=block_map,
-        predicted_peak_bytes=result.predicted_peak_bytes,
-        predicted_iter_s=result.predicted_iter_s,
+        predicted_peak_bytes=recomputed_peak,
+        predicted_iter_s=recomputed_iter_s,
         predicted_init_transient_peak_bytes=result.predicted_init_transient_peak_bytes,
     )
 
@@ -2521,6 +2542,8 @@ def protrain_model_wrapper(
         blocks=blocks,
         result=result,
         trace=trace,
+        layout=layout,
+        hw=hardware_profile,
         cpu_capacity_bytes=cpu_capacity_bytes,
     )
     result = _broadcast_runtime_search_result(result)
@@ -2551,6 +2574,8 @@ def protrain_model_wrapper(
             blocks=blocks,
             result=boot_result,
             trace=trace,
+            layout=layout,
+            hw=hardware_profile,
             cpu_capacity_bytes=cpu_capacity_bytes,
         )
         boot_result = _broadcast_runtime_search_result(boot_result)
@@ -2810,6 +2835,8 @@ def protrain_model_wrapper(
                     blocks=blocks,
                     result=new_result,
                     trace=trace,
+                    layout=layout,
+                    hw=hardware_profile,
                     cpu_capacity_bytes=cpu_capacity_bytes,
                 )
                 new_result = _broadcast_runtime_search_result(new_result)

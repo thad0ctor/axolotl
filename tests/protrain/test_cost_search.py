@@ -4219,7 +4219,7 @@ def test_estimate_peak_4bit_floors_alpha_at_one_no_deflation():
     cfg = CostConfig(n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=0)
     bm = assign_modes(0, 0, n_block)
 
-    peak = estimate_peak(cfg, layout=layout, trace=trace, block_map=bm, hw=hw)
+    peak = estimate_peak(cfg, trace, layout, bm, hw)
     # Floor guarantee: multiplier is 1.0 for 4-bit, so peak >= resident state.
     model_state = model_state_present_bytes(cfg, layout, trace)
     assert gate_consistent_alpha(0.75) == pytest.approx(1.0)
@@ -4255,17 +4255,15 @@ def test_estimate_peak_includes_optimizer_state_floor():
     # Same model_state_bytes aggregate so only the explicit floor differs.
     trace_big = _replace(trace_small, trainable_training_state_bytes=4 * GB)
 
-    peak_small = estimate_peak(
-        cfg, layout=layout, trace=trace_small, block_map=bm, hw=hw
-    )
-    peak_big = estimate_peak(cfg, layout=layout, trace=trace_big, block_map=bm, hw=hw)
+    peak_small = estimate_peak(cfg, trace_small, layout, bm, hw)
+    peak_big = estimate_peak(cfg, trace_big, layout, bm, hw)
     assert peak_big > peak_small, (
         f"larger trainable optimizer state must raise the peak: "
         f"small={peak_small / GB:.2f} GiB big={peak_big / GB:.2f} GiB"
     )
     # Legacy trace (field == 0) must not crash and degrades to the smear.
     trace_legacy = _replace(trace_small, trainable_training_state_bytes=0)
-    estimate_peak(cfg, layout=layout, trace=trace_legacy, block_map=bm, hw=hw)
+    estimate_peak(cfg, trace_legacy, layout, bm, hw)
 
 
 def test_searcher_pick_passes_gate_no_fail_closed_4bit():
@@ -4291,9 +4289,7 @@ def test_searcher_pick_passes_gate_no_fail_closed_4bit():
             result = search(trace, layout, budget, hw, forbid_activation_offload=True)
         except RuntimeError:
             continue  # genuinely no fit at this budget — acceptable
-        recomputed = estimate_peak(
-            result.cfg, layout=layout, trace=trace, block_map=result.block_map, hw=hw
-        )
+        recomputed = estimate_peak(result.cfg, trace, layout, result.block_map, hw)
         assert abs(recomputed - result.predicted_peak_bytes) <= 2 * MB, (
             f"inline gate {result.predicted_peak_bytes / GB:.3f} GiB diverged "
             f"from estimate_peak {recomputed / GB:.3f} GiB at budget "
@@ -4325,13 +4321,7 @@ def test_searcher_selects_swap_when_activation_offload_only_fit_4bit():
     swap_free_min = GB * 1000
     for nck in range(0, n_block + 1):
         cfg0 = CostConfig(n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=nck)
-        peak0 = estimate_peak(
-            cfg0,
-            layout=layout,
-            trace=trace,
-            block_map=assign_modes(0, nck, n_block),
-            hw=hw,
-        )
+        peak0 = estimate_peak(cfg0, trace, layout, assign_modes(0, nck, n_block), hw)
         swap_free_min = min(swap_free_min, peak0)
 
     # Budget strictly below the best swap-free config -> swap is mandatory.
