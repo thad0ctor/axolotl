@@ -366,6 +366,55 @@ def tile_image_source_for_processor(
     return tiles
 
 
+class TilingImageTransform:
+    """MMImageTransform adapter exposing tiling through the generic core seam."""
+
+    def __init__(self, config: ImageTilingConfig):
+        self._config = config
+
+    def per_source(
+        self, source, *, image_base_dir=None, resize_algorithm=None, cache=None
+    ):
+        return tile_image_source_with_labels(
+            source,
+            self._config,
+            image_base_dir=image_base_dir,
+            resize_algorithm=resize_algorithm,
+            cache=cache,
+        )
+
+    def expand_placeholders(self, text, *, image_token, counts, labels=None):
+        return expand_image_placeholders_for_tiling(
+            text, image_token=image_token, counts=counts, labels=labels
+        )
+
+    def prepare(
+        self,
+        text,
+        images,
+        *,
+        image_token,
+        image_base_dir=None,
+        resize_algorithm=None,
+        cache=None,
+    ):
+        return prepare_tiled_text_and_images(
+            text,
+            images,
+            image_token=image_token,
+            tiling_config=self._config,
+            image_base_dir=image_base_dir,
+            resize_algorithm=resize_algorithm,
+            cache=cache,
+        )
+
+    def policy_payload(self):
+        return _tiling_policy_payload(self._config)
+
+    def new_cache(self):
+        return ImageTileCache(self._config.cache_path)
+
+
 def prepare_tiled_text_and_images(
     text: str,
     images: list[Any],
