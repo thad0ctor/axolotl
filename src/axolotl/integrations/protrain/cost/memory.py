@@ -541,6 +541,51 @@ def apply_hot_iter_cap(
 SWAP_PREFETCH_DEPTH: int = 2
 SWAP_SLOTS_PER_BLOCK: int = 8
 
+# Per-block saved-for-backward tensors a non-recomputed (SWAP/NONE) block keeps
+# resident on the host once swapped: block I/O + each linear's saved input + the
+# FFN intermediates. The fused QLoRA stack (FLCE, fused RMSNorm/attn, LoRA
+# kernels) collapses much of the naive set; measured on Qwen3-14B the surviving
+# population is ~12*(seq*hidden) + ~5*(seq*intermediate) bytes/elem. Coefficients
+# are deliberately conservative: the SWAP slab is sized from this, and
+# UNDER-provisioning spills tensors back onto the GPU and breaks the steady-peak
+# prediction, whereas over-provisioning only costs (abundant) pinned host RAM.
+_SWAP_HIDDEN_TENSORS_PER_BLOCK: int = 12
+_SWAP_INTERMEDIATE_TENSORS_PER_BLOCK: int = 5
+
+# Headroom over n_swap * per-block aggregate for first-fit fragmentation + a few
+# in-flight backward-prefetch slices.
+_SWAP_POOL_HEADROOM: float = 1.25
+
+
+def swap_block_saved_bytes(trace: ProfilerTrace, bytes_per_element: float = 2.0) -> int:
+    """Host bytes one SWAP block's saved-for-backward set occupies, arch-aware."""
+    seq = int(getattr(trace, "seq", 0) or 0)
+    hidden = int(getattr(trace, "hidden_size", 0) or 0)
+    if seq <= 0 or hidden <= 0:
+        # Legacy trace without arch fields: block-output proxy x a count heuristic.
+        outs = list((trace.activation_sizes or {}).values())
+        base = max((int(v) for v in outs), default=0)
+        return int(base * SWAP_SLOTS_PER_BLOCK)
+    intermediate = int(getattr(trace, "intermediate_size", 0) or 0)
+    experts_per_tok = int(getattr(trace, "num_experts_per_tok", 0) or 0)
+    moe_intermediate = int(getattr(trace, "moe_intermediate_size", 0) or 0)
+    if experts_per_tok > 0 and moe_intermediate > 0:
+        intermediate = experts_per_tok * moe_intermediate
+    hidden_bytes = _SWAP_HIDDEN_TENSORS_PER_BLOCK * seq * hidden
+    inter_bytes = _SWAP_INTERMEDIATE_TENSORS_PER_BLOCK * seq * max(intermediate, 0)
+    return int((hidden_bytes + inter_bytes) * bytes_per_element)
+
+
+def swap_pool_capacity_bytes(
+    trace: ProfilerTrace, n_swap: int, bytes_per_element: float = 2.0
+) -> int:
+    """Pinned-host capacity for the activation-swap slab: n_swap blocks coexist."""
+    n = int(n_swap)
+    if n <= 0:
+        return 0
+    per_block = swap_block_saved_bytes(trace, bytes_per_element=bytes_per_element)
+    return int(n * per_block * _SWAP_POOL_HEADROOM)
+
 
 def estimate_cpu_footprint(
     cfg: CostConfig,
@@ -560,24 +605,11 @@ def estimate_cpu_footprint(
     per_chunk_sharded = (layout.S_chunk + per_rank_divisor - 1) // per_rank_divisor
     chunk_term = non_persist * per_chunk_sharded
 
-    # Swap term rank-local; size slots to per-block aggregate (strict upper bound).
+    # Swap term rank-local: the variable-size slab holds all n_swap blocks'
+    # saved-for-backward sets simultaneously (carved per-tensor, not equal slots).
     swap_term = 0
-    if cfg.n_swap > 0 and trace is not None and trace.activation_sizes:
-        # Normalise stringified keys from JSON/pickle round-trips for correct sort.
-        normalized_activation_sizes: dict[BlockId, int] = {
-            BlockId(int(bid)): int(sz) for bid, sz in trace.activation_sizes.items()
-        }
-        # Swap-early rule: first n_swap blocks in BlockId order.
-        sorted_bids = sorted(normalized_activation_sizes.keys())
-        swap_band = sorted_bids[: cfg.n_swap]
-        if swap_band:
-            per_block_activation_bytes = max(
-                normalized_activation_sizes.get(bid, 0) for bid in swap_band
-            )
-            slot_bytes = max(1, int(per_block_activation_bytes))
-            swap_term = (
-                cfg.n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH * slot_bytes
-            )
+    if cfg.n_swap > 0 and trace is not None:
+        swap_term = swap_pool_capacity_bytes(trace, cfg.n_swap)
 
     return chunk_term + swap_term
 

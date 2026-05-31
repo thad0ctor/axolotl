@@ -118,25 +118,25 @@ def _make_pack_unpack(
         # empty_strided + copy_ requires non-overlapping; reimplement std PyTorch check.
         if not _is_non_overlapping_and_dense(t):
             return _PassThrough(t)
-        if nbytes > pool.slot_bytes:
-            # Tensor exceeds slot size; keep on GPU to avoid corruption.
+        if nbytes > pool.capacity_bytes:
+            # Single tensor larger than the whole pool; keep on GPU to avoid corruption.
             LOG.error(
-                "_swap pack: tensor of %d bytes exceeds pool slot "
+                "_swap pack: tensor of %d bytes exceeds pool capacity "
                 "%d bytes — keeping on GPU",
                 nbytes,
-                pool.slot_bytes,
+                pool.capacity_bytes,
             )
             return _PassThrough(t)
         # Pool may be exhausted under pathological scheduling. Fall
         # back to identity rather than raising — autograd will simply
         # keep this tensor on GPU.
         try:
-            slot_id, slot_view = pool.acquire()
+            slot_id, slot_view = pool.acquire(nbytes)
         except RuntimeError:
             LOG.warning(
-                "_swap pack: pool exhausted (n_slot=%d, in-flight=%d); "
+                "_swap pack: pool exhausted (free=%dB, in-flight=%d); "
                 "keeping tensor on GPU",
-                pool.n_slot,
+                pool.free_bytes,
                 pool.inflight_count,
             )
             return _PassThrough(t)
@@ -262,7 +262,9 @@ def _make_pack_unpack(
                 )
             _swap_stream_wait_compute(handle.device, handle.swap_stream)
             with torch.cuda.stream(handle.swap_stream):
-                slot_view = handle.pool._pinned.buffer(handle.slot_id)  # noqa: SLF001
+                # Slab view by slot_id; the slot stays in-flight (protecting the
+                # pinned region from close()) until handle.pool.release() below.
+                slot_view = handle.pool.view(handle.slot_id)
                 second_borrow_acquired = True
                 slot_src = (
                     slot_view[: handle.nbytes].view(handle.dtype).reshape(handle.shape)
@@ -286,8 +288,10 @@ def _make_pack_unpack(
                 h2d_done.synchronize()
             elif did_h2d:
                 handle.swap_stream.synchronize()
-            if second_borrow_acquired:
-                handle.pool._pinned.release_buffer(handle.slot_id)  # noqa: SLF001
+            # The slab has no per-slot borrow counter (the single backing region
+            # is borrowed once for the pool's lifetime); releasing the slot
+            # extent is sufficient and frees it for reuse.
+            _ = second_borrow_acquired
             handle.pool.release(handle.slot_id)
 
         # Restore requires_grad; saved tensors are read as data only by consumers.

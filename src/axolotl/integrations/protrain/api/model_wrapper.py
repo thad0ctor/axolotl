@@ -1481,86 +1481,34 @@ def _construct_runtime(
                         break
             blocks[idx] = wrapped_block
 
-    # Build the activation SWAP pool when n_swap > 0.
+    # Build the activation SWAP slab when n_swap > 0.
     if result.cfg.n_swap > 0:
         from axolotl.integrations.protrain.types import BlockMode as _BM_swap
 
-        # Slot must hold the largest SAVED tensor (output | intra-op transient | saved weight).
-        max_act_bytes = 0
-        max_param_bytes = 0
-        max_intra_delta_bytes = 0
-        swap_block_ids: set[int] = set()
-        for bid, mode in result.block_map.items():
-            if mode is _BM_swap.SWAP:
-                swap_block_ids.add(int(bid))
-                act = trace.activation_sizes.get(bid, 0)
-                if act > max_act_bytes:
-                    max_act_bytes = int(act)
-        # Largest forward-op intra delta across SWAP blocks.
-        if swap_block_ids:
-            for op in trace.op_order:
-                if not op.is_forward:
-                    continue
-                if op.block_id is None:
-                    continue
-                if int(op.block_id) not in swap_block_ids:
-                    continue
-                delta = int(trace.intra_op_delta.get(op.op_id, 0))
-                if delta > max_intra_delta_bytes:
-                    max_intra_delta_bytes = delta
-        # Largest individual parameter tensor across SWAP blocks (covers F.linear saved weight).
-        for idx, block in enumerate(blocks):
-            if int(idx) not in swap_block_ids:
-                continue
-            inner = getattr(block, "block", block)
-            for p in inner.parameters(recurse=True):
-                pb = int(p.numel() * p.element_size())
-                if pb > max_param_bytes:
-                    max_param_bytes = pb
-        slot_bytes_required = max(
-            int(max_act_bytes),
-            int(max_intra_delta_bytes),
-            int(max_param_bytes),
+        swap_block_count = sum(
+            1 for mode in result.block_map.values() if mode is _BM_swap.SWAP
         )
-        if slot_bytes_required <= 0:
+        from axolotl.integrations.protrain.block.swap_pool import ActivationSwapPool
+        from axolotl.integrations.protrain.cost.memory import swap_pool_capacity_bytes
+
+        capacity_bytes = swap_pool_capacity_bytes(trace, swap_block_count)
+        if capacity_bytes <= 0:
             LOG.warning(
-                "ProTrain: result.cfg.n_swap=%d but no SWAP block has "
-                "non-zero activation_sizes/params; skipping swap-pool "
-                "construction",
+                "ProTrain: result.cfg.n_swap=%d but computed swap capacity is 0 "
+                "(missing arch/activation sizes); skipping swap-slab construction",
                 result.cfg.n_swap,
             )
         else:
-            from axolotl.integrations.protrain.block.swap_pool import (
-                DEFAULT_SLOTS_PER_BLOCK,
-                ActivationSwapPool,
-            )
-            from axolotl.integrations.protrain.cost.memory import (
-                SWAP_PREFETCH_DEPTH,
-            )
-
-            slots_per_block = DEFAULT_SLOTS_PER_BLOCK
-            # Floor at 1 byte for the pool's positive-size invariant.
-            per_slot = max(1, slot_bytes_required)
-            swap_pool = ActivationSwapPool(
-                n_swap=result.cfg.n_swap,
-                slot_bytes=per_slot,
-                prefetch_depth=SWAP_PREFETCH_DEPTH,
-                slots_per_block=slots_per_block,
-            )
+            swap_pool = ActivationSwapPool(capacity_bytes=capacity_bytes)
             scheduler.swap_pool = swap_pool
             for block in blocks:
                 if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
                     block.attach_runtime(swap_pool, scheduler.swap_stream)
             LOG.info(
-                "ProTrain: SWAP pool wired — %d slots x %d bytes = %.2f MB "
-                "pinned (slot sized from max(act=%.2f MB, intra_op=%.2f MB, "
-                "param=%.2f MB))",
-                swap_pool.n_slot,
-                swap_pool.slot_bytes,
-                swap_pool.total_bytes / (1 << 20),
-                max_act_bytes / (1 << 20),
-                max_intra_delta_bytes / (1 << 20),
-                max_param_bytes / (1 << 20),
+                "ProTrain: SWAP slab wired — %.2f GiB pinned for %d SWAP blocks "
+                "(variable-size, per-tensor)",
+                capacity_bytes / (1 << 30),
+                swap_block_count,
             )
 
     handles = install_hooks(
@@ -1751,58 +1699,18 @@ def _profiler_trace_controls_for_model(
 
 def _swap_pool_required_bytes(
     *,
-    blocks: list[nn.Module],
     result: SearchResult,
     trace,
-) -> tuple[int, int, int, int, int, int]:
-    """Return ``(total, n_slot, slot, max_act, max_intra, max_param)``."""
+) -> tuple[int, int]:
+    """Return ``(slab_capacity_bytes, n_swap_blocks)`` for the activation-swap pool."""
     if int(result.cfg.n_swap) <= 0:
-        return (0, 0, 0, 0, 0, 0)
+        return (0, 0)
 
     from axolotl.integrations.protrain.block.strategy import BlockMode
-    from axolotl.integrations.protrain.block.swap_pool import DEFAULT_SLOTS_PER_BLOCK
-    from axolotl.integrations.protrain.cost.memory import SWAP_PREFETCH_DEPTH
+    from axolotl.integrations.protrain.cost.memory import swap_pool_capacity_bytes
 
-    max_act_bytes = 0
-    max_intra_delta_bytes = 0
-    max_param_bytes = 0
-    swap_block_ids: set[int] = set()
-    for bid, mode in result.block_map.items():
-        if mode is BlockMode.SWAP:
-            swap_block_ids.add(int(bid))
-            max_act_bytes = max(max_act_bytes, int(trace.activation_sizes.get(bid, 0)))
-
-    if swap_block_ids:
-        for op in trace.op_order:
-            if (
-                op.is_forward
-                and op.block_id is not None
-                and int(op.block_id) in swap_block_ids
-            ):
-                max_intra_delta_bytes = max(
-                    max_intra_delta_bytes,
-                    int(trace.intra_op_delta.get(op.op_id, 0)),
-                )
-
-    for idx, block in enumerate(blocks):
-        if idx not in swap_block_ids:
-            continue
-        inner = getattr(block, "block", block)
-        for param in inner.parameters(recurse=True):
-            max_param_bytes = max(
-                max_param_bytes, int(param.numel() * param.element_size())
-            )
-
-    slot_bytes = max(1, max_act_bytes, max_intra_delta_bytes, max_param_bytes)
-    n_slot = int(result.cfg.n_swap) * DEFAULT_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH
-    return (
-        int(n_slot * slot_bytes),
-        int(n_slot),
-        int(slot_bytes),
-        int(max_act_bytes),
-        int(max_intra_delta_bytes),
-        int(max_param_bytes),
-    )
+    n_swap_blocks = sum(1 for m in result.block_map.values() if m is BlockMode.SWAP)
+    return (int(swap_pool_capacity_bytes(trace, n_swap_blocks)), int(n_swap_blocks))
 
 
 def _downgrade_oversized_swap_to_checkpoint(
@@ -1820,9 +1728,7 @@ def _downgrade_oversized_swap_to_checkpoint(
     ):
         return result
 
-    total, n_slot, slot_bytes, max_act, max_intra, max_param = (
-        _swap_pool_required_bytes(blocks=blocks, result=result, trace=trace)
-    )
+    total, n_swap_blocks = _swap_pool_required_bytes(result=result, trace=trace)
     if total <= int(cpu_capacity_bytes):
         return result
 
@@ -1845,16 +1751,12 @@ def _downgrade_oversized_swap_to_checkpoint(
         n_offload=result.cfg.n_offload,
     )
     LOG.warning(
-        "ProTrain: SWAP pool would require %.2f GiB pinned CPU "
-        "(%d slots x %.2f MiB; max act=%.2f MiB, intra=%.2f MiB, "
-        "param=%.2f MiB), exceeding the %.2f GiB CPU budget. "
-        "Downgrading %d SWAP blocks to CKPT before runtime construction.",
+        "ProTrain: SWAP slab would require %.2f GiB pinned CPU "
+        "(%d SWAP blocks, per-tensor variable-size), exceeding the %.2f GiB "
+        "CPU budget. Downgrading %d SWAP blocks to CKPT before runtime "
+        "construction.",
         total / (1 << 30),
-        n_slot,
-        slot_bytes / (1 << 20),
-        max_act / (1 << 20),
-        max_intra / (1 << 20),
-        max_param / (1 << 20),
+        n_swap_blocks,
         int(cpu_capacity_bytes) / (1 << 30),
         int(result.cfg.n_swap),
     )
