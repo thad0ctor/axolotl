@@ -158,7 +158,7 @@ def grid_rows(value: Any) -> list[tuple[int, int, int]]:
         return []
     if hasattr(value, "tolist"):
         value = value.tolist()
-    return [tuple(int(part) for part in row) for row in value]
+    return [(int(row[0]), int(row[1]), int(row[2])) for row in value]
 
 
 def row_shape(

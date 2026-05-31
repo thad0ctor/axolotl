@@ -87,13 +87,13 @@ def resize_image_for_processor(
             color=pad_color,
         )
 
-    if isinstance(image_size, list):
-        image_size = tuple(image_size)
-    if isinstance(image_size, tuple):
+    if isinstance(image_size, (list, tuple)):
         return image.resize(
             (int(image_size[0]), int(image_size[1])),
             resize_algorithm,
         )
+    # image_size is None only when buckets are set, which returned above.
+    assert image_size is not None
     size = int(image_size)
     return _pad_to_canvas(
         image,

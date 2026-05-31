@@ -276,7 +276,7 @@ def run_training(args) -> dict[str, Any]:
         shape_counts[batch_shapes(batch)] += 1
         label_tokens = shifted_label_token_count(batch["labels"])
         visual_rows = (
-            int(batch.get("pixel_values").shape[0]) if "pixel_values" in batch else 0
+            int(batch["pixel_values"].shape[0]) if "pixel_values" in batch else 0
         )
         inputs = move_batch_to_device(batch, device)
 

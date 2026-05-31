@@ -613,7 +613,7 @@ def encode_packed_streaming_multimodal(
             safe_mode=False,
         )
 
-    packed = defaultdict(list)
+    packed: defaultdict[str, list[Any]] = defaultdict(list)
     for bin_indices in bins:
         bin_rows = [rows[idx] for idx in bin_indices]
         packed["_mm_text"].append(

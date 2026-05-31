@@ -624,7 +624,7 @@ def run_variant(
                 f"s_it={step_elapsed:.4f} docs={docs_per_timed_step[-1]} "
                 f"{loss_part}"
                 f"input_shape={tuple(batch['input_ids'].shape)} "
-                f"visual_rows={batch.get('pixel_values').shape[0] if 'pixel_values' in batch else 0}",
+                f"visual_rows={batch['pixel_values'].shape[0] if 'pixel_values' in batch else 0}",
                 flush=True,
             )
 

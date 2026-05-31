@@ -276,7 +276,7 @@ def encode_multimodal_pretrain(
                     oversized[0][1],
                 )
 
-    out = {
+    out: dict[str, list[Any]] = {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": attention_mask,

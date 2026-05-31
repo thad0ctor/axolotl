@@ -273,7 +273,7 @@ def to_grid_rows(grid: Any) -> list[tuple[int, int, int]]:
         return []
     if hasattr(grid, "tolist"):
         grid = grid.tolist()
-    return [tuple(int(value) for value in row) for row in grid]
+    return [(int(row[0]), int(row[1]), int(row[2])) for row in grid]
 
 
 def process_real_batch(

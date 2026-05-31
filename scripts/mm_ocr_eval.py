@@ -219,6 +219,10 @@ def evaluate(args) -> dict[str, Any]:
     spec = build_image_token_spec(processor)
     rows = load_rows(data_file, limit=args.limit, offset=args.offset)
     tiling_config = image_tiling_config_from_cfg(cfg)
+    sequence_len = args.sequence_len or cfg.get("sequence_len")
+    if sequence_len is None:
+        raise SystemExit("sequence_len must be set via --sequence-len or the config.")
+    sequence_len = int(sequence_len)
 
     encoded = encode_multimodal_pretrain(
         {
@@ -227,7 +231,7 @@ def evaluate(args) -> dict[str, Any]:
         },
         tokenizer=processor.tokenizer,
         processor=processor,
-        max_tokens=args.sequence_len or cfg.get("sequence_len"),
+        max_tokens=sequence_len,
         image_token=spec.image_token,
         image_token_id=spec.image_token_id,
         text_column=text_column,
@@ -244,8 +248,8 @@ def evaluate(args) -> dict[str, Any]:
         processor=processor,
         image_token_spec=spec,
         image_base_dir=image_base_dir,
-        max_length=args.sequence_len or cfg.get("sequence_len"),
-        pad_to_multiple_of=args.sequence_len or cfg.get("sequence_len"),
+        max_length=sequence_len,
+        pad_to_multiple_of=sequence_len,
         image_size=cfg.get("image_size"),
         image_resize_algorithm=resize_algorithm(cfg.get("image_resize_algorithm")),
         image_resize_buckets=cfg.get("image_resize_buckets"),
