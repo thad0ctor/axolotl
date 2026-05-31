@@ -29,6 +29,40 @@ if TYPE_CHECKING:
 LOG = get_logger(__name__)
 
 
+def _patch_deepspeed_cpu_info_probe() -> None:
+    """Neutralize py-cpuinfo's subprocess CPU probe inside ``DeepSpeedCPUAdam``.
+
+    ``DeepSpeedCPUAdam.__init__`` calls ``cpuinfo.get_cpu_info()`` only to read
+    ``vendor_id_raw`` for an AMD-FP16 warning. py-cpuinfo forks a probe
+    subprocess that deadlocks once the parent holds a live CUDA context plus
+    worker threads (``communicate()`` blocks in ``select`` forever), hanging
+    optimizer construction. Swap the module's bound reference for a
+    subprocess-free ``/proc/cpuinfo`` vendor lookup; DeepSpeed guards missing
+    keys with ``in`` checks, so the sparse dict is safe. Idempotent.
+    """
+    try:
+        from deepspeed.ops.adam import cpu_adam as _ds_cpu_adam
+    except Exception:  # noqa: BLE001 — DeepSpeed optional / import-time issues
+        return
+    if getattr(_ds_cpu_adam, "_protrain_cpuinfo_patched", False):
+        return
+
+    def _safe_cpu_info() -> dict:
+        vendor = ""
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("vendor_id"):
+                        vendor = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+        return {"vendor_id_raw": vendor}
+
+    _ds_cpu_adam.get_cpu_info = _safe_cpu_info
+    _ds_cpu_adam._protrain_cpuinfo_patched = True
+
+
 class _DestroyedDsAdam:
     """Replaces a destroyed DeepSpeedCPUAdam C-state binding to neutralise __del__."""
 
@@ -70,6 +104,8 @@ class CpuFusedAdamAdapter:
                 "CpuFusedAdamAdapter requires DeepSpeed's CPU Adam kernel — "
                 "install via `pip install axolotl[deepspeed]`."
             ) from err
+
+        _patch_deepspeed_cpu_info_probe()
 
         self._params_per_chunk = dict(params_per_chunk)
         self.lr = float(lr)

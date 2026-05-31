@@ -1421,11 +1421,16 @@ def _construct_runtime(
     for cid, chunk_params in cpu_params_per_chunk.items():
         shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
         if shard_state is not None and shard_state.regions:
-            cpu_params_per_chunk_for_optim[cid] = [
-                r.shard_param for r in shard_state.regions
-            ]
+            candidate = [r.shard_param for r in shard_state.regions]
         else:
-            cpu_params_per_chunk_for_optim[cid] = chunk_params
+            candidate = chunk_params
+        # Only trainable params are ever stepped; a frozen offloaded chunk
+        # (QLoRA's 4-bit base) needs no CPU optimizer. Skipping it also avoids
+        # constructing DeepSpeedCPUAdam — whose py-cpuinfo CPU probe can deadlock
+        # in a forked subprocess — for chunks that would never call .step().
+        trainable = [p for p in candidate if getattr(p, "requires_grad", False)]
+        if trainable:
+            cpu_params_per_chunk_for_optim[cid] = trainable
 
     cpu_optim: CpuFusedAdamAdapter | None = None
     if any(params for params in cpu_params_per_chunk_for_optim.values()):
