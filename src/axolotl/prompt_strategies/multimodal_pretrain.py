@@ -10,12 +10,9 @@ from transformers.image_utils import load_image
 
 from axolotl.prompt_tokenizers import DatasetWrappingStrategy
 from axolotl.utils.data.mm_image import resize_image_for_processor
-from axolotl.utils.data.mm_tiling import (
-    ImageTileCache,
-    ImageTilingConfig,
-    image_tiling_config_from_cfg,
-    prepare_tiled_text_and_images,
-    tile_image_source_for_processor,
+from axolotl.utils.data.mm_image_transform import (
+    MMImageTransform,
+    resolve_mm_image_transform,
 )
 from axolotl.utils.logging import get_logger
 
@@ -38,7 +35,7 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
         image_resize_buckets: list[tuple[int, int]] | None = None,
         image_resize_no_upscale: bool = False,
         image_resize_pad_color: Any | None = None,
-        image_tiling_config: ImageTilingConfig | None = None,
+        image_transform: MMImageTransform | None = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -52,7 +49,7 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
         self.image_resize_buckets = image_resize_buckets
         self.image_resize_no_upscale = image_resize_no_upscale
         self.image_resize_pad_color = image_resize_pad_color
-        self.image_tiling_config = image_tiling_config
+        self.image_transform = image_transform
         self.image_token_spec = build_image_token_spec(processor, override=image_token)
 
     def _encode_batch(self, examples: dict[str, list]) -> dict[str, list]:
@@ -72,7 +69,7 @@ class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
             image_resize_buckets=self.image_resize_buckets,
             image_resize_no_upscale=self.image_resize_no_upscale,
             image_resize_pad_color=self.image_resize_pad_color,
-            image_tiling_config=self.image_tiling_config,
+            image_transform=self.image_transform,
         )
 
     def wrap_dataset(
@@ -145,7 +142,7 @@ def load(
         image_resize_buckets=cfg.image_resize_buckets,
         image_resize_no_upscale=bool(cfg.image_resize_no_upscale),
         image_resize_pad_color=cfg.image_resize_pad_color,
-        image_tiling_config=image_tiling_config_from_cfg(cfg),
+        image_transform=resolve_mm_image_transform(cfg),
     )
 
 
@@ -167,7 +164,7 @@ def encode_multimodal_pretrain(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
-    image_tiling_config: ImageTilingConfig | None = None,
+    image_transform: MMImageTransform | None = None,
 ) -> dict[str, list]:
     texts: list[str] = examples[text_column]
     imgs_list: list[list[str]] = examples[image_column]
@@ -251,7 +248,7 @@ def encode_multimodal_pretrain(
             image_resize_buckets=image_resize_buckets,
             image_resize_no_upscale=image_resize_no_upscale,
             image_resize_pad_color=image_resize_pad_color,
-            image_tiling_config=image_tiling_config,
+            image_transform=image_transform,
             image_token=image_token,
         )
         if enforce_max_length:
@@ -354,26 +351,24 @@ def _load_images_for_lengths(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
-    image_tiling_config: ImageTilingConfig | None = None,
+    image_transform: MMImageTransform | None = None,
 ) -> list[list[Any]]:
     loaded: list[list[Any]] = []
     tile_cache = (
-        ImageTileCache(image_tiling_config.cache_path) if image_tiling_config else None
+        image_transform.new_cache() if image_transform else None
     )
     for row_idx, sources in enumerate(imgs_list):
-        if image_tiling_config is not None:
+        if image_transform is not None:
             row = []
             try:
                 for raw in sources or []:
-                    row.extend(
-                        tile_image_source_for_processor(
-                            raw,
-                            image_tiling_config,
-                            image_base_dir=image_base_dir,
-                            resize_algorithm=image_resize_algorithm,
-                            cache=tile_cache,
-                        )
+                    tiles, _labels = image_transform.per_source(
+                        raw,
+                        image_base_dir=image_base_dir,
+                        resize_algorithm=image_resize_algorithm,
+                        cache=tile_cache,
                     )
+                    row.extend(tiles)
             except Exception as exc:
                 raise RuntimeError(
                     f"Row {row_idx}: failed to tile image(s) while estimating "
@@ -443,7 +438,7 @@ def compute_multimodal_processor_lengths(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
-    image_tiling_config: ImageTilingConfig | None = None,
+    image_transform: MMImageTransform | None = None,
     image_token: str | None = None,
 ) -> list[int]:
     if len(texts) != len(imgs_list):
@@ -453,18 +448,17 @@ def compute_multimodal_processor_lengths(
         )
 
     tile_cache = (
-        ImageTileCache(image_tiling_config.cache_path) if image_tiling_config else None
+        image_transform.new_cache() if image_transform else None
     )
-    if image_tiling_config is not None:
+    if image_transform is not None:
         tiling_image_token = (
             image_token or build_image_token_spec(processor).image_token
         )
         prepared = [
-            prepare_tiled_text_and_images(
+            image_transform.prepare(
                 text,
                 list(images or []),
                 image_token=tiling_image_token,
-                tiling_config=image_tiling_config,
                 image_base_dir=image_base_dir,
                 resize_algorithm=image_resize_algorithm,
                 cache=tile_cache,
@@ -486,18 +480,18 @@ def compute_multimodal_processor_lengths(
     loaded_images = _load_images_for_lengths(
         imgs_list,
         image_base_dir,
-        image_size=None if image_tiling_config is not None else image_size,
+        image_size=None if image_transform is not None else image_size,
         image_resize_algorithm=image_resize_algorithm,
         image_resize_buckets=(
-            None if image_tiling_config is not None else image_resize_buckets
+            None if image_transform is not None else image_resize_buckets
         ),
         image_resize_no_upscale=(
-            False if image_tiling_config is not None else image_resize_no_upscale
+            False if image_transform is not None else image_resize_no_upscale
         ),
         image_resize_pad_color=(
-            None if image_tiling_config is not None else image_resize_pad_color
+            None if image_transform is not None else image_resize_pad_color
         ),
-        image_tiling_config=None,
+        image_transform=None,
     )
     try:
         batch = processor(

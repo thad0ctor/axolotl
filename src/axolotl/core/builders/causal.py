@@ -45,7 +45,7 @@ from axolotl.utils.collators import (
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
-from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
+from axolotl.utils.data.mm_image_transform import resolve_mm_image_transform
 from axolotl.utils.import_helper import get_cls_from_module_str
 from axolotl.utils.logging import get_logger
 
@@ -564,7 +564,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             "image_resize_buckets": self.cfg.get("image_resize_buckets"),
             "image_resize_no_upscale": bool(self.cfg.get("image_resize_no_upscale")),
             "image_resize_pad_color": self.cfg.get("image_resize_pad_color"),
-            "image_tiling_config": image_tiling_config_from_cfg(self.cfg),
+            "image_transform": resolve_mm_image_transform(self.cfg),
         }
         if pad_to_multiple_of is not None:
             if self.cfg.pad_to_sequence_len:
@@ -697,7 +697,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 image_resize_buckets=training_args.image_resize_buckets,
                 image_resize_no_upscale=bool(training_args.image_resize_no_upscale),
                 image_resize_pad_color=training_args.image_resize_pad_color,
-                image_tiling_config=image_tiling_config_from_cfg(training_args),
+                image_transform=resolve_mm_image_transform(training_args),
                 train_on_inputs=bool(self.cfg.train_on_inputs),
                 roles_to_train=roles_to_train,
                 train_on_eos=train_on_eos,

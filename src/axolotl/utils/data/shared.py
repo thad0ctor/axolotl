@@ -536,20 +536,13 @@ def _mm_processing_fingerprint(cfg) -> str:
     the old policy. Returns "" when nothing image-related is set, to avoid churning
     hashes for text-only / non-tiling users.
     """
-    from axolotl.utils.data.mm_tiling import (  # local import avoids any import cycle
-        _tiling_policy_payload,
-        image_tiling_config_from_cfg,
-    )
+    from axolotl.utils.data.mm_image_transform import resolve_mm_image_transform
 
     parts: list[str] = []
-    tiling_config = image_tiling_config_from_cfg(cfg)
-    if tiling_config is not None:
-        parts.append(
-            "tiling="
-            + json.dumps(
-                _tiling_policy_payload(tiling_config), sort_keys=True, default=str
-            )
-        )
+    transform = resolve_mm_image_transform(cfg)
+    payload = transform.policy_payload() if transform is not None else None
+    if payload is not None:
+        parts.append("tiling=" + json.dumps(payload, sort_keys=True, default=str))
     resize = {
         key: cfg.get(key)
         for key in (

@@ -21,7 +21,7 @@ from axolotl.prompt_strategies.multimodal_pretrain import (
 )
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.mm_packing import MultimodalPackingMetadata
-from axolotl.utils.data.mm_tiling import ImageTilingConfig
+from axolotl.utils.data.mm_tiling import ImageTilingConfig, TilingImageTransform
 from axolotl.utils.data.streaming import (
     _multimodal_metadata_ram_budget_mb,
     encode_packed_streaming_multimodal,
@@ -629,8 +629,8 @@ def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkey
     assert captured["kwargs"]["image_resize_buckets"] == [(1024, 1536), (1536, 1536)]
     assert captured["kwargs"]["image_resize_no_upscale"] is True
     assert captured["kwargs"]["image_resize_pad_color"] == "white"
-    assert captured["kwargs"]["image_tiling_config"].tile_size == 1024
-    assert captured["kwargs"]["image_tiling_config"].shape_buckets
+    assert captured["kwargs"]["image_transform"].policy_payload()["tile_size"] == 1024
+    assert captured["kwargs"]["image_transform"].policy_payload()["shape_buckets"]
     assert cfg.micro_batch_size == 1
 
 
@@ -708,8 +708,8 @@ def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
     assert collator.image_resize_buckets == [(1024, 1536), (1536, 1536)]
     assert collator.image_resize_no_upscale is True
     assert collator.image_resize_pad_color == "white"
-    assert collator.image_tiling_config is not None
-    assert collator.image_tiling_config.tile_size == 512
+    assert collator.image_transform is not None
+    assert collator.image_transform.policy_payload()["tile_size"] == 512
 
 
 def test_mm_cpt_packed_collator_pads_to_full_pack_capacity():
@@ -813,10 +813,12 @@ def test_collator_tiling_expands_cpt_placeholders_and_images(
         tokenizer=smolvlm_processor.tokenizer,
         processor=smolvlm_processor,
         image_token_spec=spec,
-        image_tiling_config=ImageTilingConfig(
-            tile_size=16,
-            grid=(2, 1),
-            overview_size=16,
+        image_transform=TilingImageTransform(
+            ImageTilingConfig(
+                tile_size=16,
+                grid=(2, 1),
+                overview_size=16,
+            )
         ),
     )
 
@@ -906,7 +908,7 @@ def test_packed_collator_tiled_lengths_match_processor(
         image_token=spec.image_token,
         image_token_id=spec.image_token_id,
         add_processor_lengths=True,
-        image_tiling_config=tiling_config,
+        image_transform=TilingImageTransform(tiling_config),
     )
     rows = [
         {
@@ -927,7 +929,7 @@ def test_packed_collator_tiled_lengths_match_processor(
         processor=smolvlm_processor,
         image_token_spec=spec,
         sample_packing=True,
-        image_tiling_config=tiling_config,
+        image_transform=TilingImageTransform(tiling_config),
     )
 
     batch = collator.torch_call([rows])

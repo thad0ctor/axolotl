@@ -194,7 +194,10 @@ class TestTilingReviewFixes:
 
     def test_metadata_cache_key_tracks_tiling_policy(self):
         from axolotl.utils.data.mm_packing import multimodal_metadata_cache_key
-        from axolotl.utils.data.mm_tiling import ImageTilingConfig
+        from axolotl.utils.data.mm_tiling import (
+            ImageTilingConfig,
+            TilingImageTransform,
+        )
 
         class _Tok:
             name_or_path = "tok"
@@ -212,11 +215,11 @@ class TestTilingReviewFixes:
             image_token_id=1,
             image_token="<image>",
         )
-        grid_a = ImageTilingConfig(tile_size=64, grid=(2, 3))
-        grid_b = ImageTilingConfig(tile_size=64, grid=(2, 4))
-        ka = multimodal_metadata_cache_key(**common, image_tiling_config=grid_a)
-        kb = multimodal_metadata_cache_key(**common, image_tiling_config=grid_b)
-        none = multimodal_metadata_cache_key(**common, image_tiling_config=None)
+        grid_a = TilingImageTransform(ImageTilingConfig(tile_size=64, grid=(2, 3)))
+        grid_b = TilingImageTransform(ImageTilingConfig(tile_size=64, grid=(2, 4)))
+        ka = multimodal_metadata_cache_key(**common, image_transform=grid_a)
+        kb = multimodal_metadata_cache_key(**common, image_transform=grid_b)
+        none = multimodal_metadata_cache_key(**common, image_transform=None)
         assert ka != kb and ka != none
 
     def test_manifest_rejects_key_mismatch(self, tmp_path):

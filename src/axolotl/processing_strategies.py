@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from PIL import Image
 from PIL.Image import Resampling
@@ -14,11 +14,7 @@ from transformers.models.smolvlm import SmolVLMProcessor
 from transformers.models.voxtral import VoxtralProcessor
 
 from axolotl.utils.data.mm_image import resize_image_for_processor
-from axolotl.utils.data.mm_tiling import (
-    ImageTileCache,
-    ImageTilingConfig,
-    tile_image_source_with_labels,
-)
+from axolotl.utils.data.mm_image_transform import MMImageTransform
 from axolotl.utils.dict import remove_none_values
 from axolotl.utils.logging import get_logger
 
@@ -79,8 +75,8 @@ class ProcessingStrategy:
         self.image_resize_buckets = None
         self.image_resize_no_upscale = False
         self.image_resize_pad_color = None
-        self.image_tiling_config: ImageTilingConfig | None = None
-        self._image_tile_cache: ImageTileCache | None = None
+        self.image_transform: MMImageTransform | None = None
+        self._image_tile_cache: Any | None = None
 
         # Defaults mirror the text-only ChatTemplateStrategy. An explicit
         # empty list is honored as "no trainable roles" (masks everything);
@@ -230,7 +226,7 @@ class ProcessingStrategy:
             return new_messages
 
         def image_content_items(image_value) -> list[dict]:
-            if self.image_tiling_config is None:
+            if self.image_transform is None:
                 image = load_image(image_value)
                 image = resize_image_for_processor(
                     image,
@@ -242,9 +238,8 @@ class ProcessingStrategy:
                 )
                 return [{"type": "image", "image": image}]
 
-            images, labels = tile_image_source_with_labels(
+            images, labels = self.image_transform.per_source(
                 image_value,
-                self.image_tiling_config,
                 resize_algorithm=self.image_resize_algorithm,
                 cache=self._image_tile_cache,
             )
@@ -317,7 +312,7 @@ class ProcessingStrategy:
             # Only pre-tile/expand inline images when tiling is on; otherwise leave
             # inline content untouched (vanilla passes it straight to the processor,
             # avoiding eager loads/resizes — and network fetches — in the collator).
-            if self.image_tiling_config is not None:
+            if self.image_transform is not None:
                 expand_message_images(processed_example["messages"])
 
             possible_image_keys = ["images", "image"]
@@ -352,7 +347,7 @@ class ProcessingStrategy:
                 # each) but never inject un-anchored extra column images. Cap to the
                 # number of placeholders (or one, for the classic no-placeholder
                 # single column image) and warn when dropping extras.
-                if self.image_tiling_config is None:
+                if self.image_transform is None:
                     cap = max(len(bare_locations), 1)
                     if len(column_images) > cap:
                         LOG.warning(
@@ -1273,7 +1268,7 @@ def get_processing_strategy(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color=None,
-    image_tiling_config: ImageTilingConfig | None = None,
+    image_transform: MMImageTransform | None = None,
     train_on_inputs: bool = False,
     roles_to_train: Optional[list[str]] = None,
     train_on_eos: Optional[str] = None,
@@ -1296,9 +1291,9 @@ def get_processing_strategy(
         strategy.image_resize_buckets = image_resize_buckets
         strategy.image_resize_no_upscale = bool(image_resize_no_upscale)
         strategy.image_resize_pad_color = image_resize_pad_color
-        strategy.image_tiling_config = image_tiling_config
-        if image_tiling_config is not None:
-            strategy._image_tile_cache = ImageTileCache(image_tiling_config.cache_path)
+        strategy.image_transform = image_transform
+        if image_transform is not None:
+            strategy._image_tile_cache = image_transform.new_cache()
         return strategy
 
     if chat_template_type in [None, "tokenizer_default"]:

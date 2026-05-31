@@ -17,12 +17,7 @@ from transformers.image_utils import load_image
 
 from axolotl.prompt_strategies.multimodal_pretrain import append_eos_for_processor
 from axolotl.utils.data.mm_image import resize_image_for_processor
-from axolotl.utils.data.mm_tiling import (
-    ImageTileCache,
-    ImageTilingConfig,
-    _tiling_policy_payload,
-    prepare_tiled_text_and_images,
-)
+from axolotl.utils.data.mm_image_transform import MMImageTransform
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -130,7 +125,7 @@ def multimodal_metadata_cache_key(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
-    image_tiling_config: ImageTilingConfig | None = None,
+    image_transform: MMImageTransform | None = None,
 ) -> str:
     payload = {
         "text": text,
@@ -154,9 +149,7 @@ def multimodal_metadata_cache_key(
         "image_resize_no_upscale": bool(image_resize_no_upscale),
         "image_resize_pad_color": _jsonable(image_resize_pad_color),
         "image_tiling_config": _jsonable(
-            _tiling_policy_payload(image_tiling_config)
-            if image_tiling_config is not None
-            else None
+            image_transform.policy_payload() if image_transform is not None else None
         ),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -178,7 +171,7 @@ def compute_multimodal_packing_metadata(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
-    image_tiling_config: ImageTilingConfig | None = None,
+    image_transform: MMImageTransform | None = None,
     cache: MultimodalPackingMetadataCache | None = None,
 ) -> list[MultimodalPackingMetadata]:
     if len(texts) != len(imgs_list):
@@ -202,7 +195,7 @@ def compute_multimodal_packing_metadata(
             image_resize_buckets=image_resize_buckets,
             image_resize_no_upscale=image_resize_no_upscale,
             image_resize_pad_color=image_resize_pad_color,
-            image_tiling_config=image_tiling_config,
+            image_transform=image_transform,
         )
         for text, images in zip(texts, imgs_list, strict=True)
     ]
@@ -236,7 +229,7 @@ def compute_multimodal_packing_metadata(
                 image_resize_buckets=image_resize_buckets,
                 image_resize_no_upscale=image_resize_no_upscale,
                 image_resize_pad_color=image_resize_pad_color,
-                image_tiling_config=image_tiling_config,
+                image_transform=image_transform,
             )
             for idx, value in zip(chunk, computed, strict=True):
                 output[idx] = value
@@ -329,16 +322,15 @@ def _compute_uncached_metadata(
     image_resize_buckets: list[tuple[int, int]] | None,
     image_resize_no_upscale: bool,
     image_resize_pad_color: Any | None,
-    image_tiling_config: ImageTilingConfig | None,
+    image_transform: MMImageTransform | None,
 ) -> list[MultimodalPackingMetadata]:
-    if image_tiling_config is not None:
-        tile_cache = ImageTileCache(image_tiling_config.cache_path)
+    if image_transform is not None:
+        tile_cache = image_transform.new_cache()
         prepared = [
-            prepare_tiled_text_and_images(
+            image_transform.prepare(
                 text,
                 list(images or []),
                 image_token=image_token or _processor_image_token(processor),
-                tiling_config=image_tiling_config,
                 image_base_dir=image_base_dir,
                 resize_algorithm=image_resize_algorithm,
                 cache=tile_cache,

@@ -201,7 +201,7 @@ class TestMultiModalChatDataCollatorShapeContract:
 
     def test_processing_strategy_receives_bucket_resize_policy(self, mock_processor):
         from axolotl.processing_strategies import get_processing_strategy
-        from axolotl.utils.data.mm_tiling import ImageTilingConfig
+        from axolotl.utils.data.mm_tiling import ImageTilingConfig, TilingImageTransform
 
         strategy = get_processing_strategy(
             mock_processor,
@@ -210,19 +210,21 @@ class TestMultiModalChatDataCollatorShapeContract:
             image_resize_buckets=[(1024, 1536), (1536, 1536)],
             image_resize_no_upscale=True,
             image_resize_pad_color="white",
-            image_tiling_config=ImageTilingConfig(tile_size=512, grid=(2, 3)),
+            image_transform=TilingImageTransform(
+                ImageTilingConfig(tile_size=512, grid=(2, 3))
+            ),
         )
 
         assert strategy.image_resize_buckets == [(1024, 1536), (1536, 1536)]
         assert strategy.image_resize_no_upscale is True
         assert strategy.image_resize_pad_color == "white"
-        assert strategy.image_tiling_config is not None
+        assert strategy.image_transform is not None
 
     def test_processing_strategy_tiling_expands_column_image(
         self, mock_processor, tmp_path
     ):
         from axolotl.processing_strategies import get_processing_strategy
-        from axolotl.utils.data.mm_tiling import ImageTilingConfig
+        from axolotl.utils.data.mm_tiling import ImageTilingConfig, TilingImageTransform
 
         image_path = tmp_path / "page.png"
         Image.new("RGB", (120, 180), "white").save(image_path)
@@ -230,10 +232,12 @@ class TestMultiModalChatDataCollatorShapeContract:
             mock_processor,
             chat_template=None,
             chat_template_type=None,
-            image_tiling_config=ImageTilingConfig(
-                tile_size=32,
-                grid=(2, 1),
-                overview_size=32,
+            image_transform=TilingImageTransform(
+                ImageTilingConfig(
+                    tile_size=32,
+                    grid=(2, 1),
+                    overview_size=32,
+                )
             ),
         )
 
@@ -558,4 +562,9 @@ class TestMultiModalChatDataCollatorShapeContract:
         ]
         assert get_strategy.call_args.kwargs["image_resize_no_upscale"] is True
         assert get_strategy.call_args.kwargs["image_resize_pad_color"] == "white"
-        assert get_strategy.call_args.kwargs["image_tiling_config"].tile_size == 512
+        assert (
+            get_strategy.call_args.kwargs["image_transform"].policy_payload()[
+                "tile_size"
+            ]
+            == 512
+        )

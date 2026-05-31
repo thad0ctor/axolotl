@@ -21,12 +21,7 @@ from axolotl.prompt_strategies.multimodal_pretrain import (
     prepare_text_for_packed_boundary,
 )
 from axolotl.utils.data.mm_image import resize_image_for_processor
-from axolotl.utils.data.mm_tiling import (
-    ImageTileCache,
-    ImageTilingConfig,
-    expand_image_placeholders_for_tiling,
-    tile_image_source_with_labels,
-)
+from axolotl.utils.data.mm_image_transform import MMImageTransform
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -50,10 +45,10 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
     image_resize_buckets: list[tuple[int, int]] | None = None
     image_resize_no_upscale: bool = False
     image_resize_pad_color: Any | None = None
-    image_tiling_config: ImageTilingConfig | None = None
+    image_transform: MMImageTransform | None = None
 
     _image_family_token_ids: set[int] = field(init=False, default_factory=set)
-    _image_tile_cache: ImageTileCache | None = field(init=False, default=None)
+    _image_tile_cache: Any | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         if self.return_tensors != "pt":
@@ -73,8 +68,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 "tokenize inconsistently."
             )
         self._image_family_token_ids = set(self.image_token_spec.image_family_token_ids)
-        if self.image_tiling_config is not None:
-            self._image_tile_cache = ImageTileCache(self.image_tiling_config.cache_path)
+        if self.image_transform is not None:
+            self._image_tile_cache = self.image_transform.new_cache()
 
     def _resolve_image_source(self, src: Any) -> Any:
         # Only join base_dir for relative string paths; pass everything else
@@ -136,7 +131,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
         sources: list,
         row_index: int,
     ) -> tuple[str, list[Image.Image]] | None:
-        if self.image_tiling_config is None:
+        if self.image_transform is None:
             loaded = self._load_images_for_row(sources, row_index=row_index)
             if self.skip_bad_images and len(loaded) != len(sources):
                 return None
@@ -147,9 +142,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
         labels: list[list[str] | None] = []
         for raw in sources:
             try:
-                tiles, tile_labels = tile_image_source_with_labels(
+                tiles, tile_labels = self.image_transform.per_source(
                     raw,
-                    self.image_tiling_config,
                     image_base_dir=self.image_base_dir,
                     resize_algorithm=self.image_resize_algorithm,
                     cache=self._image_tile_cache,
@@ -173,7 +167,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             labels.append(tile_labels)
             out.extend(tiles)
         return (
-            expand_image_placeholders_for_tiling(
+            self.image_transform.expand_placeholders(
                 text,
                 image_token=self.image_token_spec.image_token,
                 counts=counts,
@@ -227,7 +221,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             image_resize_buckets=self.image_resize_buckets,
             image_resize_no_upscale=self.image_resize_no_upscale,
             image_resize_pad_color=self.image_resize_pad_color,
-            image_tiling_config=self.image_tiling_config,
+            image_transform=self.image_transform,
             image_token=self.image_token_spec.image_token,
         )
 
