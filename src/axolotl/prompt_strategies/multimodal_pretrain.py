@@ -206,8 +206,11 @@ def encode_multimodal_pretrain(
                 )
         # Avoid truncation before processor re-tokenization.
         enc = tokenizer(text, add_special_tokens=True)
-        ids = list(enc["input_ids"]) + [tokenizer.eos_token_id]
-        mask = list(enc["attention_mask"]) + [1]
+        ids = list(enc["input_ids"])
+        mask = list(enc["attention_mask"])
+        if add_eos_token:
+            ids.append(tokenizer.eos_token_id)
+            mask.append(1)
         # Count by id; text.count can match <image> inside <image_soft_token>.
         n_placeholders = sum(1 for t in ids if t == image_token_id)
         if n_placeholders != len(imgs):

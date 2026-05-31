@@ -160,7 +160,7 @@ def multimodal_metadata_cache_key(
         ),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return md5(raw.encode("utf-8")).hexdigest()
+    return md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def compute_multimodal_packing_metadata(
@@ -271,6 +271,11 @@ def pack_2d_first_fit_decreasing(
 ) -> list[list[int]]:
     if len(token_lengths) != len(visual_lengths):
         raise ValueError("token_lengths and visual_lengths must have the same length")
+    if token_capacity <= 0 or visual_capacity <= 0:
+        raise ValueError(
+            "pack_2d_first_fit_decreasing requires positive capacities; got "
+            f"token_capacity={token_capacity}, visual_capacity={visual_capacity}."
+        )
     order = sorted(
         range(len(token_lengths)),
         key=lambda idx: max(
@@ -480,7 +485,8 @@ def _processor_image_token(processor: ProcessorMixin) -> str:
             continue
         try:
             token_id = tokenizer.convert_tokens_to_ids(candidate)
-        except Exception:  # noqa: BLE001
+        except (KeyError, TypeError, ValueError) as exc:
+            LOG.debug("convert_tokens_to_ids failed for %r: %s", candidate, exc)
             continue
         unk_id = getattr(tokenizer, "unk_token_id", None)
         if token_id is not None and token_id != unk_id:

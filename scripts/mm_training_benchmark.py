@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -461,7 +462,11 @@ def main() -> None:
     parser.add_argument("--tile-overview-size", type=int)
     parser.add_argument("--tile-overview-buckets", type=parse_resize_bucket, nargs="*")
     parser.add_argument("--tile-reading-order", choices=("rtl", "ltr"), default="rtl")
-    parser.add_argument("--cache-dir", type=Path, default=Path("/tmp/axolotl-mm-train-bench"))
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(tempfile.gettempdir()) / "axolotl-mm-train-bench",
+    )
     parser.add_argument("--ram-budget-mb", type=int, default=512)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")

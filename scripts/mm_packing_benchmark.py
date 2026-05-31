@@ -8,6 +8,7 @@ import json
 import math
 import os
 import shutil
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -752,7 +753,11 @@ def main() -> None:
         help="Comma-separated variant names to run. Defaults to all configured variants.",
     )
     parser.add_argument("--progress", action="store_true")
-    parser.add_argument("--cache-dir", type=Path, default=Path("/tmp/axolotl-mm-pack-bench"))
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(tempfile.gettempdir()) / "axolotl-mm-pack-bench",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--no-model", action="store_true")

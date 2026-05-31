@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -501,10 +502,11 @@ def main() -> None:
         nargs="*",
         type=Path,
         default=[
-            Path("/home/rgilbreth/Desktop/Models/Models"),
-            Path("/home/rgilbreth/Desktop/Models/Models-1"),
-            Path("/home/rgilbreth/Desktop/Models/Models-2"),
+            Path(p)
+            for p in os.environ.get("AXOLOTL_MODEL_ROOTS", "").split(os.pathsep)
+            if p
         ],
+        help="Model directories to scan (or set AXOLOTL_MODEL_ROOTS).",
     )
     parser.add_argument("--sequence-len", type=int, default=2048)
     parser.add_argument("--micro-batch-size", type=int, default=2)
