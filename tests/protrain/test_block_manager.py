@@ -247,20 +247,27 @@ def test_swap_forward_backward_correctness() -> None:
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    # Dims chosen so the saved input activation (2048 x 256 fp32 = 2 MiB) clears
-    # SIZE_THRESHOLD_BYTES and routes through pack_to_pool, while the 256x256
-    # weight (256 KiB) stays below it — a clean single-tensor swap that actually
-    # exercises acquire()/view()/release() instead of the pass-through path.
-    block = nn.Linear(256, 256).to(device)
-    ref_block = nn.Linear(256, 256).to(device)
+    # Size the saved input activation just over SIZE_THRESHOLD_BYTES so it routes
+    # through pack_to_pool, while the 256x256 weight (256 KiB at fp32) stays below
+    # it — a clean single-tensor swap that exercises acquire()/view()/release()
+    # instead of the pass-through path. Rows are derived from the threshold (with
+    # the original 2 MiB as a floor) so the test stays correct if the threshold
+    # is retuned.
+    cols = 256
+    block = nn.Linear(cols, cols).to(device)
+    ref_block = nn.Linear(cols, cols).to(device)
     ref_block.load_state_dict(block.state_dict())
 
+    elem_size = torch.empty(0, dtype=torch.float32).element_size()
+    rows = max(2048, -(-SIZE_THRESHOLD_BYTES // (cols * elem_size)))
+    activation_bytes = rows * cols * elem_size
+
     wrapped = SwappedBlock(block)
-    pool = ActivationSwapPool(capacity_bytes=4 << 20)
+    pool = ActivationSwapPool(capacity_bytes=max(4 << 20, activation_bytes * 2))
     swap_stream = torch.cuda.Stream()
     wrapped.attach_runtime(pool, swap_stream)
 
-    x_a = torch.randn(2048, 256, device=device, requires_grad=True)
+    x_a = torch.randn(rows, cols, device=device, requires_grad=True)
     x_b = x_a.detach().clone().requires_grad_(True)
     assert x_a.numel() * x_a.element_size() >= SIZE_THRESHOLD_BYTES
 
