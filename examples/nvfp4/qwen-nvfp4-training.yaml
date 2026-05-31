@@ -9,7 +9,8 @@ load_in_8bit: false
 load_in_4bit: false
 strict: false
 
-# nvfp4_training is full fine-tune only: no `adapter:` here.
+# Full fine-tune mode: no `adapter:` here, so every eligible base nn.Linear is
+# swapped for an FP4-GEMM linear. For LoRA/QLoRA variants see qwen-nvfp4-qlora.yaml.
 
 datasets:
   - path: yahma/alpaca-cleaned

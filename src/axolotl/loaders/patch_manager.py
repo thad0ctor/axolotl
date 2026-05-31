@@ -272,10 +272,13 @@ class PatchManager:
             patch_fp8_attention(model)
 
     def _apply_nvfp4_training(self, model: PreTrainedModel):
-        """Swap eligible nn.Linear for NVFP4-GEMM linears (Blackwell FP4 compute).
+        """Swap eligible linears for NVFP4-GEMM linears (Blackwell FP4 compute).
 
-        Runs in post-load (after weights + any merge, before the trainer/FSDP
-        wrap) so the swap sees real linear modules in their final tree position.
+        Runs in post-load (after weights + any merge AND after PEFT wraps the
+        model in ``ModelLoader._load_adapters``) so the swap sees real linear
+        modules in their final tree position. FFT swaps raw ``nn.Linear``;
+        adapter modes swap the FROZEN base_layer inside each ``lora.Linear``,
+        which only exists once PEFT has wrapped the model — hence post-load.
         """
         nvfp4 = self.cfg.nvfp4_training
         if not (nvfp4 and nvfp4.enabled):
@@ -283,6 +286,7 @@ class PatchManager:
 
         from axolotl.utils.nvfp4_training import (
             NVFP4Recipe,
+            convert_lora_base_to_nvfp4,
             convert_to_nvfp4_training,
         )
 
@@ -291,13 +295,29 @@ class PatchManager:
             hadamard=nvfp4.hadamard,
         )
         exclude = tuple(nvfp4.exclude_modules or ()) + self._nvfp4_block_exclusions(
-            model, nvfp4.skip_first_n_blocks, nvfp4.skip_last_n_blocks
+            model, nvfp4.skip_first_n_blocks or 0, nvfp4.skip_last_n_blocks or 0
         )
-        count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
-        if count == 0:
-            LOG.warning(
+
+        adapter = self.cfg.adapter
+        if adapter in ("lora", "qlora"):
+            # `adapter: qlora` == quantized base intent; `quantize_base` opts a
+            # plain LoRA into FP4 storage. Either => NVFP4-QLoRA (FP4 storage);
+            # otherwise LoRA + FP4 compute (HP frozen base, throughput only).
+            quantized_storage = bool(nvfp4.quantize_base) or adapter == "qlora"
+            count = convert_lora_base_to_nvfp4(
+                model, recipe, quantized_storage=quantized_storage, exclude=exclude
+            )
+            empty_msg = (
+                "nvfp4_training enabled but no eligible LoRA base layers were "
+                "swapped (is the model PEFT-wrapped?)"
+            )
+        else:
+            count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
+            empty_msg = (
                 "nvfp4_training enabled but no eligible nn.Linear layers were swapped"
             )
+        if count == 0:
+            LOG.warning(empty_msg)
 
     @staticmethod
     def _nvfp4_block_exclusions(

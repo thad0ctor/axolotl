@@ -29,6 +29,18 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Random Hadamard transform on wgrad inputs (NVFP4Recipe)."
         },
     )
+    quantize_base: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Adapter modes only. When false (LoRA + FP4 compute): the "
+            "frozen base weight stays high-precision and only the GEMM operands are "
+            "FP4 — a throughput win, no memory saving. When true (NVFP4-QLoRA): the "
+            "frozen base weight is stored packed in FP4 (~3.5x weight memory saving), "
+            "replacing bnb NF4 storage. This is the FP4 equivalent of QLoRA, so it "
+            "conflicts with load_in_4bit/load_in_8bit (drop those). `adapter: qlora` "
+            "implies this (qlora == quantized base intent)."
+        },
+    )
     exclude_modules: list[str] = Field(
         default_factory=lambda: ["lm_head", "embed_tokens"],
         json_schema_extra={
@@ -38,12 +50,18 @@ class NVFP4TrainingConfig(BaseModel):
     skip_first_n_blocks: int = Field(
         default=0,
         json_schema_extra={
-            "description": "Keep the first N transformer blocks in high precision."
+            "description": "Keep the first N transformer blocks in high precision. "
+            "The NVFP4 paper keeps ~15% of linear layers in bf16 (embeddings/lm_head "
+            "plus the first ~2 and last ~8 blocks of a 12B model, weighted to the "
+            "tail) for convergence; for a model with L blocks a reasonable default is "
+            "skip_first_n_blocks=1 and skip_last_n_blocks~=round(0.13*L)."
         },
     )
     skip_last_n_blocks: int = Field(
         default=0,
         json_schema_extra={
-            "description": "Keep the last N transformer blocks in high precision."
+            "description": "Keep the last N transformer blocks in high precision. "
+            "See skip_first_n_blocks for the ~15% high-precision policy from the "
+            "NVFP4 training paper (the tail blocks matter most)."
         },
     )

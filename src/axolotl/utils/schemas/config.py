@@ -1586,12 +1586,28 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
         if not (self.nvfp4_training and self.nvfp4_training.enabled):
             return self
 
-        if self.adapter:
+        if self.adapter and self.adapter not in ("lora", "qlora"):
             raise ValueError(
-                "nvfp4_training is full-fine-tune only (it swaps base nn.Linear "
-                "for FP4-GEMM linears); it cannot extend a LoRA/QLoRA adapter. "
-                "Remove `adapter`."
+                f"nvfp4_training supports full fine-tune or adapter in (lora, qlora), "
+                f"got adapter={self.adapter!r}."
             )
+
+        # `adapter: qlora` implies a quantized base; the FP4-storage path REPLACES
+        # bnb NF4, so the two quant schemes on the same base layer conflict.
+        wants_fp4_storage = bool(self.adapter) and (
+            self.nvfp4_training.quantize_base or self.adapter == "qlora"
+        )
+        if wants_fp4_storage and (self.load_in_4bit or self.load_in_8bit):
+            raise ValueError(
+                "nvfp4_training FP4-storage QLoRA (adapter: qlora or "
+                "nvfp4_training.quantize_base: true) replaces bnb quantized storage; "
+                "it conflicts with load_in_4bit/load_in_8bit on the same base. "
+                "For NVFP4-QLoRA use `adapter: lora` + "
+                "`nvfp4_training.quantize_base: true` and drop "
+                "load_in_4bit/load_in_8bit (note `adapter: qlora` forces "
+                "load_in_4bit, so it cannot pair with FP4 storage)."
+            )
+
         if self.deepspeed:
             raise ValueError(
                 "nvfp4_training is not compatible with DeepSpeed (no ZeRO path for "
