@@ -198,6 +198,12 @@ _LINEAR_MEM_ATTN_BACKENDS: frozenset[str] = frozenset(
 )
 
 
+# Gated-MLP (SwiGLU) saved-for-backward intermediates per block: gate_proj
+# output, up_proj output, and the silu(gate)*up product — three seq*ffn_width
+# tensors. See attn_activation_bytes for the empirical justification.
+_GATED_MLP_SAVED_INTERMEDIATES: int = 3
+
+
 def attn_activation_bytes(
     trace: ProfilerTrace,
     bytes_per_element: float = 2.0,
@@ -266,7 +272,19 @@ def attn_activation_bytes(
         ffn_width = experts_per_tok * moe_intermediate
     else:
         ffn_width = intermediate
-    ffn_bytes = bs * seq * ffn_width * bytes_per_element if ffn_width > 0 else 0
+    # Gated MLP (SwiGLU — Llama/Qwen/Mistral/...) retains THREE seq*ffn_width
+    # intermediates for backward: gate_proj output, up_proj output, and the
+    # silu(gate)*up product. Counting a single intermediate under-counts the
+    # per-block recompute working set ~2x at long seq — measured on Qwen3-14B,
+    # the gate tracked actual max_active to +-0.1 GiB at <=8k but drifted -1.3
+    # GiB at 16k (and worse at 32k) until this was corrected; recompute is O(seq)
+    # (FA2, no score matrix), so the fix is this linear factor, not an O(seq^2)
+    # term. Non-gated MLPs save fewer, so this stays conservative (never under).
+    ffn_bytes = (
+        bs * seq * ffn_width * _GATED_MLP_SAVED_INTERMEDIATES * bytes_per_element
+        if ffn_width > 0
+        else 0
+    )
 
     return int(qkv_bytes + out_bytes + attn_core_bytes + ffn_bytes)
 
