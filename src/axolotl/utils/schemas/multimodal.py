@@ -258,6 +258,12 @@ class MultiModalConfig(BaseModel):
             "description": "Prefix each tile with a textual position token (<rowX_colY>, plus <global_img> for the overview) so the model knows tile layout. Recommended for OCR."
         },
     )
+    image_tiling_native_resolution: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Pass each tile at its native crop resolution (ignore image_tiling_tile_size) so the reconstructed page ~ the original — detail-preserving but higher token cost and variable tile shapes. Capped by the processor's max-pixels."
+        },
+    )
 
     @field_validator("image_resize_algorithm", mode="before")
     @classmethod

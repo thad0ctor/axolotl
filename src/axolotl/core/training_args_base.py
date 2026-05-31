@@ -366,6 +366,10 @@ class AxolotlTrainingMixins:
         default=None,
         metadata={"help": "Inject <rowX_colY>/<global_img> position tokens per tile"},
     )
+    image_tiling_native_resolution: bool | None = field(
+        default=None,
+        metadata={"help": "Pass tiles at native crop resolution (~original page res)"},
+    )
 
     # end of multi-modal section
 

@@ -43,6 +43,7 @@ class ImageTilingConfig:
     cache_hash_images: bool = False
     shape_buckets: tuple["ImageTilingBucketConfig", ...] | None = None
     tile_labels: bool = True
+    native_resolution: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ def build_image_tiling_config(
     cache_hash_images: bool | None = None,
     shape_buckets: Any | None = None,
     tile_labels: bool | None = None,
+    native_resolution: bool | None = None,
 ) -> ImageTilingConfig | None:
     if not enabled:
         return None
@@ -192,6 +194,7 @@ def build_image_tiling_config(
         cache_hash_images=bool(cache_hash_images),
         shape_buckets=normalized_shape_buckets,
         tile_labels=True if tile_labels is None else bool(tile_labels),
+        native_resolution=bool(native_resolution),
     )
 
 
@@ -219,6 +222,7 @@ def image_tiling_config_from_cfg(cfg: Any) -> ImageTilingConfig | None:
         cache_hash_images=get("image_tiling_cache_hash_images"),
         shape_buckets=get("image_tiling_shape_buckets"),
         tile_labels=get("image_tiling_tile_labels"),
+        native_resolution=get("image_tiling_native_resolution"),
     )
 
 
@@ -252,6 +256,8 @@ def tile_image_for_processor(
     resize_algorithm: Image.Resampling | None = None,
 ) -> list[Image.Image]:
     if image.width * image.height < config.min_area:
+        if config.native_resolution:
+            return [image]
         # Still canvas to the fixed tile size so small images don't reintroduce
         # variable visual shapes (which would defeat compile-stability).
         return [
@@ -282,6 +288,11 @@ def tile_image_for_processor(
         image.size, config.grid, config.overlap, config.reading_order
     ):
         crop = image.crop(box)
+        if config.native_resolution:
+            # Keep each tile at its native crop resolution so the reconstructed
+            # page ~ the original (detail-preserving); processor max-pixels caps it.
+            output.append(crop)
+            continue
         output.append(
             resize_image_for_processor(
                 crop,

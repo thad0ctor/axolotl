@@ -418,6 +418,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             "image_tiling_cache_hash_images",
             "image_tiling_shape_buckets",
             "image_tiling_tile_labels",
+            "image_tiling_native_resolution",
         ):
             if self.cfg.get(key) is not None:
                 training_arguments_kwargs[key] = self.cfg.get(key)

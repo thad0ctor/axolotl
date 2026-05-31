@@ -238,3 +238,30 @@ def test_bare_dict_bucket_without_name_does_not_crash():
     buckets = _normalize_shape_buckets([{"grid": [2, 3], "min_aspect_ratio": 0.9}])
     assert buckets[0].name is None
     assert buckets[0].grid == (2, 3)
+
+
+def test_native_resolution_keeps_crop_size():
+    """native_resolution: tiles are the raw crops (no resize), so the reconstructed
+    page ~ the original; fixed tile_size instead pads/resizes to a constant canvas."""
+    from PIL import Image
+
+    from axolotl.utils.data.mm_tiling import (
+        ImageTileCache,
+        build_image_tiling_config,
+    )
+
+    img = Image.new("RGB", (600, 900), "white")  # portrait -> ocr_pages 2x3
+    native = build_image_tiling_config(
+        enabled=True, shape_buckets="ocr_pages", overlap=0.0, native_resolution=True
+    )
+    fixed = build_image_tiling_config(
+        enabled=True, shape_buckets="ocr_pages", overlap=0.0, tile_size=512
+    )
+    n_tiles, _ = ImageTileCache(None).get_or_create(img, native)
+    f_tiles, _ = ImageTileCache(None).get_or_create(img, fixed)
+    assert len(n_tiles) == 6 and len(f_tiles) == 6
+    # native tiles ~ region size (600/2 x 900/3 = 300x300); fixed are 512x512
+    assert all(t.size == (300, 300) for t in n_tiles)
+    assert all(t.size == (512, 512) for t in f_tiles)
+    # reconstructed native area == original (overlap 0)
+    assert sum(w * h for w, h in (t.size for t in n_tiles)) == 600 * 900
