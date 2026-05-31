@@ -1,0 +1,270 @@
+---
+title: "NVFP4-GEMM Training"
+description: "Real FP4 forward and backward GEMMs on Blackwell tensor cores for higher training throughput."
+back-to-top-navigation: true
+toc: true
+toc-expand: 2
+toc-depth: 4
+---
+
+## Overview
+
+NVFP4-GEMM training runs the matrix multiplications inside `nn.Linear` layers in
+real 4-bit floating point (NVFP4) on Blackwell tensor cores — in the forward pass
+(fprop) and in *both* backward passes (dgrad and wgrad). This is distinct from the
+"fake-quant" [QAT/PTQ](qat.qmd) `quantization:` block: NVFP4 training does genuine
+low-precision *compute*, not simulated quantization.
+
+It is enabled by the `nvfp4_training:` config block and is **off by default**. When
+enabled, it leaves all existing training paths untouched and only swaps eligible
+linear layers.
+
+::: {.callout-important}
+This is a **throughput** feature, not a memory feature (for the full fine-tune and
+LoRA-compute modes). Master weights and optimizer state stay in bf16/fp32 — only
+the GEMM *operands* are cast to FP4. The speedup **only materializes under
+`torch.compile`**; in eager mode NVFP4 is slower than bf16.
+:::
+
+## Hardware and version requirements
+
+NVFP4 training requires 5th-generation FP4 tensor cores, which exist only on
+Blackwell:
+
+- **Datacenter**: B200 / B300 (`sm_100` / `sm_103`)
+- **Consumer / workstation**: RTX 50xx and RTX PRO 6000 (`sm_120`)
+
+Software requirements:
+
+- `torch >= 2.8`
+- `torchao >= 0.18`
+- CUDA available (the capability gate refuses to run on non-Blackwell GPUs with a
+  clear error)
+
+If any requirement is missing, Axolotl raises a validation error at config-check
+time rather than failing mid-run.
+
+## When to use it
+
+NVFP4 training is **dim-gated**: each swapped GEMM pays a fixed quantization
+prologue (×3 per layer, for the three GEMMs), and the FP4 win only outgrows that
+cost as the GEMM dimensions get large. The crossover sits between hidden size 896
+and 2048, so:
+
+- **Use it on models with hidden size ≥ ~2048 (roughly ≥ 3B parameters).**
+- **Do not use it on sub-3B models** — it is *slower* than bf16 there.
+- **Always set `torch_compile: true`.** Eager mode never wins.
+
+### Measured end-to-end throughput
+
+Compiled NVFP4 vs compiled bf16, optimizer step included (measured on RTX 5090,
+`sm_120`, torch 2.11 + torchao 0.18):
+
+| Model | Hidden size | Compiled NVFP4 vs compiled bf16 |
+|-------|------------:|--------------------------------:|
+| 0.5B  | 896  | **0.08–0.65× (SLOWER)** |
+| ~3B   | 2048 | **1.38×** |
+| 7B    | 3584 | **1.92×** |
+| 8B    | 4096 | **1.97×** (35.9k → 70.3k tok/s) |
+
+The isolated-GEMM ceiling is ~2.9–3.6×; about 2× is realized end-to-end at 7–8B.
+**Eager mode is always slower** (0.1–0.25×) — compile is mandatory.
+
+### Convergence
+
+In an A/B run (same model/data/seed/optimizer; Qwen2.5-0.5B, 120 steps), NVFP4 full
+fine-tune tracked bf16 with no NaN or divergence, with a small upward loss offset:
+
+| | bf16 | NVFP4 full (SR + RHT) | NVFP4 recipe-off |
+|---|--:|--:|--:|
+| tail-mean loss | 3.486 | 3.628 (+4.08%) | 3.613 (+3.64%) |
+
+The convergence recipe (see below) matters most at scale; on a short 0.5B
+shape-check its edge sits within noise. NVFP4 stays finite under stress learning
+rates where bf16 can overshoot.
+
+## Modes
+
+NVFP4 training has three modes, selected from the `adapter:` setting plus the
+`quantize_base` knob:
+
+| Mode | `adapter:` | `quantize_base` | What runs in FP4 | Memory savings |
+|------|-----------|-----------------|------------------|----------------|
+| 1. Full fine-tune | *(none)* | n/a | all eligible base `nn.Linear` GEMMs (trainable) | none (throughput only) |
+| 2. LoRA + FP4 compute | `lora` | `false` | frozen base GEMMs; adapters bf16 | none (throughput only) |
+| 3. NVFP4-QLoRA | `qlora` | `true` (implied) | frozen base GEMMs, base stored packed in FP4 | ~3.5× weight memory |
+
+### Mode 1 — Full fine-tune (FFT)
+
+The default path. Eligible base `nn.Linear` layers are swapped for `NVFP4Linear`:
+the weight stays a normal high-precision (bf16) trainable `nn.Parameter`, and
+quantization to FP4 happens inside each GEMM. This is **throughput only — no memory
+savings**.
+
+```yaml
+base_model: Qwen/Qwen2.5-3B
+
+bf16: true
+# REQUIRED: the speedup only materializes under torch.compile.
+torch_compile: true
+
+# Full fine-tune: do NOT set `adapter:`.
+nvfp4_training:
+  enabled: true
+  stochastic_rounding: true
+  hadamard: true
+  exclude_modules: [lm_head, embed_tokens]
+  skip_first_n_blocks: 0
+  skip_last_n_blocks: 0
+```
+
+### Mode 2 — LoRA + FP4 base compute
+
+The frozen base `nn.Linear` inside each PEFT LoRA layer runs its GEMM in FP4
+(`NVFP4Linear` over the frozen, still-high-precision base weight); the trainable
+LoRA adapters stay in bf16. This is a **throughput** play: there is no weight
+memory savings (the base weight is still stored high-precision), but base-layer
+GEMMs are faster.
+
+```yaml
+base_model: Qwen/Qwen2.5-7B
+
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+bf16: true
+torch_compile: true
+
+nvfp4_training:
+  enabled: true
+  quantize_base: false   # base weight stored high-precision; only the GEMM runs in FP4
+```
+
+### Mode 3 — NVFP4-QLoRA
+
+The frozen base weight is **stored packed in FP4** (`NVFP4FrozenBaseLinear`), with
+no high-precision master copy — giving **~3.5× weight memory savings** *and* FP4
+compute. The base is frozen (no weight gradient; only dgrad propagates into the
+trainable adapters and earlier layers), with LoRA adapters in bf16.
+
+This replaces bitsandbytes NF4 as the 4-bit QLoRA storage format. `adapter: qlora`
+implies `quantize_base: true`.
+
+```yaml
+base_model: Qwen/Qwen2.5-7B
+
+adapter: qlora
+lora_r: 16
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+bf16: true
+torch_compile: true
+
+nvfp4_training:
+  enabled: true
+  quantize_base: true    # base weight stored packed in FP4 (~3.5x weight memory savings)
+```
+
+::: {.callout-important}
+Do **not** combine `load_in_4bit: true` (bitsandbytes NF4) with NVFP4 base
+quantization — NVFP4-QLoRA *is* the 4-bit storage path; the two are mutually
+exclusive.
+:::
+
+## The convergence recipe
+
+FP4 has very few mantissa bits, so naive round-to-nearest loses too much signal in
+the gradients. Two recipe knobs (both **on by default**) bring NVFP4 close to bf16
+convergence, plus a non-optional two-level scaling:
+
+- **`stochastic_rounding`** — unbiased stochastic rounding on the gradient
+  operands. Implemented as a uniform dither over one FP4 step before
+  round-to-nearest. Averaged SR error collapses to ~0.11× of RTN's fixed bias.
+- **`hadamard`** — a fixed 16×16 random Hadamard transform (RHT) applied to the
+  wgrad inputs. The orthonormal rotation cancels across the shared contraction
+  dimension of both wgrad operands while the FP4 quantization in between sees
+  Gaussian-ized values; on outlier-heavy gradients this cuts wgrad FP4 noise ~63%.
+  16×16 is the paper's ablation sweet spot (4×4 worse, 128×128 only marginally
+  better).
+- **Two-level scaling (always on, not a knob)** — a per-tensor fp32 scale plus the
+  per-block e4m3 scale. This is *mandatory*: without the per-tensor level, small
+  gradients (~1e-5/element) underflow the per-block e4m3 scale floor (2^-9) and
+  round to exactly zero, so `grad_norm == 0` and the model never learns.
+
+The recipe's benefit grows with model size; on small/short runs it sits within
+noise. You can disable either knob for ablation:
+
+```yaml
+nvfp4_training:
+  enabled: true
+  stochastic_rounding: false   # default true
+  hadamard: false              # default true
+```
+
+## Sensitive-layer exclusion
+
+Some layers are too sensitive to run in FP4 and are kept in high precision:
+
+- **`exclude_modules`** (default `[lm_head, embed_tokens]`) — name fragments; any
+  module whose name contains a fragment is skipped. The defaults keep the output
+  head and embeddings high-precision.
+- **`skip_first_n_blocks` / `skip_last_n_blocks`** (default `0`) — keep the first
+  and/or last N transformer blocks high-precision. The NVFP4 paper keeps ~15% of
+  linear layers in bf16 (embeddings/lm_head plus the first ~2 and last ~8 blocks of
+  a 12B model, weighted to the tail) for convergence. For a model with `L` blocks a
+  reasonable starting point is `skip_first_n_blocks: 1` and
+  `skip_last_n_blocks: round(0.13 * L)`. The Axolotl default is `0` (swap everything
+  eligible).
+- **Automatic dimension exclusion** — NVFP4 requires both `in_features` and
+  `out_features` to be divisible by 16 (`torch._scaled_mm` packs 2 FP4 per byte and
+  the packed contraction dim must be a multiple of 16). Layers that violate this —
+  e.g. odd-vocab projections — are **automatically skipped** with a warning; you do
+  not need to list them in `exclude_modules`.
+
+::: {.callout-note}
+At the time of writing, `skip_first_n_blocks` / `skip_last_n_blocks` may be applied
+by the integration layer rather than inside `convert_to_nvfp4_training` directly
+(the swap helper notes that block-range exclusion can be applied by the caller via
+`exclude`). If you depend on precise block-range behavior, verify it against the
+current integration code.
+:::
+
+## Configuration reference
+
+The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
+`NVFP4TrainingConfig`). These fields are also auto-included in the generated
+[Config Reference](config-reference.qmd).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `null` (off) | Enable NVFP4-GEMM training (real FP4 forward/backward GEMMs). Blackwell-only; speedup requires `torch.compile`. |
+| `stochastic_rounding` | `bool` | `true` | Stochastic rounding on gradient operands. |
+| `hadamard` | `bool` | `true` | Random Hadamard transform on wgrad inputs. |
+| `quantize_base` | `bool` | `false` | Adapter modes only. `false` = LoRA + FP4 compute (frozen base high-precision, FP4 GEMMs, throughput only). `true` = NVFP4-QLoRA (frozen base stored packed in FP4, ~3.5× weight memory). Implied by `adapter: qlora`. Conflicts with `load_in_4bit`/`load_in_8bit`. |
+| `exclude_modules` | `list[str]` | `[lm_head, embed_tokens]` | Module name fragments kept in high precision (not swapped). |
+| `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
+| `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
+
+## Limitations
+
+- **`torch.compile` is required.** Eager mode is slower than bf16 (0.1–0.25×).
+  Always set `torch_compile: true`.
+- **Slower below ~hidden 1024.** Do not use on sub-3B models — the per-GEMM quant
+  prologue dominates and you regress versus bf16.
+- **No DeepSpeed.** There is no ZeRO path for the FP4-GEMM module swap; the config
+  validator rejects `deepspeed` when NVFP4 training is enabled. Use FSDP or
+  single-GPU instead.
+- **Multi-GPU FSDP2: single-process validated only.** Because the master weight
+  stays a plain bf16 `nn.Parameter` (only GEMM operands are quantized inside
+  forward), FSDP2 shards params as normal DTensors, and single-process
+  (`world_size=1`) forward + backward + step is finite with gradient checkpointing
+  on and off. Cross-rank collectives have **not** yet been exercised in a
+  multi-GPU loss-curve A/B — treat multi-GPU FSDP2 as unvalidated for now.
+- **Full fine-tune has the most validation coverage.** The convergence and
+  throughput numbers above were measured on the full fine-tune path; the LoRA
+  (mode 2) and NVFP4-QLoRA (mode 3) paths share the same FP4 GEMM machinery but have
+  less standalone validation — sanity-check loss curves on your model before a long
+  run.
