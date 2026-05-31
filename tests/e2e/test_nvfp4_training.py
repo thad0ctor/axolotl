@@ -108,6 +108,11 @@ class TestNVFP4Training:
         dyn.reset()
         explanation = dyn.explain(lambda z: mod(z).sum())(x)
         assert explanation.graph_break_count == 0
+        # fullgraph fwd+bwd must trace cleanly (RHT's Hadamard build must not
+        # reach a torch.Generator inside the backward graph)
+        compiled = torch.compile(lambda z: mod(z).sum(), fullgraph=True)
+        compiled(x).backward()
+        assert torch.isfinite(mod.weight.grad).all().item()
 
     def test_sr_unbiased(self):
         """Averaging stochastic-rounded quant converges to the true value; RTN

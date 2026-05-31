@@ -88,35 +88,27 @@ class QuantPolicy:
     hadamard: bool = False
 
 
-# Cache the orthonormal block-Hadamard + random sign by (device, dtype). Built
-# once with pure tensor ops so the quant boundary stays graph-break-free; the
-# sign vector is the recipe's fixed randomization (same for both wgrad operands,
-# so D H cancels in the dot product).
-_HAD_CACHE: dict = {}
-
-
-def _hadamard_block(device, dtype):
+def _build_base_dh() -> torch.Tensor:
     """Orthonormal 16x16 Hadamard (H_16/4) times a fixed random ±1 diagonal.
 
     (D H)^T (D H) = H^T D^T D H = H^T H = 16 I, so dividing by sqrt(16)=4 gives
     an orthonormal rotation: applied to the contraction dim of both wgrad
     operands it cancels, while the FP4 quant in between sees Gaussian-ized values.
     """
-    key = (device, dtype)
-    cached = _HAD_CACHE.get(key)
-    if cached is not None:
-        return cached
     h = torch.ones(1, 1, dtype=torch.float64)
     while h.shape[0] < _HAD_DIM:
-        h = torch.cat(
-            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0
-        )
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
     h = h / (_HAD_DIM**0.5)
     gen = torch.Generator().manual_seed(0)
     sign = torch.randint(0, 2, (_HAD_DIM,), generator=gen).to(torch.float64) * 2 - 1
-    dh = (sign.unsqueeze(1) * h).to(device=device, dtype=dtype)  # D @ H, orthonormal
-    _HAD_CACHE[key] = dh
-    return dh
+    return sign.unsqueeze(1) * h  # D @ H, orthonormal
+
+
+# Built once at import (the Generator call must stay out of the traced region —
+# a torch.Generator() inside the backward graph forces a dynamo break under
+# fullgraph). The hot path only casts this constant to device/dtype, which is
+# fully traceable.
+_BASE_DH = _build_base_dh()
 
 
 def _apply_rht(t: torch.Tensor) -> torch.Tensor:
@@ -126,7 +118,7 @@ def _apply_rht(t: torch.Tensor) -> torch.Tensor:
     ``_quantize`` (``gt`` directly, ``xp`` via ``b.t()``), so the same rotation
     on both cancels the product.
     """
-    dh = _hadamard_block(t.device, t.dtype)
+    dh = _BASE_DH.to(device=t.device, dtype=t.dtype)
     lead = t.shape[:-1]
     blocks = t.shape[-1] // _HAD_DIM
     return (t.reshape(*lead, blocks, _HAD_DIM) @ dh.t()).reshape(*lead, t.shape[-1])
