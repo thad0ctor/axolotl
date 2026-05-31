@@ -39,6 +39,14 @@ _BLOCK_SIZE = 16  # NVFP4 is fixed at block_size 16
 # multiple of 32. The token dimension (M) is padded to this alignment.
 _GEMM_ALIGN = 32
 
+# Paper ablation sweet spot: 16x16 random Hadamard (4x4 worse, 128x128 marginal).
+# 16 | 32 (_GEMM_ALIGN) so the block tiles the padded contraction dim cleanly.
+_HAD_DIM = 16
+# FP4 E2M1 normalized-mantissa exponent range: levels are 2^e * {1, 1.5} for
+# e in {0,1,2} (above the denormal step), so the half-step granularity at which
+# SR dithers lives in this clamp.
+_FP4_EXP_LO, _FP4_EXP_HI = 0, 2
+
 
 def nvfp4_supported() -> tuple[bool, str]:
     """Return (ok, reason). ok=False means refuse with `reason`."""
@@ -80,11 +88,88 @@ class QuantPolicy:
     hadamard: bool = False
 
 
+# Cache the orthonormal block-Hadamard + random sign by (device, dtype). Built
+# once with pure tensor ops so the quant boundary stays graph-break-free; the
+# sign vector is the recipe's fixed randomization (same for both wgrad operands,
+# so D H cancels in the dot product).
+_HAD_CACHE: dict = {}
+
+
+def _hadamard_block(device, dtype):
+    """Orthonormal 16x16 Hadamard (H_16/4) times a fixed random ±1 diagonal.
+
+    (D H)^T (D H) = H^T D^T D H = H^T H = 16 I, so dividing by sqrt(16)=4 gives
+    an orthonormal rotation: applied to the contraction dim of both wgrad
+    operands it cancels, while the FP4 quant in between sees Gaussian-ized values.
+    """
+    key = (device, dtype)
+    cached = _HAD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < _HAD_DIM:
+        h = torch.cat(
+            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0
+        )
+    h = h / (_HAD_DIM**0.5)
+    gen = torch.Generator().manual_seed(0)
+    sign = torch.randint(0, 2, (_HAD_DIM,), generator=gen).to(torch.float64) * 2 - 1
+    dh = (sign.unsqueeze(1) * h).to(device=device, dtype=dtype)  # D @ H, orthonormal
+    _HAD_CACHE[key] = dh
+    return dh
+
+
+def _apply_rht(t: torch.Tensor) -> torch.Tensor:
+    """Block-Hadamard rotation along the last (contraction) dim of ``t``.
+
+    Last dim is the contraction axis for both wgrad operands as fed to
+    ``_quantize`` (``gt`` directly, ``xp`` via ``b.t()``), so the same rotation
+    on both cancels the product.
+    """
+    dh = _hadamard_block(t.device, t.dtype)
+    lead = t.shape[:-1]
+    blocks = t.shape[-1] // _HAD_DIM
+    return (t.reshape(*lead, blocks, _HAD_DIM) @ dh.t()).reshape(*lead, t.shape[-1])
+
+
+def _sr_dither(t: torch.Tensor, per_tensor_scale: torch.Tensor) -> torch.Tensor:
+    """Uniform dither over one FP4 step so the subsequent RTN realizes SR.
+
+    Adding uniform noise of width = one quantization step before RTN is exactly
+    unbiased stochastic rounding. The step is computed in the original domain by
+    mirroring torchao's two-level scaling: rotate to the per-block-scaled value
+    ``v``, take the FP4 half-step ``2^floor(log2|v|)`` (mantissa is 1 bit, levels
+    are 2^e*{1,1.5}; clamp e to the E2M1 normal range), then de-scale.
+    """
+    from torchao.prototype.mx_formats.constants import (
+        F4_E2M1_MAX,
+        F8E4M3_MAX,
+    )
+
+    eps = torch.finfo(torch.float8_e4m3fn).tiny
+    x = t.float().reshape(t.shape[0], -1, _BLOCK_SIZE)
+    block_scale = torch.amax(torch.abs(x), dim=-1) / F4_E2M1_MAX
+    scaled_block = block_scale / per_tensor_scale
+    sbf8 = (
+        torch.clamp(scaled_block, min=eps, max=F8E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    recip = (1.0 / per_tensor_scale) / sbf8  # original -> fp4-grid multiplier
+    v = x * recip.unsqueeze(-1)
+    e = torch.floor(torch.log2(v.abs().clamp(min=eps))).clamp(_FP4_EXP_LO, _FP4_EXP_HI)
+    step_orig = (2.0**e) / recip.unsqueeze(-1)  # one FP4 step, original domain
+    u = (torch.rand_like(v) - 0.5) * step_orig
+    return (x + u).reshape(t.shape).to(t.dtype)
+
+
 def _quantize(t: torch.Tensor, policy: QuantPolicy):
     """Quantize a high-precision tensor to an NVFP4Tensor (along its last dim).
 
     Two-level scaling (per-tensor fp32 scale + per-block e4m3 scale) is always
     applied: without it small-magnitude tensors (gradients) underflow to zero.
+    ``policy.hadamard`` rotates the contraction dim (RHT, wgrad inputs);
+    ``policy.stochastic`` dithers for stochastic rounding (gradient operands).
     """
     from torchao.prototype.mx_formats.nvfp4_tensor import (
         NVFP4Tensor,
@@ -92,13 +177,11 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
     )
 
     t = t.contiguous()
-    # TODO(recipe): RHT on (hadamard) and stochastic rounding (stochastic) hook
-    # here. Base path is round-to-nearest with two-level scaling.
-    if policy.hadamard or policy.stochastic:
-        # Seam for the convergence recipe; base path is a no-op passthrough so
-        # the module is fully functional with RTN until the recipe lands.
-        pass
+    if policy.hadamard:
+        t = _apply_rht(t).contiguous()
     per_tensor_scale = per_tensor_amax_to_scale(torch.max(torch.abs(t)))
+    if policy.stochastic:
+        t = _sr_dither(t, per_tensor_scale).contiguous()
     return NVFP4Tensor.to_nvfp4(
         t, block_size=_BLOCK_SIZE, per_tensor_scale=per_tensor_scale
     )

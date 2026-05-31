@@ -98,10 +98,72 @@ class TestNVFP4Training:
 
         torch.manual_seed(0)
         linear = nn.Linear(512, 256).cuda().bfloat16()
-        mod = NVFP4Linear.from_linear(linear, NVFP4Recipe())
+        # recipe on: SR + RHT live at the quant boundary, must not break the graph
+        mod = NVFP4Linear.from_linear(
+            linear, NVFP4Recipe(stochastic_rounding=True, hadamard=True)
+        )
         x = torch.randn(
             128, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
         dyn.reset()
         explanation = dyn.explain(lambda z: mod(z).sum())(x)
         assert explanation.graph_break_count == 0
+
+    def test_sr_unbiased(self):
+        """Averaging stochastic-rounded quant converges to the true value; RTN
+        keeps a systematic bias."""
+        from axolotl.utils.nvfp4_training import QuantPolicy, _quantize
+
+        torch.manual_seed(0)
+        t = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16) * 0.01
+        true = t.float()
+        rtn = _quantize(t, QuantPolicy()).dequantize(torch.float32)
+        acc = torch.zeros_like(true)
+        n = 3000
+        for _ in range(n):
+            acc += _quantize(t, QuantPolicy(stochastic=True)).dequantize(torch.float32)
+        sr_mean = acc / n
+        rtn_bias = (rtn - true).abs().mean().item()
+        sr_bias = (sr_mean - true).abs().mean().item()
+        # SR is unbiased: its averaged error collapses far below RTN's fixed bias
+        assert sr_bias < 0.25 * rtn_bias, (rtn_bias, sr_bias)
+
+    def test_rht_cancels(self):
+        """With FP4 quant bypassed, the Hadamard rotation applied to both wgrad
+        operands cancels in the product (orthonormal H^T H = I)."""
+        from axolotl.utils.nvfp4_training import _apply_rht
+
+        torch.manual_seed(1)
+        g = torch.randn(32, 64, device="cuda", dtype=torch.float32)  # [N,M]
+        x = torch.randn(64, 48, device="cuda", dtype=torch.float32)  # [M,K]
+        ref = g @ x
+        g_r = _apply_rht(g)  # rotate along contraction M (last dim)
+        x_r = _apply_rht(x.t().contiguous()).t()  # rotate along M
+        rel = ((g_r @ x_r) - ref).norm() / ref.norm()
+        assert rel < 1e-4, rel
+
+    def test_recipe_reduces_wgrad_noise(self):
+        """RHT rotates contraction-dim outliers toward Gaussian, cutting the FP4
+        wgrad quantization noise vs no-RHT."""
+        from axolotl.utils.nvfp4_training import QuantPolicy, _fp4_mm, _pad_to_block
+
+        torch.manual_seed(7)
+        n, m, k = 128, 512, 256
+        g = torch.randn(n, m, device="cuda", dtype=torch.bfloat16) * 0.01
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.01
+        out_tok = torch.randperm(m)[:8]  # outliers concentrated on a few tokens (dim M)
+        g[:, out_tok] *= 30.0
+        x[out_tok, :] *= 30.0
+        ref = g.float() @ x.float()
+        gt, _ = _pad_to_block(g.contiguous(), 1)
+        xp, _ = _pad_to_block(x.contiguous(), 0)
+
+        def noise(hadamard):
+            p = QuantPolicy(stochastic=True, hadamard=hadamard)
+            vals = [
+                ((_fp4_mm(gt, xp, p, p).float() - ref).norm() / ref.norm()).item()
+                for _ in range(10)
+            ]
+            return sum(vals) / len(vals)
+
+        assert noise(True) < noise(False)
