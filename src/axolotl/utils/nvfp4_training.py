@@ -301,6 +301,88 @@ class NVFP4Linear(nn.Module):
         return cls(linear.weight, linear.bias, recipe)
 
 
+class NVFP4FrozenBaseFunction(torch.autograd.Function):
+    """Forward GEMM against a pre-quantized FROZEN weight; dgrad only.
+
+    For the NVFP4-QLoRA path: the base weight is stored packed in FP4 (no
+    high-precision master copy → ~3.5x weight memory savings) and is frozen, so
+    there is no weight gradient — only dgrad to propagate into the trainable
+    LoRA adapters and earlier layers.
+    """
+
+    @staticmethod
+    def forward(ctx, x, w_q, recipe):
+        import torch.nn.functional as F
+
+        orig_shape = x.shape
+        x2d = x.reshape(-1, orig_shape[-1])
+        x2d_p, m = _pad_to_block(x2d, 0)
+        out = F.linear(x2d_p, w_q)[:m]  # torchao dynamic-act FP4 GEMM, stored weight
+        ctx.w_q = w_q
+        ctx.recipe = recipe
+        ctx.x_shape = orig_shape
+        return out.reshape(*orig_shape[:-1], w_q.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        w_q = ctx.w_q
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            g = grad_out.reshape(-1, w_q.shape[0])
+            g_p, m = _pad_to_block(g, 0)
+            # dgrad = g @ W; dequant the stored weight for the contraction-along-N
+            # GEMM (the stored layout is quantized along K for the forward).
+            w_hp = w_q.dequantize(torch.bfloat16)
+            grad_x = _fp4_mm(
+                g_p, w_hp, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding),
+                QuantPolicy(),
+            )[:m]
+            grad_x = grad_x.reshape(ctx.x_shape)
+        return grad_x, None, None
+
+
+class NVFP4FrozenBaseLinear(nn.Module):
+    """Frozen base linear whose weight is stored packed in FP4 (QLoRA base).
+
+    Unlike ``NVFP4Linear`` (which keeps a high-precision trainable master weight
+    — throughput only), this drops the master copy for ~3.5x weight memory
+    savings. It is FROZEN (no weight gradient) and is meant to sit under LoRA
+    adapters. Bias, if any, stays high-precision.
+    """
+
+    def __init__(self, w_q, bias, recipe: NVFP4Recipe):
+        super().__init__()
+        self.w_q = w_q  # NVFP4Tensor, frozen (not an nn.Parameter)
+        self.bias = bias
+        self.recipe = recipe
+        self.in_features = w_q.shape[1]
+        self.out_features = w_q.shape[0]
+
+    def forward(self, x):
+        out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
+        return out if self.bias is None else out + self.bias
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear, recipe: NVFP4Recipe
+    ) -> "NVFP4FrozenBaseLinear":
+        from torchao.prototype.mx_formats.nvfp4_tensor import (
+            NVFP4Tensor,
+            QuantizeTensorToNVFP4Kwargs,
+            per_tensor_amax_to_scale,
+        )
+
+        w = linear.weight.detach()
+        pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
+        w_q = NVFP4Tensor.to_nvfp4(
+            w.contiguous(),
+            block_size=_BLOCK_SIZE,
+            per_tensor_scale=pts,
+            act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE),
+        )
+        return cls(w_q, linear.bias, recipe)
+
+
 def _is_swappable(module: nn.Linear) -> bool:
     return (
         module.in_features % _BLOCK_SIZE == 0
@@ -348,4 +430,47 @@ def convert_to_nvfp4_training(
         setattr(parent, leaf, NVFP4Linear.from_linear(module, recipe))
         swapped += 1
     LOG.info("NVFP4 training: swapped %d linear layers", swapped)
+    return swapped
+
+
+def convert_lora_base_to_nvfp4(
+    model: nn.Module,
+    recipe: NVFP4Recipe | None = None,
+    *,
+    quantized_storage: bool = False,
+    exclude: tuple[str, ...] = ("lm_head", "embed_tokens"),
+) -> int:
+    """Swap the FROZEN base_layer inside each PEFT ``lora.Linear`` for an NVFP4
+    linear, leaving the trainable adapters in high precision.
+
+    ``quantized_storage=False`` (LoRA + FP4 compute): base_layer -> NVFP4Linear,
+    keeping the high-precision (frozen) weight — throughput only, no memory win.
+    ``quantized_storage=True`` (NVFP4-QLoRA): base_layer -> NVFP4FrozenBaseLinear,
+    storing the weight packed in FP4 — ~3.5x weight memory savings.
+
+    Returns the number of base layers swapped. Requires PEFT-wrapped adapters.
+    """
+    from peft.tuners.lora import Linear as LoraLinear
+
+    recipe = recipe or NVFP4Recipe()
+    swapped = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, LoraLinear):
+            continue
+        if any(frag in name for frag in exclude):
+            continue
+        base = module.base_layer
+        if not isinstance(base, nn.Linear) or not _is_swappable(base):
+            continue
+        if quantized_storage:
+            module.base_layer = NVFP4FrozenBaseLinear.from_linear(base, recipe)
+        else:
+            base.weight.requires_grad_(False)
+            module.base_layer = NVFP4Linear.from_linear(base, recipe)
+        swapped += 1
+    LOG.info(
+        "NVFP4 training: swapped %d LoRA base layers (quantized_storage=%s)",
+        swapped,
+        quantized_storage,
+    )
     return swapped
