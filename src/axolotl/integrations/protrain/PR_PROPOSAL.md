@@ -640,6 +640,41 @@ Kernel-stack compatibility (what can and cannot be combined):
   `seq=1024` it is approximately break-even on the q/k-norm+RoPE path and
   contributes more at longer context.
 
+### 6.7 Long-context single card: seq 32768 via activation swap
+
+Where Mode A stops fitting — its all-resident + checkpoint-chain peak for
+Qwen3-14B QLoRA is ~24.6 GiB at `seq=32768`, over a 24 GiB card — partial
+activation swap brings it back under the ceiling. Forcing
+`n_swap=24, n_checkpoint=16` (24 of 40 transformer blocks stream their
+saved-for-backward activations to pinned CPU; the rest checkpoint) trains a
+clean step on one RTX 3090 Ti:
+
+| seq | config | loss | max_active | device_reserved |
+|---|---|---:|---:|---:|
+| 32768 | QLoRA r=64, `n_swap=24`/`n_checkpoint=16`, ~227 GiB pinned host | 0.011 | 19.1 GiB | 20.4 GiB |
+
+Confirmed independently on a 32 GiB RTX 5090 (`n_swap=20`, loss 0.011). This is
+PCIe-bound — ~minutes/step with 24 swapped blocks — so it proves the memory
+envelope rather than a fast path; **16k remains the practical single-card
+ceiling**. The sweet spot is counter-intuitive: too FEW swapped blocks
+(`n_swap=12/16`) OOM, because each remaining checkpointed block materializes
+~one full forward (~8 GiB at 32k) during its backward recompute, so MORE swap
+(fewer recompute transients) LOWERS the peak.
+
+Two fixes in this PR made the path usable:
+
+- The activation-swap pool is now a **variable-size slab** (one pinned
+  `PinnedHostMemory` region + a first-fit offset allocator with coalescing,
+  `block/swap_pool.py`), sized to the real per-block saved aggregate. It replaces
+  fixed equal-size slots, which both wasted pinned RAM (every slot sized to the
+  max tensor) and exhausted mid-iteration (more saved tensors than slots →
+  activations spilled back onto the GPU, breaking the steady-peak prediction).
+- The CPU-Adam constructor no longer hangs: `DeepSpeedCPUAdam.__init__` calls
+  py-cpuinfo's `get_cpu_info()`, whose forked CPU-probe subprocess deadlocks once
+  the process holds a live CUDA context plus worker threads (mis-read earlier as
+  the CUDA-toolkit version mismatch). `chunk/optim.py` swaps the bound
+  `get_cpu_info` for a subprocess-free `/proc/cpuinfo` vendor lookup.
+
 ---
 
 ## 7. Comparison to the paper
@@ -686,7 +721,7 @@ agreement or divergence.
 
 | Paper claim | This integration | Agreement |
 |---|---|---|
-| §5.3.2 + §C.2: runtime and peak-memory estimators within **4% error** on the 10B GPT-2 model; within **10% over-estimate** on peak memory across the model ladder for safety | This integration's `estimate_peak` predicts 19.6 GB for Meta-Llama-3-8B BF16 LoRA Mode A search candidate; pre-offload measured is 17.31 GB (∼13% over-estimate, Mode A). On Mode-C-CKPT the raw `estimate_peak` is a lower-bound search gate, not a runtime feasibility check. The cost model carries (a) a per-mode α split (Mode-A 0.75 / Mode-C-CKPT 0.95) and (b) a per-block CKPT internal saved-tensor proxy in `_compute_ckpt_chain_bytes` (FFN-intermediate + attention scores + Q/K/V; one-block per-block-max bump, not chained N_block × residual, so the O(seq^2) attention term does not over-correct at high seq). Calibrated `alpha_steady` on 30B-Llama Mode-C lands at ~1.18 / 0.99 / 0.80 across seq=512/1024/2048 — slight under-prediction at low seq, slight over-prediction at seq=2048. The 27B + 4-bit + seq=128 run demonstrates why the distinction matters: raw `predicted=15.05 GiB` vs measured 19.98 GiB peak is not presented as a final fit decision. The wrapper-side `_calibrate_peak_with_actual_chunk_bytes` (`api/model_wrapper.py`) raises the prediction before the budget check; the runtime-visible "peak prediction calibrated X -> Y GB" log line is the value users should watch, especially near the 24 GiB ceiling. | **Safe at the runtime gate by construction** because final acceptance uses the calibrated wrapper prediction, not the raw search estimate. The per-mode α split + per-block residual make raw Mode-C-CKPT estimates tighter, and `protrain_ckpt_internal_residual_factor` (default 1.0, 0.0 disables) lets users dial in conservative tuning. At-scale validation is recorded in §16.B B1; the analytical model is part of the current implementation. |
+| §5.3.2 + §C.2: runtime and peak-memory estimators within **4% error** on the 10B GPT-2 model; within **10% over-estimate** on peak memory across the model ladder for safety | After the SwiGLU FFN-intermediate fix (`attn_activation_bytes` now charges THREE `seq×ffn_width` intermediates per gated-MLP block — `gate_proj` out, `up_proj` out, and the `silu(gate)×up` product — not one), the calibrated gate tracks measured `max_memory_allocated` within **~1% on Qwen3-14B QLoRA** across the seq ladder: 8k 15.97/16.04, 16k 21.15/21.36, 24k 26.32/26.68, 32k-swap 18.97/19.10 GiB (mean 0.9% / max 1.3% relative; slightly *under*, covered by the 2 GiB capacity headroom). The residual drift is an O(seq) backward-gradient transient, NOT an O(seq²) attention term — a clean Mode-A seq sweep shows the per-block recompute set scales ~linearly (recompute/seq ≈ const), and an eager-vs-FA2 control confirms it (eager OOMs allocating the O(seq²) score matrix; FA2, which checkpoint-recompute re-runs, never materializes it). The per-mode α split (Mode-A 0.75 / Mode-C-CKPT 0.95) and the `_compute_ckpt_chain_bytes` per-block residual are otherwise unchanged. Final acceptance still uses the wrapper-side `_calibrate_peak_with_actual_chunk_bytes` (`api/model_wrapper.py`); the runtime "peak prediction calibrated X → Y GiB" log line is what users watch near the 24 GiB ceiling. | **Tighter than the paper's own tolerance.** The paper's estimator carries a deliberate ~10% over-estimate (α=1.10, §3.3) as a safety margin; this integration tracks within **~1%** — and slightly *under*, leaning on the capacity headroom rather than a built-in margin. `protrain_ckpt_internal_residual_factor` (default 1.0, 0.0 disables) remains for conservative tuning. Validated post-SwiGLU-fix on Qwen3-14B QLoRA Mode-A (8k/16k/24k) and a 32k partial-swap config. |
 
 ### 7.7 CPU Adam and the overlap window
 
@@ -699,7 +734,7 @@ agreement or divergence.
 | Paper claim | This integration | Agreement |
 |---|---|---|
 | §3.1 + Eqs. 3–7: forward issues `gather + upload` for chunks `> n_persist`; backward issues `reduce + offload` for the same, with `buffer_pool` carrying forward-resident chunks into backward to avoid double-loading | This integration implements both via `runtime/scheduler.py`'s `prefetch_chunks` / `reduce_grads_and_offload`. The `BufferPool` (`chunk/buffer_pool.py`) carries forward-resident slots into backward, exactly per paper §3.1.1. | **Faithful** to the paper. |
-| §3.1.2: SWAP wrapper D2H's activations on `_swap_stream` in forward, H2D's back in backward | `block/swap.py::SwappedBlock` wraps every autograd-saved tensor (not just block output) in `saved_tensors_hooks` and routes through a pinned `ActivationSwapPool`. | **Faithful**, with the explicit clarification (DESIGN.md §3.1.2) that memory accounting must charge the sum of saved-tensor bytes, not just the block output. |
+| §3.1.2: SWAP wrapper D2H's activations on `_swap_stream` in forward, H2D's back in backward | `block/swap.py::SwappedBlock` wraps every autograd-saved tensor (not just block output) in `saved_tensors_hooks` and routes through a pinned `ActivationSwapPool` — now a **variable-size slab** (one `PinnedHostMemory` region + a first-fit offset allocator with coalescing, `block/swap_pool.py`) sized to the per-block saved aggregate, so it charges the true sum of saved-tensor bytes instead of fixed equal-size slots. | **Faithful**, with the explicit clarification (DESIGN.md §3.1.2) that memory accounting must charge the sum of saved-tensor bytes, not just the block output — which the slab now does directly. |
 
 ### 7.9 Single-stream allocation and pinned-host allocator
 

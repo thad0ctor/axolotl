@@ -77,7 +77,7 @@ GPU lanes are opt-in/self-hosted; standard CI remains CPU-only.
 
 | Lane | Result | Coverage |
 |---|---|---|
-| Default ProTrain pytest | `632 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
+| Default ProTrain pytest | `650 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
 | `cpu-core` | PASS | Validators, cost/search math, calibrated memory gate, metadata, layout determinism, non-finite guard. |
 | `cpu-surface` | PASS | Mode selection, force-mode safety, save/resume hooks, Path B LoRA ownership, debug/watchdog hooks. |
 | `merge-surface` | PASS | `merge-lora` CLI and LoRA/QLoRA/rsLoRA/DoRA/MoE merge math. |
@@ -130,6 +130,25 @@ dequant), and the upstream Qwen3 fused RMSNorm+RoPE kernel (`fused_attn_kernel`)
 The `fused_attn_kernel` contribution grows with sequence length; at seq=1024 it
 is roughly break-even on the q/k-norm+RoPE path. See the recommended config and
 per-flag compatibility notes in [`PR_PROPOSAL.md`](PR_PROPOSAL.md) §6.6.
+
+### Long-context single card (seq 32768) + cost-model accuracy
+
+Beyond where Mode A fits, **Qwen3-14B QLoRA trains a clean step at `seq=32768`
+on a single 24 GiB RTX 3090 Ti** via partial activation swap (`n_swap=24`,
+`n_checkpoint=16`): loss 0.011, `max_active` 19.1 GiB, `device_reserved` 20.4
+GiB (also confirmed on a 32 GiB RTX 5090). It is PCIe-bound (~minutes/step), so
+it proves the memory envelope — 16k stays the fast single-card ceiling. Two PR
+fixes enable it: a **variable-size slab allocator** for the swap pool
+(`block/swap_pool.py`, replacing fixed equal-size slots that wasted RAM and
+exhausted) and a **CPU-Adam construction hang fix** (py-cpuinfo's forked CPU
+probe deadlocks after CUDA init; `chunk/optim.py` reads `/proc/cpuinfo`
+directly).
+
+A SwiGLU FFN-intermediate fix (`cost/memory.py`: count the 3 gated-MLP saved
+intermediates, not 1) brings the calibrated memory gate to within **~1% of
+measured peak** on Qwen3-14B QLoRA (0.9% mean / 1.3% max across seq 4k–32k) —
+versus the paper's deliberate ~10% over-estimate margin (α=1.10, §3.3). Details
+and the validation table are in [`PR_PROPOSAL.md`](PR_PROPOSAL.md) §6.7 and §7.6.
 
 ## AI Usage Disclaimer
 
