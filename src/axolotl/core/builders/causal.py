@@ -45,6 +45,7 @@ from axolotl.utils.collators import (
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
+from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
 from axolotl.utils.import_helper import get_cls_from_module_str
 from axolotl.utils.logging import get_logger
 
@@ -402,6 +403,24 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             training_arguments_kwargs["image_resize_pad_color"] = (
                 self.cfg.image_resize_pad_color
             )
+        for key in (
+            "image_tiling",
+            "image_tiling_tile_size",
+            "image_tiling_grid",
+            "image_tiling_overlap",
+            "image_tiling_min_area",
+            "image_tiling_overview_size",
+            "image_tiling_overview_buckets",
+            "image_tiling_no_upscale",
+            "image_tiling_pad_color",
+            "image_tiling_reading_order",
+            "image_tiling_cache_path",
+            "image_tiling_cache_hash_images",
+            "image_tiling_shape_buckets",
+            "image_tiling_tile_labels",
+        ):
+            if self.cfg.get(key) is not None:
+                training_arguments_kwargs[key] = self.cfg.get(key)
 
         if self.cfg.plugins:
             plugin_manager = PluginManager.get_instance()
@@ -544,6 +563,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             "image_resize_buckets": self.cfg.get("image_resize_buckets"),
             "image_resize_no_upscale": bool(self.cfg.get("image_resize_no_upscale")),
             "image_resize_pad_color": self.cfg.get("image_resize_pad_color"),
+            "image_tiling_config": image_tiling_config_from_cfg(self.cfg),
         }
         if pad_to_multiple_of is not None:
             if self.cfg.pad_to_sequence_len:
@@ -676,6 +696,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 image_resize_buckets=training_args.image_resize_buckets,
                 image_resize_no_upscale=bool(training_args.image_resize_no_upscale),
                 image_resize_pad_color=training_args.image_resize_pad_color,
+                image_tiling_config=image_tiling_config_from_cfg(training_args),
                 train_on_inputs=bool(self.cfg.train_on_inputs),
                 roles_to_train=roles_to_train,
                 train_on_eos=train_on_eos,

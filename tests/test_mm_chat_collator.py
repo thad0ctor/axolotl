@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from PIL import Image
 from transformers import BatchFeature
 
 
@@ -200,6 +201,7 @@ class TestMultiModalChatDataCollatorShapeContract:
 
     def test_processing_strategy_receives_bucket_resize_policy(self, mock_processor):
         from axolotl.processing_strategies import get_processing_strategy
+        from axolotl.utils.data.mm_tiling import ImageTilingConfig
 
         strategy = get_processing_strategy(
             mock_processor,
@@ -208,11 +210,165 @@ class TestMultiModalChatDataCollatorShapeContract:
             image_resize_buckets=[(1024, 1536), (1536, 1536)],
             image_resize_no_upscale=True,
             image_resize_pad_color="white",
+            image_tiling_config=ImageTilingConfig(tile_size=512, grid=(2, 3)),
         )
 
         assert strategy.image_resize_buckets == [(1024, 1536), (1536, 1536)]
         assert strategy.image_resize_no_upscale is True
         assert strategy.image_resize_pad_color == "white"
+        assert strategy.image_tiling_config is not None
+
+    def test_processing_strategy_tiling_expands_column_image(
+        self, mock_processor, tmp_path
+    ):
+        from axolotl.processing_strategies import get_processing_strategy
+        from axolotl.utils.data.mm_tiling import ImageTilingConfig
+
+        image_path = tmp_path / "page.png"
+        Image.new("RGB", (120, 180), "white").save(image_path)
+        strategy = get_processing_strategy(
+            mock_processor,
+            chat_template=None,
+            chat_template_type=None,
+            image_tiling_config=ImageTilingConfig(
+                tile_size=32,
+                grid=(2, 1),
+                overview_size=32,
+            ),
+        )
+
+        out = strategy(
+            [
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": "OCR"},
+                            ],
+                        },
+                        {"role": "assistant", "content": "text"},
+                    ],
+                    "images": [str(image_path)],
+                }
+            ]
+        )
+
+        image_items = [
+            content
+            for content in out[0]["messages"][0]["content"]
+            if content["type"] == "image"
+        ]
+        assert len(image_items) == 3
+
+    def test_processing_strategy_fills_multiple_bare_column_placeholders(
+        self, mock_processor, tmp_path
+    ):
+        from axolotl.processing_strategies import get_processing_strategy
+
+        image_paths = []
+        for idx in range(2):
+            image_path = tmp_path / f"page_{idx}.png"
+            Image.new("RGB", (32, 32), "white").save(image_path)
+            image_paths.append(str(image_path))
+        strategy = get_processing_strategy(
+            mock_processor,
+            chat_template=None,
+            chat_template_type=None,
+        )
+
+        out = strategy(
+            [
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": "first"},
+                                {"type": "image"},
+                                {"type": "text", "text": "second"},
+                            ],
+                        },
+                        {"role": "assistant", "content": "text"},
+                    ],
+                    "images": image_paths,
+                }
+            ]
+        )
+
+        content = out[0]["messages"][0]["content"]
+        image_items = [item for item in content if item["type"] == "image"]
+        assert len(image_items) == 2
+        assert all("image" in item for item in image_items)
+
+    def test_non_tiling_caps_extra_column_images(self, mock_processor, tmp_path):
+        """R2: without tiling, extra column images beyond placeholders are dropped
+        (vanilla contract), not injected as un-anchored images."""
+        from axolotl.processing_strategies import get_processing_strategy
+
+        paths = []
+        for idx in range(3):
+            p = tmp_path / f"p{idx}.png"
+            Image.new("RGB", (32, 32), "white").save(p)
+            paths.append(str(p))
+        strategy = get_processing_strategy(
+            mock_processor, chat_template=None, chat_template_type=None
+        )
+        out = strategy(
+            [
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": "one"},
+                            ],
+                        },
+                        {"role": "assistant", "content": "text"},
+                    ],
+                    "images": paths,  # 3 images, 1 placeholder, tiling off
+                }
+            ]
+        )
+        image_items = [
+            item for item in out[0]["messages"][0]["content"] if item["type"] == "image"
+        ]
+        assert len(image_items) == 1  # capped to the single placeholder
+
+    def test_processing_strategy_rejects_unmatched_column_placeholders(
+        self, mock_processor, tmp_path
+    ):
+        from axolotl.processing_strategies import get_processing_strategy
+
+        image_path = tmp_path / "page.png"
+        Image.new("RGB", (32, 32), "white").save(image_path)
+        strategy = get_processing_strategy(
+            mock_processor,
+            chat_template=None,
+            chat_template_type=None,
+        )
+
+        with pytest.raises(ValueError, match="bare image placeholder"):
+            strategy(
+                [
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image"},
+                                    {"type": "image"},
+                                ],
+                            },
+                            {"role": "assistant", "content": "text"},
+                        ],
+                        "images": [str(image_path)],
+                    }
+                ]
+            )
 
     def test_packing_concatenates_nested_rows_and_resets_positions(
         self, mock_processing_strategy
@@ -324,9 +480,7 @@ class TestMultiModalChatDataCollatorShapeContract:
             "__call__",
             side_effect=lambda rows: rows,
         ):
-            batch = collator.process_rows(
-                [[{"messages": []}, {"messages": []}]]
-            )
+            batch = collator.process_rows([[{"messages": []}, {"messages": []}]])
 
         assert batch["pixel_values"].shape == (1, 3, 3, 4, 4)
 
@@ -361,6 +515,9 @@ class TestMultiModalChatDataCollatorShapeContract:
                 "role_boundaries": None,
                 "train_on_inputs": False,
                 "chat_template": None,
+                "image_tiling": True,
+                "image_tiling_tile_size": 512,
+                "image_tiling_grid": (2, 3),
             }
         )
         training_args = DictDefault(
@@ -374,6 +531,9 @@ class TestMultiModalChatDataCollatorShapeContract:
                 "image_resize_buckets": [(1024, 1536), (1536, 1536)],
                 "image_resize_no_upscale": True,
                 "image_resize_pad_color": "white",
+                "image_tiling": True,
+                "image_tiling_tile_size": 512,
+                "image_tiling_grid": (2, 3),
             }
         )
 
@@ -398,3 +558,4 @@ class TestMultiModalChatDataCollatorShapeContract:
         ]
         assert get_strategy.call_args.kwargs["image_resize_no_upscale"] is True
         assert get_strategy.call_args.kwargs["image_resize_pad_color"] == "white"
+        assert get_strategy.call_args.kwargs["image_tiling_config"].tile_size == 512

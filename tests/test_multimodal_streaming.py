@@ -21,6 +21,7 @@ from axolotl.prompt_strategies.multimodal_pretrain import (
 )
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.mm_packing import MultimodalPackingMetadata
+from axolotl.utils.data.mm_tiling import ImageTilingConfig
 from axolotl.utils.data.streaming import (
     _multimodal_metadata_ram_budget_mb,
     encode_packed_streaming_multimodal,
@@ -277,7 +278,9 @@ def test_encode_packed_streaming_multimodal_can_group_by_visual_signature(
             MultimodalPackingMetadata(10, 10, 1, "grid-b"),
         ]
 
-    monkeypatch.setattr(mm_packing, "compute_multimodal_packing_metadata", fake_metadata)
+    monkeypatch.setattr(
+        mm_packing, "compute_multimodal_packing_metadata", fake_metadata
+    )
 
     packed = encode_packed_streaming_multimodal(
         {
@@ -595,6 +598,11 @@ def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkey
             "image_resize_buckets": [(1024, 1536), (1536, 1536)],
             "image_resize_no_upscale": True,
             "image_resize_pad_color": "white",
+            "image_tiling": True,
+            "image_tiling_tile_size": 1024,
+            "image_tiling_grid": (2, 3),
+            "image_tiling_overview_buckets": [(1024, 1536)],
+            "image_tiling_shape_buckets": "ocr_pages",
             "seed": 42,
         }
     )
@@ -621,6 +629,8 @@ def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkey
     assert captured["kwargs"]["image_resize_buckets"] == [(1024, 1536), (1536, 1536)]
     assert captured["kwargs"]["image_resize_no_upscale"] is True
     assert captured["kwargs"]["image_resize_pad_color"] == "white"
+    assert captured["kwargs"]["image_tiling_config"].tile_size == 1024
+    assert captured["kwargs"]["image_tiling_config"].shape_buckets
     assert cfg.micro_batch_size == 1
 
 
@@ -682,6 +692,10 @@ def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
             "image_resize_buckets": [(1024, 1536), (1536, 1536)],
             "image_resize_no_upscale": True,
             "image_resize_pad_color": "white",
+            "image_tiling": True,
+            "image_tiling_tile_size": 512,
+            "image_tiling_grid": (2, 3),
+            "image_tiling_shape_buckets": "ocr_pages",
         }
     )
 
@@ -694,6 +708,8 @@ def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
     assert collator.image_resize_buckets == [(1024, 1536), (1536, 1536)]
     assert collator.image_resize_no_upscale is True
     assert collator.image_resize_pad_color == "white"
+    assert collator.image_tiling_config is not None
+    assert collator.image_tiling_config.tile_size == 512
 
 
 def test_mm_cpt_packed_collator_pads_to_full_pack_capacity():
@@ -788,6 +804,33 @@ def test_collator_resizes_images_before_processor(smolvlm_processor, two_tiny_im
     assert loaded[0].size == (32, 32)
 
 
+def test_collator_tiling_expands_cpt_placeholders_and_images(
+    smolvlm_processor,
+    two_tiny_images,
+):
+    spec = build_image_token_spec(smolvlm_processor)
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        image_tiling_config=ImageTilingConfig(
+            tile_size=16,
+            grid=(2, 1),
+            overview_size=16,
+        ),
+    )
+
+    text, images = collator._prepare_row_text_and_images(
+        f"{spec.image_token}\nrow one",
+        [str(two_tiny_images[0])],
+        row_index=0,
+    )
+
+    assert text.count(spec.image_token) == 3
+    assert len(images) == 3
+    assert all(image.size == (16, 16) for image in images)
+
+
 def test_packed_collator_builds_boundary_masks(smolvlm_processor, two_tiny_images):
     spec = build_image_token_spec(smolvlm_processor)
     encoded = encode_multimodal_pretrain(
@@ -838,7 +881,62 @@ def test_packed_collator_builds_boundary_masks(smolvlm_processor, two_tiny_image
     assert pos[lengths[0]] == 0
     assert pos[lengths[0] - 1] == lengths[0] - 1
     assert set(mask[: lengths[0]]) == {1}
-    assert set(mask[lengths[0] : total_len]) == {2}
+
+
+def test_packed_collator_tiled_lengths_match_processor(
+    smolvlm_processor, two_tiny_images
+):
+    spec = build_image_token_spec(smolvlm_processor)
+    tiling_config = ImageTilingConfig(
+        tile_size=16,
+        grid=(2, 1),
+        overview_size=16,
+    )
+    encoded = encode_multimodal_pretrain(
+        {
+            "text": [
+                f"{spec.image_token}\nrow one",
+                f"{spec.image_token}\nrow two",
+            ],
+            "images": [[str(two_tiny_images[0])], [str(two_tiny_images[1])]],
+        },
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        max_tokens=2048,
+        image_token=spec.image_token,
+        image_token_id=spec.image_token_id,
+        add_processor_lengths=True,
+        image_tiling_config=tiling_config,
+    )
+    rows = [
+        {
+            k: encoded[k][i]
+            for k in (
+                "input_ids",
+                "labels",
+                "attention_mask",
+                "images",
+                "_mm_text",
+                "length",
+            )
+        }
+        for i in range(2)
+    ]
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        sample_packing=True,
+        image_tiling_config=tiling_config,
+    )
+
+    batch = collator.torch_call([rows])
+
+    lengths = encoded["length"]
+    total_len = sum(lengths)
+    assert batch["position_ids"][0, lengths[0]].item() == 0
+    assert set(batch["attention_mask"][0, : lengths[0]].tolist()) == {1}
+    assert set(batch["attention_mask"][0, lengths[0] : total_len].tolist()) == {2}
 
 
 def test_collator_raises_on_missing_columns(smolvlm_processor):

@@ -1470,6 +1470,7 @@ class PretrainingValidationMixin:
             "multimodal_sample_packing_visual_capacity",
             "multimodal_sample_packing_dataloader_num_workers",
             "multimodal_sample_packing_dataloader_prefetch_factor",
+            "image_tiling_min_area",
         ):
             value = data.get(key)
             if value is not None and value < 0:

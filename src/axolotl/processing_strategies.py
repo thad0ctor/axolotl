@@ -14,6 +14,11 @@ from transformers.models.smolvlm import SmolVLMProcessor
 from transformers.models.voxtral import VoxtralProcessor
 
 from axolotl.utils.data.mm_image import resize_image_for_processor
+from axolotl.utils.data.mm_tiling import (
+    ImageTileCache,
+    ImageTilingConfig,
+    tile_image_source_with_labels,
+)
 from axolotl.utils.dict import remove_none_values
 from axolotl.utils.logging import get_logger
 
@@ -74,6 +79,8 @@ class ProcessingStrategy:
         self.image_resize_buckets = None
         self.image_resize_no_upscale = False
         self.image_resize_pad_color = None
+        self.image_tiling_config: ImageTilingConfig | None = None
+        self._image_tile_cache: ImageTileCache | None = None
 
         # Defaults mirror the text-only ChatTemplateStrategy. An explicit
         # empty list is honored as "no trainable roles" (masks everything);
@@ -222,6 +229,52 @@ class ProcessingStrategy:
 
             return new_messages
 
+        def image_content_items(image_value) -> list[dict]:
+            if self.image_tiling_config is None:
+                image = load_image(image_value)
+                image = resize_image_for_processor(
+                    image,
+                    self.image_size,
+                    self.image_resize_algorithm,
+                    self.image_resize_buckets,
+                    self.image_resize_no_upscale,
+                    self.image_resize_pad_color,
+                )
+                return [{"type": "image", "image": image}]
+
+            images, labels = tile_image_source_with_labels(
+                image_value,
+                self.image_tiling_config,
+                resize_algorithm=self.image_resize_algorithm,
+                cache=self._image_tile_cache,
+            )
+            if labels and len(labels) == len(images):
+                items: list[dict] = []
+                for label, image in zip(labels, images, strict=True):
+                    items.append({"type": "text", "text": label})
+                    items.append({"type": "image", "image": image})
+                return items
+            return [{"type": "image", "image": image} for image in images]
+
+        def image_source_from_content(content: dict):
+            if content.get("type") != "image":
+                return None
+            for key in ("image", "path", "url", "base64"):
+                if key in content and content[key] is not None:
+                    return content[key]
+            return None
+
+        def expand_message_images(messages: list[dict]) -> None:
+            for message in messages:
+                expanded = []
+                for content in message["content"]:
+                    image_value = image_source_from_content(content)
+                    if image_value is None:
+                        expanded.append(content)
+                        continue
+                    expanded.extend(image_content_items(image_value))
+                message["content"] = expanded
+
         processed_examples = []
         for example in examples:
             messages_field = self._get_messages_field(example)
@@ -261,6 +314,11 @@ class ProcessingStrategy:
             processed_example["messages"] = convert_messages_to_multimedia_messages(
                 processed_example["messages"]
             )
+            # Only pre-tile/expand inline images when tiling is on; otherwise leave
+            # inline content untouched (vanilla passes it straight to the processor,
+            # avoiding eager loads/resizes — and network fetches — in the collator).
+            if self.image_tiling_config is not None:
+                expand_message_images(processed_example["messages"])
 
             possible_image_keys = ["images", "image"]
             image_key = None
@@ -270,29 +328,11 @@ class ProcessingStrategy:
                     break
 
             if image_key is not None and processed_example[image_key] is not None:
-                # TODO: support multi-image samples; for now we take the first.
-                if len(processed_example[image_key]) > 1:
-                    LOG.warning(
-                        f"Found {len(processed_example[image_key])} images in a sample. Using the first one."
-                        "If you are using a dataset with multiple images per sample, please convert it to use multi-content Messages."
-                        "See https://docs.axolotl.ai/docs/multimodal.html#dataset-format"
-                    )
+                column_images = processed_example[image_key]
+                if not isinstance(column_images, (list, tuple)):
+                    column_images = [column_images]
 
-                image_value = processed_example[image_key][0]
-
-                image_value = load_image(image_value)
-
-                image_value = resize_image_for_processor(
-                    image_value,
-                    self.image_size,
-                    self.image_resize_algorithm,
-                    self.image_resize_buckets,
-                    self.image_resize_no_upscale,
-                    self.image_resize_pad_color,
-                )
-
-                msg_ind_to_add = None
-                ind_to_add = None
+                bare_locations = []
                 first_user_idx = None
 
                 for msg_idx, msg_content in enumerate(processed_example["messages"]):
@@ -305,22 +345,70 @@ class ProcessingStrategy:
                         if content["type"] == "image" and all(
                             k not in content for k in ["image", "url", "path", "base64"]
                         ):
-                            msg_ind_to_add = msg_idx
-                            ind_to_add = i
-                            break
+                            bare_locations.append((msg_idx, i))
 
-                if ind_to_add is not None and msg_ind_to_add is not None:
-                    processed_example["messages"][msg_ind_to_add]["content"][
-                        ind_to_add
-                    ]["image"] = image_value
-                else:
+                # Tiling deliberately expands one image into many tiles. Without it,
+                # preserve vanilla's intent: fill explicit placeholders (one image
+                # each) but never inject un-anchored extra column images. Cap to the
+                # number of placeholders (or one, for the classic no-placeholder
+                # single column image) and warn when dropping extras.
+                if self.image_tiling_config is None:
+                    cap = max(len(bare_locations), 1)
+                    if len(column_images) > cap:
+                        LOG.warning(
+                            "Found %d column image(s) but only %d image slot(s); "
+                            "using the first %d. For multi-image samples use "
+                            "multi-content Messages with explicit image "
+                            "placeholders: "
+                            "https://docs.axolotl.ai/docs/multimodal.html#dataset-format",
+                            len(column_images),
+                            cap,
+                            cap,
+                        )
+                        column_images = list(column_images[:cap])
+
+                image_items_by_source = [
+                    image_content_items(image_value) for image_value in column_images
+                ]
+
+                if len(bare_locations) > len(image_items_by_source):
+                    raise ValueError(
+                        f"Found {len(bare_locations)} bare image placeholder(s) "
+                        f"but only {len(image_items_by_source)} image(s) in "
+                        f"`{image_key}`."
+                    )
+
+                replacements = list(
+                    zip(bare_locations, image_items_by_source, strict=False)
+                )
+                for (msg_idx, idx), image_items in reversed(replacements):
+                    processed_example["messages"][msg_idx]["content"][idx : idx + 1] = (
+                        image_items
+                    )
+
+                extra_sources = image_items_by_source[len(bare_locations) :]
+                remaining_items = [item for group in extra_sources for item in group]
+                if remaining_items:
+                    # Old behavior used only the first column image and warned on
+                    # extras. We now append them, but a column carrying more images
+                    # than placeholders is still usually a dataset mistake; warn so
+                    # it isn't a silent count change. The single bare-placeholder-less
+                    # column image is the normal path and stays quiet.
+                    if len(bare_locations) > 0 or len(extra_sources) > 1:
+                        LOG.warning(
+                            "Found %d column image(s) beyond the %d bare image "
+                            "placeholder(s); appending the extra image(s) to the "
+                            "first user message. For multi-image samples, use "
+                            "multi-content Messages with explicit image "
+                            "placeholders: "
+                            "https://docs.axolotl.ai/docs/multimodal.html#dataset-format",
+                            len(extra_sources),
+                            len(bare_locations),
+                        )
                     if first_user_idx is None:
                         first_user_idx = 0
-                    processed_example["messages"][first_user_idx]["content"].append(
-                        {
-                            "type": "image",
-                            "image": image_value,
-                        }
+                    processed_example["messages"][first_user_idx]["content"].extend(
+                        remaining_items
                     )
 
             processed_examples.append(remove_none_values(processed_example))
@@ -1185,6 +1273,7 @@ def get_processing_strategy(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color=None,
+    image_tiling_config: ImageTilingConfig | None = None,
     train_on_inputs: bool = False,
     roles_to_train: Optional[list[str]] = None,
     train_on_eos: Optional[str] = None,
@@ -1207,6 +1296,9 @@ def get_processing_strategy(
         strategy.image_resize_buckets = image_resize_buckets
         strategy.image_resize_no_upscale = bool(image_resize_no_upscale)
         strategy.image_resize_pad_color = image_resize_pad_color
+        strategy.image_tiling_config = image_tiling_config
+        if image_tiling_config is not None:
+            strategy._image_tile_cache = ImageTileCache(image_tiling_config.cache_path)
         return strategy
 
     if chat_template_type in [None, "tokenizer_default"]:
@@ -1231,7 +1323,9 @@ def get_processing_strategy(
     if chat_template_type == "pixtral":
         return with_resize_policy(PixtralProcessingStrategy(**processing_kwargs))
     if chat_template_type == "mistral_v7_tekken":
-        return with_resize_policy(MistralV7TekkenProcessingStrategy(**processing_kwargs))
+        return with_resize_policy(
+            MistralV7TekkenProcessingStrategy(**processing_kwargs)
+        )
 
     if isinstance(processor, VoxtralProcessor):
         return with_resize_policy(VoxtralProcessingStrategy(**processing_kwargs))

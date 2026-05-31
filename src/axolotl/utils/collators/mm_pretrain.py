@@ -21,6 +21,12 @@ from axolotl.prompt_strategies.multimodal_pretrain import (
     prepare_text_for_packed_boundary,
 )
 from axolotl.utils.data.mm_image import resize_image_for_processor
+from axolotl.utils.data.mm_tiling import (
+    ImageTileCache,
+    ImageTilingConfig,
+    expand_image_placeholders_for_tiling,
+    tile_image_source_with_labels,
+)
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -44,8 +50,10 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
     image_resize_buckets: list[tuple[int, int]] | None = None
     image_resize_no_upscale: bool = False
     image_resize_pad_color: Any | None = None
+    image_tiling_config: ImageTilingConfig | None = None
 
     _image_family_token_ids: set[int] = field(init=False, default_factory=set)
+    _image_tile_cache: ImageTileCache | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         if self.return_tensors != "pt":
@@ -65,6 +73,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 "tokenize inconsistently."
             )
         self._image_family_token_ids = set(self.image_token_spec.image_family_token_ids)
+        if self.image_tiling_config is not None:
+            self._image_tile_cache = ImageTileCache(self.image_tiling_config.cache_path)
 
     def _resolve_image_source(self, src: Any) -> Any:
         # Only join base_dir for relative string paths; pass everything else
@@ -120,6 +130,58 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             )
         return out
 
+    def _prepare_row_text_and_images(
+        self,
+        text: str,
+        sources: list,
+        row_index: int,
+    ) -> tuple[str, list[Image.Image]] | None:
+        if self.image_tiling_config is None:
+            loaded = self._load_images_for_row(sources, row_index=row_index)
+            if self.skip_bad_images and len(loaded) != len(sources):
+                return None
+            return text, loaded
+
+        out: list[Image.Image] = []
+        counts: list[int] = []
+        labels: list[list[str] | None] = []
+        for raw in sources:
+            try:
+                tiles, tile_labels = tile_image_source_with_labels(
+                    raw,
+                    self.image_tiling_config,
+                    image_base_dir=self.image_base_dir,
+                    resize_algorithm=self.image_resize_algorithm,
+                    cache=self._image_tile_cache,
+                )
+            except Exception as exc:
+                label = (
+                    os.path.basename(raw)
+                    if isinstance(raw, str)
+                    else type(raw).__name__
+                )
+                msg = (
+                    f"Row {row_index}: failed to tile image {label!r} "
+                    f"({type(exc).__name__})"
+                )
+                LOG.debug("failed tile full source: %r; error: %s", raw, exc)
+                if self.skip_bad_images:
+                    LOG.warning("%s — skipping row", msg)
+                    return None
+                raise RuntimeError(msg) from exc
+            counts.append(len(tiles))
+            labels.append(tile_labels)
+            out.extend(tiles)
+        return (
+            expand_image_placeholders_for_tiling(
+                text,
+                image_token=self.image_token_spec.image_token,
+                counts=counts,
+                labels=labels,
+            ),
+            out,
+        )
+
     @staticmethod
     def _coerce_length(value: Any) -> int | None:
         if value is None:
@@ -165,6 +227,8 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             image_resize_buckets=self.image_resize_buckets,
             image_resize_no_upscale=self.image_resize_no_upscale,
             image_resize_pad_color=self.image_resize_pad_color,
+            image_tiling_config=self.image_tiling_config,
+            image_token=self.image_token_spec.image_token,
         )
 
     def _pack_rows(self, rows: list[dict], pack_index: int) -> dict[str, Any] | None:
@@ -183,16 +247,24 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                     "is missing '_mm_text' or 'images'."
                 )
             raw_sources = self._raw_image_sources(row.get("images"), row_index)
-            loaded = self._load_images_for_row(raw_sources, row_index=row_index)
-            if self.skip_bad_images and len(loaded) != len(raw_sources):
+            prepared = self._prepare_row_text_and_images(
+                prepare_text_for_packed_boundary(
+                    row,
+                    self.tokenizer,
+                    is_first=len(packed_text_parts) == 0,
+                    add_eos_token=self.add_eos_token,
+                ),
+                raw_sources,
+                row_index=row_index,
+            )
+            if prepared is None:
                 LOG.warning(
-                    "Packed row %d.%d: %d/%d images failed to load; dropping row.",
+                    "Packed row %d.%d: image preparation failed; dropping row.",
                     pack_index,
                     row_index,
-                    len(raw_sources) - len(loaded),
-                    len(raw_sources),
                 )
                 continue
+            prepared_text, loaded = prepared
 
             length = self._coerce_length(row.get("length"))
             if length is None:
@@ -201,14 +273,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             kept_rows.append(row)
             sample_lengths.append(length or 0)
             packed_images.extend(loaded)
-            packed_text_parts.append(
-                prepare_text_for_packed_boundary(
-                    row,
-                    self.tokenizer,
-                    is_first=len(packed_text_parts) == 0,
-                    add_eos_token=self.add_eos_token,
-                )
-            )
+            packed_text_parts.append(prepared_text)
 
         if not kept_rows:
             return None
@@ -232,17 +297,20 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             )
         sample_lengths = self._coerce_sample_lengths(row.get("_mm_sample_lengths"))
         raw_sources = self._raw_image_sources(row.get("images"), row_index=pack_index)
-        loaded = self._load_images_for_row(raw_sources, row_index=pack_index)
-        if self.skip_bad_images and len(loaded) != len(raw_sources):
+        prepared = self._prepare_row_text_and_images(
+            row["_mm_text"],
+            raw_sources,
+            row_index=pack_index,
+        )
+        if prepared is None:
             LOG.warning(
-                "Packed row %d: %d/%d images failed to load; dropping packed row.",
+                "Packed row %d: image preparation failed; dropping packed row.",
                 pack_index,
-                len(raw_sources) - len(loaded),
-                len(raw_sources),
             )
             return None
+        prepared_text, loaded = prepared
         return {
-            "text": row["_mm_text"],
+            "text": prepared_text,
             "images": loaded,
             "sample_lengths": sample_lengths,
         }
@@ -397,18 +465,19 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             if self.add_eos_token and self.tokenizer.eos_token:
                 if not mm_text.endswith(self.tokenizer.eos_token):
                     mm_text = mm_text + self.tokenizer.eos_token
-            texts.append(mm_text)
-            loaded = self._load_images_for_row(raw_sources, row_index=i)
-            if self.skip_bad_images and len(loaded) != len(raw_sources):
-                # Drop the row to avoid silent placeholder/image count mismatch.
+            prepared = self._prepare_row_text_and_images(
+                mm_text,
+                raw_sources,
+                row_index=i,
+            )
+            if prepared is None:
                 LOG.warning(
-                    "Row %d: %d/%d images failed to load; dropping row.",
+                    "Row %d: image preparation failed; dropping row.",
                     i,
-                    len(raw_sources) - len(loaded),
-                    len(raw_sources),
                 )
-                texts.pop()
                 continue
+            mm_text, loaded = prepared
+            texts.append(mm_text)
             images.append(loaded)
 
         if not texts:

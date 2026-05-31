@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator
@@ -527,6 +528,44 @@ def _dataset_hash_component(dataset_config) -> str:
     return component
 
 
+def _mm_processing_fingerprint(cfg) -> str:
+    """Image tiling + resize knobs that change the cached encoding / packing.
+
+    Folded into the dataset-cache hashes so changing the tile policy (or disabling
+    tiling) invalidates a prepared dataset whose packed lengths were computed under
+    the old policy. Returns "" when nothing image-related is set, to avoid churning
+    hashes for text-only / non-tiling users.
+    """
+    from axolotl.utils.data.mm_tiling import (  # local import avoids any import cycle
+        _tiling_policy_payload,
+        image_tiling_config_from_cfg,
+    )
+
+    parts: list[str] = []
+    tiling_config = image_tiling_config_from_cfg(cfg)
+    if tiling_config is not None:
+        parts.append(
+            "tiling="
+            + json.dumps(
+                _tiling_policy_payload(tiling_config), sort_keys=True, default=str
+            )
+        )
+    resize = {
+        key: cfg.get(key)
+        for key in (
+            "image_size",
+            "image_resize_algorithm",
+            "image_resize_buckets",
+            "image_resize_no_upscale",
+            "image_resize_pad_color",
+        )
+        if cfg.get(key) is not None
+    }
+    if resize:
+        parts.append("resize=" + json.dumps(resize, sort_keys=True, default=str))
+    return "|".join(parts)
+
+
 def generate_pretraining_dataset_hash(
     cfg: DictDefault,
     pretraining_config: DictDefault,
@@ -562,6 +601,9 @@ def generate_pretraining_dataset_hash(
         f"{tokenizer_fingerprint}|"
         f"processor={processor_name or 'None'}"
     )
+    mm_fingerprint = _mm_processing_fingerprint(cfg)
+    if mm_fingerprint:
+        config_str += f"|{mm_fingerprint}"
     return str(md5(config_str))
 
 
@@ -594,6 +636,9 @@ def generate_dataset_hash_from_config(
         f"{'|'.join(_dataset_hash_component(d) for d in cfg_datasets)}"
         f"|{tokenizer_fingerprint}"
     )
+    mm_fingerprint = _mm_processing_fingerprint(cfg)
+    if mm_fingerprint:
+        config_str += f"|{mm_fingerprint}"
     return str(md5(config_str))
 
 

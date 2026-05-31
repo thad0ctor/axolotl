@@ -20,9 +20,16 @@ from axolotl.utils.data.mm_packing import (
     pack_2d_first_fit_decreasing,
 )
 from axolotl.utils.data.mm_tiling import (
+    DEFAULT_OCR_IMAGE_TILING_BUCKETS,
+    ImageTileCache,
     ImageTilingConfig,
+    build_image_tiling_config,
+    expand_image_placeholders_for_tiling,
+    image_tile_cache_key,
     replace_first_image_placeholder,
+    select_tiling_config_for_image,
     tile_image_for_processor,
+    tile_image_source_for_processor,
 )
 
 
@@ -83,6 +90,106 @@ def test_replace_first_image_placeholder_repeats_qwen_wrapped_placeholder():
 
     assert tiled.count("<|image_pad|>") == 3
     assert tiled.endswith("\nOCR text")
+
+
+def test_expand_image_placeholders_for_tiling_handles_multiple_placeholders():
+    text = "a <image> b <image> c <image> d"
+
+    tiled = expand_image_placeholders_for_tiling(
+        text,
+        image_token="<image>",
+        counts=[2, 1, 3],
+    )
+
+    assert tiled == "a <image>\n<image> b <image> c <image>\n<image>\n<image> d"
+
+
+def test_select_tiling_config_for_shape_buckets():
+    config = ImageTilingConfig(
+        tile_size=512,
+        grid=(2, 3),
+        shape_buckets=DEFAULT_OCR_IMAGE_TILING_BUCKETS,
+    )
+
+    assert select_tiling_config_for_image((2000, 1000), config).grid == (3, 2)
+    assert select_tiling_config_for_image((1000, 1500), config).grid == (2, 3)
+    assert select_tiling_config_for_image((1000, 2200), config).grid == (2, 4)
+
+
+def test_build_image_tiling_config_accepts_ocr_pages_preset():
+    config = build_image_tiling_config(
+        enabled=True,
+        tile_size=[256, 512],
+        shape_buckets="ocr_pages",
+    )
+
+    assert config is not None
+    assert config.tile_size == (256, 512)
+    assert config.shape_buckets == DEFAULT_OCR_IMAGE_TILING_BUCKETS
+
+
+def test_tile_cache_round_trips_from_ssd(tmp_path, monkeypatch):
+    from PIL import Image
+
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (120, 180), "white").save(image_path)
+    config = ImageTilingConfig(
+        tile_size=32,
+        grid=(2, 3),
+        cache_path=str(tmp_path / "tiles"),
+    )
+
+    first = tile_image_source_for_processor(
+        str(image_path),
+        config,
+        cache=ImageTileCache(config.cache_path),
+    )
+    assert len(first) == 6
+    assert list((tmp_path / "tiles").rglob("manifest.json"))
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("tile cache hit should not recreate tiles")
+
+    monkeypatch.setattr("axolotl.utils.data.mm_tiling.tile_image_for_processor", _fail)
+    second = tile_image_source_for_processor(
+        str(image_path),
+        config,
+        cache=ImageTileCache(config.cache_path),
+    )
+    assert len(second) == 6
+
+
+def test_tile_cache_key_changes_with_source_stat_and_policy(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (120, 180), "white").save(image_path)
+    base_config = ImageTilingConfig(tile_size=32, grid=(2, 3))
+
+    key = image_tile_cache_key(str(image_path), base_config)
+    policy_key = image_tile_cache_key(
+        str(image_path),
+        ImageTilingConfig(tile_size=32, grid=(2, 4)),
+    )
+    Image.new("RGB", (121, 180), "white").save(image_path)
+    stat_key = image_tile_cache_key(str(image_path), base_config)
+
+    assert key != policy_key
+    assert key != stat_key
+
+
+def test_tile_cache_key_can_include_image_hash(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (16, 16), "white").save(image_path)
+    config = ImageTilingConfig(tile_size=16, grid=(1, 1))
+
+    key = image_tile_cache_key(str(image_path), config, hash_image=True)
+    Image.new("RGB", (16, 16), "black").save(image_path)
+    hashed_key = image_tile_cache_key(str(image_path), config, hash_image=True)
+
+    assert key != hashed_key
 
 
 class _Tokenizer:

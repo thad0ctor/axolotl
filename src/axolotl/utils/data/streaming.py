@@ -12,6 +12,7 @@ from torch.utils.data import RandomSampler
 from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 from axolotl.utils.collators import PretrainingBatchSamplerDataCollatorForSeq2Seq
+from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
 from axolotl.utils.logging import get_logger
 from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 from axolotl.utils.samplers.multipack import pack_parallel
@@ -203,6 +204,9 @@ def encode_streaming_multimodal(
     image_token_id: int,
     text_column: str = "text",
     image_column: str = "images",
+    processor: ProcessorMixin | None = None,
+    image_base_dir: str | None = None,
+    image_tiling_config=None,
 ) -> Dict[str, List]:
     from axolotl.prompt_strategies.multimodal_pretrain import (
         encode_multimodal_pretrain,
@@ -216,6 +220,9 @@ def encode_streaming_multimodal(
         image_token_id=image_token_id,
         text_column=text_column,
         image_column=image_column,
+        processor=processor,
+        image_base_dir=image_base_dir,
+        image_tiling_config=image_tiling_config,
         enforce_max_length=True,
     )
 
@@ -299,6 +306,7 @@ def wrap_streaming_dataset(
                 image_resize_buckets=cfg.get("image_resize_buckets"),
                 image_resize_no_upscale=bool(cfg.get("image_resize_no_upscale")),
                 image_resize_pad_color=cfg.get("image_resize_pad_color"),
+                image_tiling_config=image_tiling_config_from_cfg(cfg),
             )
         else:
             # For SFT (non-pretraining) datasets, always use multipack_attn=True to ensure
@@ -363,6 +371,9 @@ def wrap_streaming_dataset(
                 image_token_id=spec.image_token_id,
                 text_column=text_column,
                 image_column=image_column,
+                processor=processor,
+                image_base_dir=get_ds_value("image_base_dir", None),
+                image_tiling_config=image_tiling_config_from_cfg(cfg),
             )
         else:
             encode = functools.partial(
@@ -476,6 +487,7 @@ def encode_packed_streaming_multimodal(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
+    image_tiling_config=None,
 ) -> Dict[str, List]:
     from axolotl.prompt_strategies.multimodal_pretrain import (
         encode_multimodal_pretrain,
@@ -504,6 +516,7 @@ def encode_packed_streaming_multimodal(
         image_resize_buckets=image_resize_buckets,
         image_resize_no_upscale=image_resize_no_upscale,
         image_resize_pad_color=image_resize_pad_color,
+        image_tiling_config=image_tiling_config,
     )
     rows = [
         {key: encoded[key][idx] for key in encoded}
@@ -531,6 +544,7 @@ def encode_packed_streaming_multimodal(
         tokenizer=tokenizer,
         processor=processor,
         image_token_id=image_token_id,
+        image_token=image_token,
         image_base_dir=image_base_dir,
         add_eos_token=True,
         image_size=image_size,
@@ -538,6 +552,7 @@ def encode_packed_streaming_multimodal(
         image_resize_buckets=image_resize_buckets,
         image_resize_no_upscale=image_resize_no_upscale,
         image_resize_pad_color=image_resize_pad_color,
+        image_tiling_config=image_tiling_config,
         cache=cache,
     )
     for row, meta in zip(rows, metadata, strict=True):

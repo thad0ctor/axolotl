@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from scripts.mm_ocr_eval import cer, generation_prompt, strip_image_placeholders
 from scripts.mm_packing_benchmark import (
     chunked_causal_lm_loss,
     shifted_label_token_count,
@@ -52,3 +53,19 @@ def test_chunked_causal_lm_loss_matches_full_logits_ce():
 
     assert shifted_label_token_count(inputs["labels"]) == 3
     assert torch.allclose(actual, expected)
+
+
+def test_mm_ocr_eval_strips_placeholders_and_computes_cer():
+    text = "<|vision_start|><|image_pad|><|vision_end|>\nhello world"
+
+    assert strip_image_placeholders(text, "<|image_pad|>") == "hello world"
+    assert cer("hello word", "hello world") == 1 / 11
+    assert (
+        generation_prompt(
+            {"text": text},
+            text_column="text",
+            image_token="<|image_pad|>",
+            template=None,
+        )
+        == "<|vision_start|><|image_pad|><|vision_end|>\n"
+    )

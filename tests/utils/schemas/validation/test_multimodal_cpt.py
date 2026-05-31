@@ -116,6 +116,34 @@ class TestMultimodalCPTGates:
         validated = validate_config(cfg)
         assert validated.sample_packing is True
 
+    def test_multimodal_image_tiling_config_validates(self, min_base_cfg):
+        cfg = _mm_cpt_cfg(
+            min_base_cfg,
+            image_tiling=True,
+            image_tiling_tile_size=[1024, 1024],
+            image_tiling_grid=[2, 3],
+            image_tiling_overlap=0.15,
+            image_tiling_min_area=1_000_000,
+            image_tiling_overview_buckets=[[1024, 1536], [1536, 1024]],
+            image_tiling_no_upscale=True,
+            image_tiling_pad_color=[255, 255, 255],
+            image_tiling_cache_path="/tmp/mm-tile-cache",
+            image_tiling_cache_hash_images=True,
+            image_tiling_shape_buckets="ocr_pages",
+        )
+
+        validated = validate_config(cfg)
+
+        assert validated.image_tiling is True
+        assert validated.image_tiling_tile_size == (1024, 1024)
+        assert validated.image_tiling_grid == (2, 3)
+        assert validated.image_tiling_overview_buckets == [
+            (1024, 1536),
+            (1536, 1024),
+        ]
+        assert validated.image_tiling_pad_color == (255, 255, 255)
+        assert validated.image_tiling_shape_buckets == "ocr_pages"
+
     def test_chat_template_rejected(self, min_base_cfg):
         cfg = _mm_cpt_cfg(min_base_cfg, chat_template="tokenizer_default")
         with pytest.raises(ValueError, match="chat_template"):
@@ -462,4 +490,69 @@ class TestMultimodalCPTGates:
         assert not any(
             "Auto-set" in r.getMessage() and "remove_unused_columns" in r.getMessage()
             for r in caplog.records
+        )
+
+
+class TestImageTilingSchema:
+    """Validation for the image_tiling_* config surface."""
+
+    @pytest.mark.parametrize("overlap", [-0.5, 0.5, 0.9])
+    def test_overlap_out_of_range_rejected(self, overlap):
+        from pydantic import ValidationError
+
+        from axolotl.utils.schemas.multimodal import MultiModalConfig
+
+        with pytest.raises(ValidationError):
+            MultiModalConfig(image_tiling=True, image_tiling_overlap=overlap)
+
+    def test_overlap_in_range_accepted(self):
+        from axolotl.utils.schemas.multimodal import MultiModalConfig
+
+        cfg = MultiModalConfig(image_tiling=True, image_tiling_overlap=0.25)
+        assert cfg.image_tiling_overlap == 0.25
+
+    def test_bad_shape_bucket_preset_clean_error(self):
+        from pydantic import ValidationError
+
+        from axolotl.utils.schemas.multimodal import MultiModalConfig
+
+        with pytest.raises(ValidationError, match="ocr_pages"):
+            MultiModalConfig(image_tiling=True, image_tiling_shape_buckets="ocr")
+
+    def test_shape_bucket_presets_accepted(self):
+        from axolotl.utils.schemas.multimodal import MultiModalConfig
+
+        assert (
+            MultiModalConfig(
+                image_tiling=True, image_tiling_shape_buckets="ocr_pages"
+            ).image_tiling_shape_buckets
+            == "ocr_pages"
+        )
+
+    def test_tiling_fields_without_enable_warns(self, caplog, monkeypatch):
+        from axolotl.utils.schemas.multimodal import MultiModalConfig
+
+        monkeypatch.setattr(logging.getLogger("axolotl"), "propagate", True)
+        with caplog.at_level(
+            logging.WARNING, logger="axolotl.utils.schemas.multimodal"
+        ):
+            MultiModalConfig(
+                image_tiling=False,
+                image_tiling_tile_size=1024,
+                image_tiling_shape_buckets="ocr_pages",
+            )
+        assert any(
+            "image_tiling is disabled" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_warn_when_no_tiling_fields_set(self, caplog, monkeypatch):
+        from axolotl.utils.schemas.multimodal import MultiModalConfig
+
+        monkeypatch.setattr(logging.getLogger("axolotl"), "propagate", True)
+        with caplog.at_level(
+            logging.WARNING, logger="axolotl.utils.schemas.multimodal"
+        ):
+            MultiModalConfig(image_tiling=False)
+        assert not any(
+            "image_tiling is disabled" in r.getMessage() for r in caplog.records
         )

@@ -17,6 +17,12 @@ from transformers.image_utils import load_image
 
 from axolotl.prompt_strategies.multimodal_pretrain import append_eos_for_processor
 from axolotl.utils.data.mm_image import resize_image_for_processor
+from axolotl.utils.data.mm_tiling import (
+    ImageTileCache,
+    ImageTilingConfig,
+    _tiling_policy_payload,
+    prepare_tiled_text_and_images,
+)
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -117,12 +123,14 @@ def multimodal_metadata_cache_key(
     processor: ProcessorMixin,
     image_base_dir: str | None,
     image_token_id: int,
-    add_eos_token: bool,
+    image_token: str | None = None,
+    add_eos_token: bool = True,
     image_size: int | tuple[int, int] | None = None,
     image_resize_algorithm: Any | None = None,
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
+    image_tiling_config: ImageTilingConfig | None = None,
 ) -> str:
     payload = {
         "text": text,
@@ -137,6 +145,7 @@ def multimodal_metadata_cache_key(
             getattr(getattr(processor, "image_processor", None), "size", None)
         ),
         "image_token_id": image_token_id,
+        "image_token": image_token,
         "eos_token": getattr(tokenizer, "eos_token", None),
         "add_eos_token": add_eos_token,
         "image_size": _jsonable(image_size),
@@ -144,6 +153,11 @@ def multimodal_metadata_cache_key(
         "image_resize_buckets": _jsonable(image_resize_buckets),
         "image_resize_no_upscale": bool(image_resize_no_upscale),
         "image_resize_pad_color": _jsonable(image_resize_pad_color),
+        "image_tiling_config": _jsonable(
+            _tiling_policy_payload(image_tiling_config)
+            if image_tiling_config is not None
+            else None
+        ),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return md5(raw.encode("utf-8")).hexdigest()
@@ -156,6 +170,7 @@ def compute_multimodal_packing_metadata(
     tokenizer: PreTrainedTokenizerBase,
     processor: ProcessorMixin,
     image_token_id: int,
+    image_token: str | None = None,
     image_base_dir: str | None = None,
     add_eos_token: bool = True,
     image_size: int | tuple[int, int] | None = None,
@@ -163,6 +178,7 @@ def compute_multimodal_packing_metadata(
     image_resize_buckets: list[tuple[int, int]] | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
+    image_tiling_config: ImageTilingConfig | None = None,
     cache: MultimodalPackingMetadataCache | None = None,
 ) -> list[MultimodalPackingMetadata]:
     if len(texts) != len(imgs_list):
@@ -179,12 +195,14 @@ def compute_multimodal_packing_metadata(
             processor=processor,
             image_base_dir=image_base_dir,
             image_token_id=image_token_id,
+            image_token=image_token,
             add_eos_token=add_eos_token,
             image_size=image_size,
             image_resize_algorithm=image_resize_algorithm,
             image_resize_buckets=image_resize_buckets,
             image_resize_no_upscale=image_resize_no_upscale,
             image_resize_pad_color=image_resize_pad_color,
+            image_tiling_config=image_tiling_config,
         )
         for text, images in zip(texts, imgs_list, strict=True)
     ]
@@ -210,6 +228,7 @@ def compute_multimodal_packing_metadata(
                 tokenizer=tokenizer,
                 processor=processor,
                 image_token_id=image_token_id,
+                image_token=image_token,
                 image_base_dir=image_base_dir,
                 add_eos_token=add_eos_token,
                 image_size=image_size,
@@ -217,6 +236,7 @@ def compute_multimodal_packing_metadata(
                 image_resize_buckets=image_resize_buckets,
                 image_resize_no_upscale=image_resize_no_upscale,
                 image_resize_pad_color=image_resize_pad_color,
+                image_tiling_config=image_tiling_config,
             )
             for idx, value in zip(chunk, computed, strict=True):
                 output[idx] = value
@@ -296,6 +316,7 @@ def _compute_uncached_metadata(
     tokenizer: PreTrainedTokenizerBase,
     processor: ProcessorMixin,
     image_token_id: int,
+    image_token: str | None,
     image_base_dir: str | None,
     add_eos_token: bool,
     image_size: int | tuple[int, int] | None,
@@ -303,7 +324,29 @@ def _compute_uncached_metadata(
     image_resize_buckets: list[tuple[int, int]] | None,
     image_resize_no_upscale: bool,
     image_resize_pad_color: Any | None,
+    image_tiling_config: ImageTilingConfig | None,
 ) -> list[MultimodalPackingMetadata]:
+    if image_tiling_config is not None:
+        tile_cache = ImageTileCache(image_tiling_config.cache_path)
+        prepared = [
+            prepare_tiled_text_and_images(
+                text,
+                list(images or []),
+                image_token=image_token or _processor_image_token(processor),
+                tiling_config=image_tiling_config,
+                image_base_dir=image_base_dir,
+                resize_algorithm=image_resize_algorithm,
+                cache=tile_cache,
+            )
+            for text, images in zip(texts, imgs_list, strict=True)
+        ]
+        texts = [text for text, _images in prepared]
+        imgs_list = [images for _text, images in prepared]
+        image_size = None
+        image_resize_buckets = None
+        image_resize_no_upscale = False
+        image_resize_pad_color = None
+
     processor_texts = [
         append_eos_for_processor(text, tokenizer, add_eos_token=add_eos_token)
         for text in texts
@@ -409,9 +452,13 @@ def _load_images(
     for row in imgs_list:
         loaded_row = []
         for image in row or []:
+            # Always go through load_image (even for PIL) to match the runtime
+            # collator's L/RGBA->RGB conversion; otherwise estimated length can
+            # diverge from the real tokenized length for non-RGB inputs.
+            raw_image = load_image(_resolve_image_source(image, image_base_dir))
             loaded_row.append(
                 resize_image_for_processor(
-                    load_image(_resolve_image_source(image, image_base_dir)),
+                    raw_image,
                     image_size,
                     image_resize_algorithm,
                     image_resize_buckets,
@@ -421,6 +468,24 @@ def _load_images(
             )
         loaded.append(loaded_row)
     return loaded
+
+
+def _processor_image_token(processor: ProcessorMixin) -> str:
+    token = getattr(processor, "image_token", None)
+    if token:
+        return token
+    tokenizer = getattr(processor, "tokenizer", None)
+    for candidate in ("<|image_pad|>", "<image>", "<|image|>", "<image_soft_token>"):
+        if tokenizer is None:
+            continue
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(candidate)
+        except Exception:  # noqa: BLE001
+            continue
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if token_id is not None and token_id != unk_id:
+            return candidate
+    return "<image>"
 
 
 def _resolve_image_source(src: Any, image_base_dir: str | None) -> Any:
