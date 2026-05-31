@@ -457,9 +457,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
             chunk_manager.model, optimizer_name
         )
         if fp16_total_bytes > 0 and footprint.frozen_param_bytes > 0:
-            frozen_factor = max(
-                1.0, footprint.frozen_param_bytes / fp16_total_bytes
-            )
+            frozen_factor = max(1.0, footprint.frozen_param_bytes / fp16_total_bytes)
     except Exception as exc:  # noqa: BLE001 — defensive over stub managers
         LOG.debug(
             "calibrate: model-state footprint recompute failed (%s); using "

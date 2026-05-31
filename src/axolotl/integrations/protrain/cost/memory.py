@@ -107,8 +107,7 @@ def _normalized_activation_sizes(trace: ProfilerTrace) -> dict[BlockId, int]:
     hit the right entries.
     """
     return {
-        BlockId(int(bid)): int(sz)
-        for bid, sz in (trace.activation_sizes or {}).items()
+        BlockId(int(bid)): int(sz) for bid, sz in (trace.activation_sizes or {}).items()
     }
 
 
@@ -878,7 +877,9 @@ def estimate_peak(
     raw_peak = apply_hot_iter_cap(raw_peak, model_state_present, measured_cap, layout)
 
     alpha = alpha_fragmentation_for_cfg(
-        hw.dominant_param_bytes_per_element, cfg, bool(getattr(hw, "zero3_shard", False))
+        hw.dominant_param_bytes_per_element,
+        cfg,
+        bool(getattr(hw, "zero3_shard", False)),
     )
     trainable_floor = trainable_state_floor_bytes(trace)
     scaled = apply_gate_consistent_scaling(

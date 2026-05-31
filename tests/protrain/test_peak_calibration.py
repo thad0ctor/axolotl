@@ -122,9 +122,7 @@ def test_calibrate_peak_scales_persistent_by_frozen_state_factor() -> None:
     chunk_bytes = {0: 800, 1: 700, 2: 500, 3: 600}  # actual_persistent = 1500
     # All chunks frozen so the explicit trainable term is 0 and we isolate
     # the frozen-factor scaling of the persistent body.
-    cm = _stub_chunk_manager(
-        layout, persistent_ids, chunk_bytes, trainable_ids=set()
-    )
+    cm = _stub_chunk_manager(layout, persistent_ids, chunk_bytes, trainable_ids=set())
     cfg = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=0)
 
     fp16_total = layout.N_chunk * layout.S_chunk  # 4096

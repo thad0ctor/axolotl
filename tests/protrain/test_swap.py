@@ -39,6 +39,7 @@ from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
 if TYPE_CHECKING:
     from axolotl.integrations.protrain.chunk import ChunkManager
     from axolotl.integrations.protrain.runtime.scheduler import Scheduler
+    from axolotl.integrations.protrain.types import ProfilerTrace
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +140,16 @@ def test_swap_pool_capacity_sizing() -> None:
         swap_pool_capacity_bytes,
     )
 
-    trace = SimpleNamespace(
-        seq=32768,
-        hidden_size=5120,
-        intermediate_size=17408,
-        num_experts_per_tok=0,
-        moe_intermediate_size=0,
-        activation_sizes={},
+    trace = cast(
+        "ProfilerTrace",
+        SimpleNamespace(
+            seq=32768,
+            hidden_size=5120,
+            intermediate_size=17408,
+            num_experts_per_tok=0,
+            moe_intermediate_size=0,
+            activation_sizes={},
+        ),
     )
     per_block = swap_block_saved_bytes(trace)
     # Conservative arch estimate should land in the multi-GiB/block range at 32k.

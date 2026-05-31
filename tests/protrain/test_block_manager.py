@@ -249,11 +249,7 @@ def test_swap_forward_backward_correctness() -> None:
     ref_block.load_state_dict(block.state_dict())
 
     wrapped = SwappedBlock(block)
-    pool = ActivationSwapPool(
-        n_swap=1,
-        slot_bytes=4 * 16 * 4,  # batch * features * fp32
-        prefetch_depth=2,
-    )
+    pool = ActivationSwapPool(capacity_bytes=4 * 16 * 4 * 16)  # batch * features * fp32
     swap_stream = torch.cuda.Stream()
     wrapped.attach_runtime(pool, swap_stream)
 

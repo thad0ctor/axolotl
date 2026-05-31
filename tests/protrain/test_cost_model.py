@@ -11,6 +11,8 @@ agrees with ``estimate_peak``'s ``ckpt_chain_bytes`` term.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from axolotl.integrations.protrain.cost.memory import (
@@ -351,7 +353,7 @@ def test_block_internal_saved_bytes_zero_when_arch_fields_missing():
 
 def _attn_trace(seq: int, backend: str, **over) -> ProfilerTrace:
     """Qwen3-14B-shaped GQA trace for backend-aware attention-term tests."""
-    fields = dict(
+    fields: dict[str, Any] = dict(
         hidden_size=5120,
         num_attention_heads=40,
         intermediate_size=17408,
@@ -412,9 +414,7 @@ def test_attn_activation_sliding_window_caps_eager_span():
     from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
 
     full = attn_activation_bytes(_attn_trace(16384, "eager", sliding_window=0))
-    windowed = attn_activation_bytes(
-        _attn_trace(16384, "eager", sliding_window=1024)
-    )
+    windowed = attn_activation_bytes(_attn_trace(16384, "eager", sliding_window=1024))
     assert windowed < full
 
 

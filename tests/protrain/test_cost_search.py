@@ -1402,8 +1402,7 @@ def test_estimate_runtime_frozen_offload_finite_when_adam_bps_zero(
         cfg_offload, trace_qlora, toy_layout, block_map, hw_no_adam
     )
     assert math.isfinite(t_qlora) and t_qlora > 0.0, (
-        f"QLoRA frozen-base offload under cpu_adam=0 should be finite; "
-        f"got t={t_qlora}"
+        f"QLoRA frozen-base offload under cpu_adam=0 should be finite; got t={t_qlora}"
     )
 
     # (2) Full-FT offload (trainable fraction 0.0 / 1.0) → still infeasible.
@@ -1419,8 +1418,7 @@ def test_estimate_runtime_frozen_offload_finite_when_adam_bps_zero(
         cfg_offload, trace_fullft, toy_layout, block_map, hw_no_adam
     )
     assert math.isinf(t_fullft), (
-        f"full-FT offload (frac=1.0) under cpu_adam=0 should be inf; "
-        f"got t={t_fullft}"
+        f"full-FT offload (frac=1.0) under cpu_adam=0 should be inf; got t={t_fullft}"
     )
 
 
@@ -4213,7 +4211,9 @@ def test_estimate_peak_4bit_floors_alpha_at_one_no_deflation():
 
     n_block = 8
     s_chunk = 128 * MB
-    trace = _make_qlora_trace(n_block=n_block, act_per_block=512 * MB, trainable_bytes=1 * GB)
+    trace = _make_qlora_trace(
+        n_block=n_block, act_per_block=512 * MB, trainable_bytes=1 * GB
+    )
     layout = _make_layout(n_chunk=n_block, s_chunk=s_chunk, n_block=n_block)
     hw = _make_4bit_hw(gpu_memory_bytes=80 * GB)
     cfg = CostConfig(n_persist=n_block, n_buffer=0, n_swap=0, n_checkpoint=0)
@@ -4255,7 +4255,9 @@ def test_estimate_peak_includes_optimizer_state_floor():
     # Same model_state_bytes aggregate so only the explicit floor differs.
     trace_big = _replace(trace_small, trainable_training_state_bytes=4 * GB)
 
-    peak_small = estimate_peak(cfg, layout=layout, trace=trace_small, block_map=bm, hw=hw)
+    peak_small = estimate_peak(
+        cfg, layout=layout, trace=trace_small, block_map=bm, hw=hw
+    )
     peak_big = estimate_peak(cfg, layout=layout, trace=trace_big, block_map=bm, hw=hw)
     assert peak_big > peak_small, (
         f"larger trainable optimizer state must raise the peak: "

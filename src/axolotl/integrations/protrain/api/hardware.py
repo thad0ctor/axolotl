@@ -21,8 +21,7 @@ DEFAULT_PCIE_BPS = 13e9
 def _in_distributed_context() -> bool:
     """True when RANK or LOCAL_RANK is exported (launcher signals a multi-rank run)."""
     return (
-        os.environ.get("RANK") is not None
-        or os.environ.get("LOCAL_RANK") is not None
+        os.environ.get("RANK") is not None or os.environ.get("LOCAL_RANK") is not None
     )
 
 
