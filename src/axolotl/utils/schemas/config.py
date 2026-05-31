@@ -1614,6 +1614,17 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "the FP4-GEMM module swap). Use FSDP or single-GPU."
             )
 
+        # NVFP4-QLoRA stores the frozen base as an NVFP4Tensor attribute (not an
+        # nn.Parameter); FSDP can't shard it, so it would replicate and lose the
+        # memory win. Refuse rather than silently waste it. (FP4-compute LoRA
+        # keeps a normal bf16 Parameter and shards fine.)
+        if wants_fp4_storage and (self.fsdp_config or self.fsdp):
+            raise ValueError(
+                "nvfp4_training FP4-storage QLoRA does not shard under FSDP — the "
+                "FP4 base would replicate. Use single-GPU, or quantize_base=false "
+                "(FP4-compute LoRA), which shards normally."
+            )
+
         from axolotl.utils.nvfp4_training import nvfp4_supported
 
         ok, reason = nvfp4_supported()
