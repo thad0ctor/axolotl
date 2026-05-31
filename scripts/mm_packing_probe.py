@@ -199,9 +199,9 @@ def expand_data_files(data_files: Any) -> list[Path]:
     expanded: list[Path] = []
     for path in paths:
         matches = glob.glob(path)
-        expanded.extend(Path(match) for match in matches) if matches else expanded.append(
-            Path(path)
-        )
+        expanded.extend(
+            Path(match) for match in matches
+        ) if matches else expanded.append(Path(path))
     return expanded
 
 
@@ -209,7 +209,9 @@ def config_data_files(cfg: dict[str, Any]) -> list[Path]:
     files: list[Path] = []
     for ds_cfg in cfg.get("pretraining_dataset") or cfg.get("datasets") or []:
         if isinstance(ds_cfg, dict):
-            files.extend(expand_data_files(ds_cfg.get("data_files") or ds_cfg.get("path")))
+            files.extend(
+                expand_data_files(ds_cfg.get("data_files") or ds_cfg.get("path"))
+            )
     return files
 
 

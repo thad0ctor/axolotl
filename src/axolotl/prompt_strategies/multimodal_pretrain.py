@@ -456,7 +456,9 @@ def compute_multimodal_processor_lengths(
         ImageTileCache(image_tiling_config.cache_path) if image_tiling_config else None
     )
     if image_tiling_config is not None:
-        tiling_image_token = image_token or build_image_token_spec(processor).image_token
+        tiling_image_token = (
+            image_token or build_image_token_spec(processor).image_token
+        )
         prepared = [
             prepare_tiled_text_and_images(
                 text,

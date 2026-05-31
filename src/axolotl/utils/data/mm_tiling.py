@@ -105,7 +105,9 @@ class ImageTileCache:
             or self.cache_path is None
             or not _is_local_path(resolved)
         ):
-            image = resolved if isinstance(resolved, Image.Image) else load_image(resolved)
+            image = (
+                resolved if isinstance(resolved, Image.Image) else load_image(resolved)
+            )
             selected = select_tiling_config_for_image(image.size, config)
             tiles = tile_image_for_processor(
                 image, selected, resize_algorithm=resize_algorithm
@@ -293,9 +295,7 @@ def tile_image_for_processor(
     return output
 
 
-def tile_position_labels(
-    config: ImageTilingConfig, n_tiles: int
-) -> list[str] | None:
+def tile_position_labels(config: ImageTilingConfig, n_tiles: int) -> list[str] | None:
     """Per-tile textual position markers aligned to tile_image_for_processor order.
 
     None when labels are disabled, the source wasn't tiled (n_tiles<=1, e.g. the

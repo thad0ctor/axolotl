@@ -31,7 +31,9 @@ class MultiModalChatDataCollator(DataCollatorMixin):
 
     def __post_init__(self):
         if self.return_tensors != "pt":
-            raise ValueError("MultiModalChatDataCollator only supports return_tensors='pt'.")
+            raise ValueError(
+                "MultiModalChatDataCollator only supports return_tensors='pt'."
+            )
 
     def torch_call(self, examples: list[dict]) -> dict[str, Any]:
         return self.process_rows(examples)
@@ -130,7 +132,9 @@ class MultiModalChatDataCollator(DataCollatorMixin):
             return value.unsqueeze(0)
         return value
 
-    def _pack_encoded_rows(self, encoded_rows: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+    def _pack_encoded_rows(
+        self, encoded_rows: list[dict[str, Tensor]]
+    ) -> dict[str, Tensor]:
         packed: dict[str, Tensor] = {}
         input_parts = [row["input_ids"].squeeze(0) for row in encoded_rows]
         label_parts = [row["labels"].squeeze(0) for row in encoded_rows]
@@ -152,7 +156,9 @@ class MultiModalChatDataCollator(DataCollatorMixin):
             if key in {"input_ids", "labels", "attention_mask", "position_ids"}:
                 continue
             values = [
-                row[key] for row in encoded_rows if key in row and torch.is_tensor(row[key])
+                row[key]
+                for row in encoded_rows
+                if key in row and torch.is_tensor(row[key])
             ]
             if values:
                 packed[key] = self._concat_extra_tensors(key, values)
@@ -175,7 +181,10 @@ class MultiModalChatDataCollator(DataCollatorMixin):
                     "Packed multimodal SFT row exceeds max_length "
                     f"{self.max_length}: packed length={target_len}."
                 )
-            if self.padding == "max_length" or self.pad_to_multiple_of == self.max_length:
+            if (
+                self.padding == "max_length"
+                or self.pad_to_multiple_of == self.max_length
+            ):
                 target_len = self.max_length
 
         pad_id = self.tokenizer.pad_token_id
@@ -190,10 +199,7 @@ class MultiModalChatDataCollator(DataCollatorMixin):
         out: dict[str, Tensor] = {}
         for key, pad_value in padding_values.items():
             out[key] = torch.cat(
-                [
-                    self._pad_2d(row[key], target_len, pad_value)
-                    for row in rows
-                ],
+                [self._pad_2d(row[key], target_len, pad_value) for row in rows],
                 dim=0,
             )
         return out

@@ -600,7 +600,9 @@ def encode_packed_streaming_multimodal(
                     token_capacity=capacity,
                     visual_capacity=visual_capacity,
                 )
-            bins.extend([[group_indices[idx] for idx in group_bin] for group_bin in group_bins])
+            bins.extend(
+                [[group_indices[idx] for idx in group_bin] for group_bin in group_bins]
+            )
     else:
         bins = pack_parallel(
             np.array([int(row["length"]) for row in rows], dtype=np.int32),

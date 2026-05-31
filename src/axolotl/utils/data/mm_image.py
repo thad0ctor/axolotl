@@ -60,7 +60,9 @@ def resize_image_for_processor(
     image: Any,
     image_size: int | tuple[int, int] | list[int] | None,
     image_resize_algorithm: Image.Resampling | None = None,
-    image_resize_buckets: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
+    image_resize_buckets: list[tuple[int, int]]
+    | tuple[tuple[int, int], ...]
+    | None = None,
     image_resize_no_upscale: bool = False,
     image_resize_pad_color: Any | None = None,
 ) -> Any:

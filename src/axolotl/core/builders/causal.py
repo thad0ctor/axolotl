@@ -717,7 +717,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 if not self.cfg.multipack_real_batches:
                     max_length *= self.cfg.micro_batch_size
                 kwargs["max_length"] = max_length
-                if kwargs.get("pad_to_multiple_of") is not None and self.cfg.pad_to_sequence_len:
+                if (
+                    kwargs.get("pad_to_multiple_of") is not None
+                    and self.cfg.pad_to_sequence_len
+                ):
                     kwargs["pad_to_multiple_of"] = max_length
         elif use_batch_sampler_collator:
             # Use V2BatchSamplerDataCollatorForSeq2Seq for flex attention,

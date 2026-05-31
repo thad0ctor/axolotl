@@ -95,7 +95,9 @@ class AxolotlTrainingMixins:
     )
     multimodal_sample_packing_dataloader_persistent_workers: bool | None = field(
         default=None,
-        metadata={"help": "persistent_workers override for multimodal CPT/SFT collators."},
+        metadata={
+            "help": "persistent_workers override for multimodal CPT/SFT collators."
+        },
     )
     max_seq_length: int = field(
         default=2048,

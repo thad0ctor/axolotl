@@ -275,7 +275,9 @@ def run_training(args) -> dict[str, Any]:
         batch = collator.torch_call([feature])
         shape_counts[batch_shapes(batch)] += 1
         label_tokens = shifted_label_token_count(batch["labels"])
-        visual_rows = int(batch.get("pixel_values").shape[0]) if "pixel_values" in batch else 0
+        visual_rows = (
+            int(batch.get("pixel_values").shape[0]) if "pixel_values" in batch else 0
+        )
         inputs = move_batch_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -333,9 +335,7 @@ def run_training(args) -> dict[str, Any]:
         visual_rows_per_step.append(visual_rows)
 
         if args.progress and (
-            step_idx == 1
-            or step_idx % args.log_every == 0
-            or step_idx == args.steps
+            step_idx == 1 or step_idx % args.log_every == 0 or step_idx == args.steps
         ):
             recent = losses[-min(args.log_every, len(losses)) :]
             elapsed = time.perf_counter() - started_at
@@ -429,7 +429,9 @@ def main() -> None:
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--adam-epsilon", type=float, default=1e-8)
-    parser.add_argument("--optimizer", choices=("adamw_8bit", "adamw"), default="adamw_8bit")
+    parser.add_argument(
+        "--optimizer", choices=("adamw_8bit", "adamw"), default="adamw_8bit"
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--loss-chunk-size", type=int, default=256)
     parser.add_argument("--lora", action=argparse.BooleanOptionalAction, default=True)

@@ -78,9 +78,7 @@ class TestMultimodalCPTGates:
         validated = validate_config(cfg)
         assert validated.sample_packing is True
 
-    def test_multimodal_sample_packing_cache_and_dataloader_flags(
-        self, min_base_cfg
-    ):
+    def test_multimodal_sample_packing_cache_and_dataloader_flags(self, min_base_cfg):
         cfg = _mm_cpt_cfg(
             min_base_cfg,
             sample_packing=True,
@@ -541,9 +539,7 @@ class TestImageTilingSchema:
                 image_tiling_tile_size=1024,
                 image_tiling_shape_buckets="ocr_pages",
             )
-        assert any(
-            "image_tiling is disabled" in r.getMessage() for r in caplog.records
-        )
+        assert any("image_tiling is disabled" in r.getMessage() for r in caplog.records)
 
     def test_no_warn_when_no_tiling_fields_set(self, caplog, monkeypatch):
         from axolotl.utils.schemas.multimodal import MultiModalConfig

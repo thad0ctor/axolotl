@@ -81,7 +81,9 @@ def config_data_files(cfg: dict[str, Any]) -> list[Path]:
     files: list[Path] = []
     for ds_cfg in cfg.get("pretraining_dataset") or cfg.get("datasets") or []:
         if isinstance(ds_cfg, dict):
-            files.extend(expand_data_files(ds_cfg.get("data_files") or ds_cfg.get("path")))
+            files.extend(
+                expand_data_files(ds_cfg.get("data_files") or ds_cfg.get("path"))
+            )
     return files
 
 

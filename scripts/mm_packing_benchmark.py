@@ -360,7 +360,9 @@ def move_batch_to_device(
     for key, value in batch.items():
         if key == "labels" and not include_labels:
             continue
-        out[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        out[key] = (
+            value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        )
     return out
 
 
@@ -593,10 +595,14 @@ def run_variant(
             if measure_loss:
                 loss = getattr(outputs, "loss", None)
                 if loss is None:
-                    raise RuntimeError("Model did not return loss with labels provided.")
+                    raise RuntimeError(
+                        "Model did not return loss with labels provided."
+                    )
                 loss_value = float(loss.detach().float().item())
                 if not math.isfinite(loss_value):
-                    raise RuntimeError(f"Non-finite loss at step {step_idx}: {loss_value}")
+                    raise RuntimeError(
+                        f"Non-finite loss at step {step_idx}: {loss_value}"
+                    )
                 loss_values.append(loss_value)
                 weighted_loss_sum += loss_value * label_tokens
                 total_label_tokens += label_tokens
@@ -632,9 +638,7 @@ def run_variant(
     mean_step_s = float(np.mean(step_seconds)) if step_seconds else 0.0
     median_step_s = float(np.median(step_seconds)) if step_seconds else 0.0
     p95_step_s = float(np.percentile(step_seconds, 95)) if step_seconds else 0.0
-    loss_mean = (
-        weighted_loss_sum / max(1, total_label_tokens) if measure_loss else None
-    )
+    loss_mean = weighted_loss_sum / max(1, total_label_tokens) if measure_loss else None
     loss_ppl = (
         math.exp(min(loss_mean, 50.0))
         if loss_mean is not None and math.isfinite(loss_mean)
@@ -780,9 +784,7 @@ def main() -> None:
     data_file = args.data_file or Path(cfg["pretraining_dataset"][0]["data_files"])
     training_steps = int(args.training_steps or cfg.get("max_steps") or 0)
     gradient_accumulation_steps = int(
-        args.gradient_accumulation_steps
-        or cfg.get("gradient_accumulation_steps")
-        or 1
+        args.gradient_accumulation_steps or cfg.get("gradient_accumulation_steps") or 1
     )
     dataset_rows = count_jsonl_rows(data_file)
     processor_kwargs = cfg.get("processor_kwargs") or {}
@@ -983,9 +985,7 @@ def main() -> None:
             result["eta_seconds"] = result["optimizer_step_s_est"] * training_steps
             result["eta"] = fmt_eta(result["eta_seconds"])
             result["docs_per_optimizer_step_est"] = (
-                result["docs_per_step"]
-                * gradient_accumulation_steps
-                * args.world_size
+                result["docs_per_step"] * gradient_accumulation_steps * args.world_size
             )
         result["dataset_rows"] = dataset_rows
         result["estimated_single_rank_steps_per_epoch"] = ceil(

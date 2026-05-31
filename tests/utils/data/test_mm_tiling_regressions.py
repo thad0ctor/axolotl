@@ -65,9 +65,12 @@ class TestTilePositionLabels:
         )
         assert tile_position_labels(cfg, 7) == [
             "<global_img>",
-            "<row0_col1>", "<row0_col0>",
-            "<row1_col1>", "<row1_col0>",
-            "<row2_col1>", "<row2_col0>",
+            "<row0_col1>",
+            "<row0_col0>",
+            "<row1_col1>",
+            "<row1_col0>",
+            "<row2_col1>",
+            "<row2_col0>",
         ]
 
     def test_ltr_no_overview_labels(self):
@@ -78,8 +81,12 @@ class TestTilePositionLabels:
 
         cfg = ImageTilingConfig(tile_size=64, grid=(3, 2), reading_order="ltr")
         assert tile_position_labels(cfg, 6) == [
-            "<row0_col0>", "<row0_col1>", "<row0_col2>",
-            "<row1_col0>", "<row1_col1>", "<row1_col2>",
+            "<row0_col0>",
+            "<row0_col1>",
+            "<row0_col2>",
+            "<row1_col0>",
+            "<row1_col1>",
+            "<row1_col2>",
         ]
 
     def test_labels_disabled(self):
