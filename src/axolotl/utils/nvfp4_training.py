@@ -312,12 +312,18 @@ class NVFP4FrozenBaseFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, w_q, recipe):
-        import torch.nn.functional as F
+        from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
 
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
         x2d_p, m = _pad_to_block(x2d, 0)
-        out = F.linear(x2d_p, w_q)[:m]  # torchao dynamic-act FP4 GEMM, stored weight
+        # w_q is the stored FP4 weight ([N,K], blocked along K); w_q.t() is the
+        # [K,N] B operand. Route through _addmm (NOT F.linear): torchao's
+        # dynamic-act F.linear path can't carry the two-level per-tensor scale
+        # (it asserts per_tensor_scale is None on both operands).
+        out = _addmm_nvfp4_dispatch(
+            _quantize(x2d_p, QuantPolicy()), w_q.t(), torch.ops.aten.mm.default
+        )[:m]
         ctx.w_q = w_q
         ctx.recipe = recipe
         ctx.x_shape = orig_shape
@@ -863,7 +869,7 @@ def convert_lora_base_to_nvfp4(
       NVFP4 layouts; fprop+dgrad run as pure FP4 GEMMs with no per-step base
       quant prologue. ~1.75x weight memory and the fastest base compute.
     - ``quantized_storage=True`` (NVFP4-QLoRA): base_layer ->
-      NVFP4FrozenBaseLinear, base stored packed in FP4 (~2.6x weight memory);
+      NVFP4FrozenBaseLinear, base stored packed in FP4 (~3.5x weight memory);
       backward dequantizes to bf16. Max memory, modest speed.
     - neither (default): base_layer -> NVFP4Linear, base kept high-precision and
       re-quantized each step. FP4 base GEMM, no memory win.
@@ -884,6 +890,13 @@ def convert_lora_base_to_nvfp4(
             continue
         if compute_base:
             fast = _mslk_available()
+            if fast and (recipe.stochastic_rounding or recipe.hadamard):
+                LOG.warning_once(
+                    "NVFP4 MSLK-fast compute base uses round-to-nearest; the "
+                    "stochastic_rounding/hadamard convergence recipe is NOT applied "
+                    "(harmless on sm_120 where the recipe is off anyway, but on "
+                    "sm_100 this drops the recipe — use base_mode without mslk for it)."
+                )
             cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
             module.base_layer = cls.from_linear(base, recipe)
         elif quantized_storage:

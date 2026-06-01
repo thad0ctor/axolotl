@@ -1603,6 +1603,16 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "lora_qkv_kernel, lora_o_kernel to false."
             )
 
+        # DoRA's weight-norm reads base_layer.weight; the FP4 base modules
+        # (compute/storage) expose no .weight, and the hp base's bf16 master is
+        # decorrelated from the FP4 forward — either way DoRA is wrong here.
+        if self.adapter and self.peft_use_dora:
+            raise ValueError(
+                "nvfp4_training does not support DoRA (peft_use_dora): the NVFP4 "
+                "base layer has no high-precision weight for the DoRA magnitude. "
+                "Set peft_use_dora: false."
+            )
+
         # `adapter: qlora` implies a quantized base; the FP4-storage path REPLACES
         # bnb NF4, so the two quant schemes on the same base layer conflict.
         wants_fp4_storage = bool(self.adapter) and (

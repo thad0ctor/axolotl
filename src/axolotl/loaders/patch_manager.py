@@ -315,6 +315,17 @@ class PatchManager:
             ok, reason = te_nvfp4_available()
             if not ok:
                 raise RuntimeError(reason)
+            # te keeps an HP (bf16) base and quantizes on the fly: it has no
+            # FP4-storage path, so a requested storage/compute base_mode would
+            # silently give no memory saving. Steer the user to backend: native.
+            if adapter in ("lora", "qlora") and (
+                nvfp4.quantize_base or getattr(nvfp4, "base_mode", None) in ("storage", "compute")
+            ):
+                LOG.warning(
+                    "nvfp4_training.backend: te ignores base_mode/quantize_base "
+                    "(te keeps a high-precision base, no FP4 storage saving). Use "
+                    "backend: native for FP4-stored/compute LoRA bases."
+                )
             if adapter in ("lora", "qlora"):
                 count = convert_lora_base_to_te_nvfp4(model, recipe, exclude=exclude)
                 empty_msg = (

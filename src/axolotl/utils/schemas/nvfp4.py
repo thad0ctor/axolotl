@@ -62,7 +62,7 @@ class NVFP4TrainingConfig(BaseModel):
             "'compute' (recommended): the frozen base is pre-quantized once into two "
             "NVFP4 layouts so fprop+dgrad run as pure FP4 GEMMs with no per-step base "
             "quant prologue — fastest base compute, ~1.75x weight memory. 'storage' "
-            "(== NVFP4-QLoRA): base packed in FP4, ~2.6x memory, backward dequants to "
+            "(== NVFP4-QLoRA): base packed in FP4, ~3.5x memory, backward dequants to "
             "bf16 (max memory, modest speed). 'hp': base kept high-precision, "
             "re-quantized each step (FP4 GEMM, no memory win)."
         },

@@ -138,7 +138,7 @@ NVFP4 training modes are selected from the `adapter:` setting plus
 |------|-----------|-------------|------------------|----------------|------|
 | Full fine-tune | *(none)* | n/a | all eligible base GEMMs (trainable: fprop+dgrad+wgrad) | none | ~1.9× vs bf16 |
 | LoRA FP4-compute (default) | `lora` | `compute` | frozen base fprop+dgrad, pre-quantized once; adapters bf16 | ~1.75× weight | **~2.0× vs bf16-LoRA** |
-| NVFP4-QLoRA (FP4 storage) | `lora`/`qlora` | `storage` | frozen base GEMMs, base stored packed in FP4 | ~2.6× weight | ~1.6× vs bf16-LoRA |
+| NVFP4-QLoRA (FP4 storage) | `lora`/`qlora` | `storage` | frozen base GEMMs, base stored packed in FP4 | ~3.5× weight | ~1.6× vs bf16-LoRA |
 | LoRA HP base | `lora` | `hp` | frozen base GEMMs, base kept bf16, re-quantized each step | none | ~1.7× vs bf16-LoRA |
 
 The default LoRA path (`base_mode: compute`) pre-quantizes the frozen base ONCE
