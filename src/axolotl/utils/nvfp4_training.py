@@ -541,6 +541,10 @@ def _mslk_available() -> bool:
     fast path is strictly optional — callers fall back to the torchao quantizer.
     """
     global _MSLK_AVAILABLE
+    import os
+
+    if os.environ.get("AXOLOTL_NVFP4_NO_MSLK") == "1":
+        return False
     if _MSLK_AVAILABLE is None:
         try:
             from mslk.quantize.triton.fp4_quantize import (  # noqa: F401
@@ -553,6 +557,7 @@ def _mslk_available() -> bool:
     return _MSLK_AVAILABLE
 
 
+@torch.compiler.disable
 def _mslk_quantize(t: torch.Tensor):
     """Quantize ``t`` (along its last dim) to NVFP4 via MSLK's fused Triton kernel.
 
@@ -560,8 +565,13 @@ def _mslk_quantize(t: torch.Tensor):
     ``qdata`` is ``float4_e2m1fn_x2`` packed, ``scale`` is the swizzled e4m3 block
     scale, and ``inv_global_scale = 1/global_scale`` is folded back into the GEMM
     output (two-level scaling). MSLK fuses amax + scale + pack into one launch —
-    ~30x faster than the torchao quantizer eager, which is what makes the FP4
-    base GEMM win once whole-model compile graph-breaks the quant prologue.
+    ~30x faster than the torchao quantizer eager.
+
+    ``torch.compiler.disable``: inductor's ``decompose_triton_kernel_wrapper_
+    functional`` pass asserts on MSLK's Triton kernel and crashes the compile, so
+    this stays a graph-break boundary (eager). It's already ~0.03ms eager — it
+    does not need to fuse; what matters is that the GEMM and the rest of the
+    decoder block still compile around it.
     """
     from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
 
