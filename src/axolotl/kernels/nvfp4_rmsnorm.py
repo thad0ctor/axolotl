@@ -16,15 +16,13 @@ from __future__ import annotations
 
 import torch
 import triton
-from torch import nn
-from torch.utils.weak import WeakTensorKeyDictionary
-
+import triton.language as tl
 from mslk.quantize.triton.fp4_quantize import (
     convert_fp32_to_fp4_packed,
     nvfp4_scale_swizzle,
 )
-
-import triton.language as tl
+from torch import nn
+from torch.utils.weak import WeakTensorKeyDictionary
 
 # Maps a fused-norm output tensor `y` to its already-computed (fp4 qdata, e4m3
 # scales). The norm output flows unchanged into the consuming NVFP4 base linear
