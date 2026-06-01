@@ -1119,9 +1119,10 @@ def convert_norms_to_nvfp4_fused(model: nn.Module) -> int:
     """Swap decoder-block RMSNorms for the fused RMSNorm->NVFP4-quant module.
 
     The fused norm emits the normalized activation AND its NVFP4 quant in one
-    kernel, so the consuming base linear skips re-quantizing. Gated to Llama/Qwen-
-    style RMSNorm (``weight * normed``); Gemma-style (``(1 + weight) * normed``)
-    is left untouched to avoid a silently wrong scale. No-op if MSLK is missing.
+    kernel, so the consuming base linear skips re-quantizing. The gamma convention
+    (plain ``weight`` vs zero-centered ``1 + weight``) is detected per norm, and
+    every swap is VERIFIED against the original on a probe before committing —
+    a mismatch reverts the swap (never silently diverges). No-op if MSLK is missing.
     """
     try:
         from axolotl.kernels.nvfp4_rmsnorm import NVFP4FusedRMSNorm
@@ -1131,22 +1132,40 @@ def convert_norms_to_nvfp4_fused(model: nn.Module) -> int:
 
     parents = dict(model.named_modules())
     swapped = 0
+    skipped = 0
     for name, module in list(model.named_modules()):
         attr = name.rsplit(".", 1)[-1]
         if attr not in _FUSE_NORM_NAMES:
             continue
-        cls = type(module).__name__
-        if not cls.endswith("RMSNorm") or "Gemma" in cls:
+        if not type(module).__name__.endswith("RMSNorm") or not hasattr(
+            module, "weight"
+        ):
             continue
-        if not hasattr(module, "weight"):
+        w = module.weight
+        if not w.is_cuda:  # the fused kernel + the verify probe need CUDA
             continue
         parent_name = name.rsplit(".", 1)[0] if "." in name else ""
         parent = parents.get(parent_name)
         if parent is None:
             continue
-        setattr(parent, attr, NVFP4FusedRMSNorm.from_norm(module))
+        fused = NVFP4FusedRMSNorm.from_norm(module)
+        # Verify the fused norm reproduces the original before committing — guards
+        # against any unhandled gamma convention silently corrupting the forward.
+        with torch.no_grad():
+            probe = torch.randn(8, w.shape[-1], device=w.device, dtype=w.dtype)
+            ref = module(probe).float()
+            rel = (fused(probe).float() - ref).norm() / (ref.norm() + 1e-9)
+        if rel > 0.05:
+            LOG.warning("NVFP4: skip fused norm %s (rel-err %.3f)", name, rel.item())
+            skipped += 1
+            continue
+        setattr(parent, attr, fused)
         swapped += 1
-    LOG.info("NVFP4 training: fused %d decoder RMSNorms", swapped)
+    LOG.info(
+        "NVFP4 training: fused %d decoder RMSNorms (%d skipped on verify)",
+        swapped,
+        skipped,
+    )
     return swapped
 
 

@@ -226,25 +226,44 @@ class NVFP4FusedRMSNorm(nn.Module):
     Falls back to a plain RMSNorm when the feature dim isn't %16 (unquantizable).
     """
 
-    def __init__(self, weight: nn.Parameter, eps: float):
+    def __init__(self, weight: nn.Parameter, eps: float, zero_centered: bool = False):
         super().__init__()
         # Reuse the original Parameter as-is to preserve PEFT's frozen/trainable
         # state (freezing is via requires_grad, not by un-Parametering).
         self.weight = weight
         self.eps = eps
+        # Zero-centered gamma (Gemma / Qwen3.x: ``y = normed * (1 + weight)``) vs
+        # plain (Llama: ``normed * weight``). Detected in from_norm; the effective
+        # gamma is built in the autograd graph so the weight grad is correct either way.
+        self.zero_centered = zero_centered
         self.quantizable = weight.shape[-1] % 16 == 0
 
+    def _gamma(self):
+        return 1.0 + self.weight if self.zero_centered else self.weight
+
     def forward(self, x):
+        gamma = self._gamma()
         if not self.quantizable:
             xf = x.float()
             r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-            return (xf * r).to(x.dtype) * self.weight
-        return _FusedRMSNormNVFP4Function.apply(x, self.weight, self.eps)
+            return (xf * r).to(x.dtype) * gamma
+        return _FusedRMSNormNVFP4Function.apply(x, gamma, self.eps)
 
     @classmethod
     def from_norm(cls, norm: nn.Module, eps_attr: str = "variance_epsilon"):
         eps = getattr(norm, eps_attr, None)
         if eps is None:
             eps = getattr(norm, "eps", 1e-6)
-        return cls(norm.weight, float(eps))
+        eps = float(eps)
+        # Detect the gamma convention empirically (robust to arch naming): compare
+        # the real norm's output to both candidate formulas on a probe.
+        w = norm.weight
+        with torch.no_grad():
+            x = torch.randn(8, w.shape[-1], device=w.device, dtype=w.dtype)
+            normed = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+            y = norm(x).float()
+            e_plain = (y - normed * w.float()).abs().mean()
+            e_zc = (y - normed * (1.0 + w.float())).abs().mean()
+            zero_centered = bool(e_zc < e_plain)
+        return cls(w, eps, zero_centered)
 

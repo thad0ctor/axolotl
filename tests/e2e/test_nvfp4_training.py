@@ -123,6 +123,40 @@ class TestNVFP4Training:
             assert out.shape == (2, 16, 4096)
             assert torch.isfinite(out).all().item()
 
+    def test_fused_rmsnorm_matches_both_gamma_conventions(self):
+        """from_norm must reproduce the norm regardless of gamma convention —
+        plain ``weight`` (Llama) AND zero-centered ``1 + weight`` (Gemma/Qwen3.x).
+        The circular original test (reference == kernel formula) missed the latter
+        and silently diverged Qwen3.5."""
+        from axolotl.kernels.nvfp4_rmsnorm import NVFP4FusedRMSNorm
+
+        K = 2048
+        for zero_centered in (False, True):
+
+            class Norm(nn.Module):
+                variance_epsilon = 1e-6
+
+                def __init__(s):
+                    super().__init__()
+                    s.weight = nn.Parameter(
+                        torch.randn(K, device="cuda", dtype=torch.bfloat16) * 0.1
+                    )
+
+                def forward(s, x):
+                    xf = x.float()
+                    n = xf * torch.rsqrt(
+                        xf.pow(2).mean(-1, keepdim=True) + s.variance_epsilon
+                    )
+                    g = (1.0 + s.weight.float()) if zero_centered else s.weight.float()
+                    return (n * g).to(x.dtype)
+
+            norm = Norm().cuda()
+            fused = NVFP4FusedRMSNorm.from_norm(norm)
+            assert fused.zero_centered == zero_centered
+            x = torch.randn(4, 64, K, device="cuda", dtype=torch.bfloat16)
+            rel = (fused(x).float() - norm(x).float()).norm() / norm(x).float().norm()
+            assert rel < 0.05, (zero_centered, rel.item())
+
     def test_swap_frozen_lm_head_skips_odd_dims(self):
         """A non-%32 output dim is left in high precision (no crash)."""
         from axolotl.utils.nvfp4_training import (

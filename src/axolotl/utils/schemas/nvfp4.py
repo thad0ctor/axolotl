@@ -110,13 +110,13 @@ class NVFP4TrainingConfig(BaseModel):
     fuse_rmsnorm: bool = Field(
         default=False,
         json_schema_extra={
-            "description": "EXPERIMENTAL, default off. Fuse decoder RMSNorm with the "
-            "NVFP4 activation quant in one Triton kernel so the qkv/gate-up base "
-            "linears reuse the norm's pre-quantized activation. The kernel is "
-            "numerically correct in isolation but the in-model cache->base-GEMM "
-            "integration DIVERGES training (loss ~20+ vs bf16) with the MSLK base — "
-            "under debug. Leave off until fixed (the throughput benefit was within "
-            "noise anyway)."
+            "description": "Default off (throughput benefit is within noise; under "
+            "torch.compile the reuse cache is bypassed). Fuse decoder RMSNorm with "
+            "the NVFP4 activation quant in one Triton kernel so the qkv/gate-up base "
+            "linears reuse the norm's pre-quantized activation. Auto-detects the "
+            "gamma convention (plain `weight` vs zero-centered `1 + weight`) per norm "
+            "and verifies each swap against the original before committing (reverts "
+            "on mismatch)."
         },
     )
     skip_first_n_blocks: int = Field(
