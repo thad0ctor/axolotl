@@ -24,6 +24,11 @@ from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.image_utils import load_image
 
+from axolotl.integrations.mm_tiling.tiling import (
+    ImageTilingConfig,
+    replace_first_image_placeholder,
+    tile_image_for_processor,
+)
 from axolotl.prompt_strategies.multimodal_pretrain import (
     build_image_token_spec,
     encode_multimodal_pretrain,
@@ -32,11 +37,6 @@ from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.mm_packing import (
     MultimodalPackingMetadataCache,
     compute_multimodal_packing_metadata,
-)
-from axolotl.utils.data.mm_tiling import (
-    ImageTilingConfig,
-    replace_first_image_placeholder,
-    tile_image_for_processor,
 )
 from axolotl.utils.data.streaming import encode_packed_streaming_multimodal
 

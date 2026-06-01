@@ -15,13 +15,16 @@ from axolotl.core.builders.causal import (
     _get_mm_cpt_config,
     _is_multimodal_cpt,
 )
+from axolotl.integrations.mm_tiling.tiling import (
+    ImageTilingConfig,
+    TilingImageTransform,
+)
 from axolotl.prompt_strategies.multimodal_pretrain import (
     build_image_token_spec,
     encode_multimodal_pretrain,
 )
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.mm_packing import MultimodalPackingMetadata
-from axolotl.utils.data.mm_tiling import ImageTilingConfig, TilingImageTransform
 from axolotl.utils.data.streaming import (
     _multimodal_metadata_ram_budget_mb,
     encode_packed_streaming_multimodal,
@@ -559,7 +562,7 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
     assert captured["kwargs"]["max_tokens"] == 4096
 
 
-def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkeypatch):
+def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkeypatch, mm_tiling_plugin):
     captured = {}
 
     def fake_partial(fn, **kwargs):
@@ -667,7 +670,7 @@ def test_mm_cpt_detection_includes_nonstreaming_datasets():
     assert _get_mm_cpt_config(cfg)["image_base_dir"] == "/train/images"
 
 
-def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
+def test_mm_cpt_collator_uses_nonstreaming_dataset_config(mm_tiling_plugin):
     tok = _StubTokenizer({"<image>": 42})
     processor = _StubProcessor(tok, image_token="<image>")
     builder = object.__new__(HFCausalTrainerBuilder)

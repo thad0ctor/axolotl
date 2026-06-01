@@ -117,6 +117,7 @@ class TestMultimodalCPTGates:
     def test_multimodal_image_tiling_config_validates(self, min_base_cfg):
         cfg = _mm_cpt_cfg(
             min_base_cfg,
+            plugins=["axolotl.integrations.mm_tiling.MMTilingPlugin"],
             image_tiling=True,
             image_tiling_tile_size=[1024, 1024],
             image_tiling_grid=[2, 3],
@@ -130,7 +131,18 @@ class TestMultimodalCPTGates:
             image_tiling_shape_buckets="ocr_pages",
         )
 
-        validated = validate_config(cfg)
+        from axolotl.integrations.base import PluginManager
+        from axolotl.utils.config import prepare_plugins
+
+        pm = PluginManager.get_instance()
+        saved = dict(pm.plugins)
+        pm.plugins.clear()
+        try:
+            prepare_plugins(cfg)
+            validated = validate_config(cfg)
+        finally:
+            pm.plugins.clear()
+            pm.plugins.update(saved)
 
         assert validated.image_tiling is True
         assert validated.image_tiling_tile_size == (1024, 1024)
@@ -498,43 +510,43 @@ class TestImageTilingSchema:
     def test_overlap_out_of_range_rejected(self, overlap):
         from pydantic import ValidationError
 
-        from axolotl.utils.schemas.multimodal import MultiModalConfig
+        from axolotl.integrations.mm_tiling.args import MMTilingArgs
 
         with pytest.raises(ValidationError):
-            MultiModalConfig(image_tiling=True, image_tiling_overlap=overlap)
+            MMTilingArgs(image_tiling=True, image_tiling_overlap=overlap)
 
     def test_overlap_in_range_accepted(self):
-        from axolotl.utils.schemas.multimodal import MultiModalConfig
+        from axolotl.integrations.mm_tiling.args import MMTilingArgs
 
-        cfg = MultiModalConfig(image_tiling=True, image_tiling_overlap=0.25)
+        cfg = MMTilingArgs(image_tiling=True, image_tiling_overlap=0.25)
         assert cfg.image_tiling_overlap == 0.25
 
     def test_bad_shape_bucket_preset_clean_error(self):
         from pydantic import ValidationError
 
-        from axolotl.utils.schemas.multimodal import MultiModalConfig
+        from axolotl.integrations.mm_tiling.args import MMTilingArgs
 
         with pytest.raises(ValidationError, match="ocr_pages"):
-            MultiModalConfig(image_tiling=True, image_tiling_shape_buckets="ocr")
+            MMTilingArgs(image_tiling=True, image_tiling_shape_buckets="ocr")
 
     def test_shape_bucket_presets_accepted(self):
-        from axolotl.utils.schemas.multimodal import MultiModalConfig
+        from axolotl.integrations.mm_tiling.args import MMTilingArgs
 
         assert (
-            MultiModalConfig(
+            MMTilingArgs(
                 image_tiling=True, image_tiling_shape_buckets="ocr_pages"
             ).image_tiling_shape_buckets
             == "ocr_pages"
         )
 
     def test_tiling_fields_without_enable_warns(self, caplog, monkeypatch):
-        from axolotl.utils.schemas.multimodal import MultiModalConfig
+        from axolotl.integrations.mm_tiling.args import MMTilingArgs
 
         monkeypatch.setattr(logging.getLogger("axolotl"), "propagate", True)
         with caplog.at_level(
-            logging.WARNING, logger="axolotl.utils.schemas.multimodal"
+            logging.WARNING, logger="axolotl.integrations.mm_tiling.args"
         ):
-            MultiModalConfig(
+            MMTilingArgs(
                 image_tiling=False,
                 image_tiling_tile_size=1024,
                 image_tiling_shape_buckets="ocr_pages",
@@ -542,13 +554,13 @@ class TestImageTilingSchema:
         assert any("image_tiling is disabled" in r.getMessage() for r in caplog.records)
 
     def test_no_warn_when_no_tiling_fields_set(self, caplog, monkeypatch):
-        from axolotl.utils.schemas.multimodal import MultiModalConfig
+        from axolotl.integrations.mm_tiling.args import MMTilingArgs
 
         monkeypatch.setattr(logging.getLogger("axolotl"), "propagate", True)
         with caplog.at_level(
-            logging.WARNING, logger="axolotl.utils.schemas.multimodal"
+            logging.WARNING, logger="axolotl.integrations.mm_tiling.args"
         ):
-            MultiModalConfig(image_tiling=False)
+            MMTilingArgs(image_tiling=False)
         assert not any(
             "image_tiling is disabled" in r.getMessage() for r in caplog.records
         )

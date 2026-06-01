@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
+from axolotl.integrations.mm_tiling.tiling import image_tiling_config_from_cfg
 from axolotl.utils.data.shared import _mm_processing_fingerprint
 from axolotl.utils.dict import DictDefault
 
@@ -28,7 +28,7 @@ def test_string_preset_shape_buckets_still_work():
     assert tiling.shape_buckets and len(tiling.shape_buckets) == 3
 
 
-def test_dataset_hash_fingerprint_tracks_tile_policy():
+def test_dataset_hash_fingerprint_tracks_tile_policy(mm_tiling_plugin):
     """B2: changing the tile policy must change the dataset-cache fingerprint."""
     grid_2x3 = DictDefault({"image_tiling": True, "image_tiling_grid": [2, 3]})
     grid_2x4 = DictDefault({"image_tiling": True, "image_tiling_grid": [2, 4]})
@@ -55,7 +55,7 @@ class TestTilePositionLabels:
     """DocOwl/InternVL-style positional tile labels (<rowX_colY> + <global_img>)."""
 
     def test_rtl_overview_labels(self):
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             tile_position_labels,
         )
@@ -74,7 +74,7 @@ class TestTilePositionLabels:
         ]
 
     def test_ltr_no_overview_labels(self):
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             tile_position_labels,
         )
@@ -90,7 +90,7 @@ class TestTilePositionLabels:
         ]
 
     def test_labels_disabled(self):
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             tile_position_labels,
         )
@@ -99,7 +99,7 @@ class TestTilePositionLabels:
         assert tile_position_labels(cfg, 6) is None
 
     def test_single_tile_unlabeled(self):
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             tile_position_labels,
         )
@@ -108,7 +108,7 @@ class TestTilePositionLabels:
         assert tile_position_labels(cfg, 1) is None
 
     def test_count_mismatch_returns_none(self):
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             tile_position_labels,
         )
@@ -117,7 +117,9 @@ class TestTilePositionLabels:
         assert tile_position_labels(cfg, 5) is None
 
     def test_expand_interleaves_labels(self):
-        from axolotl.utils.data.mm_tiling import expand_image_placeholders_for_tiling
+        from axolotl.integrations.mm_tiling.tiling import (
+            expand_image_placeholders_for_tiling,
+        )
 
         out = expand_image_placeholders_for_tiling(
             "<img>\nx",
@@ -128,7 +130,7 @@ class TestTilePositionLabels:
         assert out == "<global_img><img>\n<row0_col1><img>\n<row0_col0><img>\nx"
 
     def test_default_tile_labels_on(self):
-        from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
+        from axolotl.integrations.mm_tiling.tiling import image_tiling_config_from_cfg
         from axolotl.utils.dict import DictDefault
 
         cfg = image_tiling_config_from_cfg(DictDefault({"image_tiling": True}))
@@ -143,7 +145,7 @@ class TestTilingReviewFixes:
         images (load_image applies exif_transpose; the bucket must use oriented size)."""
         from PIL import Image
 
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             DEFAULT_OCR_IMAGE_TILING_BUCKETS,
             ImageTileCache,
             ImageTilingConfig,
@@ -173,7 +175,10 @@ class TestTilingReviewFixes:
     def test_tile_labels_excluded_from_pixel_cache_key(self):
         from dataclasses import replace
 
-        from axolotl.utils.data.mm_tiling import ImageTilingConfig, image_tile_cache_key
+        from axolotl.integrations.mm_tiling.tiling import (
+            ImageTilingConfig,
+            image_tile_cache_key,
+        )
 
         on = ImageTilingConfig(tile_size=64, grid=(2, 3), tile_labels=True)
         off = replace(on, tile_labels=False)
@@ -183,7 +188,7 @@ class TestTilingReviewFixes:
         """Labels DO change token length, so they must stay in the metadata payload."""
         from dataclasses import replace
 
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             _tiling_policy_payload,
         )
@@ -193,11 +198,11 @@ class TestTilingReviewFixes:
         assert _tiling_policy_payload(on) != _tiling_policy_payload(off)
 
     def test_metadata_cache_key_tracks_tiling_policy(self):
-        from axolotl.utils.data.mm_packing import multimodal_metadata_cache_key
-        from axolotl.utils.data.mm_tiling import (
+        from axolotl.integrations.mm_tiling.tiling import (
             ImageTilingConfig,
             TilingImageTransform,
         )
+        from axolotl.utils.data.mm_packing import multimodal_metadata_cache_key
 
         class _Tok:
             name_or_path = "tok"
@@ -225,7 +230,7 @@ class TestTilingReviewFixes:
     def test_manifest_rejects_key_mismatch(self, tmp_path):
         import json
 
-        from axolotl.utils.data.mm_tiling import _read_cached_manifest
+        from axolotl.integrations.mm_tiling.tiling import _read_cached_manifest
 
         manifest = tmp_path / "manifest.json"
         (tmp_path / "0000.png").write_bytes(b"x")
@@ -236,7 +241,7 @@ class TestTilingReviewFixes:
 
 def test_bare_dict_bucket_without_name_does_not_crash():
     """Hardening: a bucket dict lacking 'name' should default it, not TypeError."""
-    from axolotl.utils.data.mm_tiling import _normalize_shape_buckets
+    from axolotl.integrations.mm_tiling.tiling import _normalize_shape_buckets
 
     buckets = _normalize_shape_buckets([{"grid": [2, 3], "min_aspect_ratio": 0.9}])
     assert buckets[0].name is None
@@ -248,7 +253,7 @@ def test_native_resolution_keeps_crop_size():
     page ~ the original; fixed tile_size instead pads/resizes to a constant canvas."""
     from PIL import Image
 
-    from axolotl.utils.data.mm_tiling import (
+    from axolotl.integrations.mm_tiling.tiling import (
         ImageTileCache,
         build_image_tiling_config,
     )

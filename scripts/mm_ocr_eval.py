@@ -18,13 +18,13 @@ from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.image_utils import load_image
 
+from axolotl.integrations.mm_tiling.tiling import image_tiling_config_from_cfg
 from axolotl.prompt_strategies.multimodal_pretrain import (
     build_image_token_spec,
     encode_multimodal_pretrain,
 )
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.mm_image import resize_image_for_processor
-from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
 
 
 def load_config(path: Path) -> dict[str, Any]:

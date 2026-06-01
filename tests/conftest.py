@@ -712,3 +712,20 @@ def test_load_fixtures(
 def disable_telemetry(monkeypatch):
     monkeypatch.setenv("AXOLOTL_DO_NOT_TRACK", "1")
     yield
+
+
+@pytest.fixture
+def mm_tiling_plugin():
+    """Register the mm_tiling plugin so cfg-driven tiling resolves in tests."""
+    from axolotl.integrations.base import PluginManager
+    from axolotl.integrations.mm_tiling import MMTilingPlugin
+
+    pm = PluginManager.get_instance()
+    saved = dict(pm.plugins)
+    pm.plugins.clear()
+    pm.plugins["mm_tiling"] = MMTilingPlugin()
+    try:
+        yield
+    finally:
+        pm.plugins.clear()
+        pm.plugins.update(saved)

@@ -9,7 +9,7 @@ from axolotl.utils.data.mm_image_transform import (
 from axolotl.utils.dict import DictDefault
 
 
-def test_resolves_tiling_transform_when_enabled():
+def test_resolves_tiling_transform_when_enabled(mm_tiling_plugin):
     t = resolve_mm_image_transform(
         DictDefault({"image_tiling": True, "image_tiling_shape_buckets": "ocr_pages"})
     )
@@ -17,7 +17,12 @@ def test_resolves_tiling_transform_when_enabled():
     assert "grid" in (t.policy_payload() or {})
 
 
-def test_resolves_none_without_tiling():
+def test_resolves_none_without_plugin():
+    # No mm_tiling plugin registered -> no transform even if cfg requests tiling.
+    assert resolve_mm_image_transform(DictDefault({"image_tiling": True})) is None
+
+
+def test_resolves_none_without_tiling(mm_tiling_plugin):
     assert resolve_mm_image_transform(DictDefault({"image_tiling": False})) is None
     assert resolve_mm_image_transform(DictDefault({})) is None
 

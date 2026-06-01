@@ -69,26 +69,13 @@ class MMImageTransform(Protocol):
 def resolve_mm_image_transform(cfg: Any) -> MMImageTransform | None:
     """Resolve the image transform for this cfg, or None if none applies.
 
-    Asks registered plugins first (``BasePlugin.get_mm_image_transform``), then
-    falls back to the in-tree tiling adapter so the feature keeps working while
-    it is migrated into the ``mm_tiling`` plugin. The fallback is removed once
-    tiling fully lives in the plugin.
+    The transform is provided by a plugin via ``BasePlugin.get_mm_image_transform``
+    (e.g. ``axolotl.integrations.mm_tiling``). Returns None when no plugin claims
+    the cfg, so non-tiling runs are untouched.
     """
     try:
         from axolotl.integrations.base import PluginManager
 
-        transform = PluginManager.get_instance().get_mm_image_transform(cfg)
-        if transform is not None:
-            return transform
+        return PluginManager.get_instance().get_mm_image_transform(cfg)
     except Exception:  # noqa: BLE001 - manager may be uninitialized in tooling
-        pass
-
-    # Built-in fallback (transitional): build the tiling transform from cfg.
-    from axolotl.utils.data.mm_tiling import image_tiling_config_from_cfg
-
-    tiling_config = image_tiling_config_from_cfg(cfg)
-    if tiling_config is None:
         return None
-    from axolotl.utils.data.mm_tiling import TilingImageTransform
-
-    return TilingImageTransform(tiling_config)

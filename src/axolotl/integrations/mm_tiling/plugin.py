@@ -13,11 +13,11 @@ from axolotl.integrations.base import BasePlugin
 class MMTilingPlugin(BasePlugin):
     """Registers the tiling image transform when ``image_tiling`` is set."""
 
+    def get_input_args(self):
+        return "axolotl.integrations.mm_tiling.args.MMTilingArgs"
+
     def get_mm_image_transform(self, cfg):
-        from axolotl.utils.data.mm_tiling import (
-            TilingImageTransform,
-            image_tiling_config_from_cfg,
-        )
+        from .tiling import TilingImageTransform, image_tiling_config_from_cfg
 
         config = image_tiling_config_from_cfg(cfg)
         if config is None:

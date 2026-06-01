@@ -6,6 +6,18 @@ import json
 
 import pytest
 
+from axolotl.integrations.mm_tiling.tiling import (
+    DEFAULT_OCR_IMAGE_TILING_BUCKETS,
+    ImageTileCache,
+    ImageTilingConfig,
+    build_image_tiling_config,
+    expand_image_placeholders_for_tiling,
+    image_tile_cache_key,
+    replace_first_image_placeholder,
+    select_tiling_config_for_image,
+    tile_image_for_processor,
+    tile_image_source_for_processor,
+)
 from axolotl.utils.data import mm_packing
 from axolotl.utils.data.mm_image import (
     resize_image_for_processor,
@@ -18,18 +30,6 @@ from axolotl.utils.data.mm_packing import (
     compute_multimodal_packing_metadata,
     multimodal_metadata_cache_key,
     pack_2d_first_fit_decreasing,
-)
-from axolotl.utils.data.mm_tiling import (
-    DEFAULT_OCR_IMAGE_TILING_BUCKETS,
-    ImageTileCache,
-    ImageTilingConfig,
-    build_image_tiling_config,
-    expand_image_placeholders_for_tiling,
-    image_tile_cache_key,
-    replace_first_image_placeholder,
-    select_tiling_config_for_image,
-    tile_image_for_processor,
-    tile_image_source_for_processor,
 )
 
 
@@ -150,7 +150,7 @@ def test_tile_cache_round_trips_from_ssd(tmp_path, monkeypatch):
     def _fail(*_args, **_kwargs):
         raise AssertionError("tile cache hit should not recreate tiles")
 
-    monkeypatch.setattr("axolotl.utils.data.mm_tiling.tile_image_for_processor", _fail)
+    monkeypatch.setattr("axolotl.integrations.mm_tiling.tiling.tile_image_for_processor", _fail)
     second = tile_image_source_for_processor(
         str(image_path),
         config,

@@ -200,8 +200,11 @@ class TestMultiModalChatDataCollatorShapeContract:
         assert params["persistent_workers"] is False
 
     def test_processing_strategy_receives_bucket_resize_policy(self, mock_processor):
+        from axolotl.integrations.mm_tiling.tiling import (
+            ImageTilingConfig,
+            TilingImageTransform,
+        )
         from axolotl.processing_strategies import get_processing_strategy
-        from axolotl.utils.data.mm_tiling import ImageTilingConfig, TilingImageTransform
 
         strategy = get_processing_strategy(
             mock_processor,
@@ -223,8 +226,11 @@ class TestMultiModalChatDataCollatorShapeContract:
     def test_processing_strategy_tiling_expands_column_image(
         self, mock_processor, tmp_path
     ):
+        from axolotl.integrations.mm_tiling.tiling import (
+            ImageTilingConfig,
+            TilingImageTransform,
+        )
         from axolotl.processing_strategies import get_processing_strategy
-        from axolotl.utils.data.mm_tiling import ImageTilingConfig, TilingImageTransform
 
         image_path = tmp_path / "page.png"
         Image.new("RGB", (120, 180), "white").save(image_path)
@@ -489,7 +495,7 @@ class TestMultiModalChatDataCollatorShapeContract:
         assert batch["pixel_values"].shape == (1, 3, 3, 4, 4)
 
     def test_builder_routes_packed_mm_sft_to_mm_chat_collator(
-        self, mock_processing_strategy
+        self, mock_processing_strategy, mm_tiling_plugin
     ):
         from axolotl.core.builders.causal import HFCausalTrainerBuilder
         from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
