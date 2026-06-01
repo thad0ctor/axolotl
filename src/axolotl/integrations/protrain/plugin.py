@@ -1668,8 +1668,11 @@ class ProTrainPlugin(BasePlugin):
                 "or it silently falls back to the auto search. Filled unset "
                 "knobs: n_persist=%d n_buffer=%d n_swap=%d n_checkpoint=%d. Set "
                 "all four explicitly to suppress this.",
-                ", ".join(_set), n_persist_override, n_buffer_override,
-                n_swap_override, n_checkpoint_override,
+                ", ".join(_set),
+                n_persist_override,
+                n_buffer_override,
+                n_swap_override,
+                n_checkpoint_override,
             )
 
         # auto_mode default True; wrapper picks (force_persist, zero3) post-search.

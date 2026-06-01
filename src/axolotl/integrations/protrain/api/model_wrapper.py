@@ -75,6 +75,7 @@ _VL_VISION_HEADROOM_BYTES = 4 * (1 << 30)
 
 
 def _has_unprofiled_vision_tower(model: "nn.Module") -> bool:
+    """True if the model has a vision tower the text-only profiling batch skips."""
     cfg = getattr(model, "config", None)
     if cfg is not None and getattr(cfg, "vision_config", None) is not None:
         return True
@@ -82,6 +83,7 @@ def _has_unprofiled_vision_tower(model: "nn.Module") -> bool:
         if name.rsplit(".", 1)[-1] in {"visual", "vision_tower", "vision_model"}:
             return True
     return False
+
 
 # Slack for allocator frag, framework working set, dataloader workers.
 _DEFAULT_CPU_HEADROOM_BYTES = 2 * (1 << 30)
@@ -1916,9 +1918,10 @@ def protrain_model_wrapper(
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
     ``forbid_activation_offload``: when True, the searcher refuses any
-    CostConfig with ``n_offload > 0``. Set from ``cfg.lora_mlp_kernel`` —
-    the fused MLP backward kernel is incompatible with chunk-storage
-    placeholders.
+    CostConfig with ``n_offload > 0``. Set from
+    ``cfg.protrain_lora_mlp_forbid_offload`` (default False) — the fused MLP
+    backward kernel now composes with offload via shape-preserving
+    placeholders, so this is opt-in rather than implied by lora_mlp_kernel.
 
     ``prefer_no_offload_on_non_nvlink``: defensive searcher tie-break;
     auto-prefers ``n_offload=0`` configs within a 5% noise band when the
@@ -2227,9 +2230,7 @@ def protrain_model_wrapper(
                 "searcher offloads instead of OOMing in the vision forward.",
                 _VL_VISION_HEADROOM_BYTES / (1 << 30),
             )
-        capacity_bytes = max(
-            0, int(hardware_profile.gpu_memory_bytes) - _headroom
-        )
+        capacity_bytes = max(0, int(hardware_profile.gpu_memory_bytes) - _headroom)
     else:
         capacity_bytes = _capacity_bytes_caller
     if _cpu_capacity_bytes_caller is None:
