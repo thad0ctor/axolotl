@@ -1592,15 +1592,21 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 f"got adapter={self.adapter!r}."
             )
 
-        # Fused LoRA kernels read base_layer.weight directly and bypass the NVFP4
-        # base swap (silent bf16 on the te backend, crash on native).
-        if self.adapter and (
-            self.lora_mlp_kernel or self.lora_qkv_kernel or self.lora_o_kernel
+        # The fused LoRA kernels now route the base GEMM through the native NVFP4
+        # modules (detected via is_nvfp4_base in kernels/lora.py), so the native
+        # backend is allowed with the kernels. The te backend still bypasses them:
+        # te.Linear keeps a real .weight, so the kernels would silently run bf16.
+        if (
+            self.adapter
+            and self.nvfp4_training.backend == "te"
+            and (self.lora_mlp_kernel or self.lora_qkv_kernel or self.lora_o_kernel)
         ):
             raise ValueError(
-                "nvfp4_training with an adapter is incompatible with the fused LoRA "
-                "kernels (they bypass the NVFP4 base layer). Set lora_mlp_kernel, "
-                "lora_qkv_kernel, lora_o_kernel to false."
+                "nvfp4_training backend=te is incompatible with the fused LoRA "
+                "kernels (te.Linear exposes a real .weight, so the kernels would "
+                "silently run the base GEMM in bf16 and bypass NVFP4). Set "
+                "lora_mlp_kernel, lora_qkv_kernel, lora_o_kernel to false, or use "
+                "backend=native."
             )
 
         # DoRA's weight-norm reads base_layer.weight; the FP4 base modules
@@ -1777,12 +1783,20 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             # RL trainers not tested so don't enable kernels by default
             return data
         nvfp4 = data.get("nvfp4_training")
-        if nvfp4 and (
-            nvfp4.get("enabled") if isinstance(nvfp4, dict) else nvfp4.enabled
-        ):
-            # The fused LoRA kernels read base_layer.weight directly, bypassing the
-            # NVFP4 base swap — silently running bf16 (te) or crashing (native).
-            return data
+        if nvfp4:
+            nvfp4_enabled = (
+                nvfp4.get("enabled") if isinstance(nvfp4, dict) else nvfp4.enabled
+            )
+            nvfp4_backend = (
+                nvfp4.get("backend", "native")
+                if isinstance(nvfp4, dict)
+                else nvfp4.backend
+            )
+            # Native backend kernels now route the base GEMM through the NVFP4
+            # modules, so leave auto-enable in place. The te backend still bypasses
+            # them (te.Linear has a real .weight → silent bf16), so skip there.
+            if nvfp4_enabled and nvfp4_backend == "te":
+                return data
         if data.get("adapter") in ["lora", "qlora"]:
             # Skip if already set or using 8-bit
             kernel_fields = [

@@ -56,18 +56,31 @@ def get_lora_parameters(
     """
     # For DPO or disabled adapters
     base_layer = proj.base_layer if hasattr(proj, "base_layer") else proj
-    W = base_layer.weight
-    b = base_layer.bias
 
-    if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+    # NVFP4 native base: thread the MODULE through the W_quant slot (like bnb's
+    # quant_state) and leave W=None — these modules have no high-precision
+    # .weight (except NVFP4Linear) and the base GEMM runs in FP4 downstream.
+    from axolotl.utils.nvfp4_training import is_nvfp4_base
+
+    if is_nvfp4_base(base_layer):
+        b = base_layer.bias
+        if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+            return None, b, base_layer, None, None, None, None, None, None
+        quant_state = base_layer
+        W = None
+    else:
+        W = base_layer.weight
+        b = base_layer.bias
+
+        if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+            quant_state = getattr(W, "quant_state", None)
+            if quant_state is None and W.dtype == torch.float8_e4m3fn:
+                quant_state = getattr(base_layer, "weight_scale_inv", None)
+            return W, b, quant_state, None, None, None, None, None, None
+
         quant_state = getattr(W, "quant_state", None)
         if quant_state is None and W.dtype == torch.float8_e4m3fn:
             quant_state = getattr(base_layer, "weight_scale_inv", None)
-        return W, b, quant_state, None, None, None, None, None, None
-
-    quant_state = getattr(W, "quant_state", None)
-    if quant_state is None and W.dtype == torch.float8_e4m3fn:
-        quant_state = getattr(base_layer, "weight_scale_inv", None)
 
     active_adapter = (
         proj.active_adapters[0]
@@ -161,6 +174,11 @@ def _compute_dora_scale(
     Returns:
         mag_norm_scale: [out_features] tensor = magnitude / ||W + s * B @ A||_2
     """
+    # DoRA + NVFP4 is rejected at config validation (the FP4 base exposes no
+    # high-precision weight for the magnitude norm); W is None here only if that
+    # guard regressed.
+    assert W is not None, "DoRA is not supported on an NVFP4 base (W is None)"
+
     # Check cache on magnitude tensor (avoids expensive norm recomputation)
     # Use tensor._version which increments on any in-place modification
     # (data_ptr doesn't change when optimizers update params in-place)
@@ -234,6 +252,7 @@ def matmul_lora(
     out: torch.Tensor | None = None,
     X_drop: torch.Tensor | None = None,
     lora_bias: torch.Tensor | None = None,
+    nvfp4_dgrad: bool = False,
 ) -> torch.Tensor:
     """
     Efficient fused matmul + LoRA computation.
@@ -248,12 +267,23 @@ def matmul_lora(
         out: Optional output tensor for inplace operations
         X_drop: Optional dropout-applied input for LoRA path (if None, uses X)
         lora_bias: Optional LoRA B layer bias [out_features]
+        nvfp4_dgrad: NVFP4 base only — compute X @ W (dgrad) instead of the
+            X @ W.T fprop. The bf16 path expresses dgrad by passing W.t() so its
+            base GEMM is unaffected; the FP4 module ignores the passed W, so the
+            dgrad direction must be selected explicitly here.
 
     Returns:
         Result of X @ W + s * X_drop @ A @ B + b + s * lora_bias
     """
     dtype = X.dtype
-    W = dequantize(W.t(), W_quant)
+
+    from axolotl.utils.nvfp4_training import (
+        is_nvfp4_base,
+        nvfp4_base_dgrad,
+        nvfp4_base_fprop,
+    )
+
+    is_nvfp4 = is_nvfp4_base(W_quant)
 
     reshape = False
     if X.dim() == 3:
@@ -263,9 +293,17 @@ def matmul_lora(
             X_drop = X_drop.view(-1, X_drop.shape[-1])
         reshape = True
 
-    out = torch.matmul(X, W, out=out)
-    if W_quant is not None:
-        del W
+    if is_nvfp4:
+        # FP4 base GEMM against the NVFP4 module (W is None); the `out=` buffer
+        # cannot be reused since the FP4 GEMM allocates its own output.
+        out = nvfp4_base_dgrad(X, W_quant) if nvfp4_dgrad else nvfp4_base_fprop(
+            X, W_quant
+        )
+    else:
+        W = dequantize(W.t(), W_quant)
+        out = torch.matmul(X, W, out=out)
+        if W_quant is not None:
+            del W
 
     if A is not None:
         X_lora = X_drop if X_drop is not None else X
@@ -568,15 +606,17 @@ class LoRA_MLP(torch.autograd.Function):
         if down_lora_bias is not None:
             d_down_lora_bias = down_scale * grad_output.sum(dim=0)
 
-        # Down projection backward
+        # Down projection backward. NVFP4: down_weight is None (module is in
+        # down_quant), so skip the .t() and let matmul_lora's dgrad branch run.
         grad_down = matmul_lora(
             grad_output,
-            down_weight.t(),
+            down_weight.t() if down_weight is not None else None,
             None,
             down_quant,
             down_B_t,
             down_A_t,
             down_scale,
+            nvfp4_dgrad=True,
         )
 
         # Activation backward
@@ -637,17 +677,27 @@ class LoRA_MLP(torch.autograd.Function):
         dX_drop = None
 
         if ctx.needs_input_grad[0]:
-            # Base path gradients through gate and up
-            up_weight_deq = dequantize(up_weight.t(), up_quant)
-            if ctx.inplace:
-                dX = torch.matmul(grad_up, up_weight_deq.t(), out=X)
-            else:
-                dX = torch.matmul(grad_up, up_weight_deq.t())
-            del up_weight_deq
+            from axolotl.utils.nvfp4_training import is_nvfp4_base, nvfp4_base_dgrad
 
-            gate_weight_deq = dequantize(gate_weight, gate_quant)
-            dX += grad_gate @ gate_weight_deq
-            del gate_weight_deq
+            # Base path gradients through gate and up. NVFP4 base: dX = grad @ W
+            # in FP4 (the module is carried in the *_quant slot, weight is None).
+            if is_nvfp4_base(up_quant):
+                # FP4 dgrad allocates its own output, so no inplace into X.
+                dX = nvfp4_base_dgrad(grad_up, up_quant)
+            else:
+                up_weight_deq = dequantize(up_weight.t(), up_quant)
+                if ctx.inplace:
+                    dX = torch.matmul(grad_up, up_weight_deq.t(), out=X)
+                else:
+                    dX = torch.matmul(grad_up, up_weight_deq.t())
+                del up_weight_deq
+
+            if is_nvfp4_base(gate_quant):
+                dX += nvfp4_base_dgrad(grad_gate, gate_quant)
+            else:
+                gate_weight_deq = dequantize(gate_weight, gate_quant)
+                dX += grad_gate @ gate_weight_deq
+                del gate_weight_deq
 
             # LoRA path: reuse grad_B_up and grad_B_gate from above
             if has_dropout:
@@ -1128,19 +1178,33 @@ class LoRA_QKV(torch.autograd.Function):
             d_B_v.addmm_(A_v @ X_lora_t, v_grad, alpha=v_scale, beta=0)
 
         # Base path input gradient (can use inplace on X since X_lora refs are done)
+        from axolotl.utils.nvfp4_training import is_nvfp4_base, nvfp4_base_dgrad
+
         out_buffer = X if ctx.inplace else None
 
-        q_weight_t = dequantize(q_weight, q_quant)
-        grad_X = torch.mm(q_grad, q_weight_t, out=out_buffer)
-        del q_weight_t
+        # NVFP4: dX = grad @ W in FP4 (module carried in *_quant). The FP4 dgrad
+        # allocates its own output, so it can't write into out_buffer; accumulate
+        # the q/k/v contributions explicitly.
+        if is_nvfp4_base(q_quant):
+            grad_X = nvfp4_base_dgrad(q_grad, q_quant)
+        else:
+            q_weight_t = dequantize(q_weight, q_quant)
+            grad_X = torch.mm(q_grad, q_weight_t, out=out_buffer)
+            del q_weight_t
 
-        k_weight_t = dequantize(k_weight, k_quant)
-        grad_X.addmm_(k_grad, k_weight_t)
-        del k_weight_t
+        if is_nvfp4_base(k_quant):
+            grad_X = grad_X + nvfp4_base_dgrad(k_grad, k_quant)
+        else:
+            k_weight_t = dequantize(k_weight, k_quant)
+            grad_X.addmm_(k_grad, k_weight_t)
+            del k_weight_t
 
-        v_weight_t = dequantize(v_weight, v_quant)
-        grad_X.addmm_(v_grad, v_weight_t)
-        del v_weight_t
+        if is_nvfp4_base(v_quant):
+            grad_X = grad_X + nvfp4_base_dgrad(v_grad, v_quant)
+        else:
+            v_weight_t = dequantize(v_weight, v_quant)
+            grad_X.addmm_(v_grad, v_weight_t)
+            del v_weight_t
 
         # LoRA path input gradient: s * grad @ B @ A (reuses grad_B_* from above)
         if has_dropout:
@@ -1517,15 +1581,25 @@ class LoRA_QK(torch.autograd.Function):
             d_B_k.addmm_(A_k @ X_lora_t, k_grad, alpha=k_scale, beta=0)
 
         # Base path input gradient
+        from axolotl.utils.nvfp4_training import is_nvfp4_base, nvfp4_base_dgrad
+
         out_buffer = X if ctx.inplace else None
 
-        q_weight_t = dequantize(q_weight, q_quant)
-        grad_X = torch.mm(q_grad, q_weight_t, out=out_buffer)
-        del q_weight_t
+        # NVFP4: dX = grad @ W in FP4 (module in *_quant); FP4 dgrad allocates its
+        # own output so it can't reuse out_buffer.
+        if is_nvfp4_base(q_quant):
+            grad_X = nvfp4_base_dgrad(q_grad, q_quant)
+        else:
+            q_weight_t = dequantize(q_weight, q_quant)
+            grad_X = torch.mm(q_grad, q_weight_t, out=out_buffer)
+            del q_weight_t
 
-        k_weight_t = dequantize(k_weight, k_quant)
-        grad_X.addmm_(k_grad, k_weight_t)
-        del k_weight_t
+        if is_nvfp4_base(k_quant):
+            grad_X = grad_X + nvfp4_base_dgrad(k_grad, k_quant)
+        else:
+            k_weight_t = dequantize(k_weight, k_quant)
+            grad_X.addmm_(k_grad, k_weight_t)
+            del k_weight_t
 
         # LoRA path input gradient
         if has_dropout:
@@ -1749,10 +1823,16 @@ class LoRA_O(torch.autograd.Function):
             d_A.addmm_(X_lora_t, grad_B, alpha=s, beta=0)
             d_B.addmm_(A @ X_lora_t, dY, alpha=s, beta=0)
 
-        # Base path input gradient
-        W_deq = dequantize(W.t(), W_quant)
-        dX = dY @ W_deq.t()
-        del W_deq
+        # Base path input gradient. NVFP4: dX = dY @ W in FP4 (W is None; the
+        # module is carried in W_quant).
+        from axolotl.utils.nvfp4_training import is_nvfp4_base, nvfp4_base_dgrad
+
+        if is_nvfp4_base(W_quant):
+            dX = nvfp4_base_dgrad(dY, W_quant)
+        else:
+            W_deq = dequantize(W.t(), W_quant)
+            dX = dY @ W_deq.t()
+            del W_deq
 
         if has_dropout:
             dX_drop = None
