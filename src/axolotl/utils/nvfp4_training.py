@@ -675,6 +675,72 @@ class NVFP4FastComputeBaseLinear(nn.Module):
         return cls(w_f, w_d, linear.bias, w.shape[0], recipe)
 
 
+# Base modules whose forward is an FP4 GEMM (no high-precision .weight to read).
+# The fused LoRA kernels detect these to route the base GEMM through FP4 instead
+# of reading base_layer.weight (which only NVFP4Linear, the hp mode, exposes).
+def _nvfp4_base_classes() -> tuple:
+    return (
+        NVFP4Linear,
+        NVFP4FrozenBaseLinear,
+        NVFP4ComputeBaseLinear,
+        NVFP4FastComputeBaseLinear,
+    )
+
+
+def is_nvfp4_base(module) -> bool:
+    return isinstance(module, _nvfp4_base_classes())
+
+
+def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
+    """``x @ W.T`` in FP4 for any native NVFP4 base module (2D ``x`` [M, K]).
+
+    Mirrors each module's forward GEMM but as a plain (no-autograd) call so the
+    fused LoRA autograd Functions can invoke it inside their own forward. Pads M
+    to the FP4 alignment and slices it back.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
+    xp, m = _pad_to_block(x, 0)
+    if isinstance(base, NVFP4FastComputeBaseLinear):
+        xq, xsc, x_inv = _mslk_quantize(xp)
+        out = _mslk_scaled_mm(
+            xq, xsc, x_inv, base.wq_f, base.wsc_f, base.w_inv_f, x.dtype
+        )
+    elif isinstance(base, NVFP4ComputeBaseLinear):
+        out = _addmm_nvfp4_dispatch(
+            _quantize(xp, QuantPolicy()), base.w_fprop, torch.ops.aten.mm.default
+        )
+    elif isinstance(base, NVFP4FrozenBaseLinear):
+        out = _addmm_nvfp4_dispatch(
+            _quantize(xp, QuantPolicy()), base.w_q.t(), torch.ops.aten.mm.default
+        )
+    else:  # NVFP4Linear (hp): high-precision master weight, per-step requant
+        out = _fp4_mm(xp, base.weight.t(), QuantPolicy(), QuantPolicy())
+    return out[:m]
+
+
+def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
+    """``g @ W`` in FP4 (the base contribution to the input gradient), 2D ``g``."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
+    gp, m = _pad_to_block(g, 0)
+    sr = QuantPolicy(stochastic=base.recipe.stochastic_rounding)
+    if isinstance(base, NVFP4FastComputeBaseLinear):
+        gq, gsc, g_inv = _mslk_quantize(gp)
+        out = _mslk_scaled_mm(
+            gq, gsc, g_inv, base.wq_d, base.wsc_d, base.w_inv_d, g.dtype
+        )
+    elif isinstance(base, NVFP4ComputeBaseLinear):
+        out = _addmm_nvfp4_dispatch(
+            _quantize(gp, sr), base.w_dgrad, torch.ops.aten.mm.default
+        )
+    elif isinstance(base, NVFP4FrozenBaseLinear):
+        out = _fp4_mm(gp, base.w_q.dequantize(g.dtype), sr, QuantPolicy())
+    else:  # NVFP4Linear (hp)
+        out = _fp4_mm(gp, base.weight, sr, QuantPolicy())
+    return out[:m]
+
+
 def _is_swappable(module: nn.Linear) -> bool:
     return (
         module.in_features % _BLOCK_SIZE == 0
