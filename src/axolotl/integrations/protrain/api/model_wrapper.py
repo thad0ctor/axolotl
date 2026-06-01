@@ -69,6 +69,20 @@ LOG = get_logger(__name__)
 # Reserve 2 GiB for CUDA context + allocator overhead.
 _DEFAULT_HEADROOM_BYTES = 2 * (1 << 30)
 
+# A vision tower the text-only profiling batch never exercises is invisible to
+# estimate_peak, so reserve extra capacity to force offload instead of OOM.
+_VL_VISION_HEADROOM_BYTES = 4 * (1 << 30)
+
+
+def _has_unprofiled_vision_tower(model: "nn.Module") -> bool:
+    cfg = getattr(model, "config", None)
+    if cfg is not None and getattr(cfg, "vision_config", None) is not None:
+        return True
+    for name, _ in model.named_modules():
+        if name.rsplit(".", 1)[-1] in {"visual", "vision_tower", "vision_model"}:
+            return True
+    return False
+
 # Slack for allocator frag, framework working set, dataloader workers.
 _DEFAULT_CPU_HEADROOM_BYTES = 2 * (1 << 30)
 
@@ -2204,8 +2218,17 @@ def protrain_model_wrapper(
     # Now derive capacity_bytes / cpu_capacity_bytes from the broadcast-synchronized
     # hardware_profile so every rank computes the identical searcher capacity-cutoff.
     if _capacity_bytes_caller is None:
+        _headroom = _DEFAULT_HEADROOM_BYTES
+        if _has_unprofiled_vision_tower(model):
+            _headroom += _VL_VISION_HEADROOM_BYTES
+            LOG.warning(
+                "ProTrain: vision tower not exercised by the text-only profiling "
+                "batch; reserving an extra %.1f GiB capacity headroom so the "
+                "searcher offloads instead of OOMing in the vision forward.",
+                _VL_VISION_HEADROOM_BYTES / (1 << 30),
+            )
         capacity_bytes = max(
-            0, int(hardware_profile.gpu_memory_bytes) - _DEFAULT_HEADROOM_BYTES
+            0, int(hardware_profile.gpu_memory_bytes) - _headroom
         )
     else:
         capacity_bytes = _capacity_bytes_caller

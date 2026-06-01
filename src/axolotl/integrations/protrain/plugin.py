@@ -1642,6 +1642,36 @@ class ProTrainPlugin(BasePlugin):
         n_offload_override = getattr(cfg, "protrain_n_offload_override", None)
         zero3_shard = getattr(cfg, "protrain_zero3_shard", None)
 
+        # The wrapper bypasses the searcher only when all four of
+        # n_persist/n_buffer/n_swap/n_checkpoint are set; a partial set would
+        # otherwise silently fall back to the auto search. Complete it with safe
+        # defaults so a partial override does what the user intended.
+        _core_overrides = {
+            "protrain_n_persist_override": n_persist_override,
+            "protrain_n_buffer_override": n_buffer_override,
+            "protrain_n_swap_override": n_swap_override,
+            "protrain_n_checkpoint_override": n_checkpoint_override,
+        }
+        _set = [k for k, v in _core_overrides.items() if v is not None]
+        if 0 < len(_set) < 4:
+            if n_persist_override is None:
+                n_persist_override = 0
+            if n_buffer_override is None:
+                n_buffer_override = 2
+            if n_swap_override is None:
+                n_swap_override = 0
+            if n_checkpoint_override is None:
+                n_checkpoint_override = 0
+            LOG.warning(
+                "ProTrain: partial residency override (set: %s). The override "
+                "path needs all four of n_persist/n_buffer/n_swap/n_checkpoint "
+                "or it silently falls back to the auto search. Filled unset "
+                "knobs: n_persist=%d n_buffer=%d n_swap=%d n_checkpoint=%d. Set "
+                "all four explicitly to suppress this.",
+                ", ".join(_set), n_persist_override, n_buffer_override,
+                n_swap_override, n_checkpoint_override,
+            )
+
         # auto_mode default True; wrapper picks (force_persist, zero3) post-search.
         auto_mode = getattr(cfg, "protrain_auto_mode", True)
         if auto_mode is None:
@@ -1664,13 +1694,16 @@ class ProTrainPlugin(BasePlugin):
                 "(force_all_persistent=False, zero3_shard=False)."
             )
 
-        # Fused LoRA MLP backward kernel + offloaded-activation chunk placeholders
-        # crash with LoRA_MLPBackward shape-mismatch (v61); pin n_offload=0.
-        forbid_activation_offload = bool(getattr(cfg, "lora_mlp_kernel", False))
+        # The v61 LoRA_MLPBackward shape-mismatch is fixed by the unconditional
+        # shape-preserving placeholders, so the fused MLP kernel now composes
+        # with offload; opt back into the old conservative pin if needed.
+        forbid_activation_offload = bool(
+            getattr(cfg, "protrain_lora_mlp_forbid_offload", False)
+        )
         if forbid_activation_offload:
             LOG.info(
-                "ProTrain: cfg.lora_mlp_kernel=True; searcher will refuse "
-                "n_offload>0 candidates."
+                "ProTrain: protrain_lora_mlp_forbid_offload=True; searcher will "
+                "refuse n_offload>0 candidates."
             )
 
         # PR #17c: defensive searcher tie-break on non-NVLink multi-rank rigs.
