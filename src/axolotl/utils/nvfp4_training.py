@@ -670,22 +670,29 @@ def _mslk_available() -> bool:
     return _MSLK_AVAILABLE
 
 
-@torch.compiler.disable
-def _mslk_quantize(t: torch.Tensor):
-    """Quantize ``t`` (along its last dim) to NVFP4 via MSLK's fused Triton kernel.
+def _swizzled_scale_shape(m: int, k: int) -> tuple[int, int]:
+    """Shape of MSLK's swizzled e4m3 block-scale tensor for a [m, k] input.
 
-    Returns ``(qdata, scale, inv_global_scale)`` ready for ``torch._scaled_mm``:
-    ``qdata`` is ``float4_e2m1fn_x2`` packed, ``scale`` is the swizzled e4m3 block
-    scale, and ``inv_global_scale = 1/global_scale`` is folded back into the GEMM
-    output (two-level scaling). MSLK fuses amax + scale + pack into one launch —
-    ~30x faster than the torchao quantizer eager.
-
-    ``torch.compiler.disable``: inductor's ``decompose_triton_kernel_wrapper_
-    functional`` pass asserts on MSLK's Triton kernel and crashes the compile, so
-    this stays a graph-break boundary (eager). It's already ~0.03ms eager — it
-    does not need to fuse; what matters is that the GEMM and the rest of the
-    decoder block still compile around it.
+    Rows pad to 128, columns (= k/16 block scales) pad to 4 — the tcgen05 MMA
+    scale-factor tile. Needed by the custom-op fake impls (the scale tensor's
+    size can't be derived from the qdata under tracing).
     """
+    rounded_m = (m + 127) // 128 * 128
+    n_blocks = k // _BLOCK_SIZE
+    rounded_k = (n_blocks + 3) // 4 * 4
+    return rounded_m, rounded_k
+
+
+# MSLK's Triton quant kernels registered as opaque custom ops. Inductor's
+# decompose_triton_kernel_wrapper_functional pass crashes if it traces INTO a raw
+# Triton kernel in the dynamo graph; a registered op with a fake impl is a black
+# box it compiles AROUND (no decompose, no graph break, no eager fallback). The
+# concrete impl runs the kernel eagerly under compile — only the GEMM and the
+# surrounding pointwise ops fuse, which is the win (the quant is already ~0.03ms).
+@torch.library.custom_op("axolotl_nvfp4::quantize_two_level", mutates_args=())
+def _mslk_quantize_op(
+    t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
 
     t = t.contiguous()
@@ -697,6 +704,47 @@ def _mslk_quantize(t: torch.Tensor):
         s.view(torch.float8_e4m3fn),
         (1.0 / global_scale).to(t.dtype),
     )
+
+
+@_mslk_quantize_op.register_fake
+def _(t):
+    m, k = t.shape
+    rm, rk = _swizzled_scale_shape(m, k)
+    return (
+        t.new_empty(m, k // 2, dtype=torch.float4_e2m1fn_x2),
+        t.new_empty(rm, rk, dtype=torch.float8_e4m3fn),
+        t.new_empty((), dtype=t.dtype),
+    )
+
+
+@torch.library.custom_op("axolotl_nvfp4::quantize_single_level", mutates_args=())
+def _mslk_quantize_sl_op(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
+
+    q, s = triton_quantize_nvfp4(t.contiguous(), None)
+    return q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn)
+
+
+@_mslk_quantize_sl_op.register_fake
+def _(t):
+    m, k = t.shape
+    rm, rk = _swizzled_scale_shape(m, k)
+    return (
+        t.new_empty(m, k // 2, dtype=torch.float4_e2m1fn_x2),
+        t.new_empty(rm, rk, dtype=torch.float8_e4m3fn),
+    )
+
+
+def _mslk_quantize(t: torch.Tensor):
+    """Quantize ``t`` (along its last dim) to NVFP4 via MSLK's fused Triton kernel.
+
+    Returns ``(qdata, scale, inv_global_scale)`` ready for ``torch._scaled_mm``:
+    ``qdata`` is ``float4_e2m1fn_x2`` packed, ``scale`` is the swizzled e4m3 block
+    scale, and ``inv_global_scale = 1/global_scale`` is folded back into the GEMM
+    output (two-level scaling). Routed through a registered custom op so it stays
+    opaque-in-graph under torch.compile (see ``_mslk_quantize_op``).
+    """
+    return _mslk_quantize_op(t)
 
 
 def _mslk_dequant(qdata, scale, inv_gs, shape, dtype=torch.bfloat16) -> torch.Tensor:
@@ -739,12 +787,19 @@ def _mslk_scaled_mm(aq, a_scale, a_inv_gs, bq, b_scale, b_inv_gs, out_dtype):
     return out * (a_inv_gs * b_inv_gs)
 
 
-@torch.compiler.disable
 def _prequant_sl(x_orig: torch.Tensor, x2d: torch.Tensor):
     """Single-level activation quant: reuse a fused-norm's pre-quantized result
     when ``x_orig`` is that norm's output (identity cache hit), else quantize
     ``x2d`` now. The cache stores the 2D ([M, K/2]) quant, drop-in for the
-    ``_mslk_quantize_sl`` output."""
+    ``_mslk_quantize_sl`` output.
+
+    The cache is an identity-keyed WeakTensorKeyDictionary (untraceable) and only
+    populated by the fuse_rmsnorm path (default OFF). Under torch.compile skip the
+    lookup and quantize directly so the quant stays an opaque op in-graph; eager
+    keeps the cache fast-path.
+    """
+    if torch.compiler.is_compiling():
+        return _mslk_quantize_sl(x2d)
     from axolotl.kernels.nvfp4_rmsnorm import get_prequant
 
     cached = get_prequant(x_orig)
@@ -759,11 +814,9 @@ def _mslk_quantize_sl(t: torch.Tensor):
     per-tensor scale to compute (no amax reduction) or fold. ~3.6x faster than
     the two-level path. Safe ONLY for the forward ACTIVATION — its magnitudes are
     large enough that the e4m3 block scales don't underflow. Small weights and
-    gradients DO underflow single-level, so they keep two-level."""
-    from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
-
-    q, s = triton_quantize_nvfp4(t.contiguous(), None)
-    return q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn)
+    gradients DO underflow single-level, so they keep two-level. Routed through a
+    registered custom op so it stays opaque-in-graph under torch.compile."""
+    return _mslk_quantize_sl_op(t)
 
 
 def _mslk_fprop_mm(aq, a_scale, bq, b_scale, b_inv_gs, out_dtype):
