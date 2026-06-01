@@ -11,9 +11,11 @@ dequantized value, backward passes the gradient through unchanged. v1 is an EAGE
 attention (P is materialized), which is correct for QAT — the STE makes the
 backward exact without the paper's auxiliary high-precision O' reconstruction.
 
-Follow-up: a fused Triton kernel would recompute P inside a FlashAttention-style
-backward and would then need the paper's O' identity (eq. 9: P^T dP = dO^T O') to
-avoid storing P. Eager has P in hand, so v1 does not need it.
+``nvfp4_qat_attention_forward`` dispatches to the fused FlashAttention-style Triton
+kernel (``axolotl.kernels.attn_qat_flash``, linear memory, recomputes P with the O'
+identity in its backward) when applicable — supported head_dim, Triton available,
+dropout off, plain causal/full mask — and falls back to the eager path below for
+exotic masks (padding/sliding window) or unsupported head_dims.
 """
 
 from __future__ import annotations
@@ -22,6 +24,11 @@ import logging
 
 import torch
 from torch import nn
+
+from axolotl.kernels.attn_qat_flash import (
+    _supported as _fused_supported,
+    fused_nvfp4_qat_attention as _fused_nvfp4_qat_attention,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -77,6 +84,27 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_kv * n_rep, slen, head_dim)
 
 
+def _mask_is_pure_causal(
+    attention_mask: torch.Tensor | None, q_len: int, kv_len: int
+) -> bool:
+    """True iff ``attention_mask`` is None or a plain lower-triangular causal mask
+    (no padding / sliding window / arbitrary bias), so the fused causal kernel is
+    exactly equivalent. A None mask with q_len==kv_len is treated as causal."""
+    if attention_mask is None:
+        return q_len == kv_len
+    if attention_mask.dim() != 4:
+        return False
+    m = attention_mask[..., :kv_len]
+    if m.shape[-1] != kv_len or q_len != kv_len:
+        return False
+    neg = torch.finfo(m.dtype).min
+    keep = m > neg / 2
+    causal = torch.tril(
+        torch.ones(q_len, kv_len, dtype=torch.bool, device=m.device)
+    )
+    return bool((keep == causal).all())
+
+
 def nvfp4_qat_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -87,13 +115,36 @@ def nvfp4_qat_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
-    """Eager attention with NVFP4 fake-quant on Q, K, V and the softmax weights P.
+    """Attention with NVFP4 fake-quant on Q, K, V and the softmax weights P.
 
-    Structurally identical to HF's ``eager_attention_forward`` (same GQA repeat,
-    scaling, additive mask, fp32 softmax, dropout) with the four fake-quant calls
-    from Algorithm 2 inserted. Registered in ``ALL_ATTENTION_FUNCTIONS`` under
-    :data:`ATTN_QAT_IMPL_NAME` and selected via ``config._attn_implementation``.
+    Uses the fused FlashAttention-style Triton kernel (linear memory) when the
+    head_dim is supported, Triton is available, dropout is off, and the mask is a
+    plain causal/full mask; otherwise falls back to the eager v1 below
+    (materialized P) — same fake-quant, exotic-mask/head_dim safe. The eager path
+    is structurally identical to HF's ``eager_attention_forward`` (GQA repeat,
+    scaling, additive mask, fp32 softmax, dropout) with the four Algorithm-2
+    fake-quants inserted.
     """
+    head_dim = query.shape[-1]
+    q_len = query.shape[-2]
+    kv_len = key.shape[-2]
+    if (
+        dropout == 0.0
+        and _fused_supported(head_dim)
+        and _mask_is_pure_causal(attention_mask, q_len, kv_len)
+    ):
+        if not getattr(nvfp4_qat_attention_forward, "_fused_logged", False):
+            LOG.info("fp4_attention_qat: using FUSED Triton flash kernel")
+            nvfp4_qat_attention_forward._fused_logged = True
+        out = _fused_nvfp4_qat_attention(
+            query, key, value, scaling, True, module.num_key_value_groups
+        )
+        return out.transpose(1, 2).contiguous(), None
+
+    if not getattr(nvfp4_qat_attention_forward, "_eager_logged", False):
+        LOG.info("fp4_attention_qat: using EAGER materialized-P attention (v1)")
+        nvfp4_qat_attention_forward._eager_logged = True
+
     key_states = _repeat_kv(key, module.num_key_value_groups)
     value_states = _repeat_kv(value, module.num_key_value_groups)
 

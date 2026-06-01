@@ -275,9 +275,11 @@ class PatchManager:
     def _apply_fp4_attention_qat(self, model: PreTrainedModel):
         """Route attention through the NVFP4 fake-quant QAT path (opt-in).
 
-        Independent of nvfp4_training: works on a bf16 base. Forces eager-style
-        materialized-P attention (v1), so it overrides any flash/sdpa request —
-        warn if the user asked for one. Post-load so it sees the final model tree.
+        Independent of nvfp4_training: works on a bf16 base. Routes through the
+        fused FlashAttention-style Triton kernel (linear memory) when applicable
+        and falls back to the eager materialized-P path otherwise, so it overrides
+        any flash/sdpa request — warn if the user asked for one. Post-load so it
+        sees the final model tree.
         """
         if not self.cfg.fp4_attention_qat:
             return
@@ -287,8 +289,8 @@ class PatchManager:
         requested = self.cfg.attn_implementation
         if requested and requested not in ("eager", "nvfp4_qat"):
             LOG.warning(
-                "fp4_attention_qat overrides attn_implementation=%s with the eager "
-                "NVFP4 fake-quant attention (v1 materializes P).",
+                "fp4_attention_qat overrides attn_implementation=%s with the "
+                "NVFP4 fake-quant attention (fused flash kernel, eager fallback).",
                 requested,
             )
         apply_nvfp4_qat_attention(model)
