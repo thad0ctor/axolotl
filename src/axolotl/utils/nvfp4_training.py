@@ -760,6 +760,95 @@ class NVFP4FastComputeBaseLinear(nn.Module):
         return cls(w_f, w_d, linear.bias, w.shape[0], recipe)
 
 
+class NVFP4FastFrozenBaseFunction(torch.autograd.Function):
+    """Storage-mode fprop/dgrad using MSLK-quantized FP4 operands.
+
+    Same math as :class:`NVFP4FrozenBaseFunction` (single FP4 weight layout, ~3.5x
+    weight memory; dgrad dequantizes the weight) but the per-step activation /
+    gradient quant uses MSLK's fused Triton kernel instead of the torchao
+    quantizer. The weight is stored ONLY in the fprop layout; dgrad dequantizes it
+    to bf16 then re-quantizes both operands — so this keeps the single-layout
+    memory win of storage mode, trading dgrad FLOPs for memory (vs the two-layout
+    compute mode which stores a second FP4 dgrad layout to skip the dequant).
+    """
+
+    @staticmethod
+    def forward(ctx, x, wq, wsc, w_inv, out_features, in_features):
+        orig_shape = x.shape
+        x2d = x.reshape(-1, orig_shape[-1])
+        xq, xsc, x_inv = _mslk_quantize(x2d)
+        out = _mslk_scaled_mm(xq, xsc, x_inv, wq, wsc, w_inv, x.dtype)
+        ctx.wstore = (wq, wsc, w_inv)
+        ctx.x_shape = orig_shape
+        ctx.out_features = out_features
+        ctx.in_features = in_features
+        return out.reshape(*orig_shape[:-1], out_features)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            wq, wsc, w_inv = ctx.wstore
+            g = grad_out.reshape(-1, ctx.out_features)
+            # dgrad = g @ W; the stored layout is blocked along K (fprop), so
+            # dequantize to bf16 for the contraction-along-N GEMM.
+            w_hp = _mslk_dequant(
+                wq, wsc, w_inv, (ctx.out_features, ctx.in_features), grad_out.dtype
+            )
+            gp, m = _pad_to_block(g, 0)
+            gq, gsc, g_inv = _mslk_quantize(gp)
+            wdq, wdsc, wd_inv = _mslk_quantize(w_hp.t().contiguous())  # B = W.t()
+            grad_x = _mslk_scaled_mm(
+                gq, gsc, g_inv, wdq, wdsc, wd_inv, grad_out.dtype
+            )[:m]
+            grad_x = grad_x.reshape(ctx.x_shape)
+        return grad_x, None, None, None, None, None
+
+
+class NVFP4FastFrozenBaseLinear(nn.Module):
+    """Storage-mode frozen base (single FP4 weight, ~3.5x memory) with MSLK-fused
+    per-step quant.
+
+    Drop-in for :class:`NVFP4FrozenBaseLinear`, chosen when MSLK is available. Same
+    single-layout FP4 storage; dgrad dequantizes the weight (no second layout).
+    ``recipe`` SR/RHT are not applied (MSLK's quant is round-to-nearest), matching
+    :class:`NVFP4FastComputeBaseLinear`.
+    """
+
+    def __init__(self, w_store, bias, out_features, in_features, recipe: NVFP4Recipe):
+        super().__init__()
+        wq, wsc, w_inv = w_store
+        self.register_buffer("wq", wq)
+        self.register_buffer("wsc", wsc)
+        self.register_buffer("w_inv", w_inv)
+        self.bias = bias
+        self.recipe = recipe
+        self.out_features = out_features
+        self.in_features = in_features
+
+    def forward(self, x):
+        out = NVFP4FastFrozenBaseFunction.apply(
+            x, self.wq, self.wsc, self.w_inv, self.out_features, self.in_features
+        )
+        return out if self.bias is None else out + self.bias
+
+    @property
+    def weight(self) -> torch.Tensor:
+        # Read-only dequantized [N,K] for PEFT; writes don't persist (see
+        # NVFP4FrozenBaseLinear.weight).
+        return _mslk_dequant(
+            self.wq, self.wsc, self.w_inv, (self.out_features, self.in_features)
+        )
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear, recipe: NVFP4Recipe
+    ) -> "NVFP4FastFrozenBaseLinear":
+        w = linear.weight.detach()  # [N, K]
+        w_store = _mslk_quantize(w)  # single fprop layout, blocked along K
+        return cls(w_store, linear.bias, w.shape[0], w.shape[1], recipe)
+
+
 # Base modules whose forward is an FP4 GEMM (no high-precision .weight to read).
 # The fused LoRA kernels detect these to route the base GEMM through FP4 instead
 # of reading base_layer.weight (which only NVFP4Linear, the hp mode, exposes).
@@ -767,6 +856,7 @@ def _nvfp4_base_classes() -> tuple:
     return (
         NVFP4Linear,
         NVFP4FrozenBaseLinear,
+        NVFP4FastFrozenBaseLinear,
         NVFP4ComputeBaseLinear,
         NVFP4FastComputeBaseLinear,
     )
@@ -789,6 +879,9 @@ def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
     if isinstance(base, NVFP4FastComputeBaseLinear):
         xq, xsc = _mslk_quantize_sl(xp)
         out = _mslk_fprop_mm(xq, xsc, base.wq_f, base.wsc_f, base.w_inv_f, x.dtype)
+    elif isinstance(base, NVFP4FastFrozenBaseLinear):
+        xq, xsc = _mslk_quantize_sl(xp)
+        out = _mslk_fprop_mm(xq, xsc, base.wq, base.wsc, base.w_inv, x.dtype)
     elif isinstance(base, NVFP4ComputeBaseLinear):
         out = _addmm_nvfp4_dispatch(
             _quantize(xp, QuantPolicy()), base.w_fprop, torch.ops.aten.mm.default
@@ -817,6 +910,12 @@ def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
         out = _addmm_nvfp4_dispatch(
             _quantize(gp, sr), base.w_dgrad, torch.ops.aten.mm.default
         )
+    elif isinstance(base, NVFP4FastFrozenBaseLinear):
+        # single FP4 layout: dequantize the stored weight for the dgrad GEMM.
+        w_hp = _mslk_dequant(
+            base.wq, base.wsc, base.w_inv, (base.out_features, base.in_features), g.dtype
+        )
+        out = _fp4_mm(gp, w_hp, sr, QuantPolicy())
     elif isinstance(base, NVFP4FrozenBaseLinear):
         out = _fp4_mm(gp, base.w_q.dequantize(g.dtype), sr, QuantPolicy())
     else:  # NVFP4Linear (hp)
@@ -1019,7 +1118,9 @@ def convert_lora_base_to_nvfp4(
       quant prologue. ~1.75x weight memory and the fastest base compute.
     - ``quantized_storage=True`` (NVFP4-QLoRA): base_layer ->
       NVFP4FrozenBaseLinear, base stored packed in FP4 (~3.5x weight memory);
-      backward dequantizes to bf16. Max memory, modest speed.
+      backward dequantizes to bf16. Max memory, modest speed. When MSLK is
+      available (and not FSDP) the MSLK-fused NVFP4FastFrozenBaseLinear is used
+      instead — same single-layout storage, fast per-step quant.
     - neither (default): base_layer -> NVFP4Linear, base kept high-precision and
       re-quantized each step. FP4 base GEMM, no memory win.
 
@@ -1049,9 +1150,14 @@ def convert_lora_base_to_nvfp4(
             cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
             module.base_layer = cls.from_linear(base, recipe)
         elif quantized_storage:
-            module.base_layer = NVFP4FrozenBaseLinear.from_linear(
-                base, recipe, fsdp=fsdp
-            )
+            # MSLK-fused storage has no FSDP all-gather hooks yet, so keep the
+            # torchao NVFP4FrozenBaseLinear (which carries them) under FSDP.
+            if _mslk_available() and not fsdp:
+                module.base_layer = NVFP4FastFrozenBaseLinear.from_linear(base, recipe)
+            else:
+                module.base_layer = NVFP4FrozenBaseLinear.from_linear(
+                    base, recipe, fsdp=fsdp
+                )
         else:
             base.weight.requires_grad_(False)
             module.base_layer = NVFP4Linear.from_linear(base, recipe)
@@ -1059,7 +1165,7 @@ def convert_lora_base_to_nvfp4(
     if compute_base:
         mode = "compute (mslk-fast)" if _mslk_available() else "compute"
     elif quantized_storage:
-        mode = "storage"
+        mode = "storage (mslk-fast)" if (_mslk_available() and not fsdp) else "storage"
     else:
         mode = "hp"
     LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
