@@ -456,6 +456,103 @@ class NVFP4FrozenBaseLinear(nn.Module):
         return cls(w_q, linear.bias, recipe)
 
 
+def _embedding_to_nvfp4(weight: torch.Tensor):
+    """Quantize an [vocab, hidden] embedding weight to a stored NVFP4Tensor.
+
+    Blocked along the hidden dim (last), two-level scaled — same packing as the
+    frozen base linear. The result is the SHARED store routed to both the
+    embedding lookup and (when tied) the lm_head GEMM.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import (
+        NVFP4Tensor,
+        QuantizeTensorToNVFP4Kwargs,
+        per_tensor_amax_to_scale,
+    )
+
+    w = weight.detach().contiguous()
+    pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
+    return NVFP4Tensor.to_nvfp4(
+        w,
+        block_size=_BLOCK_SIZE,
+        per_tensor_scale=pts,
+        act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE),
+    )
+
+
+class NVFP4Embedding(nn.Module):
+    """Input embedding whose weight is stored packed in FP4 (W4A16 lookup).
+
+    The lookup gathers rows by integer index — no activation quant — so forward
+    is ``F.embedding`` over the dequantized weight. FROZEN only: an FP4-stored
+    weight has no high-precision master to receive gradients (use QAT for a
+    trainable FP4 embedding). Hidden dim must be divisible by 16.
+    """
+
+    def __init__(self, w_q, num_embeddings, embedding_dim, padding_idx=None):
+        super().__init__()
+        # Buffer (not Parameter): frozen, but must enter the state_dict so the
+        # FP4-packed embedding survives save/load (NVFP4Tensor round-trips).
+        self.register_buffer("w_q", w_q)
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.padding_idx = padding_idx
+
+    def forward(self, input):
+        w = self.w_q.dequantize(torch.bfloat16)
+        return torch.nn.functional.embedding(input, w, self.padding_idx)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        # Read-only dequantized [vocab, hidden] view; writes don't persist.
+        return self.w_q.dequantize(torch.bfloat16)
+
+    @classmethod
+    def from_embedding(cls, emb: nn.Embedding) -> "NVFP4Embedding":
+        return cls.from_weight(
+            emb.weight, emb.num_embeddings, emb.embedding_dim, emb.padding_idx
+        )
+
+    @classmethod
+    def from_weight(
+        cls, weight, num_embeddings, embedding_dim, padding_idx=None
+    ) -> "NVFP4Embedding":
+        return cls(
+            _embedding_to_nvfp4(weight), num_embeddings, embedding_dim, padding_idx
+        )
+
+
+class NVFP4TiedLMHead(nn.Module):
+    """lm_head GEMM over a SHARED FP4 store (tied-embedding case).
+
+    Holds no weight of its own: it reads the SAME ``NVFP4Tensor`` that backs the
+    input :class:`NVFP4Embedding`, so the dequantized weight is bit-identical for
+    the lookup and the GEMM. Frozen (no wgrad); dgrad flows via the storage-mode
+    frozen-base function.
+    """
+
+    def __init__(self, embedding: NVFP4Embedding, bias, recipe: NVFP4Recipe):
+        super().__init__()
+        # Reference the embedding's buffer directly so the two roles always read
+        # the same FP4 store (the embedding owns it in the state_dict).
+        self._embedding = embedding
+        self.bias = bias
+        self.recipe = recipe
+        self.in_features = embedding.w_q.shape[1]
+        self.out_features = embedding.w_q.shape[0]
+
+    @property
+    def w_q(self):
+        return self._embedding.w_q
+
+    def forward(self, x):
+        out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
+        return out if self.bias is None else out + self.bias
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.w_q.dequantize(torch.bfloat16)
+
+
 class NVFP4ComputeBaseFunction(torch.autograd.Function):
     """Frozen-base linear with FP4 compute on BOTH base GEMMs, zero per-step
     base-quant prologue.
@@ -946,6 +1043,12 @@ def _is_swappable(module: nn.Linear) -> bool:
     )
 
 
+def _embedding_swappable(emb: nn.Embedding) -> bool:
+    # Only the hidden dim is a quant block axis for the lookup (no GEMM), so the
+    # NVFP4 block_size 16 is the only constraint — vocab is unrestricted.
+    return emb.embedding_dim % _BLOCK_SIZE == 0
+
+
 # Decoder-block norm attributes whose output feeds an NVFP4 base linear (qkv /
 # gate-up). q_norm/k_norm (head-dim, feed attention) and the final norm (feeds
 # lm_head, not an NVFP4 base) are intentionally excluded.
@@ -1077,6 +1180,191 @@ def swap_frozen_linear_to_nvfp4(
     setattr(parent, name.rsplit(".", 1)[-1], new_module)
     LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
     return True
+
+
+def _set_submodule(model: nn.Module, name: str, new_module: nn.Module) -> None:
+    parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+    setattr(parent, name.rsplit(".", 1)[-1], new_module)
+
+
+def swap_frozen_embedding_to_nvfp4(
+    model: nn.Module, name: str
+) -> NVFP4Embedding | None:
+    """Swap a FROZEN ``nn.Embedding`` for :class:`NVFP4Embedding` in place.
+
+    Skips (returns None) a trainable embedding — an FP4-stored weight can't carry
+    gradients — or a hidden dim not divisible by 16. Returns the new module on
+    success so the tied path can route the lm_head through the same store.
+    """
+    try:
+        module = model.get_submodule(name)
+    except AttributeError:
+        return None
+    if not isinstance(module, nn.Embedding):
+        return None
+    if module.weight is not None and module.weight.requires_grad:
+        LOG.warning(
+            "nvfp4_training.quantize_embeddings: %s is trainable; skipping (an "
+            "FP4-stored embedding has no high-precision master for gradients).",
+            name,
+        )
+        return None
+    if not _embedding_swappable(module):
+        LOG.warning(
+            "nvfp4_training.quantize_embeddings: %s hidden dim %d not divisible "
+            "by %d; keeping it in high precision.",
+            name,
+            module.embedding_dim,
+            _BLOCK_SIZE,
+        )
+        return None
+    new_module = NVFP4Embedding.from_embedding(module)
+    _set_submodule(model, name, new_module)
+    LOG.info("NVFP4 training: swapped frozen embedding %s", name)
+    return new_module
+
+
+def swap_tied_embedding_and_lm_head_to_nvfp4(
+    model: nn.Module,
+    embed_name: str,
+    lm_head_name: str,
+    recipe: NVFP4Recipe | None = None,
+) -> bool:
+    """Quantize a tied (shared) FROZEN weight ONCE and route both roles to it.
+
+    The shared weight becomes a single :class:`NVFP4Embedding` store; the input
+    embedding reads it for the lookup and the lm_head reads the SAME store for
+    its GEMM (:class:`NVFP4TiedLMHead`), so the dequantized weight is identical
+    for both. No-op (False) if the shared weight is trainable or not eligible —
+    the caller must keep RAISING on a trainable tied weight.
+    """
+    recipe = recipe or NVFP4Recipe()
+    try:
+        embed = model.get_submodule(embed_name)
+        lm_head = model.get_submodule(lm_head_name)
+    except AttributeError:
+        return False
+    if not isinstance(embed, nn.Embedding) or not isinstance(lm_head, nn.Linear):
+        return False
+    if not _embedding_swappable(embed) or not _is_swappable(lm_head):
+        LOG.warning(
+            "nvfp4_training: tied embedding/lm_head dims not NVFP4-eligible "
+            "(hidden %%16 and lm_head %%32); keeping both in high precision."
+        )
+        return False
+    new_embed = NVFP4Embedding.from_embedding(embed)
+    _set_submodule(model, embed_name, new_embed)
+    _set_submodule(
+        model, lm_head_name, NVFP4TiedLMHead(new_embed, lm_head.bias, recipe)
+    )
+    LOG.info(
+        "NVFP4 training: tied embedding/lm_head quantized once (shared FP4 store)"
+    )
+    return True
+
+
+# Vision-tower submodule names / class-name fragments to locate the encoder.
+_VISION_ATTR_NAMES = ("visual", "vision_tower", "vision_model")
+_VISION_CLASS_FRAGS = ("Vision",)
+# Linears under the vision tower that are NOT encoder GEMMs: the merger /
+# patch-embed projection feed the language model, not the attention/MLP stack.
+_VISION_SKIP_FRAGS = ("merger", "patch_embed", "deepstack")
+
+
+def _find_vision_tower(model: nn.Module):
+    """Return (name, module) of the vision encoder, or (None, None).
+
+    Prefers the conventional attribute names (``visual``/``vision_tower``/
+    ``vision_model``, possibly one level under ``model``); falls back to the
+    first submodule whose class name contains "Vision".
+    """
+    for prefix in ("", "model."):
+        for attr in _VISION_ATTR_NAMES:
+            name = f"{prefix}{attr}"
+            try:
+                mod = model.get_submodule(name)
+            except AttributeError:
+                continue
+            if isinstance(mod, nn.Module):
+                return name, mod
+    for name, mod in model.named_modules():
+        if not name:
+            continue
+        cls = type(mod).__name__
+        if any(frag in cls for frag in _VISION_CLASS_FRAGS) and any(
+            isinstance(c, nn.Linear) for c in mod.modules()
+        ):
+            return name, mod
+    return None, None
+
+
+def convert_vision_tower_to_nvfp4(
+    model: nn.Module,
+    recipe: NVFP4Recipe | None = None,
+    *,
+    base_mode: str = "compute",
+) -> int:
+    """Swap eligible FROZEN ``nn.Linear`` layers under the vision tower to NVFP4.
+
+    Scopes strictly to linears under the located vision encoder (attn qkv/proj,
+    mlp fc1/fc2); the merger / patch-embed projection and any %32-ineligible or
+    trainable linear are skipped. Warns and returns 0 if no vision tower is found
+    (text-only model). Returns the count swapped.
+    """
+    recipe = recipe or NVFP4Recipe()
+    vt_name, vt = _find_vision_tower(model)
+    if vt is None:
+        LOG.warning(
+            "nvfp4_training.quantize_vision_tower: no vision tower found "
+            "(visual/vision_tower/vision_model or a *Vision* module); skipping."
+        )
+        return 0
+
+    swapped = 0
+    for name, module in list(vt.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(frag in name for frag in _VISION_SKIP_FRAGS):
+            continue
+        if module.weight is not None and module.weight.requires_grad:
+            continue
+        if not _is_swappable(module):
+            LOG.warning(
+                "nvfp4_training.quantize_vision_tower: skipping %s.%s "
+                "(in=%d out=%d not both divisible by %d)",
+                vt_name,
+                name,
+                module.in_features,
+                module.out_features,
+                _GEMM_ALIGN,
+            )
+            continue
+        if base_mode == "compute":
+            cls = (
+                NVFP4FastComputeBaseLinear
+                if _mslk_available()
+                else NVFP4ComputeBaseLinear
+            )
+            new_module = cls.from_linear(module, recipe)
+        elif base_mode == "storage":
+            new_module = (
+                NVFP4FastFrozenBaseLinear.from_linear(module, recipe)
+                if _mslk_available()
+                else NVFP4FrozenBaseLinear.from_linear(module, recipe, fsdp=False)
+            )
+        else:
+            module.weight.requires_grad_(False)
+            new_module = NVFP4Linear.from_linear(module, recipe)
+        _set_submodule(vt, name, new_module)
+        swapped += 1
+    LOG.info(
+        "nvfp4_training.quantize_vision_tower: swapped %d linears under %s "
+        "(mode=%s)",
+        swapped,
+        vt_name,
+        base_mode,
+    )
+    return swapped
 
 
 def te_nvfp4_available() -> tuple[bool, str]:

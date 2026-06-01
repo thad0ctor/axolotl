@@ -140,7 +140,8 @@ class TestNVFP4Training:
         assert isinstance(m.lm_head, nn.Linear)
 
     def test_quantize_lm_head_guard_tied_embeddings(self):
-        """The patch-manager guard raises on tied embeddings, passes when untied."""
+        """Tied + FROZEN now succeeds (quantize-once); tied + TRAINABLE still
+        raises; untied removes lm_head from the exclusion as before."""
         from axolotl.loaders.patch_manager import PatchManager
         from axolotl.utils.dict import DictDefault
 
@@ -148,7 +149,7 @@ class TestNVFP4Training:
             tie_word_embeddings = False
 
         class TinyModel(nn.Module):
-            def __init__(self, tie):
+            def __init__(self, tie, frozen=True):
                 super().__init__()
                 self.config = Cfg()
                 self.config.tie_word_embeddings = tie
@@ -156,6 +157,9 @@ class TestNVFP4Training:
                 self.lm_head = nn.Linear(32, 64, bias=False)
                 if tie:
                     self.lm_head.weight = self.embed.weight
+                if frozen:
+                    for p in self.parameters():
+                        p.requires_grad_(False)
 
             def get_output_embeddings(self):
                 return self.lm_head
@@ -169,8 +173,19 @@ class TestNVFP4Training:
         assert PatchManager._model_ties_embeddings(TinyModel(tie=True))
         assert not PatchManager._model_ties_embeddings(TinyModel(tie=False))
 
-        with pytest.raises(RuntimeError, match="tied embeddings"):
-            pm._nvfp4_unexclude_lm_head(TinyModel(tie=True), ["lm_head", "embed_tokens"])
+        # tied + frozen: no longer raises — the shared weight is quantized once
+        # (the name-fragment exclusion is returned unchanged for the tied path).
+        out = pm._nvfp4_unexclude_lm_head(
+            TinyModel(tie=True, frozen=True), ["lm_head", "embed_tokens"]
+        )
+        assert out == ["lm_head", "embed_tokens"]
+
+        # tied + trainable shared weight: still raises (FP4-storing it corrupts
+        # training).
+        with pytest.raises(RuntimeError, match="FROZEN"):
+            pm._nvfp4_unexclude_lm_head(
+                TinyModel(tie=True, frozen=False), ["lm_head", "embed_tokens"]
+            )
 
         # untied: lm_head removed from exclusion, embed_tokens retained
         out = pm._nvfp4_unexclude_lm_head(
@@ -185,6 +200,162 @@ class TestNVFP4Training:
             pm_cce._nvfp4_unexclude_lm_head(
                 TinyModel(tie=False), ["lm_head", "embed_tokens"]
             )
+
+    def test_embedding_quant_forward_and_memory(self):
+        """NVFP4Embedding lookup matches bf16 F.embedding within FP4 tolerance and
+        the weight memory drops ~3.5x."""
+        import torch.nn.functional as F
+
+        from axolotl.utils.nvfp4_training import NVFP4Embedding
+
+        torch.manual_seed(0)
+        emb = nn.Embedding(2048, 512).cuda().bfloat16()
+        emb.weight.requires_grad_(False)
+        ne = NVFP4Embedding.from_embedding(emb)
+        idx = torch.randint(0, 2048, (4, 32), device="cuda")
+        ref = F.embedding(idx, emb.weight)
+        got = ne(idx)
+        cos = F.cosine_similarity(
+            ref.flatten().float(), got.flatten().float(), dim=0
+        ).item()
+        assert cos > 0.99, cos
+
+        bf16_bytes = emb.weight.numel() * 2
+        fp4_bytes = (
+            ne.w_q.qdata.numel()
+            + ne.w_q.scale.numel()
+            + ne.w_q.per_tensor_scale.numel() * 4
+        )
+        assert bf16_bytes / fp4_bytes > 3.0, bf16_bytes / fp4_bytes
+
+    def test_embedding_quant_skips_trainable(self):
+        """A trainable embedding is left in high precision (no FP4 master)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Embedding,
+            swap_frozen_embedding_to_nvfp4,
+        )
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(256, 64)
+
+        m = M().cuda().bfloat16()  # weight trainable by default
+        assert swap_frozen_embedding_to_nvfp4(m, "embed") is None
+        assert isinstance(m.embed, nn.Embedding)
+        assert not isinstance(m.embed, NVFP4Embedding)
+
+    def test_tied_quantize_once_shared_store(self):
+        """Tied frozen weight: the embedding lookup and the lm_head GEMM read the
+        SAME dequantized FP4 store (quantize-once)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Embedding,
+            NVFP4Recipe,
+            NVFP4TiedLMHead,
+            swap_tied_embedding_and_lm_head_to_nvfp4,
+        )
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(2048, 512)
+                self.lm_head = nn.Linear(512, 2048, bias=False)
+                self.lm_head.weight = self.embed.weight
+                for p in self.parameters():
+                    p.requires_grad_(False)
+
+            def get_input_embeddings(self):
+                return self.embed
+
+            def get_output_embeddings(self):
+                return self.lm_head
+
+        m = M().cuda().bfloat16()
+        ok = swap_tied_embedding_and_lm_head_to_nvfp4(
+            m, "embed", "lm_head", NVFP4Recipe()
+        )
+        assert ok
+        assert isinstance(m.embed, NVFP4Embedding)
+        assert isinstance(m.lm_head, NVFP4TiedLMHead)
+        # one store, two roles
+        assert m.lm_head.w_q is m.embed.w_q
+        assert torch.equal(m.embed.weight, m.lm_head.weight)
+
+        x = torch.randn(2, 16, 512, device="cuda", dtype=torch.bfloat16)
+        logits = m.lm_head(x)
+        ref = x @ m.embed.weight.t()  # same dequantized weight as the lookup
+        rel = ((logits - ref).norm() / ref.norm()).item()
+        assert rel < 0.2 and torch.isfinite(logits).all().item(), rel
+
+    def test_vision_tower_targets_only_vision_linears(self):
+        """The vision-tower swap touches ONLY eligible frozen linears under the
+        vision module — merger/patch-embed/non-%32 dims and the language head are
+        left untouched."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4FrozenBaseLinear,
+            NVFP4Recipe,
+            _find_vision_tower,
+            convert_vision_tower_to_nvfp4,
+        )
+
+        class VisionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Module()
+                self.attn.qkv = nn.Linear(1152, 3456, bias=True)
+                self.attn.proj = nn.Linear(1152, 1152)
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(1152, 4304)  # 4304 not %32 -> skip
+                self.mlp.fc2 = nn.Linear(4304, 1152)
+
+        class VisionModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.patch_embed = nn.Module()
+                self.patch_embed.proj = nn.Conv2d(3, 1152, 16, 16)
+                self.blocks = nn.ModuleList([VisionBlock() for _ in range(2)])
+                self.merger = nn.Module()
+                self.merger.linear_fc1 = nn.Linear(1152, 2048)
+
+        class FakeVL(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.visual = VisionModel()
+                self.lm_head = nn.Linear(2048, 1024)
+
+        m = FakeVL().cuda().bfloat16()
+        for p in m.parameters():
+            p.requires_grad_(False)
+
+        name, vt = _find_vision_tower(m)
+        assert name == "model.visual"
+        n = convert_vision_tower_to_nvfp4(m, NVFP4Recipe(), base_mode="storage")
+        # qkv + proj per block (fc1/fc2 skipped for %32), 2 blocks => 4
+        assert n == 4, n
+        assert isinstance(m.model.visual.blocks[0].attn.qkv, NVFP4FrozenBaseLinear)
+        assert isinstance(m.model.visual.blocks[0].attn.proj, NVFP4FrozenBaseLinear)
+        assert isinstance(m.model.visual.blocks[0].mlp.fc1, nn.Linear)
+        assert isinstance(m.model.visual.merger.linear_fc1, nn.Linear)
+        assert isinstance(m.lm_head, nn.Linear)
+
+    def test_vision_tower_warns_on_text_model(self):
+        """No vision tower => no swap, count 0 (text-only model)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            convert_vision_tower_to_nvfp4,
+        )
+
+        class TextModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Linear(64, 64)])
+                self.lm_head = nn.Linear(64, 64)
+
+        m = TextModel().cuda().bfloat16()
+        assert convert_vision_tower_to_nvfp4(m, NVFP4Recipe()) == 0
+        assert isinstance(m.lm_head, nn.Linear)
 
     def test_compile_no_graph_breaks(self):
         from axolotl.utils.nvfp4_training import NVFP4Linear, NVFP4Recipe

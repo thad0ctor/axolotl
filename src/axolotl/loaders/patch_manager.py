@@ -406,18 +406,27 @@ class PatchManager:
                 "nvfp4_training enabled but no eligible LoRA base layers were "
                 "swapped (is the model PEFT-wrapped?)"
             )
-            # The LoRA base converter only swaps `lora.Linear` base_layers. A
-            # frozen lm_head that isn't a LoRA target stays a bare nn.Linear and
-            # is invisible to it, so swap it directly when quantize_lm_head is on.
-            if getattr(nvfp4, "quantize_lm_head", False) and "lm_head" not in exclude:
-                self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
         else:
+            base_mode = getattr(nvfp4, "base_mode", None) or "compute"
             count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
             empty_msg = (
                 "nvfp4_training enabled but no eligible nn.Linear layers were swapped"
             )
         if count == 0:
             LOG.warning(empty_msg)
+
+        # lm_head / input-embedding / tied-shared-weight swaps (each opt-in). The
+        # LoRA base converter only touches lora.Linear base_layers, so a frozen
+        # lm_head/embedding that isn't a LoRA target is invisible to it and is
+        # handled here.
+        self._nvfp4_apply_tied_or_lm_head(model, recipe, base_mode)
+
+        # Vision-tower encoder linears (multimodal, opt-in): frozen nn.Linear
+        # under the vision module stay bf16 otherwise (not lora.Linear).
+        if getattr(nvfp4, "quantize_vision_tower", False):
+            from axolotl.utils.nvfp4_training import convert_vision_tower_to_nvfp4
+
+            convert_vision_tower_to_nvfp4(model, recipe, base_mode=base_mode)
 
         # Fuse decoder RMSNorm + activation quant into one kernel so the base
         # linear reuses the norm's pre-quantized activation (native backend only;
@@ -461,23 +470,29 @@ class PatchManager:
     ) -> list[str]:
         """Drop ``lm_head`` from the NVFP4 exclusion so the converter swaps it.
 
-        Guards first: tied embeddings make this destructive (the lm_head shares
-        storage with tok_embd, so quantizing it corrupts the input embedding) —
-        raise. A fused-linear cross-entropy path (cut_cross_entropy) consumes the
-        lm_head weight directly and bypasses the NVFP4 forward — raise. If the
+        Tied embeddings are handled by the quantize-once path (see
+        ``_nvfp4_apply_tied_or_lm_head``), so a FROZEN tied weight is allowed
+        here; a TRAINABLE tied weight still raises (FP4-storing it would corrupt
+        training). A fused-linear cross-entropy path (cut_cross_entropy) consumes
+        the lm_head weight directly and bypasses the NVFP4 forward — raise. If the
         lm_head dims aren't FP4-swappable (%32), leave it excluded with a warning
         rather than crash. Only ``lm_head`` is removed; ``embed_tokens`` stays.
         """
         from axolotl.utils.nvfp4_training import _is_swappable
 
         if self._model_ties_embeddings(model):
-            raise RuntimeError(
-                "nvfp4_training.quantize_lm_head is incompatible with tied "
-                "embeddings (tie_word_embeddings): the lm_head shares storage with "
-                "the input embedding, so quantizing it to NVFP4 would corrupt "
-                "tok_embd. Either set quantize_lm_head: false, or use a model whose "
-                "output embedding is untied from its input embedding."
-            )
+            if self._tied_weight_trainable(model):
+                raise RuntimeError(
+                    "nvfp4_training.quantize_lm_head with tied embeddings requires a "
+                    "FROZEN shared weight: the output and input embeddings share one "
+                    "weight, and FP4-storing a TRAINABLE shared weight would corrupt "
+                    "training. Freeze the embedding (e.g. use LoRA, which freezes the "
+                    "base), or set quantize_lm_head: false."
+                )
+            # Frozen tied: the shared weight is quantized once and routed to both
+            # roles in _nvfp4_apply_tied_or_lm_head; the name-fragment exclusion is
+            # irrelevant for the tied path, so return unchanged.
+            return exclude_modules
 
         if self.cfg.cut_cross_entropy:
             raise RuntimeError(
@@ -556,6 +571,72 @@ class PatchManager:
         out_w = getattr(out_emb, "weight", None)
         in_w = getattr(in_emb, "weight", None)
         return out_w is not None and in_w is not None and out_w is in_w
+
+    @staticmethod
+    def _tied_weight_trainable(model: PreTrainedModel) -> bool:
+        """Whether the shared (tied) embedding weight requires grad.
+
+        FP4-storing a trainable shared weight would corrupt training, so the
+        quantize-once path is gated on this being False.
+        """
+        try:
+            in_w = getattr(model.get_input_embeddings(), "weight", None)
+        except (AttributeError, NotImplementedError):
+            return False
+        return bool(getattr(in_w, "requires_grad", False))
+
+    def _nvfp4_apply_tied_or_lm_head(self, model, recipe, base_mode: str) -> None:
+        """Route the tied / lm_head / embedding NVFP4 swaps post linear-conversion.
+
+        Three independent flags (all OFF by default):
+        - tied + quantize_lm_head (frozen): quantize the SHARED weight once and
+          point both the embedding lookup and the lm_head GEMM at it.
+        - quantize_lm_head (untied): swap the bare frozen lm_head.
+        - quantize_embeddings: swap the frozen input embedding (also covers the
+          tied case when quantize_lm_head is off — the shared weight is stored
+          FP4 for the lookup, lm_head left HP).
+        """
+        import torch.nn as nn
+
+        from axolotl.utils.nvfp4_training import (
+            swap_frozen_embedding_to_nvfp4,
+            swap_tied_embedding_and_lm_head_to_nvfp4,
+        )
+
+        nvfp4 = self.cfg.nvfp4_training
+        want_lm_head = bool(getattr(nvfp4, "quantize_lm_head", False))
+        want_embed = bool(getattr(nvfp4, "quantize_embeddings", False))
+        if not (want_lm_head or want_embed):
+            return
+
+        tied = self._model_ties_embeddings(model)
+
+        if tied and want_lm_head:
+            # Frozen-tied is guaranteed here (the trainable case raised in
+            # _nvfp4_unexclude_lm_head). Quantize the shared weight once.
+            in_name = self._module_name(model, model.get_input_embeddings())
+            out_name = self._module_name(model, model.get_output_embeddings())
+            if in_name and out_name:
+                swap_tied_embedding_and_lm_head_to_nvfp4(
+                    model, in_name, out_name, recipe
+                )
+            return
+
+        if want_lm_head:
+            self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
+
+        if want_embed:
+            in_emb = model.get_input_embeddings()
+            if isinstance(in_emb, nn.Embedding):
+                in_name = self._module_name(model, in_emb)
+                if in_name:
+                    swap_frozen_embedding_to_nvfp4(model, in_name)
+
+    @staticmethod
+    def _module_name(model: PreTrainedModel, target) -> str | None:
+        if target is None:
+            return None
+        return next((n for n, m in model.named_modules() if m is target), None)
 
     def _apply_chunked_cross_entropy_patch(self):
         if self.cfg.chunked_cross_entropy:
