@@ -200,9 +200,12 @@ def set_default_ckpt_internal_residual_factor(factor: float) -> None:
 
 
 # Attention backends that never materialize the O(seq^2) score/softmax matrix.
-# Flash-Attention (2/3), xFormers, and mem-efficient SDPA stream the softmax in
-# tiles, so their peak attention working set is O(seq), not O(seq^2). "math"/
-# "eager" SDPA and plain eager DO materialize the full score matrix.
+# Flash-Attention (2/3), xFormers, and mem-efficient stream the softmax in tiles,
+# so their peak attention working set is O(seq), not O(seq^2). "math"/"eager" and
+# plain eager DO materialize the full score matrix. "sdpa" is deliberately NOT
+# here: PyTorch SDPA dispatches to flash/mem-efficient OR the math backend
+# depending on eligibility, so it is resolved per-trace via the warmup probe
+# (``dispatched_sdpa_backend``) in ``_attn_is_linear_mem``.
 _LINEAR_MEM_ATTN_BACKENDS: frozenset[str] = frozenset(
     {
         "flash_attention_2",
@@ -211,9 +214,25 @@ _LINEAR_MEM_ATTN_BACKENDS: frozenset[str] = frozenset(
         "flash",
         "xformers",
         "mem_efficient",
-        "sdpa",  # PyTorch SDPA dispatches to flash/mem-efficient kernels when eligible
     }
 )
+
+
+def _attn_is_linear_mem(trace: "ProfilerTrace", backend: str) -> bool:
+    """True if attention streams the softmax (O(seq), no score matrix).
+
+    Flash/mem-efficient backends are always linear. SDPA is linear ONLY when the
+    warmup probe recorded a flash/mem-efficient dispatch; without that evidence
+    (a math dispatch, or no probe at all) we conservatively budget O(seq^2),
+    because SDPA can fall back to the math backend. Over-prediction is safe;
+    under-prediction risks a runtime OOM.
+    """
+    if backend in _LINEAR_MEM_ATTN_BACKENDS:
+        return True
+    if backend == "sdpa":
+        dispatched = str(getattr(trace, "dispatched_sdpa_backend", "") or "").lower()
+        return dispatched in {"flash", "mem_efficient"}
+    return False
 
 
 # Gated-MLP (SwiGLU) saved-for-backward intermediates per block: gate_proj
@@ -236,14 +255,15 @@ def attn_activation_bytes(
 
     Backend cases (``trace.attn_implementation``):
 
-    - Flash-Attention-2/3, xFormers, mem-efficient/SDPA → O(seq): Q,K,V,O
+    - Flash-Attention-2/3, xFormers, mem-efficient (and SDPA *proven* to
+      dispatch flash/mem-efficient via the warmup probe) → O(seq): Q,K,V,O
       projections + the FA softmax-LSE working set. NO score matrix. KV is
       scaled by ``num_key_value_heads`` (GQA) so grouped-query models aren't
       over-counted.
-    - eager / math SDPA → O(seq^2): the full score matrix
-      ``mbs * heads * seq^2`` is real and retained. Kept (conservative) only
-      here. Sliding-window attention caps the span to ``min(seq, window)`` so
-      even eager degrades to O(seq * window).
+    - eager / math / SDPA without flash evidence → O(seq^2): the full score
+      matrix ``mbs * heads * seq^2`` is real and retained (conservative).
+      Sliding-window attention caps the span to ``min(seq, window)`` so even
+      eager degrades to O(seq * window). See ``_attn_is_linear_mem``.
 
     MLP term follows the MoE config: dense models use ``intermediate_size``;
     MoE models that expose ``num_experts_per_tok`` / ``moe_intermediate_size``
@@ -272,9 +292,9 @@ def attn_activation_bytes(
     # Attention output projection (retained input to o_proj).
     out_bytes = bs * seq * max(heads, 1) * head_dim * bytes_per_element
 
-    if heads > 0 and backend not in _LINEAR_MEM_ATTN_BACKENDS:
-        # eager / math: full score matrix is materialized + retained. Sliding
-        # window bounds the second seq factor to the attended span.
+    if heads > 0 and not _attn_is_linear_mem(trace, backend):
+        # eager / math / unproven-SDPA: full score matrix is materialized +
+        # retained. Sliding window bounds the second seq factor to the span.
         span = min(seq, window) if window > 0 else seq
         attn_core_bytes = bs * heads * seq * span * bytes_per_element
     else:

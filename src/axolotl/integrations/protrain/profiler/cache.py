@@ -185,6 +185,9 @@ def _trace_to_dict(trace: ProfilerTrace) -> dict[str, Any]:
         "num_experts_per_tok": int(getattr(trace, "num_experts_per_tok", 0) or 0),
         "moe_intermediate_size": int(getattr(trace, "moe_intermediate_size", 0) or 0),
         "attn_implementation": str(getattr(trace, "attn_implementation", "") or ""),
+        "dispatched_sdpa_backend": str(
+            getattr(trace, "dispatched_sdpa_backend", "") or ""
+        ),
     }
     return payload
 
@@ -241,6 +244,10 @@ def _trace_from_dict(data: dict[str, Any]) -> ProfilerTrace:
             extra[_arch_fname] = int(data.get(_arch_fname, 0) or 0)
     if "attn_implementation" in _trace_field_names:
         extra["attn_implementation"] = str(data.get("attn_implementation", "") or "")
+    if "dispatched_sdpa_backend" in _trace_field_names:
+        extra["dispatched_sdpa_backend"] = str(
+            data.get("dispatched_sdpa_backend", "") or ""
+        )
     return ProfilerTrace(
         op_order=tuple(_op_record_from_dict(d) for d in data["op_order"]),
         intra_op_delta={

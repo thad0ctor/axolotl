@@ -428,6 +428,42 @@ def test_attn_activation_flash_never_underpredicts_eager_lower_bounds():
     assert 0 < flash < eager  # flash is tight; eager stays conservative
 
 
+def test_attn_activation_sdpa_without_evidence_is_quadratic():
+    """SDPA with no dispatch probe must budget O(seq^2): it can fall back to math."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    # No dispatched_sdpa_backend recorded -> conservative, equals eager.
+    sdpa = attn_activation_bytes(_attn_trace(16384, "sdpa"))
+    eager = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert sdpa == eager
+    # And it is super-linear in seq (the score matrix is budgeted).
+    r8k = attn_activation_bytes(_attn_trace(8192, "sdpa"))
+    assert sdpa / r8k > 3.0
+
+
+def test_attn_activation_sdpa_flash_evidence_is_linear():
+    """SDPA proven to dispatch flash/mem-efficient gets the O(seq) flash term."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    flash = attn_activation_bytes(_attn_trace(16384, "flash_attention_2"))
+    for evidence in ("flash", "mem_efficient"):
+        sdpa = attn_activation_bytes(
+            _attn_trace(16384, "sdpa", dispatched_sdpa_backend=evidence)
+        )
+        assert sdpa == flash
+
+
+def test_attn_activation_sdpa_math_evidence_is_quadratic():
+    """SDPA proven to dispatch the math backend gets the O(seq^2) eager term."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    eager = attn_activation_bytes(_attn_trace(16384, "eager"))
+    sdpa = attn_activation_bytes(
+        _attn_trace(16384, "sdpa", dispatched_sdpa_backend="math")
+    )
+    assert sdpa == eager
+
+
 def test_attn_activation_sliding_window_caps_eager_span():
     """Sliding-window attention bounds the eager O(seq^2) term to O(seq*window)."""
     from axolotl.integrations.protrain.cost.memory import attn_activation_bytes

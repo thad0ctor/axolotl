@@ -599,30 +599,72 @@ def run_trace(
 
     # Warmup passes JIT-compile kernels so steady-state per-op latencies aren't cold.
     N_WARMUP = 0 if engage_on_demand else 2
+    # Best-effort: record whether SDPA dispatches flash/mem-efficient (O(seq)) or
+    # the math backend (O(seq^2)) on this model's real inputs, so the cost model
+    # budgets the right attention working set. Stays "" (treated as conservative
+    # O(seq^2)) for non-SDPA backends, the on-demand path (no warmup), or on any
+    # failure. The spy self-selects: it only records on an actual SDPA call.
+    dispatched_sdpa_backend = ""
     if cuda_available and N_WARMUP > 0:
-        for _i in range(N_WARMUP):
-            try:
-                torch.cuda.synchronize(device)
-                with _forward_grad_ctx(), autocast_ctx:
-                    warm_out = model(**batch)
-                if cfg.include_backward:
-                    warm_loss = _extract_loss(warm_out)
-                    warm_loss.backward()
-                    model.zero_grad(set_to_none=True)
-                del warm_out
-                torch.cuda.synchronize(device)
-                # No empty_cache: keep warm allocator state for the traced iter.
-            except Exception as exc:  # pragma: no cover - defensive
-                LOG.debug("profiler warmup pass failed (%s); continuing cold", exc)
-                # On warmup OOM, clear cache for a clean steady-state baseline.
+        import torch.nn.functional as _torch_F
+
+        _sdpa_orig = _torch_F.scaled_dot_product_attention
+        _sdpa_probe: dict[str, str] = {}
+
+        def _sdpa_spy(
+            query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, *a, **k
+        ):
+            if not _sdpa_probe.get("backend"):
                 try:
-                    torch.cuda.empty_cache()
-                except Exception as cleanup_exc:  # noqa: BLE001 - best-effort cleanup
-                    LOG.debug(
-                        "profiler warmup empty_cache failed (%s); continuing cold",
-                        cleanup_exc,
+                    from torch.backends.cuda import (
+                        SDPAParams,
+                        can_use_efficient_attention,
+                        can_use_flash_attention,
                     )
-                break
+
+                    params = SDPAParams(
+                        query, key, value, attn_mask, dropout_p, is_causal
+                    )
+                    if can_use_flash_attention(params, False):
+                        _sdpa_probe["backend"] = "flash"
+                    elif can_use_efficient_attention(params, False):
+                        _sdpa_probe["backend"] = "mem_efficient"
+                    else:
+                        _sdpa_probe["backend"] = "math"
+                except Exception:  # noqa: BLE001 - best-effort probe
+                    _sdpa_probe["backend"] = ""
+            return _sdpa_orig(
+                query, key, value, attn_mask, dropout_p, is_causal, *a, **k
+            )
+
+        _torch_F.scaled_dot_product_attention = _sdpa_spy
+        try:
+            for _i in range(N_WARMUP):
+                try:
+                    torch.cuda.synchronize(device)
+                    with _forward_grad_ctx(), autocast_ctx:
+                        warm_out = model(**batch)
+                    if cfg.include_backward:
+                        warm_loss = _extract_loss(warm_out)
+                        warm_loss.backward()
+                        model.zero_grad(set_to_none=True)
+                    del warm_out
+                    torch.cuda.synchronize(device)
+                    # No empty_cache: keep warm allocator state for the traced iter.
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOG.debug("profiler warmup pass failed (%s); continuing cold", exc)
+                    # On warmup OOM, clear cache for a clean steady-state baseline.
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception as cleanup_exc:  # noqa: BLE001 - best-effort cleanup
+                        LOG.debug(
+                            "profiler warmup empty_cache failed (%s); continuing cold",
+                            cleanup_exc,
+                        )
+                    break
+        finally:
+            _torch_F.scaled_dot_product_attention = _sdpa_orig
+            dispatched_sdpa_backend = _sdpa_probe.get("backend", "")
 
     # Steady-state wall captured pre-hook for hook-dispatch calibration scale.
     # Per-block peak hooks (block-granularity, not per-leaf) are cheap and give the cost model a ground-truth cap.
@@ -1038,6 +1080,7 @@ def run_trace(
     arch_intermediate_size = _infer_intermediate_size(model, arch_hidden_size)
     arch_num_attention_heads = _infer_num_attention_heads(model, arch_hidden_size)
     arch_extras = _infer_attn_arch_extras(model)
+    arch_extras["dispatched_sdpa_backend"] = dispatched_sdpa_backend
 
     return ProfilerTrace(
         op_order=tuple(op_records),

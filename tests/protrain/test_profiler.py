@@ -323,6 +323,89 @@ def test_cache_roundtrip_preserves_bwd_peak_fields(tmp_path, monkeypatch):
     assert loaded == trace
 
 
+def test_cache_roundtrip_preserves_dispatched_sdpa_backend(tmp_path, monkeypatch):
+    """save -> load preserves the probed SDPA dispatch backend (TRACE_VERSION 27)."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    key = ProfilerCacheKey(
+        arch_hash="sdpa01",
+        bs=1,
+        seq=64,
+        sku="NVIDIA GeForce RTX 3090",
+        world=1,
+    )
+    op = OpRecord(
+        op_id=OpId(0),
+        module_path="root.layer0",
+        qualified_name="Linear",
+        shape_signature=((1, 64, 16),),
+        block_id=BlockId(0),
+        is_forward=True,
+    )
+    trace = ProfilerTrace(
+        op_order=(op,),
+        intra_op_delta={OpId(0): 1024},
+        inter_op_delta={OpId(0): 512},
+        activation_sizes={BlockId(0): 2048},
+        model_state_bytes=1 << 20,
+        pcie_h2d_bps=25e9,
+        pcie_d2h_bps=23e9,
+        nccl_gather_s={},
+        nccl_reduce_s={},
+        arch_hash="sdpa01",
+        bs=1,
+        seq=64,
+        sku="NVIDIA GeForce RTX 3090",
+        world=1,
+        attn_implementation="sdpa",
+        dispatched_sdpa_backend="math",
+        cpu_adam_bytes_per_sec=1.0e9,
+    )
+    save_cached_trace(key, trace)
+    loaded = load_cached_trace(key)
+    assert loaded is not None
+    assert loaded.dispatched_sdpa_backend == "math"
+    assert loaded == trace
+
+
+def test_trace_from_dict_defaults_missing_dispatched_sdpa_backend():
+    """An older cache payload lacking the field loads as '' (back-compat)."""
+    from axolotl.integrations.protrain.profiler.cache import (
+        _trace_from_dict,
+        _trace_to_dict,
+    )
+
+    op = OpRecord(
+        op_id=OpId(0),
+        module_path="root.layer0",
+        qualified_name="Linear",
+        shape_signature=((1, 64, 16),),
+        block_id=BlockId(0),
+        is_forward=True,
+    )
+    trace = ProfilerTrace(
+        op_order=(op,),
+        intra_op_delta={OpId(0): 1},
+        inter_op_delta={OpId(0): 1},
+        activation_sizes={BlockId(0): 1},
+        model_state_bytes=1,
+        pcie_h2d_bps=1e9,
+        pcie_d2h_bps=1e9,
+        nccl_gather_s={},
+        nccl_reduce_s={},
+        arch_hash="x",
+        bs=1,
+        seq=64,
+        sku="cpu",
+        world=1,
+        attn_implementation="sdpa",
+        dispatched_sdpa_backend="flash",
+    )
+    payload = _trace_to_dict(trace)
+    payload.pop("dispatched_sdpa_backend")  # simulate a pre-v27 cache file
+    restored = _trace_from_dict(payload)
+    assert restored.dispatched_sdpa_backend == ""
+
+
 def test_cache_invalidates_stale_zero_cpu_adam_when_deepspeed_now_imports(
     tmp_path, monkeypatch
 ):
