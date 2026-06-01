@@ -79,9 +79,32 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Remove lm_head from the high-precision exclusion and "
             "quantize the output projection to NVFP4 (memory + GEMM win on a large "
             "[vocab, hidden] tensor), at a small convergence cost (the NVFP4 paper "
-            "keeps lm_head bf16). OFF by default. embed_tokens stays excluded. "
-            "INCOMPATIBLE with tied embeddings (tie_word_embeddings): quantizing a "
-            "tied lm_head would corrupt the shared input embedding — that case raises."
+            "keeps lm_head bf16). OFF by default. With UNtied embeddings only the "
+            "lm_head is quantized (embed_tokens stays excluded unless "
+            "quantize_embeddings is also set). With TIED embeddings (the frozen "
+            "shared weight) the shared weight is quantized ONCE and routed to both "
+            "the embedding lookup and the lm_head GEMM. A TRAINABLE tied weight "
+            "still RAISES (FP4-storing it would corrupt training)."
+        },
+    )
+    quantize_embeddings: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Store the input token embedding (embed_tokens) packed "
+            "in FP4 and dequantize on lookup (W4A16; the lookup gathers rows, no "
+            "activation quant). FROZEN only — a trainable embedding is skipped with "
+            "a warning (no FP4 master for gradients). Hidden dim must be %16. OFF by "
+            "default."
+        },
+    )
+    quantize_vision_tower: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Multimodal only. Swap the FROZEN nn.Linear layers under "
+            "the vision encoder (attn qkv/proj, mlp fc1/fc2) to the NVFP4 frozen "
+            "base. The vision merger and patch-embed projection are left untouched, "
+            "as are %32-ineligible dims. Warns if no vision tower is found (text "
+            "model). OFF by default."
         },
     )
     fuse_rmsnorm: bool = Field(
