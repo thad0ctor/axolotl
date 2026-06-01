@@ -808,3 +808,43 @@ class TestNVFP4Adapters:
         assert fresh.wq.dtype == torch.float4_e2m1fn_x2
         assert torch.equal(fresh.wq, mod.wq)
         assert torch.equal(fresh(x), ref)
+
+    def test_embedding_checkpoint_roundtrip(self):
+        """NVFP4Embedding: the packed FP4 weight buffer survives save/load and
+        reproduces the lookup bit-exactly (else quantize_embeddings resume
+        reinitializes the embedding)."""
+        import io
+
+        from axolotl.utils.nvfp4_training import NVFP4Embedding
+
+        torch.manual_seed(0)
+        emb = nn.Embedding(2048, 512).cuda().bfloat16()
+        mod = NVFP4Embedding.from_embedding(emb)
+        idx = torch.randint(0, 2048, (4, 32), device="cuda")
+        ref = mod(idx)
+
+        sd = mod.state_dict()
+        assert any(k.endswith("w_q") for k in sd)
+        buf = io.BytesIO()
+        torch.save(sd, buf)
+        buf.seek(0)
+        fresh = NVFP4Embedding.from_embedding(nn.Embedding(2048, 512).cuda().bfloat16())
+        fresh.load_state_dict(torch.load(buf, weights_only=False))
+        assert torch.equal(fresh.w_q.qdata, mod.w_q.qdata)
+        assert torch.equal(fresh(idx), ref)
+
+    def test_tied_lmhead_shares_embedding_store(self):
+        """NVFP4TiedLMHead must read the SAME FP4 store as its NVFP4Embedding
+        (quantize-once), so the lookup and the GEMM use a bit-identical weight and
+        only the embedding's buffer needs checkpointing."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Embedding,
+            NVFP4Recipe,
+            NVFP4TiedLMHead,
+        )
+
+        torch.manual_seed(0)
+        nvemb = NVFP4Embedding.from_embedding(nn.Embedding(2048, 512).cuda().bfloat16())
+        head = NVFP4TiedLMHead(nvemb, None, NVFP4Recipe())
+        assert head.w_q is nvemb.w_q  # same object => quantized once
+        assert torch.equal(head.weight, nvemb.weight)
