@@ -1689,6 +1689,23 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "multiple physical ranks. Verify loss parity on your setup."
             )
 
+        # Under torch.compile, variable batch lengths recompile the FP4 GEMM path
+        # (the token dim is padded to a multiple of 32, and torchao's scale-swizzle
+        # re-specializes per 128-block); automatic-dynamic bounds the graph count
+        # but the recompiles are individually expensive. Pinning one static shape
+        # avoids them entirely.
+        if (
+            self.torch_compile
+            and not self.sample_packing
+            and not self.pad_to_sequence_len
+        ):
+            LOG.warning(
+                "nvfp4_training + torch_compile without pad_to_sequence_len: variable "
+                "batch lengths trigger torch.compile recompiles of the FP4 GEMM path. "
+                "Set pad_to_sequence_len: true (or sample_packing: true) to pin one "
+                "shape and avoid recompile stalls."
+            )
+
         from axolotl.utils.nvfp4_training import nvfp4_supported
 
         ok, reason = nvfp4_supported()
