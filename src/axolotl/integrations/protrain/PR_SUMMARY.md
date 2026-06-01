@@ -77,7 +77,7 @@ GPU lanes are opt-in/self-hosted; standard CI remains CPU-only.
 
 | Lane | Result | Coverage |
 |---|---|---|
-| Default ProTrain pytest | `632 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
+| Default ProTrain pytest | `650 passed, 17 skipped, 180 deselected` | CPU-safe unit and integration coverage. |
 | `cpu-core` | PASS | Validators, cost/search math, calibrated memory gate, metadata, layout determinism, non-finite guard. |
 | `cpu-surface` | PASS | Mode selection, force-mode safety, save/resume hooks, Path B LoRA ownership, debug/watchdog hooks. |
 | `merge-surface` | PASS | `merge-lora` CLI and LoRA/QLoRA/rsLoRA/DoRA/MoE merge math. |
@@ -107,6 +107,48 @@ Representative hardware validation summarized from `PR_PROPOSAL.md`:
 | Qwen3.5-27B 4-bit LoRA on one 3090 | Fits at seq=128; Mode B reaches seq=256. |
 | Qwen3.5-4B full-FT forced Mode C | Local 5x 3090-class train/save/resume coverage. |
 | Qwen3.5-9B full-FT forced Mode C | High-memory 2-rank train/save/resume coverage. |
+
+### Single-card efficiency: Mode A under the full Axolotl + Liger kernel stack
+
+Forced Mode A is runtime-inert (no per-step ProTrain hooks), so it is a
+zero-overhead substrate for Axolotl's and Liger's fused kernels plus
+`torch.compile`. Benchmarked head-to-head against Unsloth on one RTX 3090 Ti
+(sm_86, 24 GiB), Qwen3-14B QLoRA (r=64, dense targets, seq=1024, mb=1, ga=4,
+`adamw_8bit`), FA2-vs-FA2 and compiled-vs-compiled, same card:
+
+| Stack (seq 1024, FA2, torch.compile, adamw_8bit) | s/it | reserved | active |
+|---|---:|---:|---:|
+| ProTrain Mode A + `lora_*_kernel` + `fused_attn_kernel` + Liger FLCE/RMSNorm | 8.07 | 12.71 GiB | 12.42 GiB |
+| Unsloth optimized path | 7.69 | 12.75 GiB | 12.50 GiB |
+
+ProTrain Mode A reaches **memory parity** with Unsloth (marginally lower) at
+**~5% lower throughput**, while keeping activations GPU-resident (Unsloth
+CPU-offloads them). No new ProTrain code is required: Mode A here is identical
+to this PR's branch, composed with existing Axolotl fused LoRA kernels, Liger
+fused-linear-cross-entropy + RMSNorm, `torch.compile` (compile-safe 4-bit
+dequant), and the upstream Qwen3 fused RMSNorm+RoPE kernel (`fused_attn_kernel`).
+The `fused_attn_kernel` contribution grows with sequence length; at seq=1024 it
+is roughly break-even on the q/k-norm+RoPE path. See the recommended config and
+per-flag compatibility notes in [`PR_PROPOSAL.md`](PR_PROPOSAL.md) §6.6.
+
+### Long-context single card (seq 32768) + cost-model accuracy
+
+Beyond where Mode A fits, **Qwen3-14B QLoRA trains a clean step at `seq=32768`
+on a single 24 GiB RTX 3090 Ti** via partial activation swap (`n_swap=24`,
+`n_checkpoint=16`): loss 0.011, `max_active` 19.1 GiB, `device_reserved` 20.4
+GiB (also confirmed on a 32 GiB RTX 5090). It is PCIe-bound (~minutes/step), so
+it proves the memory envelope — 16k stays the fast single-card ceiling. Two PR
+fixes enable it: a **variable-size slab allocator** for the swap pool
+(`block/swap_pool.py`, replacing fixed equal-size slots that wasted RAM and
+exhausted) and a **CPU-Adam construction hang fix** (py-cpuinfo's forked CPU
+probe deadlocks after CUDA init; `chunk/optim.py` reads `/proc/cpuinfo`
+directly).
+
+A SwiGLU FFN-intermediate fix (`cost/memory.py`: count the 3 gated-MLP saved
+intermediates, not 1) brings the calibrated memory gate to within **~1% of
+measured peak** on Qwen3-14B QLoRA (0.9% mean / 1.3% max across seq 4k–32k) —
+versus the paper's deliberate ~10% over-estimate margin (α=1.10, §3.3). Details
+and the validation table are in [`PR_PROPOSAL.md`](PR_PROPOSAL.md) §6.7 and §7.6.
 
 ## AI Usage Disclaimer
 

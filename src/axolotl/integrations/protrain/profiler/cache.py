@@ -174,9 +174,17 @@ def _trace_to_dict(trace: ProfilerTrace) -> dict[str, Any]:
         "block_tree_index": {
             str(int(k)): int(v) for k, v in trace.block_tree_index.items()
         },
-        "hidden_size": int(getattr(trace, "hidden_size", 0)),
-        "num_attention_heads": int(getattr(trace, "num_attention_heads", 0)),
-        "intermediate_size": int(getattr(trace, "intermediate_size", 0)),
+        # ``or 0`` because these arch fields may be present-but-None (e.g.
+        # sliding_window / head_dim from an HF config); bare int(None) raises.
+        "hidden_size": int(getattr(trace, "hidden_size", 0) or 0),
+        "num_attention_heads": int(getattr(trace, "num_attention_heads", 0) or 0),
+        "intermediate_size": int(getattr(trace, "intermediate_size", 0) or 0),
+        "num_key_value_heads": int(getattr(trace, "num_key_value_heads", 0) or 0),
+        "head_dim": int(getattr(trace, "head_dim", 0) or 0),
+        "sliding_window": int(getattr(trace, "sliding_window", 0) or 0),
+        "num_experts_per_tok": int(getattr(trace, "num_experts_per_tok", 0) or 0),
+        "moe_intermediate_size": int(getattr(trace, "moe_intermediate_size", 0) or 0),
+        "attn_implementation": str(getattr(trace, "attn_implementation", "") or ""),
     }
     return payload
 
@@ -219,9 +227,20 @@ def _trace_from_dict(data: dict[str, Any]) -> ProfilerTrace:
         extra["phase2_per_comp_pred_iter_s"] = float(
             data.get("phase2_per_comp_pred_iter_s", 0.0)
         )
-    for _arch_fname in ("hidden_size", "num_attention_heads", "intermediate_size"):
+    for _arch_fname in (
+        "hidden_size",
+        "num_attention_heads",
+        "intermediate_size",
+        "num_key_value_heads",
+        "head_dim",
+        "sliding_window",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+    ):
         if _arch_fname in _trace_field_names:
-            extra[_arch_fname] = int(data.get(_arch_fname, 0))
+            extra[_arch_fname] = int(data.get(_arch_fname, 0) or 0)
+    if "attn_implementation" in _trace_field_names:
+        extra["attn_implementation"] = str(data.get("attn_implementation", "") or "")
     return ProfilerTrace(
         op_order=tuple(_op_record_from_dict(d) for d in data["op_order"]),
         intra_op_delta={

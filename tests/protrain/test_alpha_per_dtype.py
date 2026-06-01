@@ -135,7 +135,16 @@ def test_dominant_param_dtype_detector_classifies_int8_dominant_model():
 
 
 def test_estimate_peak_uses_per_dtype_alpha():
-    """End-to-end pin: bpe=0.5 makes ``estimate_peak`` scale by 0.75 (4-bit alpha) while bpe=2.0 stays at 1.10."""
+    """End-to-end pin: ``estimate_peak`` floors the 4-bit multiplier at 1.0.
+
+    The per-dtype lookup still returns 0.75 for 4-bit, but ``estimate_peak``
+    routes it through ``gate_consistent_alpha`` (floor 1.0) so it never
+    DEFLATES a realistic component sum — the deflation let the searcher accept
+    aggressive configs the calibrated fit-gate then rejected (fail-closed).
+    bpe=2.0 (fp16/bf16) keeps the conservative 1.10. So 4-bit (1.0) still
+    yields a strictly smaller peak than fp16 (1.10) on the same raw inputs,
+    but the ratio is now 1.0/1.10, not 0.75/1.10.
+    """
     from axolotl.integrations.protrain.cost.memory import estimate_peak
     from axolotl.integrations.protrain.types import (
         BlockId,
@@ -205,19 +214,25 @@ def test_estimate_peak_uses_per_dtype_alpha():
     peak_fp16 = estimate_peak(cfg, trace, layout, block_map, hw_fp16)
     peak_4bit = estimate_peak(cfg, trace, layout, block_map, hw_4bit)
 
-    # The alpha=0.75 branch must return strictly less peak than the
-    # alpha=1.10 branch on the same raw inputs — concrete value depends
-    # on the op-walk's exact accounting, so assert the relative
+    # The 4-bit branch (multiplier floored to 1.0) must return strictly less
+    # peak than the fp16 branch (1.10) on the same raw inputs — concrete value
+    # depends on the op-walk's exact accounting, so assert the relative
     # contract.
     assert peak_4bit < peak_fp16, (
-        f"per-dtype alpha should yield smaller peak for 4-bit "
-        f"(alpha=0.75): got peak_4bit={peak_4bit}, peak_fp16={peak_fp16}"
+        f"4-bit multiplier (floored to 1.0) should yield smaller peak than "
+        f"fp16 (1.10): got peak_4bit={peak_4bit}, peak_fp16={peak_fp16}"
     )
-    # Ratio is 0.75 / 1.10 modulo int() rounding (cost model
-    # casts the alpha-scaled value to int). Use 1% slack.
-    expected_ratio = ALPHA_FRAGMENTATION_4BIT / ALPHA_FRAGMENTATION
+    # Ratio is now 1.0 / 1.10 (4-bit alpha floored at 1.0), modulo int()
+    # rounding. The deflating 0.75 factor is gone. Use 1% slack.
+    expected_ratio = 1.0 / ALPHA_FRAGMENTATION
     observed_ratio = peak_4bit / max(peak_fp16, 1)
     assert observed_ratio == pytest.approx(expected_ratio, rel=0.01), (
         f"peak_4bit / peak_fp16 = {observed_ratio:.4f} should match "
-        f"alpha_4bit / alpha_fp16 = {expected_ratio:.4f}"
+        f"floored_alpha_4bit / alpha_fp16 = {expected_ratio:.4f}"
+    )
+    # And the 4-bit estimate must NOT deflate below the un-scaled raw peak
+    # (the old 0.75 factor did exactly that). Reconstruct raw from fp16.
+    raw_peak = peak_fp16 / ALPHA_FRAGMENTATION
+    assert peak_4bit >= int(raw_peak) - 1, (
+        "4-bit estimate_peak must never deflate below the raw component sum"
     )

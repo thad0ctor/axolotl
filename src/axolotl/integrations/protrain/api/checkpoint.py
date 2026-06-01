@@ -296,6 +296,14 @@ def _gpu_optim_rank_param_name_meta(
             getattr(chunk_manager, "_params_by_id", {}) or {}
         ).items()
     }
+    for orig, shard in zip(
+        getattr(optim, "_persistent_huge_originals", None) or [],
+        getattr(optim, "_persistent_huge_shards", None) or [],
+        strict=True,
+    ):
+        base_name = param_names_by_obj_id.get(id(orig))
+        if base_name is not None:
+            param_names_by_obj_id[id(shard)] = f"{base_name}[rank_shard]"
     saved_groups = state_dict.get("param_groups", [])
     actual_groups = getattr(inner, "param_groups", [])
     if len(saved_groups) != len(actual_groups):

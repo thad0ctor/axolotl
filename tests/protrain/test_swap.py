@@ -39,6 +39,7 @@ from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
 if TYPE_CHECKING:
     from axolotl.integrations.protrain.chunk import ChunkManager
     from axolotl.integrations.protrain.runtime.scheduler import Scheduler
+    from axolotl.integrations.protrain.types import ProfilerTrace
 
 
 # ---------------------------------------------------------------------------
@@ -47,94 +48,117 @@ if TYPE_CHECKING:
 
 
 def test_pool_acquire_release_cycles() -> None:
-    """Slots return to the free list and can be re-acquired."""
-    # M5+: pool capacity is n_swap * slots_per_block * prefetch_depth.
-    # Pin slots_per_block=1 here to keep the legacy 1-slot-per-block
-    # arithmetic for this allocator-semantics test.
-    pool = ActivationSwapPool(
-        n_swap=2, slot_bytes=64, prefetch_depth=2, slots_per_block=1
-    )
-    assert pool.n_slot == 4
-    assert pool.free_count == 4
+    """Variable-size slices carve from the slab, return on release, re-acquire."""
+    pool = ActivationSwapPool(capacity_bytes=256, alignment=64)
+    assert pool.total_bytes == 256
+    assert pool.free_bytes == 256
 
-    sid_a, view_a = pool.acquire()
-    sid_b, view_b = pool.acquire()
-    assert pool.free_count == 2
+    sid_a, view_a = pool.acquire(64)
+    sid_b, view_b = pool.acquire(50)  # rounds up to 64 internally
     assert pool.inflight_count == 2
     assert view_a.numel() == 64
-    assert view_b.numel() == 64
+    assert view_b.numel() == 50  # view is exactly nbytes
+    assert pool.free_bytes == 256 - 64 - 64
 
     pool.release(sid_a)
-    assert pool.free_count == 3
     pool.release(sid_b)
-    assert pool.free_count == 4
+    assert pool.free_bytes == 256
+    assert pool.inflight_count == 0
 
-    # Re-acquire after release.
-    sid_c, _ = pool.acquire()
+    # Re-acquire after release; coalesced free-list serves the whole region.
+    sid_c, view_c = pool.acquire(256)
+    assert view_c.numel() == 256
     assert pool.inflight_count == 1
     pool.release(sid_c)
     pool.close()
 
 
+def test_pool_variable_sizes_and_coalesce() -> None:
+    """Freeing adjacent slices coalesces so a larger request fits afterwards."""
+    pool = ActivationSwapPool(capacity_bytes=256, alignment=64)
+    sid0, _ = pool.acquire(64)
+    sid1, _ = pool.acquire(64)
+    sid2, _ = pool.acquire(64)
+    sid3, _ = pool.acquire(64)
+    assert pool.free_bytes == 0
+    # Free two adjacent middle extents → 128 contiguous bytes after coalesce.
+    pool.release(sid1)
+    pool.release(sid2)
+    assert pool.free_bytes == 128
+    sid_big, view_big = pool.acquire(128)
+    assert view_big.numel() == 128
+    pool.release(sid0)
+    pool.release(sid3)
+    pool.release(sid_big)
+    pool.close()
+
+
 def test_pool_exhaustion_raises() -> None:
-    """Acquiring beyond ``n_slot`` raises a clear RuntimeError."""
-    pool = ActivationSwapPool(
-        n_swap=1, slot_bytes=8, prefetch_depth=2, slots_per_block=1
-    )
-    held = []
-    held.append(pool.acquire())
-    held.append(pool.acquire())
+    """A request that cannot be served from the free-list raises clearly."""
+    pool = ActivationSwapPool(capacity_bytes=128, alignment=64)
+    a = pool.acquire(64)
+    b = pool.acquire(64)
     with pytest.raises(RuntimeError, match="exhausted"):
-        pool.acquire()
-    for sid, _ in held:
+        pool.acquire(64)
+    for sid, _ in (a, b):
         pool.release(sid)
     pool.close()
 
 
 def test_pool_double_release_warns_no_corruption() -> None:
     """Double-release is logged but does not corrupt the free list."""
-    pool = ActivationSwapPool(
-        n_swap=1, slot_bytes=8, prefetch_depth=2, slots_per_block=1
-    )
-    sid, _ = pool.acquire()
+    pool = ActivationSwapPool(capacity_bytes=128, alignment=64)
+    sid, _ = pool.acquire(64)
     pool.release(sid)
-    pre = pool.free_count
-    # Double-release should not mutate state further.
-    pool.release(sid)
-    assert pool.free_count == pre
+    pre = pool.free_bytes
+    pool.release(sid)  # unknown now → ignored
+    assert pool.free_bytes == pre
     pool.close()
 
 
-def test_pool_total_bytes_matches_sizing() -> None:
-    """``total_bytes`` is the product of n_slot × slot_bytes."""
-    pool = ActivationSwapPool(
-        n_swap=3, slot_bytes=128, prefetch_depth=2, slots_per_block=4
-    )
-    # n_slot = n_swap * slots_per_block * prefetch_depth = 3 * 4 * 2 = 24
-    assert pool.n_slot == 24
-    assert pool.total_bytes == 24 * 128
-    pool.close()
-
-
-def test_pool_default_slots_per_block_yields_k_capacity() -> None:
-    """M5+: default ``slots_per_block`` multiplies the pool capacity."""
-    from axolotl.integrations.protrain.block.swap_pool import (
-        DEFAULT_SLOTS_PER_BLOCK,
-    )
-
-    pool = ActivationSwapPool(n_swap=1, slot_bytes=64, prefetch_depth=2)
-    assert pool.n_slot == 1 * DEFAULT_SLOTS_PER_BLOCK * 2
+def test_pool_total_bytes_matches_capacity() -> None:
+    """``total_bytes`` equals the requested capacity."""
+    pool = ActivationSwapPool(capacity_bytes=4096)
+    assert pool.total_bytes == 4096
     pool.close()
 
 
 def test_pool_invalid_args_raise() -> None:
     """Constructor rejects non-positive sizing inputs."""
     with pytest.raises(ValueError):
-        ActivationSwapPool(n_swap=0, slot_bytes=8)
+        ActivationSwapPool(capacity_bytes=0)
     with pytest.raises(ValueError):
-        ActivationSwapPool(n_swap=1, slot_bytes=0)
-    with pytest.raises(ValueError):
-        ActivationSwapPool(n_swap=1, slot_bytes=8, prefetch_depth=0)
+        ActivationSwapPool(capacity_bytes=64, alignment=0)
+
+
+def test_swap_pool_capacity_sizing() -> None:
+    """swap_pool_capacity_bytes scales with n_swap and the per-block aggregate."""
+    from types import SimpleNamespace
+
+    from axolotl.integrations.protrain.cost.memory import (
+        swap_block_saved_bytes,
+        swap_pool_capacity_bytes,
+    )
+
+    trace = cast(
+        "ProfilerTrace",
+        SimpleNamespace(
+            seq=32768,
+            hidden_size=5120,
+            intermediate_size=17408,
+            num_experts_per_tok=0,
+            moe_intermediate_size=0,
+            activation_sizes={},
+        ),
+    )
+    per_block = swap_block_saved_bytes(trace)
+    # Conservative arch estimate should land in the multi-GiB/block range at 32k.
+    assert per_block > 4 * (1 << 30)
+    cap12 = swap_pool_capacity_bytes(trace, 12)
+    cap24 = swap_pool_capacity_bytes(trace, 24)
+    assert cap24 == pytest.approx(2 * cap12, rel=1e-6)
+    assert cap12 > 12 * per_block  # includes fragmentation headroom
+    assert swap_pool_capacity_bytes(trace, 0) == 0
 
 
 def test_pool_close_waits_for_inflight_drain() -> None:
@@ -148,10 +172,8 @@ def test_pool_close_waits_for_inflight_drain() -> None:
     """
     import threading
 
-    pool = ActivationSwapPool(
-        n_swap=1, slot_bytes=8, prefetch_depth=2, slots_per_block=1
-    )
-    sid, _view = pool.acquire()
+    pool = ActivationSwapPool(capacity_bytes=128, alignment=64)
+    sid, _view = pool.acquire(64)
     assert pool.inflight_count == 1
 
     close_errors: list[BaseException] = []
@@ -189,10 +211,8 @@ def test_pool_close_drain_timeout_is_retryable() -> None:
     never freed. After the fix, ``close()`` rolls back ``_closing`` on
     failure so the caller can retry once the borrow retires.
     """
-    pool = ActivationSwapPool(
-        n_swap=1, slot_bytes=8, prefetch_depth=2, slots_per_block=1
-    )
-    sid, _view = pool.acquire()
+    pool = ActivationSwapPool(capacity_bytes=128, alignment=64)
+    sid, _view = pool.acquire(64)
 
     # First close: drain never converges → RuntimeError.
     with pytest.raises(RuntimeError, match="in-flight"):
@@ -231,11 +251,7 @@ def test_swap_correctness_matches_reference_three_steps() -> None:
     block_ref = nn.Linear(32, 32).to(device)
     block_ref.load_state_dict(block_swap.state_dict())
 
-    pool = ActivationSwapPool(
-        n_swap=1,
-        slot_bytes=8 * 32 * 4,  # batch * features * fp32
-        prefetch_depth=2,
-    )
+    pool = ActivationSwapPool(capacity_bytes=8 * 32 * 4 * 16)
     swap_stream = torch.cuda.Stream()
     wrapped = SwappedBlock(block_swap)
     wrapped.attach_runtime(pool, swap_stream)
@@ -350,12 +366,7 @@ def test_swap_m5_frees_gpu_activations_via_saved_tensors_hooks() -> None:
             wrapped_blocks = nn.ModuleList(swap_mod.SwappedBlock(b) for b in blocks)
             # Pool: enough capacity for all blocks × all saved tensors.
             # slot_bytes = exactly one (B, S, D) fp32 tensor.
-            pool = ActivationSwapPool(
-                n_swap=n_blocks,
-                slot_bytes=B * S * D * 4,
-                prefetch_depth=2,
-                slots_per_block=16,
-            )
+            pool = ActivationSwapPool(capacity_bytes=n_blocks * B * S * D * 4 * 32)
             stream = torch.cuda.Stream()
             for wb in wrapped_blocks:
                 wb.attach_runtime(pool, stream)
@@ -486,12 +497,7 @@ def test_swap_single_block_backward_peak_at_autograd_floor() -> None:
         block = _BigBlock(D).to(device)
         if use_swap:
             wrapped = swap_mod.SwappedBlock(block)
-            pool = ActivationSwapPool(
-                n_swap=1,
-                slot_bytes=B * S * D * 4,
-                prefetch_depth=2,
-                slots_per_block=16,
-            )
+            pool = ActivationSwapPool(capacity_bytes=B * S * D * 4 * 32)
             stream = torch.cuda.Stream()
             wrapped.attach_runtime(pool, stream)
             chain: nn.Module = wrapped
@@ -573,11 +579,7 @@ def test_swap_path_does_not_blow_peak() -> None:
         block = nn.Linear(256, 256).to(device)
         if use_swap:
             wrapped = SwappedBlock(block)
-            pool = ActivationSwapPool(
-                n_swap=1,
-                slot_bytes=64 * 256 * 4,
-                prefetch_depth=2,
-            )
+            pool = ActivationSwapPool(capacity_bytes=64 * 256 * 4 * 16)
             stream = torch.cuda.Stream()
             wrapped.attach_runtime(pool, stream)
             mod: nn.Module = wrapped
@@ -871,12 +873,7 @@ def test_swap_chunk_view_save_survives_pool_eviction() -> None:
         block_ref.weight.data = weight_master.clone()
         block_ref.weight.requires_grad_(True)
 
-        pool = ActivationSwapPool(
-            n_swap=1,
-            slot_bytes=max(weight_bytes, 64 * in_dim * 4),
-            prefetch_depth=2,
-            slots_per_block=4,
-        )
+        pool = ActivationSwapPool(capacity_bytes=max(weight_bytes, 64 * in_dim * 4) * 8)
         swap_stream = torch.cuda.Stream()
         wrapped = SwappedBlock(block)
         wrapped.attach_runtime(pool, swap_stream)
@@ -1028,11 +1025,12 @@ def test_swap_smoke_n_swap_override_runs_three_iters() -> None:
         n_swap_override=2,
         n_checkpoint_override=0,
     )
-    # Verify the SWAP pool was wired.
+    # Verify the override was honored and the SWAP pool was wired.
+    assert wrapped.search_result.cfg.n_swap == 2, "n_swap_override not honored"
     scheduler = cast("Scheduler", wrapped.scheduler)
     swap_pool = getattr(scheduler, "swap_pool", None)
     assert swap_pool is not None, "SWAP pool was not constructed"
-    assert swap_pool.n_swap == 2
+    assert swap_pool.total_bytes > 0, "SWAP slab wired with zero capacity"
 
     # Drive 3 iterations.
     for _i in range(3):
@@ -1274,7 +1272,7 @@ def test_swap_under_genuine_capacity_pressure() -> None:
     scheduler = cast("Scheduler", wrapped.scheduler)
     swap_pool = getattr(scheduler, "swap_pool", None)
     assert swap_pool is not None, "SWAP pool was not constructed"
-    assert swap_pool.n_swap == n_swap_target
+    assert swap_pool.total_bytes > 0, "SWAP slab wired with zero capacity"
 
     # Real optimizer (FusedAdam under the hood). lr=1e-3 produces a
     # measurable loss drop within 4 iters at this scale + bf16.
@@ -1399,9 +1397,7 @@ def test_swap_gate_raises_when_headroom_unrecoverable(monkeypatch) -> None:
     # large allocation". The gate consults handle.nbytes and
     # handle.device only — pool/stream/slot fields aren't touched on
     # the raise path.
-    pool = ActivationSwapPool(
-        n_swap=1, slot_bytes=64, prefetch_depth=2, slots_per_block=1
-    )
+    pool = ActivationSwapPool(capacity_bytes=128)
     swap_stream = torch.cuda.Stream()
     handle = swap_mod._CPUHandle(
         pool=pool,
@@ -1485,9 +1481,7 @@ def test_swap_gate_message_names_invariant_and_remediation(monkeypatch) -> None:
 
     device = torch.device("cuda")
 
-    pool = ActivationSwapPool(
-        n_swap=1, slot_bytes=64, prefetch_depth=2, slots_per_block=1
-    )
+    pool = ActivationSwapPool(capacity_bytes=128)
     swap_stream = torch.cuda.Stream()
     handle = swap_mod._CPUHandle(
         pool=pool,

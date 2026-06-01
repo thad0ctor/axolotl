@@ -136,6 +136,13 @@ class ProfilerTrace:
     # requires_grad fraction; low fractions (LoRA ~0.1%) get tighter bwd/fwd ratio fallback.
     trainable_param_fraction: float = 0.0
 
+    # Trainable grad + optimizer-state bytes (default 16 B/param: fp16 grad +
+    # fp32 master + m + v). The searcher's estimate_peak adds this as a flat
+    # floor so it stays consistent with the calibrated fit-gate, which adds the
+    # same term explicitly (smearing it into persistent_factor under-counts when
+    # a large frozen base dominates). 0 = legacy trace → degrade to the smear.
+    trainable_training_state_bytes: int = 0
+
     # Phase-2 chunked-runtime measurement; 0.0 → v8 fallback path.
     steady_bwd_chunked_wall_s: float = 0.0
     steady_step_overlap_s: float = 0.0
@@ -173,6 +180,18 @@ class ProfilerTrace:
     hidden_size: int = 0
     num_attention_heads: int = 0
     intermediate_size: int = 0
+
+    # Extended architecture + backend metadata for the backend-aware attention
+    # activation term. 0/empty = unknown (legacy traces) → safe O(seq^2) fallback.
+    num_key_value_heads: int = 0  # GQA KV heads; 0 → assume == num_attention_heads
+    head_dim: int = 0  # 0 → derive hidden_size // num_attention_heads
+    sliding_window: int = 0  # 0 → full (global) attention span
+    num_experts_per_tok: int = 0  # MoE active experts; 0 → dense MLP
+    moe_intermediate_size: int = 0  # per-expert FFN width; 0 → dense intermediate_size
+    # Resolved HF attention backend (config._attn_implementation): one of
+    # "flash_attention_2"/"flash_attention_3"/"sdpa"/"xformers" (O(seq), no score
+    # matrix) or "eager"/"math" (O(seq^2), materializes scores). "" → eager-safe.
+    attn_implementation: str = ""
 
 
 # ---------------------------------------------------------------------------

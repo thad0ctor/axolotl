@@ -77,6 +77,10 @@ def _run_as_rank() -> None:
     parser.add_argument("--n-iters", type=int, default=8)
     parser.add_argument("--n-warmup", type=int, default=2)
     args = parser.parse_args()
+    if args.n_iters < 1:
+        parser.error("--n-iters must be >= 1.")
+    if args.n_warmup < 0 or args.n_warmup >= args.n_iters:
+        parser.error("--n-warmup must satisfy 0 <= n_warmup < n_iters.")
 
     if rank == 0:
         print(
@@ -165,6 +169,10 @@ def main() -> None:
         "``scripts/nccl_results_world<N>.json``.",
     )
     args = parser.parse_args()
+    if args.n_iters < 1:
+        parser.error("--n-iters must be >= 1.")
+    if args.n_warmup < 0 or args.n_warmup >= args.n_iters:
+        parser.error("--n-warmup must satisfy 0 <= n_warmup < n_iters.")
     if args.world_size is None or args.world_size < 1:
         parser.error(
             "--world-size is required when running outside torchrun "

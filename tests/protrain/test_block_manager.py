@@ -238,58 +238,78 @@ def test_swap_forward_backward_correctness() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
+    from axolotl.integrations.protrain.block.swap import (  # noqa: E402
+        SIZE_THRESHOLD_BYTES,
+    )
     from axolotl.integrations.protrain.block.swap_pool import (  # noqa: E402
         ActivationSwapPool,
     )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    block = nn.Linear(16, 16).to(device)
-    ref_block = nn.Linear(16, 16).to(device)
+    # Size the saved input activation just over SIZE_THRESHOLD_BYTES so it routes
+    # through pack_to_pool, while the 256x256 weight (256 KiB at fp32) stays below
+    # it — a clean single-tensor swap that exercises acquire()/view()/release()
+    # instead of the pass-through path. Rows are derived from the threshold (with
+    # the original 2 MiB as a floor) so the test stays correct if the threshold
+    # is retuned.
+    cols = 256
+    block = nn.Linear(cols, cols).to(device)
+    ref_block = nn.Linear(cols, cols).to(device)
     ref_block.load_state_dict(block.state_dict())
 
+    elem_size = torch.empty(0, dtype=torch.float32).element_size()
+    rows = max(2048, -(-SIZE_THRESHOLD_BYTES // (cols * elem_size)))
+    activation_bytes = rows * cols * elem_size
+
     wrapped = SwappedBlock(block)
-    pool = ActivationSwapPool(
-        n_swap=1,
-        slot_bytes=4 * 16 * 4,  # batch * features * fp32
-        prefetch_depth=2,
-    )
+    pool = ActivationSwapPool(capacity_bytes=max(4 << 20, activation_bytes * 2))
     swap_stream = torch.cuda.Stream()
     wrapped.attach_runtime(pool, swap_stream)
 
-    x_a = torch.randn(4, 16, device=device, requires_grad=True)
-    x_b = x_a.detach().clone().requires_grad_(True)
+    try:
+        x_a = torch.randn(rows, cols, device=device, requires_grad=True)
+        x_b = x_a.detach().clone().requires_grad_(True)
+        assert x_a.numel() * x_a.element_size() >= SIZE_THRESHOLD_BYTES
 
-    out_wrapped = wrapped(x_a)
-    out_ref = ref_block(x_b)
+        out_wrapped = wrapped(x_a)
+        out_ref = ref_block(x_b)
 
-    # Forward outputs must match to fp32 tolerance.
-    assert torch.allclose(out_wrapped, out_ref, atol=1e-5), (
-        "SwappedBlock forward must match unwrapped block to fp32 tolerance"
-    )
+        # Forward outputs must match to fp32 tolerance.
+        assert torch.allclose(out_wrapped, out_ref, atol=1e-5), (
+            "SwappedBlock forward must match unwrapped block to fp32 tolerance"
+        )
 
-    # Backward: grad must flow through the swap wrapper.
-    out_wrapped.sum().backward()
-    out_ref.sum().backward()
+        # Backward: grad must flow through the swap wrapper.
+        out_wrapped.sum().backward()
+        out_ref.sum().backward()
 
-    # Parameter grads exist and are finite.
-    w_grad = block.weight.grad
-    assert w_grad is not None, "grad did not flow to SwappedBlock's inner param"
-    assert torch.isfinite(w_grad).all(), "SwappedBlock produced NaN/Inf grads"
+        # Parameter grads exist and are finite.
+        w_grad = block.weight.grad
+        assert w_grad is not None, "grad did not flow to SwappedBlock's inner param"
+        assert torch.isfinite(w_grad).all(), "SwappedBlock produced NaN/Inf grads"
 
-    # Parameter grads match the reference block (same init + same input).
-    assert torch.allclose(w_grad, ref_block.weight.grad, atol=1e-5), (
-        "SwappedBlock param grads must match unwrapped reference"
-    )
-    # Input grads match as well.
-    assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
+        # Parameter grads match the reference block (same init + same input).
+        assert torch.allclose(w_grad, ref_block.weight.grad, atol=1e-5), (
+            "SwappedBlock param grads must match unwrapped reference"
+        )
+        # Input grads match as well.
+        assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
 
-    # Pool slots must be returned to free list after backward completes.
-    torch.cuda.synchronize()
-    assert pool.inflight_count == 0, (
-        "SwappedBlock did not release pool slots after backward"
-    )
-    pool.close()
+        # The activation must have actually been swapped through the pool, not
+        # silently passed through — otherwise acquire()/view()/release()
+        # regressions would go undetected.
+        assert pool.peak_used_bytes > 0, "activation never routed through the swap pool"
+
+        # Pool slots must be returned to free list after backward completes.
+        torch.cuda.synchronize()
+        assert pool.inflight_count == 0, (
+            "SwappedBlock did not release pool slots after backward"
+        )
+    finally:
+        # Deterministic pinned-host cleanup; never leak a slab to __del__ where
+        # a failing assert above would otherwise poison later GPU tests.
+        pool.close()
 
 
 # ---------------------------------------------------------------------------

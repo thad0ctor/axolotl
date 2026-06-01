@@ -18,19 +18,29 @@ LOG = get_logger(__name__)
 DEFAULT_PCIE_BPS = 13e9
 
 
+def _in_distributed_context() -> bool:
+    """True when RANK or LOCAL_RANK is exported (launcher signals a multi-rank run)."""
+    return (
+        os.environ.get("RANK") is not None or os.environ.get("LOCAL_RANK") is not None
+    )
+
+
 def resolve_world_size_from_env() -> int:
     """Return WORLD_SIZE env (default 1)."""
     raw = os.environ.get("WORLD_SIZE")
     if raw is None:
+        # Missing WORLD_SIZE + set RANK/LOCAL_RANK → raise; collapse to 1 only without rank vars.
+        if _in_distributed_context():
+            raise RuntimeError(
+                "WORLD_SIZE is unset but RANK / LOCAL_RANK is set; refusing to "
+                "silently collapse a distributed run to world size 1."
+            )
         return 1
     try:
         world_size = int(raw)
     except ValueError as exc:
         # Malformed WORLD_SIZE + set RANK/LOCAL_RANK → raise; collapse to 1 only without rank vars.
-        if (
-            os.environ.get("RANK") is not None
-            or os.environ.get("LOCAL_RANK") is not None
-        ):
+        if _in_distributed_context():
             LOG.error(
                 "ProTrain: WORLD_SIZE=%r is not an integer but RANK / LOCAL_RANK "
                 "is set; refusing to silently collapse a distributed run to 1.",
@@ -43,10 +53,7 @@ def resolve_world_size_from_env() -> int:
         return 1
     # Same RANK-aware policy for non-positive WORLD_SIZE.
     if world_size < 1:
-        if (
-            os.environ.get("RANK") is not None
-            or os.environ.get("LOCAL_RANK") is not None
-        ):
+        if _in_distributed_context():
             LOG.error(
                 "ProTrain: WORLD_SIZE=%r is not >= 1 but RANK / LOCAL_RANK "
                 "is set; refusing to silently collapse a distributed run to 1.",
@@ -67,10 +74,7 @@ def _resolve_world_size() -> int:
         if _dist.is_available() and _dist.is_initialized():
             return max(1, int(_dist.get_world_size()))
         # Gate env-WORLD_SIZE on RANK/LOCAL_RANK presence to catch misconfigured exports.
-        if (
-            os.environ.get("RANK") is not None
-            and os.environ.get("LOCAL_RANK") is not None
-        ):
+        if _in_distributed_context():
             return resolve_world_size_from_env()
         return 1
     except ImportError:
@@ -81,10 +85,23 @@ def _resolve_device_index() -> int:
     """Pick CUDA ordinal from LOCAL_RANK; falls back to current_device on parse/range errors."""
     import torch
 
-    raw_local_rank = os.environ.get("LOCAL_RANK", "0")
+    raw_local_rank = os.environ.get("LOCAL_RANK")
+    if raw_local_rank is None:
+        # Missing LOCAL_RANK + set RANK → fail closed: colocating ranks on cuda:0 corrupts training.
+        if _in_distributed_context():
+            raise RuntimeError(
+                "LOCAL_RANK is unset but RANK is set; refusing to default the "
+                "CUDA device index to 0 in a distributed run."
+            )
+        raw_local_rank = "0"
     try:
         local_rank = int(raw_local_rank)
     except ValueError:
+        # Fail closed in a distributed run: colocating ranks on one GPU corrupts training silently.
+        if _in_distributed_context():
+            raise RuntimeError(
+                f"LOCAL_RANK={raw_local_rank!r} is invalid in distributed context."
+            ) from None
         LOG.warning(
             "ProTrain: invalid LOCAL_RANK=%r; falling back to current CUDA device.",
             raw_local_rank,
@@ -95,6 +112,10 @@ def _resolve_device_index() -> int:
     if visible <= 0:
         raise RuntimeError("ProTrain requires at least one visible CUDA device.")
     if not (0 <= local_rank < visible):
+        if _in_distributed_context():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is out of visible CUDA range [0, {visible})."
+            )
         LOG.warning(
             "ProTrain: LOCAL_RANK=%d out of visible CUDA range [0, %d); "
             "falling back to current CUDA device.",

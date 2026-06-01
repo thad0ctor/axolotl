@@ -44,6 +44,26 @@ _WARNED_APPROXIMATE_COMPUTE_PROXY: bool = False
 # Backward-vs-forward compute ratio when the trace has no per-block backward split.
 _BWD_FWD_COMPUTE_RATIO: float = 2.0
 
+# Adapter (LoRA/QLoRA) trainable-fraction signature. A positive-but-tiny
+# fraction means the offloaded/non-persistent chunks are the FROZEN base
+# weights (no grad, no optimizer state, never stepped). Mirrors
+# profiler.trace.ADAPTER_TRAINABLE_PARAM_FRACTION. Exactly 0.0 is the legacy/
+# unknown sentinel and is NOT treated as frozen-base.
+_ADAPTER_TRAINABLE_PARAM_FRACTION: float = 0.05
+
+
+def _offloaded_chunks_are_frozen(trace: ProfilerTrace) -> bool:
+    """Whether the non-persistent (offloaded) chunks carry no trainable optimizer state.
+
+    True for adapter-style training (LoRA/QLoRA): the offloaded chunks are the
+    frozen base weights, so no CPU-Adam step is ever required for them. A
+    positive-but-tiny ``trainable_param_fraction`` is the adapter signature;
+    exactly 0.0 (legacy/unknown) is treated as full-FT to stay fail-safe.
+    """
+    frac = float(getattr(trace, "trainable_param_fraction", 0.0) or 0.0)
+    return 0.0 < frac < _ADAPTER_TRAINABLE_PARAM_FRACTION
+
+
 # Hook-less/hooked forward wall-time scale clamp; <0.3 over-corrects, >1.0 indicates measurement glitch.
 _HOOK_SCALE_MIN: float = 0.3
 _HOOK_SCALE_MAX: float = 1.0
@@ -536,10 +556,14 @@ def _estimate_runtime_components(
             )
 
     # NCCL gather + reduce both charged per Eq. 6; reduce is uniform across cached/uncached.
-    # Fail-closed on world-mismatched ZeRO-3 traces — silently zeroing under-prices candidates.
-    if hw.zero3_shard and hw.gpu_count > 1 and trace.world != hw.gpu_count:
+    # trace.world is the global world size at profile time; multi-node ZeRO-3
+    # shards across all global ranks, so use it (not the per-node gpu_count) for
+    # both the >1 gate below and the shard divisor in the optimizer math.
+    # Fail-closed when a multi-rank ZeRO-3 run reuses a single-rank trace —
+    # its zeroed NCCL tables would silently under-price candidates.
+    if hw.zero3_shard and hw.gpu_count > 1 and trace.world <= 1:
         return _INF_COMPONENTS
-    if not hw.zero3_shard or hw.gpu_count <= 1 or trace.world <= 1:
+    if not hw.zero3_shard or trace.world <= 1:
         nccl_gather = 0.0
         nccl_reduce = 0.0
     else:
@@ -917,10 +941,21 @@ def _estimate_runtime_components(
         gpu_adam_bps = _GPU_ADAM_FALLBACK
 
     t_gpu_optim = n_persist_eff * ms_per_chunk / gpu_adam_bps
-    # ZeRO-3 divides per-chunk CPU-Adam by world_size; replicated DDP doesn't.
-    cpu_shard_divisor = max(1, hw.gpu_count) if hw.zero3_shard else 1
-    if cpu_adam_bps <= 0.0:
-        # CPU Adam unavailable: mark configs that offload as infeasible.
+    # ZeRO-3 divides per-chunk CPU-Adam by the global world size; replicated DDP
+    # doesn't. trace.world is the global world (per-node gpu_count undercounts
+    # the shard divisor on multi-node, overestimating t_cpu_optim).
+    cpu_shard_divisor = max(1, int(trace.world)) if hw.zero3_shard else 1
+    offloaded_frozen = _offloaded_chunks_are_frozen(trace)
+    if offloaded_frozen:
+        # Adapter-style (QLoRA/LoRA): offloaded chunks are the frozen base
+        # weights — no grad, no optimizer state, never stepped by any
+        # optimizer. No CPU Adam step is required regardless of whether
+        # DeepSpeedCPUAdam is available, so t_cpu_optim is genuinely 0.
+        t_cpu_optim = 0.0
+    elif cpu_adam_bps <= 0.0:
+        # CPU Adam unavailable and the offloaded chunks ARE trainable
+        # (full-FT offload): a CPU step is truly required but can't run, so
+        # the config can't train correctly — reject as infeasible.
         if n_nonpersist > 0:
             return _INF_COMPONENTS
         t_cpu_optim = 0.0

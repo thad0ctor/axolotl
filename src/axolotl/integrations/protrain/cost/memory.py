@@ -33,15 +33,36 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
         for block_id, peak_bytes in persisted_per_block_peak.items()
     }
     activation_sizes = trace.activation_sizes or {}
+    # When the profiler skipped per-block peak capture — on-demand mode at high
+    # seq leaves ``steady_fwd_block_peak_bytes`` empty (all steady-state fields
+    # zero) — ``activation_sizes`` carries only the block-OUTPUT boundary
+    # tensor. A NONE/OFFLOAD block recomputes nothing, so its FULL forward saved
+    # set (Q/K/V/O projections, FA softmax-LSE, FFN intermediate) stays resident
+    # across the backward window. The block-output proxy alone misses that
+    # internal residency, so no-checkpoint configs look ~order-of-magnitude
+    # cheaper than reality and the searcher picks n_checkpoint=0 the gate then
+    # fail-closes at long seq. Backfill the internal term analytically (arch +
+    # backend aware) so the fallback proxies full per-block residency.
+    internal_saved = attn_activation_bytes(trace)
+
+    def _full_residency(sz: int) -> int:
+        return int(sz) + internal_saved
+
     if not per_block_peak:
-        return {BlockId(int(bid)): int(sz) for bid, sz in activation_sizes.items()}
+        return {
+            BlockId(int(bid)): _full_residency(sz)
+            for bid, sz in activation_sizes.items()
+        }
 
     # Sort by block id to walk in forward order. Keys are already
     # canonical ``BlockId`` after the normalization above, so sorted()
     # operates on int-equivalent NewType values without further coercion.
     sorted_bids = sorted(per_block_peak.keys())
     if not sorted_bids:
-        return {BlockId(int(bid)): int(sz) for bid, sz in activation_sizes.items()}
+        return {
+            BlockId(int(bid)): _full_residency(sz)
+            for bid, sz in activation_sizes.items()
+        }
 
     forward_diffs: list[int] = []
     for prev_bid, cur_bid in zip(sorted_bids, sorted_bids[1:], strict=False):
@@ -67,13 +88,27 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
         if last_bid not in deltas:
             deltas[last_bid] = median_diff
 
-    # Fill gaps from activation_sizes for blocks missing or zero in the per-block peaks.
+    # Fill gaps for blocks missing or zero in the per-block peaks. Measured
+    # forward diffs already include internal saved tensors, so a gap-filled
+    # block must match that basis (output + internal), not output alone.
     for bid_raw, act_sz in activation_sizes.items():
         bid = BlockId(int(bid_raw))
         if bid not in deltas:
-            deltas[bid] = int(act_sz)
+            deltas[bid] = _full_residency(act_sz)
 
     return deltas
+
+
+def _normalized_activation_sizes(trace: ProfilerTrace) -> dict[BlockId, int]:
+    """Re-key ``trace.activation_sizes`` to canonical ``BlockId``.
+
+    Persisted (JSON/pickle) traces stringify dict keys, so ``.get(BlockId)``
+    lookups miss and undercount. Normalize once so all BlockId-keyed lookups
+    hit the right entries.
+    """
+    return {
+        BlockId(int(bid)): int(sz) for bid, sz in (trace.activation_sizes or {}).items()
+    }
 
 
 # Eq. 11 fragmentation factor; fp16/bf16/8-bit default. Per-dtype override in alpha_fragmentation_for_dtype.
@@ -108,7 +143,7 @@ def alpha_fragmentation_for_dtype(bytes_per_element: float) -> float:
 
 
 def alpha_fragmentation_for_cfg(
-    bytes_per_element: float, cfg: CostConfig | None
+    bytes_per_element: float, cfg: CostConfig | None, is_mode_c: bool = False
 ) -> float:
     """Pick the fragmentation factor for ``(dtype, mode)``.
 
@@ -117,11 +152,16 @@ def alpha_fragmentation_for_cfg(
     0.95 because activation churn fragments differently. Non-4-bit dtypes
     keep the unconditional ``ALPHA_FRAGMENTATION`` (1.10) regardless of
     mode.
+
+    ``is_mode_c`` reflects ZeRO-3 chunk sharding (``HardwareProfile.zero3_shard``);
+    the 0.95 factor only applies under Mode C, so checkpointed Mode-A
+    candidates are NOT over-predicted with it. Defaults to ``False``
+    (Mode A) so callers without a hardware profile keep the 0.75 baseline.
     """
     if bytes_per_element >= 1.0:
         return ALPHA_FRAGMENTATION
     is_ckpt = bool(cfg is not None and int(getattr(cfg, "n_checkpoint", 0)) > 0)
-    if is_ckpt:
+    if is_ckpt and is_mode_c:
         return ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT
     return ALPHA_FRAGMENTATION_4BIT_MODE_A
 
@@ -140,39 +180,122 @@ def set_default_ckpt_internal_residual_factor(factor: float) -> None:
     DEFAULT_CKPT_INTERNAL_RESIDUAL_FACTOR = float(max(0.0, factor))
 
 
-def _block_internal_saved_bytes(
+# Attention backends that never materialize the O(seq^2) score/softmax matrix.
+# Flash-Attention (2/3), xFormers, and mem-efficient SDPA stream the softmax in
+# tiles, so their peak attention working set is O(seq), not O(seq^2). "math"/
+# "eager" SDPA and plain eager DO materialize the full score matrix.
+_LINEAR_MEM_ATTN_BACKENDS: frozenset[str] = frozenset(
+    {
+        "flash_attention_2",
+        "flash_attention_3",
+        "flash_attn",
+        "flash",
+        "xformers",
+        "mem_efficient",
+        "sdpa",  # PyTorch SDPA dispatches to flash/mem-efficient kernels when eligible
+    }
+)
+
+
+# Gated-MLP (SwiGLU) saved-for-backward intermediates per block: gate_proj
+# output, up_proj output, and the silu(gate)*up product — three seq*ffn_width
+# tensors. See attn_activation_bytes for the empirical justification.
+_GATED_MLP_SAVED_INTERMEDIATES: int = 3
+
+
+def attn_activation_bytes(
     trace: ProfilerTrace,
-    block_id: BlockId,
     bytes_per_element: float = 2.0,
 ) -> int:
-    """Estimate block-internal saved-for-backward bytes for one transformer block.
+    """Per-block attention + MLP saved-for-backward bytes, backend-aware.
 
-    The existing ``trace.activation_sizes[bid]`` proxies the BLOCK OUTPUT bytes;
-    this helper estimates the INTERNAL saved tensors the block-output proxy
-    misses. For Llama-class blocks:
+    ``trace.activation_sizes[bid]`` proxies only the BLOCK OUTPUT (the CKPT
+    boundary tensor); this estimates the INTERNAL saved tensors the proxy
+    misses for one transformer block, choosing the formula by attention
+    MECHANISM so the cost model doesn't budget a score matrix the kernel never
+    allocates.
 
-    - Q/K/V projections: ``3 * bs * seq * hidden``
-    - Attention scores: ``bs * heads * seq * seq`` (quadratic in seq)
-    - FFN intermediate: ``bs * seq * intermediate_size``
+    Backend cases (``trace.attn_implementation``):
 
-    Returns 0 when the trace lacks the architecture fields (legacy traces);
-    the run-time fields are populated by ``run_trace`` /
-    ``synth_trace_from_overrides``.
+    - Flash-Attention-2/3, xFormers, mem-efficient/SDPA → O(seq): Q,K,V,O
+      projections + the FA softmax-LSE working set. NO score matrix. KV is
+      scaled by ``num_key_value_heads`` (GQA) so grouped-query models aren't
+      over-counted.
+    - eager / math SDPA → O(seq^2): the full score matrix
+      ``mbs * heads * seq^2`` is real and retained. Kept (conservative) only
+      here. Sliding-window attention caps the span to ``min(seq, window)`` so
+      even eager degrades to O(seq * window).
+
+    MLP term follows the MoE config: dense models use ``intermediate_size``;
+    MoE models that expose ``num_experts_per_tok`` / ``moe_intermediate_size``
+    use the active-expert width (``experts_per_tok * moe_intermediate``).
+
+    Returns 0 when the trace lacks bs/seq/hidden (legacy traces) so the chain
+    degrades to the block-output-only sum.
     """
     bs = int(getattr(trace, "bs", 0) or 0)
     seq = int(getattr(trace, "seq", 0) or 0)
     hidden = int(getattr(trace, "hidden_size", 0) or 0)
     heads = int(getattr(trace, "num_attention_heads", 0) or 0)
     intermediate = int(getattr(trace, "intermediate_size", 0) or 0)
-    # block_id is per-block-uniform under the Llama-class assumption; carried
-    # in the signature so future heterogeneous-arch hooks can specialize.
-    _ = block_id
     if bs <= 0 or seq <= 0 or hidden <= 0:
         return 0
-    qkv_bytes = 3 * bs * seq * hidden * bytes_per_element
-    attn_bytes = bs * max(heads, 1) * seq * seq * bytes_per_element if heads > 0 else 0
-    ffn_bytes = bs * seq * intermediate * bytes_per_element if intermediate > 0 else 0
-    return int(qkv_bytes + attn_bytes + ffn_bytes)
+
+    kv_heads = int(getattr(trace, "num_key_value_heads", 0) or 0) or max(heads, 1)
+    head_dim = int(getattr(trace, "head_dim", 0) or 0)
+    if head_dim <= 0:
+        head_dim = hidden // max(heads, 1)
+    window = int(getattr(trace, "sliding_window", 0) or 0)
+    backend = str(getattr(trace, "attn_implementation", "") or "").lower()
+
+    # Q,K,V projections with GQA: K,V have only kv_heads * head_dim columns.
+    qkv_bytes = bs * seq * (max(heads, 1) + 2 * kv_heads) * head_dim * bytes_per_element
+    # Attention output projection (retained input to o_proj).
+    out_bytes = bs * seq * max(heads, 1) * head_dim * bytes_per_element
+
+    if heads > 0 and backend not in _LINEAR_MEM_ATTN_BACKENDS:
+        # eager / math: full score matrix is materialized + retained. Sliding
+        # window bounds the second seq factor to the attended span.
+        span = min(seq, window) if window > 0 else seq
+        attn_core_bytes = bs * heads * seq * span * bytes_per_element
+    else:
+        # Flash / xFormers / mem-efficient: no score matrix. The retained
+        # working set is the projections + a small softmax-LSE (O(seq*heads),
+        # fp32). 4 bytes/elem for the LSE regardless of compute dtype.
+        lse_bytes = bs * max(heads, 1) * seq * 4
+        attn_core_bytes = lse_bytes
+
+    experts_per_tok = int(getattr(trace, "num_experts_per_tok", 0) or 0)
+    moe_intermediate = int(getattr(trace, "moe_intermediate_size", 0) or 0)
+    if experts_per_tok > 0 and moe_intermediate > 0:
+        ffn_width = experts_per_tok * moe_intermediate
+    else:
+        ffn_width = intermediate
+    # Gated MLP (SwiGLU — Llama/Qwen/Mistral/...) retains THREE seq*ffn_width
+    # intermediates for backward: gate_proj output, up_proj output, and the
+    # silu(gate)*up product. Counting a single intermediate under-counts the
+    # per-block recompute working set ~2x at long seq — measured on Qwen3-14B,
+    # the gate tracked actual max_active to +-0.1 GiB at <=8k but drifted -1.3
+    # GiB at 16k (and worse at 32k) until this was corrected; recompute is O(seq)
+    # (FA2, no score matrix), so the fix is this linear factor, not an O(seq^2)
+    # term. Non-gated MLPs save fewer, so this stays conservative (never under).
+    ffn_bytes = (
+        bs * seq * ffn_width * _GATED_MLP_SAVED_INTERMEDIATES * bytes_per_element
+        if ffn_width > 0
+        else 0
+    )
+
+    return int(qkv_bytes + out_bytes + attn_core_bytes + ffn_bytes)
+
+
+def _block_internal_saved_bytes(
+    trace: ProfilerTrace,
+    block_id: BlockId,
+    bytes_per_element: float = 2.0,
+) -> int:
+    """Compat shim over :func:`attn_activation_bytes` (block_id reserved for heterogeneous-arch hooks)."""
+    _ = block_id
+    return attn_activation_bytes(trace, bytes_per_element=bytes_per_element)
 
 
 def _compute_ckpt_chain_bytes(
@@ -293,7 +416,7 @@ def cross_attn_persist_bytes(
     if last_enc_mode is BlockMode.CKPT:
         # ckpt_chain_bytes already covers residual.
         return 0
-    return int(trace.activation_sizes.get(last_enc_bid, 0))
+    return int(_normalized_activation_sizes(trace).get(last_enc_bid, 0))
 
 
 def cross_attn_handoff_bytes(
@@ -312,7 +435,7 @@ def cross_attn_handoff_bytes(
     # NONE/OFFLOAD already retain the full block bytes on GPU so the cap need not preserve them again.
     if last_enc_mode is BlockMode.NONE or last_enc_mode is BlockMode.OFFLOAD:
         return 0
-    return int(trace.activation_sizes.get(last_enc_bid, 0))
+    return int(_normalized_activation_sizes(trace).get(last_enc_bid, 0))
 
 
 def op_cross_attn_surcharge(
@@ -435,6 +558,51 @@ def apply_hot_iter_cap(
 SWAP_PREFETCH_DEPTH: int = 2
 SWAP_SLOTS_PER_BLOCK: int = 8
 
+# Per-block saved-for-backward tensors a non-recomputed (SWAP/NONE) block keeps
+# resident on the host once swapped: block I/O + each linear's saved input + the
+# FFN intermediates. The fused QLoRA stack (FLCE, fused RMSNorm/attn, LoRA
+# kernels) collapses much of the naive set; measured on Qwen3-14B the surviving
+# population is ~12*(seq*hidden) + ~5*(seq*intermediate) bytes/elem. Coefficients
+# are deliberately conservative: the SWAP slab is sized from this, and
+# UNDER-provisioning spills tensors back onto the GPU and breaks the steady-peak
+# prediction, whereas over-provisioning only costs (abundant) pinned host RAM.
+_SWAP_HIDDEN_TENSORS_PER_BLOCK: int = 12
+_SWAP_INTERMEDIATE_TENSORS_PER_BLOCK: int = 5
+
+# Headroom over n_swap * per-block aggregate for first-fit fragmentation + a few
+# in-flight backward-prefetch slices.
+_SWAP_POOL_HEADROOM: float = 1.25
+
+
+def swap_block_saved_bytes(trace: ProfilerTrace, bytes_per_element: float = 2.0) -> int:
+    """Host bytes one SWAP block's saved-for-backward set occupies, arch-aware."""
+    seq = int(getattr(trace, "seq", 0) or 0)
+    hidden = int(getattr(trace, "hidden_size", 0) or 0)
+    if seq <= 0 or hidden <= 0:
+        # Legacy trace without arch fields: block-output proxy x a count heuristic.
+        outs = list((trace.activation_sizes or {}).values())
+        base = max((int(v) for v in outs), default=0)
+        return int(base * SWAP_SLOTS_PER_BLOCK)
+    intermediate = int(getattr(trace, "intermediate_size", 0) or 0)
+    experts_per_tok = int(getattr(trace, "num_experts_per_tok", 0) or 0)
+    moe_intermediate = int(getattr(trace, "moe_intermediate_size", 0) or 0)
+    if experts_per_tok > 0 and moe_intermediate > 0:
+        intermediate = experts_per_tok * moe_intermediate
+    hidden_bytes = _SWAP_HIDDEN_TENSORS_PER_BLOCK * seq * hidden
+    inter_bytes = _SWAP_INTERMEDIATE_TENSORS_PER_BLOCK * seq * max(intermediate, 0)
+    return int((hidden_bytes + inter_bytes) * bytes_per_element)
+
+
+def swap_pool_capacity_bytes(
+    trace: ProfilerTrace, n_swap: int, bytes_per_element: float = 2.0
+) -> int:
+    """Pinned-host capacity for the activation-swap slab: n_swap blocks coexist."""
+    n = int(n_swap)
+    if n <= 0:
+        return 0
+    per_block = swap_block_saved_bytes(trace, bytes_per_element=bytes_per_element)
+    return int(n * per_block * _SWAP_POOL_HEADROOM)
+
 
 def estimate_cpu_footprint(
     cfg: CostConfig,
@@ -454,24 +622,11 @@ def estimate_cpu_footprint(
     per_chunk_sharded = (layout.S_chunk + per_rank_divisor - 1) // per_rank_divisor
     chunk_term = non_persist * per_chunk_sharded
 
-    # Swap term rank-local; size slots to per-block aggregate (strict upper bound).
+    # Swap term rank-local: the variable-size slab holds all n_swap blocks'
+    # saved-for-backward sets simultaneously (carved per-tensor, not equal slots).
     swap_term = 0
-    if cfg.n_swap > 0 and trace is not None and trace.activation_sizes:
-        # Normalise stringified keys from JSON/pickle round-trips for correct sort.
-        normalized_activation_sizes: dict[BlockId, int] = {
-            BlockId(int(bid)): int(sz) for bid, sz in trace.activation_sizes.items()
-        }
-        # Swap-early rule: first n_swap blocks in BlockId order.
-        sorted_bids = sorted(normalized_activation_sizes.keys())
-        swap_band = sorted_bids[: cfg.n_swap]
-        if swap_band:
-            per_block_activation_bytes = max(
-                normalized_activation_sizes.get(bid, 0) for bid in swap_band
-            )
-            slot_bytes = max(1, int(per_block_activation_bytes))
-            swap_term = (
-                cfg.n_swap * SWAP_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH * slot_bytes
-            )
+    if cfg.n_swap > 0 and trace is not None:
+        swap_term = swap_pool_capacity_bytes(trace, cfg.n_swap)
 
     return chunk_term + swap_term
 
@@ -514,6 +669,64 @@ def model_state_present_bytes(
     )
 
 
+def gate_consistent_alpha(alpha: float) -> float:
+    """Floor ``alpha`` at 1.0 so the searcher never deflates a realistic sum.
+
+    Mirrors the wrapper-side ``_calibrate_peak_with_actual_chunk_bytes``, whose
+    ``calibration_alpha = max(1.0, ...)`` floors the fragmentation factor at 1.0
+    — the 0.75 4-bit Mode-A factor was a phantom-compensator for an old
+    O(seq^2) attention over-estimate, and applying it to a realistic component
+    sum DEFLATES the peak (the searcher then accepts aggressive configs the
+    calibrated gate rejects, fail-closing at runtime). Only the FLOOR is
+    mirrored: the gate additionally caps at 1.05, but that cap is paired with
+    its explicit additive component terms; ``estimate_peak``'s non-4-bit
+    ``raw_peak`` carries the conservative 1.10 dtype alpha instead, so capping
+    it would UNDER-predict relative to the established non-4-bit baseline.
+    Floor-only keeps the fix safe (never deflates) and back-compatible.
+    """
+    return max(1.0, float(alpha))
+
+
+def trainable_state_floor_bytes(trace: ProfilerTrace) -> int:
+    """Trainable grad + optimizer-state bytes the searcher must always count.
+
+    Returns the trace-recorded ``trainable_training_state_bytes`` (populated at
+    profile time from the model-state footprint). This is a flat additive floor
+    so the searcher counts the full trainable optimizer state regardless of
+    ``n_persist`` — matching the calibrated gate, which adds the term
+    explicitly. ``model_state_present_bytes`` smears the same bytes into
+    ``persistent_factor``, which rounds toward 1.0 when a large frozen base
+    dominates and under-counts the optimizer state. Legacy traces lacking the
+    field (== 0) degrade to the smear (no floor), preserving back-compat.
+    """
+    return int(getattr(trace, "trainable_training_state_bytes", 0) or 0)
+
+
+def apply_gate_consistent_scaling(
+    raw_peak: int,
+    model_state_present: int,
+    trainable_floor: int,
+    alpha: float,
+) -> int:
+    """Scale ``raw_peak`` the way the calibrated gate does.
+
+    1. Floor/cap the fragmentation alpha at ``[1.0, 1.05]`` (no deflation).
+    2. Add the trainable optimizer-state floor that ``model_state_present`` may
+       have under-smeared, BUT only the portion not already resident: when
+       ``model_state_present`` already exceeds the trainable floor (large
+       ``n_persist`` recovers the full state through ``persistent_factor``), the
+       additive top-up is zero, so we never double-count.
+
+    Never under-predicts relative to the un-floored ``alpha * raw_peak``.
+    """
+    gate_alpha = gate_consistent_alpha(alpha)
+    # Portion of the trainable optimizer state not yet captured by the resident
+    # model-state term. Clamp at 0 so a fully-resident config adds nothing.
+    trainable_topup = max(0, int(trainable_floor) - int(model_state_present))
+    scaled = int(gate_alpha * (raw_peak + trainable_topup))
+    return scaled
+
+
 def estimate_peak(
     cfg: CostConfig,
     trace: ProfilerTrace,
@@ -524,6 +737,9 @@ def estimate_peak(
     """Estimate steady-state peak GPU memory in bytes."""
     # Delegated so searcher inline fast-path and this validator share Eq. 11 accounting.
     model_state_present = model_state_present_bytes(cfg, layout, trace)
+
+    # Persisted traces stringify keys; normalize once for all BlockId lookups.
+    activation_sizes = _normalized_activation_sizes(trace)
 
     forward_ops_by_block = _group_ops_by_block(trace)
     tree_index_map = block_tree_index_map(trace)
@@ -547,11 +763,19 @@ def estimate_peak(
     # CKPT chain term factored to ``_compute_ckpt_chain_bytes`` so the wrapper-side
     # ``_reconstruct_f_bm`` shares the same chain-sum semantics.
     ckpt_chain_bytes = _compute_ckpt_chain_bytes(trace, block_map)
-    for block_id_raw, act_sz in trace.activation_sizes.items():
-        bid = BlockId(int(block_id_raw))
+    for bid, act_sz in activation_sizes.items():
         mode = block_map.get(bid, BlockMode.NONE)
         if mode is BlockMode.NONE or mode is BlockMode.OFFLOAD:
-            retained_none_bytes += act_sz
+            # A NONE/OFFLOAD block recomputes nothing, so ALL its forward
+            # saved-for-backward tensors (block input/output + FFN
+            # intermediate + attention working set) stay resident across the
+            # whole backward window. ``activation_sizes[bid]`` proxies only the
+            # block-output boundary tensor; the saved-tensor proxy captures the
+            # full per-block residency. Mirrors the calibrated gate's
+            # ``_reconstruct_f_bm`` live-NONE term — using the block output
+            # alone under-counts ~Σ(internal saved bytes) and let the searcher
+            # accept n_checkpoint=0 configs the gate then fail-closes at long seq.
+            retained_none_bytes += int(saved_bytes_proxy_for_op_walk.get(bid, act_sz))
         # SWAP: live only during the block's forward compute; assumed
         #       to overlap free GPU memory (§3.3). The CKPT-chain term
         #       does NOT apply because SWAP evicts the block-output
@@ -588,8 +812,12 @@ def estimate_peak(
             # the NONE running total so the live_none-at-op-i view sees
             # the same bytes as a NONE block would; the backward-window
             # chunk gather bump is a separate per-op bump landed via
-            # ``offload_bump_op`` below.
-            running += trace.activation_sizes.get(bid, 0)
+            # ``offload_bump_op`` below. Use the saved-tensor proxy (full
+            # per-block forward residency), not the block-output-only
+            # ``activation_sizes``, so the live-NONE set matches the gate.
+            running += int(
+                saved_bytes_proxy_for_op_walk.get(bid, activation_sizes.get(bid, 0))
+            )
         cumulative_none.append((first_idx, running))
 
     def _none_live_at(op_idx: int) -> int:
@@ -616,7 +844,7 @@ def estimate_peak(
         ckpt_extra = 0
         if i in ckpt_bump_op:
             bid = BlockId(ckpt_bump_op[i])
-            block_act = trace.activation_sizes.get(bid, 0)
+            block_act = activation_sizes.get(bid, 0)
             block_saved = int(saved_bytes_proxy_for_op_walk.get(bid, block_act))
             ckpt_extra = max(0, block_saved - block_act)
 
@@ -648,12 +876,19 @@ def estimate_peak(
     measured_cap = hot_iter_peak_cap(trace, block_map, cfg, layout)
     raw_peak = apply_hot_iter_cap(raw_peak, model_state_present, measured_cap, layout)
 
-    alpha = alpha_fragmentation_for_cfg(hw.dominant_param_bytes_per_element, cfg)
-    scaled = int(alpha * raw_peak)
+    alpha = alpha_fragmentation_for_cfg(
+        hw.dominant_param_bytes_per_element,
+        cfg,
+        bool(getattr(hw, "zero3_shard", False)),
+    )
+    trainable_floor = trainable_state_floor_bytes(trace)
+    scaled = apply_gate_consistent_scaling(
+        raw_peak, model_state_present, trainable_floor, alpha
+    )
     if LOG.isEnabledFor(logging.DEBUG):
         LOG.debug(
             "estimate_peak: n_persist=%d n_buffer=%d n_swap=%d n_ckpt=%d n_offload=%d "
-            "raw=%dB alpha=%.2f -> %dB",
+            "raw=%dB alpha=%.2f gate_alpha=%.2f trainable_floor=%dB -> %dB",
             cfg.n_persist,
             cfg.n_buffer,
             cfg.n_swap,
@@ -661,6 +896,8 @@ def estimate_peak(
             cfg.n_offload,
             raw_peak,
             alpha,
+            gate_consistent_alpha(alpha),
+            trainable_floor,
             scaled,
         )
     return scaled
@@ -674,6 +911,9 @@ __all__ = [
     "DEFAULT_CKPT_INTERNAL_RESIDUAL_FACTOR",
     "alpha_fragmentation_for_cfg",
     "alpha_fragmentation_for_dtype",
+    "apply_gate_consistent_scaling",
+    "attn_activation_bytes",
+    "gate_consistent_alpha",
     "_block_internal_saved_bytes",
     "_compute_ckpt_chain_bytes",
     "_saved_tensor_bytes_per_block",
@@ -686,4 +926,5 @@ __all__ = [
     "model_state_present_bytes",
     "op_cross_attn_surcharge",
     "set_default_ckpt_internal_residual_factor",
+    "trainable_state_floor_bytes",
 ]

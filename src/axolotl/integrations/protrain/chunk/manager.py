@@ -2164,6 +2164,25 @@ class ChunkManager:
             return
         self._closed = True
 
+        # Drain manager-owned state first: rebind params to standalone storage
+        # before any pinned pool / buffer-pool slot is freed, otherwise params
+        # left bound to gathered chunk buffers or placeholders survive teardown
+        # with invalid storage. restore_to_gpu() also closes the CPU pools and
+        # uninstalls hooks; the steps below stay for the nothing-offloaded path.
+        try:
+            self.restore_to_gpu()
+        except Exception:
+            # close() is the deterministic teardown API (used before re-wrapping);
+            # if the param rebind fails, freeing the pools below would leave
+            # params bound to invalid storage while the caller believes teardown
+            # succeeded. Fail closed and let the caller retry once the drain can
+            # complete. Best-effort swallowing stays limited to __del__.
+            self._closed = False
+            LOG.exception(
+                "ChunkManager.close: restore_to_gpu drain failed; aborting teardown"
+            )
+            raise
+
         if self.cpu_optim is not None:
             try:
                 self.cpu_optim.shutdown()
@@ -2225,12 +2244,12 @@ class ChunkManager:
         try:
             self.uninstall()
         except Exception:  # noqa: BLE001 — destructors must not throw
-            pass
+            LOG.debug("ChunkManager.__del__: uninstall failed", exc_info=True)
         try:
             # GC safety net for the unified pinned pools.
             self._close_cpu_pools()
         except Exception:  # noqa: BLE001 — destructors must not throw
-            pass
+            LOG.debug("ChunkManager.__del__: _close_cpu_pools failed", exc_info=True)
 
     # ---- M2 / Option B: backward-window pinning -----------------------
 

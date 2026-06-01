@@ -317,6 +317,13 @@ class BufferPool:
         """Drop pool buffers + paired pinned region (host first so teardown is retryable)."""
         if self._closed:
             return
+        leased_slots = [slot for slot, lease in enumerate(self._leases) if lease > 0]
+        if leased_slots or self._large_leases:
+            raise RuntimeError(
+                "BufferPool.close(): outstanding buffer lease(s) remain "
+                f"(slots={leased_slots}, oversize={sorted(self._large_leases)}); "
+                "release them before close() for deterministic teardown."
+            )
         # Release pinned host first; on raise leave pool retryable instead of leaking the pinned allocation.
         if self.pinned_host is not None:
             self.pinned_host.close()

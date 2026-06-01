@@ -11,6 +11,8 @@ agrees with ``estimate_peak``'s ``ckpt_chain_bytes`` term.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from axolotl.integrations.protrain.cost.memory import (
@@ -52,10 +54,21 @@ def test_alpha_fragmentation_dispatch_mode_a():
 
 
 def test_alpha_fragmentation_dispatch_mode_c_ckpt():
-    """4-bit + n_checkpoint>0 picks the Mode-C-CKPT 0.95 factor."""
+    """4-bit + n_checkpoint>0 picks the Mode-C-CKPT 0.95 factor under ZeRO-3 sharding."""
     cfg_mode_c = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=4)
-    alpha = alpha_fragmentation_for_cfg(0.5, cfg_mode_c)
+    alpha = alpha_fragmentation_for_cfg(0.5, cfg_mode_c, is_mode_c=True)
     assert alpha == pytest.approx(ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT)
+
+
+def test_alpha_fragmentation_dispatch_mode_a_with_ckpt_keeps_mode_a():
+    """4-bit + n_checkpoint>0 WITHOUT Mode-C sharding stays on the 0.75 factor.
+
+    Guards the bug where checkpointed Mode-A candidates were over-predicted with
+    the 0.95 Mode-C-CKPT factor and wrongly rejected as over-capacity.
+    """
+    cfg_ckpt = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=4)
+    alpha = alpha_fragmentation_for_cfg(0.5, cfg_ckpt, is_mode_c=False)
+    assert alpha == pytest.approx(ALPHA_FRAGMENTATION_4BIT_MODE_A)
 
 
 def test_alpha_fragmentation_dispatch_mode_c_without_ckpt_keeps_mode_a():
@@ -336,6 +349,106 @@ def test_block_internal_saved_bytes_zero_when_arch_fields_missing():
     """Legacy traces (arch fields = 0) get a 0 residual so the chain helper degrades."""
     trace = _build_synthetic_trace(n_blocks=1, activation_per_block=1, bs=1, seq=512)
     assert _block_internal_saved_bytes(trace, BlockId(0)) == 0
+
+
+def _attn_trace(seq: int, backend: str, **over) -> ProfilerTrace:
+    """Qwen3-14B-shaped GQA trace for backend-aware attention-term tests."""
+    fields: dict[str, Any] = dict(
+        hidden_size=5120,
+        num_attention_heads=40,
+        intermediate_size=17408,
+        num_key_value_heads=8,
+        head_dim=128,
+        attn_implementation=backend,
+    )
+    fields.update(over)
+    return ProfilerTrace(
+        op_order=(),
+        intra_op_delta={},
+        inter_op_delta={},
+        activation_sizes={BlockId(0): 1},
+        model_state_bytes=0,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        nccl_gather_s={},
+        nccl_reduce_s={},
+        arch_hash="test",
+        bs=1,
+        seq=seq,
+        sku="test",
+        world=1,
+        **fields,
+    )
+
+
+def test_attn_activation_flash_is_linear_in_seq():
+    """Flash-Attention-2 retains no score matrix → term scales ~O(seq)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    r8k = attn_activation_bytes(_attn_trace(8192, "flash_attention_2"))
+    r16k = attn_activation_bytes(_attn_trace(16384, "flash_attention_2"))
+    # Linear: doubling seq roughly doubles the term (small LSE keeps it ~2x).
+    assert 1.9 < r16k / r8k < 2.2
+
+
+def test_attn_activation_eager_is_quadratic_in_seq():
+    """eager materializes the score matrix → term scales O(seq^2)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    r8k = attn_activation_bytes(_attn_trace(8192, "eager"))
+    r16k = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert r16k / r8k > 3.0  # super-linear
+
+
+def test_attn_activation_flash_never_underpredicts_eager_lower_bounds():
+    """Flash term must stay >= the genuine projection/MLP floor (never 0 with arch)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    flash = attn_activation_bytes(_attn_trace(16384, "flash_attention_2"))
+    eager = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert 0 < flash < eager  # flash is tight; eager stays conservative
+
+
+def test_attn_activation_sliding_window_caps_eager_span():
+    """Sliding-window attention bounds the eager O(seq^2) term to O(seq*window)."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    full = attn_activation_bytes(_attn_trace(16384, "eager", sliding_window=0))
+    windowed = attn_activation_bytes(_attn_trace(16384, "eager", sliding_window=1024))
+    assert windowed < full
+
+
+def test_attn_activation_unknown_backend_is_eager_safe():
+    """Empty/unknown backend (legacy traces) keeps the conservative O(seq^2) path."""
+    from axolotl.integrations.protrain.cost.memory import attn_activation_bytes
+
+    unknown = attn_activation_bytes(_attn_trace(16384, ""))
+    eager = attn_activation_bytes(_attn_trace(16384, "eager"))
+    assert unknown == eager
+
+
+def test_saved_tensor_proxy_backfills_internal_when_peaks_empty():
+    """Empty steady_fwd_block_peak_bytes → proxy = block-output + internal saved.
+
+    On-demand profiling at high seq leaves the per-block peaks empty; the proxy
+    must fall back to full per-block residency (output + arch-aware internal),
+    not the block-output boundary alone, or the searcher under-counts
+    no-checkpoint configs the gate then fail-closes.
+    """
+    from axolotl.integrations.protrain.cost.memory import (
+        _saved_tensor_bytes_per_block,
+        attn_activation_bytes,
+    )
+
+    trace = _attn_trace(32768, "flash_attention_2")  # steady_fwd_block_peak_bytes empty
+    assert not trace.steady_fwd_block_peak_bytes
+    internal = attn_activation_bytes(trace)
+    assert internal > 0
+    proxy = _saved_tensor_bytes_per_block(trace)
+    block_output = int(trace.activation_sizes[BlockId(0)])
+    assert proxy[BlockId(0)] == block_output + internal
+    # The internal term dominates: full residency is far above block-output alone.
+    assert proxy[BlockId(0)] > 100 * block_output
 
 
 def test_ckpt_chain_includes_internal_residual_when_enabled():

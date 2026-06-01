@@ -29,6 +29,40 @@ if TYPE_CHECKING:
 LOG = get_logger(__name__)
 
 
+def _patch_deepspeed_cpu_info_probe() -> None:
+    """Neutralize py-cpuinfo's subprocess CPU probe inside ``DeepSpeedCPUAdam``.
+
+    ``DeepSpeedCPUAdam.__init__`` calls ``cpuinfo.get_cpu_info()`` only to read
+    ``vendor_id_raw`` for an AMD-FP16 warning. py-cpuinfo forks a probe
+    subprocess that deadlocks once the parent holds a live CUDA context plus
+    worker threads (``communicate()`` blocks in ``select`` forever), hanging
+    optimizer construction. Swap the module's bound reference for a
+    subprocess-free ``/proc/cpuinfo`` vendor lookup; DeepSpeed guards missing
+    keys with ``in`` checks, so the sparse dict is safe. Idempotent.
+    """
+    try:
+        from deepspeed.ops.adam import cpu_adam as _ds_cpu_adam
+    except Exception:  # noqa: BLE001 — DeepSpeed optional / import-time issues
+        return
+    if getattr(_ds_cpu_adam, "_protrain_cpuinfo_patched", False):
+        return
+
+    def _safe_cpu_info() -> dict:
+        vendor = ""
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("vendor_id"):
+                        vendor = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+        return {"vendor_id_raw": vendor}
+
+    _ds_cpu_adam.get_cpu_info = _safe_cpu_info
+    _ds_cpu_adam._protrain_cpuinfo_patched = True
+
+
 class _DestroyedDsAdam:
     """Replaces a destroyed DeepSpeedCPUAdam C-state binding to neutralise __del__."""
 
@@ -71,6 +105,8 @@ class CpuFusedAdamAdapter:
                 "install via `pip install axolotl[deepspeed]`."
             ) from err
 
+        _patch_deepspeed_cpu_info_probe()
+
         self._params_per_chunk = dict(params_per_chunk)
         self.lr = float(lr)
         self.betas = (float(betas[0]), float(betas[1]))
@@ -79,39 +115,45 @@ class CpuFusedAdamAdapter:
 
         # One DeepSpeedCPUAdam per chunk; probe for ds_opt_adam to catch half-init from extension load failure.
         self._optims: dict[ChunkId, Any] = {}
-        for cid, params in self._params_per_chunk.items():
-            if not params:
-                continue
-            opt = DeepSpeedCPUAdam(
-                params,
-                lr=self.lr,
-                betas=self.betas,
-                eps=self.eps,
-                weight_decay=self.weight_decay,
-            )
-            if not hasattr(opt, "ds_opt_adam"):
-                # Plant no-op stub so __del__ doesn't AttributeError before the raise below.
-                class _NoopDsAdam:  # noqa: N801 — internal stub
-                    def destroy_adam(self, _opt_id):
-                        return None
-
-                try:
-                    opt.ds_opt_adam = _NoopDsAdam()  # type: ignore[attr-defined]
-                except Exception:  # noqa: BLE001 — best-effort cleanup
-                    LOG.debug(
-                        "CpuFusedAdamAdapter: failed to install ds_opt_adam noop stub",
-                        exc_info=True,
-                    )
-                raise RuntimeError(
-                    "DeepSpeedCPUAdam C++ extension (adam_bindings) is not "
-                    "loaded — the constructed object is missing "
-                    "`ds_opt_adam` and will crash on .step(). Common "
-                    "cause: system nvcc CUDA version differs from the "
-                    "version PyTorch was compiled with. Either install a "
-                    "matching CUDA toolkit or set DS_SKIP_CUDA_CHECK=1 "
-                    "and rebuild DeepSpeed."
+        try:
+            for cid, params in self._params_per_chunk.items():
+                if not params:
+                    continue
+                opt = DeepSpeedCPUAdam(
+                    params,
+                    lr=self.lr,
+                    betas=self.betas,
+                    eps=self.eps,
+                    weight_decay=self.weight_decay,
                 )
-            self._optims[cid] = opt
+                if not hasattr(opt, "ds_opt_adam"):
+                    # Plant no-op stub so __del__ doesn't AttributeError before the raise below.
+                    class _NoopDsAdam:  # noqa: N801 — internal stub
+                        def destroy_adam(self, _opt_id):
+                            return None
+
+                    try:
+                        opt.ds_opt_adam = _NoopDsAdam()  # type: ignore[attr-defined]
+                    except Exception:  # noqa: BLE001 — best-effort cleanup
+                        LOG.debug(
+                            "CpuFusedAdamAdapter: failed to install ds_opt_adam noop stub",
+                            exc_info=True,
+                        )
+                    raise RuntimeError(
+                        "DeepSpeedCPUAdam C++ extension (adam_bindings) is not "
+                        "loaded — the constructed object is missing "
+                        "`ds_opt_adam` and will crash on .step(). Common "
+                        "cause: system nvcc CUDA version differs from the "
+                        "version PyTorch was compiled with. Either install a "
+                        "matching CUDA toolkit or set DS_SKIP_CUDA_CHECK=1 "
+                        "and rebuild DeepSpeed."
+                    )
+                self._optims[cid] = opt
+        except Exception:
+            # Free C++ state of optimizers built so far instead of relying on GC.
+            self._destroy_ds_adam_state()
+            self._optims = {}
+            raise
 
         # Single-worker executor — see module docstring for rationale.
         self._executor = ThreadPoolExecutor(

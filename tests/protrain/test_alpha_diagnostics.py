@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import pytest
 
@@ -84,9 +85,15 @@ def test_estimate_peak_debug_log_includes_mode_alpha(caplog: pytest.LogCaptureFi
         dominant_param_bytes_per_element=0.5,
     )
 
-    estimate_peak(cfg, _trace(), layout, {BlockId(0): BlockMode.CKPT}, hw)
+    hw_mode_c = replace(hw, zero3_shard=True)
 
+    # Checkpointed Mode A (no ZeRO-3 sharding) keeps the 0.75 factor; only
+    # Mode-C-with-CKPT escalates to 0.95.
+    estimate_peak(cfg, _trace(), layout, {BlockId(0): BlockMode.CKPT}, hw)
     assert "estimate_peak:" in caplog.text
+    assert "alpha=0.75" in caplog.text
+
+    estimate_peak(cfg, _trace(), layout, {BlockId(0): BlockMode.CKPT}, hw_mode_c)
     assert "alpha=0.95" in caplog.text
 
 

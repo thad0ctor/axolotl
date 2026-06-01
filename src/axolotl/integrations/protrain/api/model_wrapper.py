@@ -38,6 +38,7 @@ from axolotl.integrations.protrain.profiler.trace import (
     _is_adapter_style_frozen_base,
     _model_state_footprint,
     synth_trace_from_overrides,
+    trainable_training_state_bytes_for_optimizer,
 )
 from axolotl.integrations.protrain.runtime.hooks import install_hooks
 from axolotl.integrations.protrain.runtime.scheduler import Scheduler
@@ -307,8 +308,18 @@ def _calibrate_peak_with_actual_chunk_bytes(
     trace=None,
     block_map=None,
     hw=None,
+    optimizer_name: str | None = None,
 ) -> int:
-    """Recompute ``predicted_peak_bytes`` using actual chunk bytes + CKPT correction."""
+    """Recompute ``predicted_peak_bytes`` using actual chunk bytes + CKPT correction.
+
+    The ``calibrated_persistent`` term recovers only RESIDENT param bytes
+    (frozen base + adapter weights). The trainable grad + optimizer state is a
+    SEPARATE allocation the resident snapshot never sees, so it is added back
+    explicitly and optimizer-aware via ``optimizer_name``. Folding it into the
+    resident-bytes ``persistent_factor`` ratio under-counted it (the ratio
+    rounds toward 1.0 when a large frozen base dominates), which let the
+    fit-gate accept configs that then OOM on the optimizer step.
+    """
     from axolotl.integrations.protrain.cost.memory import (
         ALPHA_FRAGMENTATION,
         _compute_ckpt_chain_bytes,
@@ -328,7 +339,11 @@ def _calibrate_peak_with_actual_chunk_bytes(
         persistent_factor = 1.0
     buffer_factor = 2.0  # fp16 params (gathered) + fp16 grads (accumulated)
     if hw is not None:
-        alpha = alpha_fragmentation_for_cfg(hw.dominant_param_bytes_per_element, cfg)
+        alpha = alpha_fragmentation_for_cfg(
+            hw.dominant_param_bytes_per_element,
+            cfg,
+            bool(getattr(hw, "zero3_shard", False)),
+        )
     else:
         alpha = ALPHA_FRAGMENTATION
 
@@ -406,7 +421,8 @@ def _calibrate_peak_with_actual_chunk_bytes(
                 f_bm_local = max(f_bm_local, reconstructed_local)
         buffer_bytes_local = int(n_buffer_local * S * buffer_factor)
         persistent_bytes_local = int(actual_persistent_local * persistent_factor)
-        calibration_alpha_local = min(alpha, 1.05)
+        # Floor at 1.0: never deflate a realistic component sum (see body note).
+        calibration_alpha_local = max(1.0, min(alpha, 1.05))
         calibrated_local = int(
             calibration_alpha_local
             * (persistent_bytes_local + buffer_bytes_local + f_bm_local)
@@ -422,6 +438,32 @@ def _calibrate_peak_with_actual_chunk_bytes(
 
     # Actual persistent param bytes; scaled by persistent_factor to recover full state.
     actual_persistent = sum(cb.get(cid, 0) for cid in persistent_ids)
+
+    # Trainable grad + optimizer state — a live steady-state allocation the
+    # resident-weight snapshot (actual_persistent) does NOT include. Optimizer-
+    # aware so adamw_8bit (~4 B/param) and adamw_torch (~10 B/param) differ.
+    #
+    # persistent_factor already smears trace.model_state_bytes (frozen +
+    # trainable@default-16B) across ALL resident bytes; re-adding the explicit
+    # trainable term on top of that double-counts. To stay exact we strip the
+    # trainable share back out of the smear (frozen_factor) and re-add the
+    # optimizer-aware value. Failure to recompute the footprint falls back to a
+    # purely-additive term (conservative: never under-predicts).
+    trainable_state_bytes = 0
+    frozen_factor = persistent_factor
+    try:
+        footprint = _model_state_footprint(chunk_manager.model)
+        trainable_state_bytes = trainable_training_state_bytes_for_optimizer(
+            chunk_manager.model, optimizer_name
+        )
+        if fp16_total_bytes > 0 and footprint.frozen_param_bytes > 0:
+            frozen_factor = max(1.0, footprint.frozen_param_bytes / fp16_total_bytes)
+    except Exception as exc:  # noqa: BLE001 — defensive over stub managers
+        LOG.debug(
+            "calibrate: model-state footprint recompute failed (%s); using "
+            "persistent_factor and additive trainable term.",
+            exc,
+        )
 
     # Mirror cost.memory.model_state_present_bytes so reverse-out uses what the cost model added.
     n_persist_eff = len(persistent_ids)
@@ -443,17 +485,27 @@ def _calibrate_peak_with_actual_chunk_bytes(
         else:
             f_bm = max(f_bm, reconstructed_f_bm)
 
-    # Two independent alphas (NOT stacked): paper 1.10 for feasibility, 1.05 post-hoc reporting.
-    calibration_alpha = min(alpha, 1.05)
+    # calibrated_raw is a sum of REAL components (measured resident weights +
+    # optimizer/grad state + reconstructed activation working set), not a
+    # worst-case. The fragmentation alpha (e.g. 0.75 for 4-bit Mode A) was a
+    # phantom-compensating DISCOUNT for the old O(seq^2) attention over-estimate;
+    # applying it to a realistic sum under-predicts (drops below resident bytes).
+    # Floor at 1.0 so it can add fragmentation headroom but never deflate.
+    calibration_alpha = max(1.0, min(alpha, 1.05))
     # BufferPool pre-allocates all n_buffer slots up front; footprint is constant.
     buffer_bytes_eff = int(n_buffer * S * buffer_factor)
-    calibrated_persistent = int(actual_persistent * persistent_factor)
-    calibrated_raw = calibrated_persistent + buffer_bytes_eff + f_bm
+    # Resident weights at frozen_factor (trainable smear stripped out), then the
+    # trainable grad+optimizer state re-added explicitly and optimizer-aware.
+    calibrated_persistent = int(actual_persistent * frozen_factor)
+    calibrated_raw = (
+        calibrated_persistent + buffer_bytes_eff + f_bm + trainable_state_bytes
+    )
     calibrated = int(calibration_alpha * calibrated_raw)
     LOG.debug(
         "ProTrain calibrate body: cfg=(np=%d nb=%d ns=%d nck=%d nof=%d) "
         "S_chunk=%.3fGiB N_chunk=%d n_persist_eff=%d n_buffer=%d "
-        "actual_persistent=%.3fGiB persistent_factor=%.3f buffer_factor=%.2f "
+        "actual_persistent=%.3fGiB persistent_factor=%.3f frozen_factor=%.3f "
+        "buffer_factor=%.2f trainable_state=%.3fGiB "
         "f_bm=%.3fGiB calibrated_persistent=%.3fGiB buffer_bytes_eff=%.3fGiB "
         "calibrated_raw=%.3fGiB calibration_alpha=%.3f -> calibrated=%.3fGiB "
         "(original_peak=%.3fGiB original_model_state=%.3fGiB)",
@@ -468,7 +520,9 @@ def _calibrate_peak_with_actual_chunk_bytes(
         n_buffer,
         actual_persistent / (1 << 30),
         persistent_factor,
+        frozen_factor,
         buffer_factor,
+        trainable_state_bytes / (1 << 30),
         f_bm / (1 << 30),
         calibrated_persistent / (1 << 30),
         buffer_bytes_eff / (1 << 30),
@@ -578,6 +632,20 @@ def _calibrate_peak_with_actual_chunk_bytes(
                     calibrated_floor = int(phase2_peak + delta)
                 # Anchor as LOWER bound only — structural body's cfg-specific terms survive above.
                 calibrated = max(calibrated, calibrated_floor)
+
+    # Hard steady-state floor: resident weights + trainable grad/optimizer state
+    # are ALWAYS co-resident during the optimizer step. The phase-2 override
+    # branches above anchor on a measured peak that can be captured BEFORE the
+    # optimizer step allocates m/v, silently dropping the trainable term and
+    # under-predicting. This floor re-asserts that minimum regardless of which
+    # branch produced ``calibrated``. Activations (f_bm) are deliberately NOT in
+    # the floor: the structural body already adds them, and a trusted phase-2
+    # measured peak already reflects them — folding them in here would fight the
+    # phase-2 over-predict cap. Priority: never under-predict and OOM the gate.
+    steady_state_floor = int(
+        calibration_alpha * (actual_persistent + trainable_state_bytes)
+    )
+    calibrated = max(calibrated, steady_state_floor)
     return calibrated
 
 
@@ -972,6 +1040,7 @@ def _construct_runtime(
     trace,
     zero3_shard,
     device,
+    optimizer_name: str | None = None,
 ) -> tuple["ChunkManager", "Scheduler", list[Any], SearchResult]:
     """Build chunk_manager + scheduler + hooks under a given ``result``."""
     import sys as _sys2
@@ -1097,6 +1166,7 @@ def _construct_runtime(
         trace=trace,
         block_map=result.block_map,
         hw=hardware_profile,
+        optimizer_name=optimizer_name,
     )
     init_transient_peak = predict_init_transient_peak_bytes(
         layout, hardware_profile, chunk_manager
@@ -1349,11 +1419,16 @@ def _construct_runtime(
     for cid, chunk_params in cpu_params_per_chunk.items():
         shard_state = chunk_manager._chunk_shards.get(cid)  # type: ignore[attr-defined]
         if shard_state is not None and shard_state.regions:
-            cpu_params_per_chunk_for_optim[cid] = [
-                r.shard_param for r in shard_state.regions
-            ]
+            candidate = [r.shard_param for r in shard_state.regions]
         else:
-            cpu_params_per_chunk_for_optim[cid] = chunk_params
+            candidate = chunk_params
+        # Only trainable params are ever stepped; a frozen offloaded chunk
+        # (QLoRA's 4-bit base) needs no CPU optimizer. Skipping it also avoids
+        # constructing DeepSpeedCPUAdam — whose py-cpuinfo CPU probe can deadlock
+        # in a forked subprocess — for chunks that would never call .step().
+        trainable = [p for p in candidate if getattr(p, "requires_grad", False)]
+        if trainable:
+            cpu_params_per_chunk_for_optim[cid] = trainable
 
     cpu_optim: CpuFusedAdamAdapter | None = None
     if any(params for params in cpu_params_per_chunk_for_optim.values()):
@@ -1404,87 +1479,42 @@ def _construct_runtime(
                         break
             blocks[idx] = wrapped_block
 
-    # Build the activation SWAP pool when n_swap > 0.
+    # Build the activation SWAP slab when n_swap > 0.
     if result.cfg.n_swap > 0:
         from axolotl.integrations.protrain.types import BlockMode as _BM_swap
 
-        # Slot must hold the largest SAVED tensor (output | intra-op transient | saved weight).
-        max_act_bytes = 0
-        max_param_bytes = 0
-        max_intra_delta_bytes = 0
-        swap_block_ids: set[int] = set()
-        for bid, mode in result.block_map.items():
-            if mode is _BM_swap.SWAP:
-                swap_block_ids.add(int(bid))
-                act = trace.activation_sizes.get(bid, 0)
-                if act > max_act_bytes:
-                    max_act_bytes = int(act)
-        # Largest forward-op intra delta across SWAP blocks.
-        if swap_block_ids:
-            for op in trace.op_order:
-                if not op.is_forward:
-                    continue
-                if op.block_id is None:
-                    continue
-                if int(op.block_id) not in swap_block_ids:
-                    continue
-                delta = int(trace.intra_op_delta.get(op.op_id, 0))
-                if delta > max_intra_delta_bytes:
-                    max_intra_delta_bytes = delta
-        # Largest individual parameter tensor across SWAP blocks (covers F.linear saved weight).
-        for idx, block in enumerate(blocks):
-            if int(idx) not in swap_block_ids:
-                continue
-            inner = getattr(block, "block", block)
-            for p in inner.parameters(recurse=True):
-                pb = int(p.numel() * p.element_size())
-                if pb > max_param_bytes:
-                    max_param_bytes = pb
-        slot_bytes_required = max(
-            int(max_act_bytes),
-            int(max_intra_delta_bytes),
-            int(max_param_bytes),
+        swap_block_count = sum(
+            1 for mode in result.block_map.values() if mode is _BM_swap.SWAP
         )
-        if slot_bytes_required <= 0:
-            LOG.warning(
-                "ProTrain: result.cfg.n_swap=%d but no SWAP block has "
-                "non-zero activation_sizes/params; skipping swap-pool "
-                "construction",
-                result.cfg.n_swap,
-            )
-        else:
-            from axolotl.integrations.protrain.block.swap_pool import (
-                DEFAULT_SLOTS_PER_BLOCK,
-                ActivationSwapPool,
-            )
-            from axolotl.integrations.protrain.cost.memory import (
-                SWAP_PREFETCH_DEPTH,
-            )
+        from axolotl.integrations.protrain.block.swap_pool import ActivationSwapPool
+        from axolotl.integrations.protrain.cost.memory import swap_pool_capacity_bytes
 
-            slots_per_block = DEFAULT_SLOTS_PER_BLOCK
-            # Floor at 1 byte for the pool's positive-size invariant.
-            per_slot = max(1, slot_bytes_required)
-            swap_pool = ActivationSwapPool(
-                n_swap=result.cfg.n_swap,
-                slot_bytes=per_slot,
-                prefetch_depth=SWAP_PREFETCH_DEPTH,
-                slots_per_block=slots_per_block,
+        swap_capacity_bytes = swap_pool_capacity_bytes(trace, swap_block_count)
+        if swap_capacity_bytes <= 0:
+            # Fail fast rather than skip: leaving the blocks in BlockMode.SWAP
+            # with no pool attached makes their wrappers run as identity, so
+            # activations stay GPU-resident while the search result still
+            # assumed they would stream to CPU — turning a "fits" plan into a
+            # runtime OOM. A zero capacity means the trace is missing both
+            # seq/hidden and activation sizes (degenerate / broken trace).
+            raise RuntimeError(
+                f"ProTrain: result.cfg.n_swap={result.cfg.n_swap} selected "
+                f"{swap_block_count} SWAP block(s) but swap_pool_capacity_bytes "
+                "resolved to 0 (trace missing seq/hidden and activation sizes); "
+                "cannot size the activation-swap slab. Re-run the searcher with "
+                "n_swap=0 or repair the profiler trace."
             )
-            scheduler.swap_pool = swap_pool
-            for block in blocks:
-                if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
-                    block.attach_runtime(swap_pool, scheduler.swap_stream)
-            LOG.info(
-                "ProTrain: SWAP pool wired — %d slots x %d bytes = %.2f MB "
-                "pinned (slot sized from max(act=%.2f MB, intra_op=%.2f MB, "
-                "param=%.2f MB))",
-                swap_pool.n_slot,
-                swap_pool.slot_bytes,
-                swap_pool.total_bytes / (1 << 20),
-                max_act_bytes / (1 << 20),
-                max_intra_delta_bytes / (1 << 20),
-                max_param_bytes / (1 << 20),
-            )
+        swap_pool = ActivationSwapPool(capacity_bytes=swap_capacity_bytes)
+        scheduler.swap_pool = swap_pool
+        for block in blocks:
+            if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
+                block.attach_runtime(swap_pool, scheduler.swap_stream)
+        LOG.info(
+            "ProTrain: SWAP slab wired — %.2f GiB pinned for %d SWAP blocks "
+            "(variable-size, per-tensor)",
+            swap_capacity_bytes / (1 << 30),
+            swap_block_count,
+        )
 
     handles = install_hooks(
         model=model,
@@ -1674,58 +1704,18 @@ def _profiler_trace_controls_for_model(
 
 def _swap_pool_required_bytes(
     *,
-    blocks: list[nn.Module],
     result: SearchResult,
     trace,
-) -> tuple[int, int, int, int, int, int]:
-    """Return ``(total, n_slot, slot, max_act, max_intra, max_param)``."""
+) -> tuple[int, int]:
+    """Return ``(slab_capacity_bytes, n_swap_blocks)`` for the activation-swap pool."""
     if int(result.cfg.n_swap) <= 0:
-        return (0, 0, 0, 0, 0, 0)
+        return (0, 0)
 
     from axolotl.integrations.protrain.block.strategy import BlockMode
-    from axolotl.integrations.protrain.block.swap_pool import DEFAULT_SLOTS_PER_BLOCK
-    from axolotl.integrations.protrain.cost.memory import SWAP_PREFETCH_DEPTH
+    from axolotl.integrations.protrain.cost.memory import swap_pool_capacity_bytes
 
-    max_act_bytes = 0
-    max_intra_delta_bytes = 0
-    max_param_bytes = 0
-    swap_block_ids: set[int] = set()
-    for bid, mode in result.block_map.items():
-        if mode is BlockMode.SWAP:
-            swap_block_ids.add(int(bid))
-            max_act_bytes = max(max_act_bytes, int(trace.activation_sizes.get(bid, 0)))
-
-    if swap_block_ids:
-        for op in trace.op_order:
-            if (
-                op.is_forward
-                and op.block_id is not None
-                and int(op.block_id) in swap_block_ids
-            ):
-                max_intra_delta_bytes = max(
-                    max_intra_delta_bytes,
-                    int(trace.intra_op_delta.get(op.op_id, 0)),
-                )
-
-    for idx, block in enumerate(blocks):
-        if idx not in swap_block_ids:
-            continue
-        inner = getattr(block, "block", block)
-        for param in inner.parameters(recurse=True):
-            max_param_bytes = max(
-                max_param_bytes, int(param.numel() * param.element_size())
-            )
-
-    slot_bytes = max(1, max_act_bytes, max_intra_delta_bytes, max_param_bytes)
-    n_slot = int(result.cfg.n_swap) * DEFAULT_SLOTS_PER_BLOCK * SWAP_PREFETCH_DEPTH
-    return (
-        int(n_slot * slot_bytes),
-        int(n_slot),
-        int(slot_bytes),
-        int(max_act_bytes),
-        int(max_intra_delta_bytes),
-        int(max_param_bytes),
-    )
+    n_swap_blocks = sum(1 for m in result.block_map.values() if m is BlockMode.SWAP)
+    return (int(swap_pool_capacity_bytes(trace, n_swap_blocks)), int(n_swap_blocks))
 
 
 def _downgrade_oversized_swap_to_checkpoint(
@@ -1733,6 +1723,8 @@ def _downgrade_oversized_swap_to_checkpoint(
     blocks: list[nn.Module],
     result: SearchResult,
     trace,
+    layout,
+    hw,
     cpu_capacity_bytes: int | None,
 ) -> SearchResult:
     """Avoid runtime SWAP-pool allocations that exceed the CPU budget."""
@@ -1743,9 +1735,7 @@ def _downgrade_oversized_swap_to_checkpoint(
     ):
         return result
 
-    total, n_slot, slot_bytes, max_act, max_intra, max_param = (
-        _swap_pool_required_bytes(blocks=blocks, result=result, trace=trace)
-    )
+    total, n_swap_blocks = _swap_pool_required_bytes(result=result, trace=trace)
     if total <= int(cpu_capacity_bytes):
         return result
 
@@ -1767,25 +1757,33 @@ def _downgrade_oversized_swap_to_checkpoint(
         N_block=n_block,
         n_offload=result.cfg.n_offload,
     )
+    # The downgraded all-CKPT plan has a DIFFERENT (higher) GPU peak than the
+    # SWAP plan it replaces — SWAP kept activations off-GPU. Carrying the SWAP
+    # plan's predicted_peak_bytes / predicted_iter_s forward would make runtime
+    # calibration, phase-2, and reporting gate and log against a plan no longer
+    # being executed (and under-predict the peak). Recompute both for the new
+    # cfg/block_map.
+    from axolotl.integrations.protrain.cost.memory import estimate_peak
+    from axolotl.integrations.protrain.cost.runtime import estimate_runtime
+
+    recomputed_peak = int(estimate_peak(cfg, trace, layout, block_map, hw))
+    recomputed_iter_s = float(estimate_runtime(cfg, trace, layout, block_map, hw))
     LOG.warning(
-        "ProTrain: SWAP pool would require %.2f GiB pinned CPU "
-        "(%d slots x %.2f MiB; max act=%.2f MiB, intra=%.2f MiB, "
-        "param=%.2f MiB), exceeding the %.2f GiB CPU budget. "
-        "Downgrading %d SWAP blocks to CKPT before runtime construction.",
+        "ProTrain: SWAP slab would require %.2f GiB pinned CPU "
+        "(%d SWAP blocks, per-tensor variable-size), exceeding the %.2f GiB "
+        "CPU budget. Downgrading %d SWAP blocks to CKPT (recomputed peak "
+        "%.2f GiB) before runtime construction.",
         total / (1 << 30),
-        n_slot,
-        slot_bytes / (1 << 20),
-        max_act / (1 << 20),
-        max_intra / (1 << 20),
-        max_param / (1 << 20),
+        n_swap_blocks,
         int(cpu_capacity_bytes) / (1 << 30),
         int(result.cfg.n_swap),
+        recomputed_peak / (1 << 30),
     )
     return SearchResult(
         cfg=cfg,
         block_map=block_map,
-        predicted_peak_bytes=result.predicted_peak_bytes,
-        predicted_iter_s=result.predicted_iter_s,
+        predicted_peak_bytes=recomputed_peak,
+        predicted_iter_s=recomputed_iter_s,
         predicted_init_transient_peak_bytes=result.predicted_init_transient_peak_bytes,
     )
 
@@ -1890,6 +1888,7 @@ def protrain_model_wrapper(
     adapter: str | None = None,
     load_in_4bit: bool = False,
     load_in_8bit: bool = False,
+    optimizer_name: str | None = None,
 ) -> WrappedModel:
     """Compose the ProTrain runtime around a standard ``nn.Module``.
 
@@ -2363,13 +2362,15 @@ def protrain_model_wrapper(
 
     result = _broadcast_runtime_search_result(result)
     if LOG.isEnabledFor(logging.DEBUG):
+        _is_mode_c = bool(getattr(hardware_profile, "zero3_shard", False))
         _alpha = alpha_fragmentation_for_cfg(
             hardware_profile.dominant_param_bytes_per_element,
             result.cfg,
+            _is_mode_c,
         )
         if hardware_profile.dominant_param_bytes_per_element >= 1.0:
             _alpha_regime = "non-4bit"
-        elif int(result.cfg.n_checkpoint) > 0:
+        elif int(result.cfg.n_checkpoint) > 0 and _is_mode_c:
             _alpha_regime = "4bit-mode-c-ckpt"
         else:
             _alpha_regime = "4bit-mode-a"
@@ -2541,6 +2542,8 @@ def protrain_model_wrapper(
         blocks=blocks,
         result=result,
         trace=trace,
+        layout=layout,
+        hw=hardware_profile,
         cpu_capacity_bytes=cpu_capacity_bytes,
     )
     result = _broadcast_runtime_search_result(result)
@@ -2571,6 +2574,8 @@ def protrain_model_wrapper(
             blocks=blocks,
             result=boot_result,
             trace=trace,
+            layout=layout,
+            hw=hardware_profile,
             cpu_capacity_bytes=cpu_capacity_bytes,
         )
         boot_result = _broadcast_runtime_search_result(boot_result)
@@ -2584,6 +2589,7 @@ def protrain_model_wrapper(
             trace=trace,
             zero3_shard=zero3_shard,
             device=device,
+            optimizer_name=optimizer_name,
         )
         boot_wrapped = WrappedModel(
             module=model,
@@ -2661,6 +2667,7 @@ def protrain_model_wrapper(
                 trace=trace,
                 zero3_shard=zero3_shard,
                 device=device,
+                optimizer_name=optimizer_name,
             )
         if not measurement_failed:
             # Pre-splice ordering mirrors v10; per_block is the same shape pre/post.
@@ -2828,6 +2835,8 @@ def protrain_model_wrapper(
                     blocks=blocks,
                     result=new_result,
                     trace=trace,
+                    layout=layout,
+                    hw=hardware_profile,
                     cpu_capacity_bytes=cpu_capacity_bytes,
                 )
                 new_result = _broadcast_runtime_search_result(new_result)
@@ -2882,6 +2891,7 @@ def protrain_model_wrapper(
                         trace=trace,
                         block_map=new_result.block_map,
                         hw=hardware_profile,
+                        optimizer_name=optimizer_name,
                     )
                     # Reuse bootstrap-time init transient — post-offload _chunk_bytes sees placeholders.
                     init_transient_peak = (
@@ -2942,6 +2952,7 @@ def protrain_model_wrapper(
                         trace=trace,
                         zero3_shard=zero3_shard,
                         device=device,
+                        optimizer_name=optimizer_name,
                     )
     else:
         chunk_manager, scheduler, handles, result = _construct_runtime(
@@ -2954,6 +2965,7 @@ def protrain_model_wrapper(
             trace=trace,
             zero3_shard=zero3_shard,
             device=device,
+            optimizer_name=optimizer_name,
         )
 
     LOG.info(

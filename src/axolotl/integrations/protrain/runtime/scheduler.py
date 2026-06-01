@@ -394,7 +394,7 @@ class Scheduler:
 
         import torch
 
-        # Order H2D writes after in-flight SWAP D2H reads (correctness for SWAP × non-persistent).
+        # Order H2D writes after in-flight SWAP D2H reads (correctness for SWAP x non-persistent).
         if self._swap_stream is not None:
             _t = time.perf_counter() if _trace else 0.0
             self._prefetch_stream.wait_stream(self._swap_stream)
@@ -576,7 +576,7 @@ class Scheduler:
         Mode C ``zero3_shard`` hang where block N's compute would otherwise
         serialize with block N-1's per-container sharded gather.
         """
-        # Per-step LoRA-container fan-out (~28 containers × 4 hooks at Llama
+        # Per-step LoRA-container fan-out (~28 containers x 4 hooks at Llama
         # class) drives this method hot — keep the CPU lane an attribute-
         # lookup-only no-op past the empty-tuple guard. The cuda.is_available
         # check is read off the cached scheduler flag, not the syscall.

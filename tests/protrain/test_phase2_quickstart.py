@@ -368,6 +368,8 @@ def test_oversized_swap_pool_downgrades_to_checkpoint():
             activation_bytes_per_block=1 << 20,
             intra_delta_bytes=1 << 20,
         ),
+        layout=_make_layout(n_block=2),
+        hw=_make_hw(),
         cpu_capacity_bytes=8 << 20,
     )
 

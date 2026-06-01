@@ -654,7 +654,7 @@ def _detect_nvlink_topology() -> bool:
     (-68% NCCL collective count → +15% sps/rank on 3090 PCIe 4-rank), but on
     NV-class fabric (300+ GB/s) the native bucketed allreduce is fast enough
     that Path B's serialization on the broadcasting rank becomes net overhead
-    (measured -55% sps/rank on 2× A100-SXM4-80GB NVLink). When the user
+    (measured -55% sps/rank on 2x A100-SXM4-80GB NVLink). When the user
     leaves ``protrain_own_lora_grad_sync`` at its ``None`` default, this
     detector picks the topology-appropriate behavior.
 
@@ -1722,6 +1722,7 @@ class ProTrainPlugin(BasePlugin):
             adapter=getattr(cfg, "adapter", None),
             load_in_4bit=bool(getattr(cfg, "load_in_4bit", False)),
             load_in_8bit=bool(getattr(cfg, "load_in_8bit", False)),
+            optimizer_name=_resolve_optimizer_name(None, cfg),
         )
 
         cfg._protrain_wrapped = wrapped  # type: ignore[attr-defined]
