@@ -14,7 +14,7 @@ Tri Dao's FlashAttention-2 backward, with the paper's Algorithms 2 & 3 inserted:
 
   Forward (per Q-block i, streaming K/V-block j, online softmax):
     Qf,Kf,Vf = fake_quant(Q),fake_quant(K),fake_quant(V)   (block-16 over head_dim)
-    S_ij = Qf_i . Kf_j^T * scale   (+ causal mask)
+    S_ij = Qf_i . Kf_j^T * scale   (+ causal mask + per-key padding bias)
     online max/denom update
     P_ij  = exp(S_ij - m_i)
     Pf_ij = fake_quant(P_ij) over the KEY axis (block-16, trailing partial block padded)
@@ -134,17 +134,19 @@ if HAS_TRITON:
 
     @triton.jit
     def _attn_qat_fwd(
-        Q, K, V, sm_scale,
+        Q, K, V, sm_scale, B,
         O, Op, M,  # noqa: E741
         stride_qz, stride_qh, stride_qm, stride_qk,
         stride_kz, stride_kh, stride_kn, stride_kk,
         stride_vz, stride_vh, stride_vn, stride_vk,
         stride_oz, stride_oh, stride_om, stride_ok,
+        stride_bz,
         Z, H, N_CTX, N_KV,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         CAUSAL: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
         GQA_GROUP: tl.constexpr,
     ):
         start_m = tl.program_id(0)
@@ -156,6 +158,7 @@ if HAS_TRITON:
         q_base = Q + off_z * stride_qz + off_h * stride_qh
         k_base = K + off_z * stride_kz + off_hk * stride_kh
         v_base = V + off_z * stride_vz + off_hk * stride_vh
+        b_base = B + off_z * stride_bz
 
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, HEAD_DIM)
@@ -185,6 +188,9 @@ if HAS_TRITON:
             k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
             kf = _fake_quant_blocks(k, BLOCK_N, HEAD_DIM)
             s = tl.dot(qf, tl.trans(kf)) * sm_scale
+            if HAS_BIAS:
+                bias = tl.load(b_base + offs_n, mask=n_mask, other=0.0)
+                s = s + bias[None, :]
             s = tl.where(n_mask[None, :], s, -float("inf"))
             if CAUSAL:
                 causal = offs_m[:, None] >= offs_n[None, :]
@@ -214,6 +220,9 @@ if HAS_TRITON:
             kf = _fake_quant_blocks(k, BLOCK_N, HEAD_DIM)
             vf = _fake_quant_blocks(v, BLOCK_N, HEAD_DIM)
             s = tl.dot(qf, tl.trans(kf)) * sm_scale
+            if HAS_BIAS:
+                bias = tl.load(b_base + offs_n, mask=n_mask, other=0.0)
+                s = s + bias[None, :]
             s = tl.where(n_mask[None, :], s, -float("inf"))
             if CAUSAL:
                 causal = offs_m[:, None] >= offs_n[None, :]
@@ -237,7 +246,7 @@ if HAS_TRITON:
 
     @triton.jit
     def _attn_qat_bwd(
-        Q, K, V, sm_scale,
+        Q, K, V, sm_scale, B,
         DO, Op, M,
         DQ, DK, DV,
         stride_qz, stride_qh, stride_qm, stride_qk,
@@ -245,11 +254,13 @@ if HAS_TRITON:
         stride_vz, stride_vh, stride_vn, stride_vk,
         stride_oz, stride_oh, stride_om, stride_ok,
         stride_dkz, stride_dkh, stride_dkn, stride_dkk,
+        stride_bz,
         Z, H, N_CTX, N_KV,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         CAUSAL: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
         GQA_GROUP: tl.constexpr,
     ):
         # One program per (z,h,kv-block n): loop over q-blocks m, accumulate dK,dV
@@ -273,6 +284,8 @@ if HAS_TRITON:
         offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_d = tl.arange(0, HEAD_DIM)
         n_mask = offs_n < N_KV
+        if HAS_BIAS:
+            bias = tl.load(B + off_z * stride_bz + offs_n, mask=n_mask, other=0.0)
 
         k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
         v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
@@ -304,6 +317,8 @@ if HAS_TRITON:
             m_i = tl.load(M + off_hz * N_CTX + offs_m, mask=m_mask, other=0.0)
 
             s = tl.dot(qf, tl.trans(kf)) * sm_scale
+            if HAS_BIAS:
+                s = s + bias[None, :]
             s = tl.where(n_mask[None, :], s, -float("inf"))
             if CAUSAL:
                 causal = offs_m[:, None] >= offs_n[None, :]
@@ -341,30 +356,37 @@ def _supported(head_dim: int) -> bool:
     )
 
 
+_NO_BIAS = torch.empty(0)
+
+
 class _AttnQatFlash(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale, causal, gqa_group):
-        # q: [Z,H,N_CTX,D]  k/v: [Z,Hk,N_KV,D]
+    def forward(ctx, q, k, v, sm_scale, causal, gqa_group, bias):
+        # q: [Z,H,N_CTX,D]  k/v: [Z,Hk,N_KV,D]  bias: [Z,N_KV] additive or empty
         Z, H, N_CTX, D = q.shape
         N_KV = k.shape[2]
         BLOCK_M = 16
         BLOCK_N = 16
+        has_bias = bias.numel() > 0
+        b = bias if has_bias else q  # placeholder ptr when unused
+        stride_bz = bias.stride(0) if has_bias else 0
         o = torch.empty_like(q)
         op = torch.empty_like(q)
         m = torch.empty((Z * H, N_CTX), device=q.device, dtype=torch.float32)
         grid = (triton.cdiv(N_CTX, BLOCK_M), Z * H)
         _attn_qat_fwd[grid](
-            q, k, v, sm_scale, o, op, m,
+            q, k, v, sm_scale, b, o, op, m,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            stride_bz,
             Z, H, N_CTX, N_KV,
             HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            CAUSAL=causal, GQA_GROUP=gqa_group,
+            CAUSAL=causal, HAS_BIAS=has_bias, GQA_GROUP=gqa_group,
             num_warps=4, num_stages=1,
         )
-        ctx.save_for_backward(q, k, v, op, m)
+        ctx.save_for_backward(q, k, v, op, m, bias)
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         ctx.gqa_group = gqa_group
@@ -372,12 +394,15 @@ class _AttnQatFlash(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, op, m = ctx.saved_tensors
+        q, k, v, op, m, bias = ctx.saved_tensors
         Z, H, N_CTX, D = q.shape
         Hk = k.shape[1]
         N_KV = k.shape[2]
         BLOCK_M = 16
         BLOCK_N = 16
+        has_bias = bias.numel() > 0
+        b = bias if has_bias else q
+        stride_bz = bias.stride(0) if has_bias else 0
         do = do.contiguous()
         dq = torch.zeros_like(q, dtype=torch.float32)
         # dK/dV per query head, reduced over the GQA group afterwards.
@@ -385,22 +410,23 @@ class _AttnQatFlash(torch.autograd.Function):
         dv = torch.empty_like(q)
         grid = (triton.cdiv(N_KV, BLOCK_N), Z * H)
         _attn_qat_bwd[grid](
-            q, k, v, ctx.sm_scale, do, op, m, dq, dk, dv,
+            q, k, v, ctx.sm_scale, b, do, op, m, dq, dk, dv,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
             dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            stride_bz,
             Z, H, N_CTX, N_KV,
             HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            CAUSAL=ctx.causal, GQA_GROUP=ctx.gqa_group,
+            CAUSAL=ctx.causal, HAS_BIAS=has_bias, GQA_GROUP=ctx.gqa_group,
             num_warps=4, num_stages=1,
         )
         dq = dq.to(q.dtype)
         if ctx.gqa_group > 1:
             dk = dk.view(Z, Hk, ctx.gqa_group, N_KV, D).sum(2)
             dv = dv.view(Z, Hk, ctx.gqa_group, N_KV, D).sum(2)
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 def fused_nvfp4_qat_attention(
@@ -410,12 +436,19 @@ def fused_nvfp4_qat_attention(
     scaling: float,
     causal: bool,
     num_key_value_groups: int,
+    key_pad_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused NVFP4 fake-quant attention. q:[Z,H,S,D], k/v:[Z,Hk,S,D] (pre-repeat_kv).
 
-    Returns [Z,H,S,D]. Requires supported head_dim and a causal/full mask.
+    ``key_pad_bias`` is an optional [Z, N_KV] additive per-key bias (0 keep, -inf
+    pad) applied to the scores before the online softmax, combined with the causal
+    mask. Returns [Z,H,S,D]. Requires supported head_dim.
     """
     q = query.contiguous()
     k = key.contiguous()
     v = value.contiguous()
-    return _AttnQatFlash.apply(q, k, v, scaling, causal, num_key_value_groups)
+    if key_pad_bias is None:
+        bias = _NO_BIAS.to(device=q.device, dtype=q.dtype)
+    else:
+        bias = key_pad_bias.contiguous().to(device=q.device, dtype=q.dtype)
+    return _AttnQatFlash.apply(q, k, v, scaling, causal, num_key_value_groups, bias)

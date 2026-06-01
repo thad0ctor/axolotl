@@ -14,8 +14,9 @@ backward exact without the paper's auxiliary high-precision O' reconstruction.
 ``nvfp4_qat_attention_forward`` dispatches to the fused FlashAttention-style Triton
 kernel (``axolotl.kernels.attn_qat_flash``, linear memory, recomputes P with the O'
 identity in its backward) when applicable — supported head_dim, Triton available,
-dropout off, plain causal/full mask — and falls back to the eager path below for
-exotic masks (padding/sliding window) or unsupported head_dims.
+dropout off, and a causal/full mask optionally combined with a per-key padding mask
+(the common padded-SFT case) — and falls back to the eager path below for exotic
+masks (sliding window / arbitrary per-query bias) or unsupported head_dims.
 """
 
 from __future__ import annotations
@@ -84,25 +85,66 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_kv * n_rep, slen, head_dim)
 
 
-def _mask_is_pure_causal(
-    attention_mask: torch.Tensor | None, q_len: int, kv_len: int
-) -> bool:
-    """True iff ``attention_mask`` is None or a plain lower-triangular causal mask
-    (no padding / sliding window / arbitrary bias), so the fused causal kernel is
-    exactly equivalent. A None mask with q_len==kv_len is treated as causal."""
+def _fused_mask_plan(
+    attention_mask: torch.Tensor | None, q_len: int, kv_len: int, dtype
+) -> tuple[bool, torch.Tensor | None] | None:
+    """Decide whether the fused kernel can serve ``attention_mask`` and, if so,
+    how. Returns ``(causal, key_pad_bias)`` or ``None`` for unsupported masks.
+
+    Supported: None (causal when square), plain causal, and causal-or-full plus a
+    pure per-key padding mask (constant across query rows). The padding is returned
+    as a ``[Z, kv_len]`` additive bias (0 keep, -inf pad). Anything else — sliding
+    window, per-query bias, arbitrary additive bias — returns ``None`` so dispatch
+    falls back to eager.
+
+    ``key_pad_bias`` is None when there is no padding (pure causal), so the kernel
+    skips the bias load entirely.
+    """
     if attention_mask is None:
-        return q_len == kv_len
+        return (True, None) if q_len == kv_len else None
     if attention_mask.dim() != 4:
-        return False
+        return None
     m = attention_mask[..., :kv_len]
-    if m.shape[-1] != kv_len or q_len != kv_len:
-        return False
+    if m.shape[-1] != kv_len:
+        return None
+
     neg = torch.finfo(m.dtype).min
-    keep = m > neg / 2
-    causal = torch.tril(
-        torch.ones(q_len, kv_len, dtype=torch.bool, device=m.device)
-    )
-    return bool((keep == causal).all())
+    keep = m > neg / 2  # [Z, Hheads_or_1, q_len, kv_len] boolean
+
+    # Must be identical across heads (HF padding/causal masks are head-broadcast).
+    if keep.shape[1] != 1:
+        if not bool((keep == keep[:, :1]).all()):
+            return None
+        keep = keep[:, :1]
+    keep = keep[:, 0]  # [Z, q_len, kv_len]
+
+    # Per-key padding = a key padded iff masked at the last query row, which (when
+    # causal) attends to every key, or (when full) at any row. Validate the whole
+    # mask equals (causal_component AND key_pad), so no other structure leaks.
+    if q_len == kv_len:
+        causal = torch.tril(
+            torch.ones(q_len, kv_len, dtype=torch.bool, device=keep.device)
+        )[None]
+        key_pad = keep[:, -1, :]  # last row sees all keys causally
+        recon = causal & key_pad[:, None, :]
+        if bool((keep == recon).all()):
+            return (True, _key_pad_bias(key_pad, neg_inf_dtype=dtype))
+    # full (non-causal) attention with pure key padding, constant over query rows
+    key_pad = keep.all(dim=1)  # [Z, kv_len]: key kept for every query row
+    recon = key_pad[:, None, :].expand_as(keep)
+    if bool((keep == recon).all()):
+        return (False, _key_pad_bias(key_pad, neg_inf_dtype=dtype))
+    return None
+
+
+def _key_pad_bias(key_pad: torch.Tensor, neg_inf_dtype) -> torch.Tensor | None:
+    """[Z, kv_len] boolean keep -> additive bias (0 keep, -inf pad), or None if
+    every key is kept (no padding -> let the kernel skip the bias path)."""
+    if bool(key_pad.all()):
+        return None
+    bias = torch.zeros(key_pad.shape, dtype=neg_inf_dtype, device=key_pad.device)
+    bias.masked_fill_(~key_pad, float("-inf"))
+    return bias
 
 
 def nvfp4_qat_attention_forward(
@@ -119,25 +161,31 @@ def nvfp4_qat_attention_forward(
 
     Uses the fused FlashAttention-style Triton kernel (linear memory) when the
     head_dim is supported, Triton is available, dropout is off, and the mask is a
-    plain causal/full mask; otherwise falls back to the eager v1 below
-    (materialized P) — same fake-quant, exotic-mask/head_dim safe. The eager path
-    is structurally identical to HF's ``eager_attention_forward`` (GQA repeat,
-    scaling, additive mask, fp32 softmax, dropout) with the four Algorithm-2
-    fake-quants inserted.
+    causal/full mask optionally with a per-key padding mask; otherwise falls back
+    to the eager v1 below (materialized P) — same fake-quant, exotic-mask/head_dim
+    safe. The eager path is structurally identical to HF's
+    ``eager_attention_forward`` (GQA repeat, scaling, additive mask, fp32 softmax,
+    dropout) with the four Algorithm-2 fake-quants inserted.
     """
     head_dim = query.shape[-1]
     q_len = query.shape[-2]
     kv_len = key.shape[-2]
-    if (
-        dropout == 0.0
-        and _fused_supported(head_dim)
-        and _mask_is_pure_causal(attention_mask, q_len, kv_len)
-    ):
+    plan = None
+    if dropout == 0.0 and _fused_supported(head_dim):
+        plan = _fused_mask_plan(attention_mask, q_len, kv_len, query.dtype)
+    if plan is not None:
+        causal, key_pad_bias = plan
         if not getattr(nvfp4_qat_attention_forward, "_fused_logged", False):
-            LOG.info("fp4_attention_qat: using FUSED Triton flash kernel")
+            LOG.info(
+                "fp4_attention_qat: using FUSED Triton flash kernel "
+                "(causal=%s, key_padding=%s)",
+                causal,
+                key_pad_bias is not None,
+            )
             nvfp4_qat_attention_forward._fused_logged = True
         out = _fused_nvfp4_qat_attention(
-            query, key, value, scaling, True, module.num_key_value_groups
+            query, key, value, scaling, causal,
+            module.num_key_value_groups, key_pad_bias,
         )
         return out.transpose(1, 2).contiguous(), None
 
