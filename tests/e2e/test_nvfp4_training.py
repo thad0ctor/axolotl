@@ -244,6 +244,42 @@ class TestNVFP4Adapters:
         l0, l1 = self._train(model)
         assert l1 < l0 and torch.isfinite(torch.tensor(l1))
 
+    def test_fsdp_hooks_present_and_reconstruct(self):
+        """The FSDP-wrapped FP4 base carries all-gather hooks and reconstructs
+        bit-exactly from row-sharded qdata/scale (the shard the hooks gather)."""
+        from torchao.prototype.mx_formats.nvfp4_tensor import (
+            NVFP4Tensor,
+            per_tensor_amax_to_scale,
+        )
+
+        from axolotl.utils.nvfp4_training import _to_fsdp_nvfp4
+
+        w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+        wq = NVFP4Tensor.to_nvfp4(
+            w.contiguous(),
+            block_size=16,
+            per_tensor_scale=per_tensor_amax_to_scale(torch.max(torch.abs(w))),
+        )
+        fq = _to_fsdp_nvfp4(wq)
+        assert hasattr(fq, "fsdp_pre_all_gather")
+        assert hasattr(fq, "fsdp_post_all_gather")
+        assert torch.equal(
+            fq.dequantize(torch.bfloat16), wq.dequantize(torch.bfloat16)
+        )
+
+        # simulate the gather: split qdata/scale by row, concat, reconstruct
+        (qd, sc), (ctx, pts) = fq.fsdp_pre_all_gather(mesh=None)
+        half = qd.shape[0] // 2
+        gathered = (
+            torch.cat([qd[:half], qd[half:]], dim=0),
+            torch.cat([sc[:half], sc[half:]], dim=0),
+        )
+        rebuilt, _ = fq.fsdp_post_all_gather(gathered, (ctx, pts), torch.bfloat16)
+        rel = (
+            rebuilt.dequantize(torch.bfloat16) - wq.dequantize(torch.bfloat16)
+        ).norm() / wq.dequantize(torch.bfloat16).norm()
+        assert rel.item() < 1e-6
+
     def test_qlora_checkpoint_roundtrip(self):
         """The FP4-packed base must survive save/load (buffer in state_dict),
         else QLoRA resume silently reinitializes the base."""

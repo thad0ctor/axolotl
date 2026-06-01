@@ -341,6 +341,58 @@ class NVFP4FrozenBaseFunction(torch.autograd.Function):
         return grad_x, None, None
 
 
+_FSDP_NVFP4_CLS = None
+
+
+def _fsdp_nvfp4_class():
+    """torchao's NVFP4Tensor subclassed with FSDP2 all-gather hooks (cached).
+
+    Built lazily so importing this module never needs the torchao.prototype
+    NVFP4Tensor symbol at top level.
+    """
+    global _FSDP_NVFP4_CLS
+    if _FSDP_NVFP4_CLS is not None:
+        return _FSDP_NVFP4_CLS
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    class FSDPNVFP4Tensor(NVFP4Tensor):
+        # The frozen FP4 base shards along dim 0: qdata and scale both split by
+        # row; the global per_tensor_scale (computed once over the whole weight,
+        # identical on every rank) is replicated. Reconstruction concatenates the
+        # row-shards — verified bit-exact against the unsharded tensor.
+        def fsdp_pre_all_gather(self, mesh):
+            return (self.qdata, self.scale), (
+                self.__tensor_flatten__()[1],
+                self.per_tensor_scale,
+            )
+
+        def fsdp_post_all_gather(
+            self, all_gather_outputs, metadata, param_dtype, *, out=None
+        ):
+            qdata, scale = all_gather_outputs
+            ctx, per_tensor_scale = metadata
+            if out is not None:
+                return
+            inner = {"qdata": qdata, "scale": scale, "per_tensor_scale": per_tensor_scale}
+            rebuilt = type(self).__tensor_unflatten__(inner, ctx, None, None)
+            return rebuilt, (qdata, scale)
+
+    _FSDP_NVFP4_CLS = FSDPNVFP4Tensor
+    return _FSDP_NVFP4_CLS
+
+
+def _to_fsdp_nvfp4(w_q):
+    """Re-wrap an NVFP4Tensor as the FSDP-hooked subclass (same inner data)."""
+    sub = _fsdp_nvfp4_class()
+    ctx = w_q.__tensor_flatten__()[1]
+    inner = {
+        "qdata": w_q.qdata,
+        "scale": w_q.scale,
+        "per_tensor_scale": w_q.per_tensor_scale,
+    }
+    return sub.__tensor_unflatten__(inner, ctx, None, None)
+
+
 class NVFP4FrozenBaseLinear(nn.Module):
     """Frozen base linear whose weight is stored packed in FP4 (QLoRA base).
 
@@ -367,7 +419,7 @@ class NVFP4FrozenBaseLinear(nn.Module):
 
     @classmethod
     def from_linear(
-        cls, linear: nn.Linear, recipe: NVFP4Recipe
+        cls, linear: nn.Linear, recipe: NVFP4Recipe, *, fsdp: bool = False
     ) -> "NVFP4FrozenBaseLinear":
         from torchao.prototype.mx_formats.nvfp4_tensor import (
             NVFP4Tensor,
@@ -383,6 +435,9 @@ class NVFP4FrozenBaseLinear(nn.Module):
             per_tensor_scale=pts,
             act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE),
         )
+        # FSDP2 needs the all-gather hooks to shard the FP4 base by row.
+        if fsdp:
+            w_q = _to_fsdp_nvfp4(w_q)
         return cls(w_q, linear.bias, recipe)
 
 
@@ -441,6 +496,7 @@ def convert_lora_base_to_nvfp4(
     recipe: NVFP4Recipe | None = None,
     *,
     quantized_storage: bool = False,
+    fsdp: bool = False,
     exclude: tuple[str, ...] = ("lm_head", "embed_tokens"),
 ) -> int:
     """Swap the FROZEN base_layer inside each PEFT ``lora.Linear`` for an NVFP4
@@ -466,7 +522,9 @@ def convert_lora_base_to_nvfp4(
         if not isinstance(base, nn.Linear) or not _is_swappable(base):
             continue
         if quantized_storage:
-            module.base_layer = NVFP4FrozenBaseLinear.from_linear(base, recipe)
+            module.base_layer = NVFP4FrozenBaseLinear.from_linear(
+                base, recipe, fsdp=fsdp
+            )
         else:
             base.weight.requires_grad_(False)
             module.base_layer = NVFP4Linear.from_linear(base, recipe)

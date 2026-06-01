@@ -1624,15 +1624,16 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "requires bf16/fp32). Set bf16: true."
             )
 
-        # NVFP4-QLoRA stores the frozen base as an NVFP4Tensor attribute (not an
-        # nn.Parameter); FSDP can't shard it, so it would replicate and lose the
-        # memory win. Refuse rather than silently waste it. (FP4-compute LoRA
-        # keeps a normal bf16 Parameter and shards fine.)
+        # NVFP4-QLoRA under FSDP shards the FP4 base via custom all-gather hooks
+        # (NVFP4FrozenBaseLinear is built with fsdp=True). The hooks are verified
+        # single-process; multi-rank gather correctness is exercised but not yet
+        # validated across physical ranks (hardware-limited), so allow it with a
+        # warning rather than refuse.
         if wants_fp4_storage and (self.fsdp_config or self.fsdp):
-            raise ValueError(
-                "nvfp4_training FP4-storage QLoRA does not shard under FSDP — the "
-                "FP4 base would replicate. Use single-GPU, or quantize_base=false "
-                "(FP4-compute LoRA), which shards normally."
+            LOG.warning(
+                "nvfp4_training FP4-storage QLoRA under FSDP uses custom NVFP4 "
+                "all-gather hooks; validated single-process but not yet across "
+                "multiple physical ranks. Verify loss parity on your setup."
             )
 
         from axolotl.utils.nvfp4_training import nvfp4_supported

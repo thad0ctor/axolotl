@@ -304,8 +304,14 @@ class PatchManager:
             # plain LoRA into FP4 storage. Either => NVFP4-QLoRA (FP4 storage);
             # otherwise LoRA + FP4 compute (HP frozen base, throughput only).
             quantized_storage = bool(nvfp4.quantize_base) or adapter == "qlora"
+            # FP4-stored base needs the NVFP4 all-gather hooks to shard under FSDP2.
+            use_fsdp = quantized_storage and bool(self.cfg.fsdp_config)
             count = convert_lora_base_to_nvfp4(
-                model, recipe, quantized_storage=quantized_storage, exclude=exclude
+                model,
+                recipe,
+                quantized_storage=quantized_storage,
+                fsdp=use_fsdp,
+                exclude=exclude,
             )
             empty_msg = (
                 "nvfp4_training enabled but no eligible LoRA base layers were "
