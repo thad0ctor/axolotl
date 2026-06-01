@@ -821,6 +821,18 @@ class AxolotlInputConfig(
         deprecated="Use `attn_implementation: eager` instead.",
     )
 
+    fp4_attention_qat: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Quantization-aware training for FP4 attention (Attn-QAT, "
+            "arXiv 2603.00040). Fake-quantizes the attention operands (Q, K, V and the "
+            "softmax probabilities) to NVFP4 each step so the model learns to tolerate "
+            "real FP4 attention at inference; all matmuls stay bf16 (accuracy feature, "
+            "not speed — training stays ~bf16 cost). Independent of nvfp4_training; "
+            "works on a bf16 base. v1 is eager-attention only. Off by default."
+        },
+    )
+
     attn_implementation: str | None = Field(
         default=None,
         json_schema_extra={

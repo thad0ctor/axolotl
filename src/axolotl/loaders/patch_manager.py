@@ -167,6 +167,7 @@ class PatchManager:
         self._apply_lora_kernel_patch(model)
         self._apply_scaling_softmax_patch(model)
         self._apply_fp8_attention_patches(model)
+        self._apply_fp4_attention_qat(model)
         self._apply_nvfp4_training(model)
 
     def _apply_gemma_hybrid_attention(self, model: PreTrainedModel):
@@ -270,6 +271,27 @@ class PatchManager:
             from axolotl.monkeypatch.attention.fp8_attn import patch_fp8_attention
 
             patch_fp8_attention(model)
+
+    def _apply_fp4_attention_qat(self, model: PreTrainedModel):
+        """Route attention through the NVFP4 fake-quant QAT path (opt-in).
+
+        Independent of nvfp4_training: works on a bf16 base. Forces eager-style
+        materialized-P attention (v1), so it overrides any flash/sdpa request —
+        warn if the user asked for one. Post-load so it sees the final model tree.
+        """
+        if not self.cfg.fp4_attention_qat:
+            return
+
+        from axolotl.utils.attn_qat import apply_nvfp4_qat_attention
+
+        requested = self.cfg.attn_implementation
+        if requested and requested not in ("eager", "nvfp4_qat"):
+            LOG.warning(
+                "fp4_attention_qat overrides attn_implementation=%s with the eager "
+                "NVFP4 fake-quant attention (v1 materializes P).",
+                requested,
+            )
+        apply_nvfp4_qat_attention(model)
 
     def _apply_nvfp4_training(self, model: PreTrainedModel):
         """Swap eligible linears for NVFP4-GEMM linears (Blackwell FP4 compute).
