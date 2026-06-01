@@ -18,7 +18,10 @@ from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.image_utils import load_image
 
-from axolotl.integrations.mm_tiling.tiling import image_tiling_config_from_cfg
+from axolotl.integrations.mm_tiling.tiling import (
+    TilingImageTransform,
+    image_tiling_config_from_cfg,
+)
 from axolotl.prompt_strategies.multimodal_pretrain import (
     build_image_token_spec,
     encode_multimodal_pretrain,
@@ -219,6 +222,9 @@ def evaluate(args) -> dict[str, Any]:
     spec = build_image_token_spec(processor)
     rows = load_rows(data_file, limit=args.limit, offset=args.offset)
     tiling_config = image_tiling_config_from_cfg(cfg)
+    image_transform = (
+        TilingImageTransform(tiling_config) if tiling_config is not None else None
+    )
     sequence_len = args.sequence_len or cfg.get("sequence_len")
     if sequence_len is None:
         raise SystemExit("sequence_len must be set via --sequence-len or the config.")
@@ -237,7 +243,7 @@ def evaluate(args) -> dict[str, Any]:
         text_column=text_column,
         image_column=image_column,
         image_base_dir=image_base_dir,
-        image_tiling_config=tiling_config,
+        image_transform=image_transform,
     )
     features = [
         {key: encoded[key][idx] for key in encoded}
@@ -255,7 +261,7 @@ def evaluate(args) -> dict[str, Any]:
         image_resize_buckets=cfg.get("image_resize_buckets"),
         image_resize_no_upscale=bool(cfg.get("image_resize_no_upscale")),
         image_resize_pad_color=cfg.get("image_resize_pad_color"),
-        image_tiling_config=tiling_config,
+        image_transform=image_transform,
     )
 
     dtype = {
@@ -352,7 +358,7 @@ def evaluate(args) -> dict[str, Any]:
         "loss": mean_loss,
         "label_tokens": total_tokens,
         "cer": mean_cer,
-        "tiling_enabled": tiling_config is not None,
+        "tiling_enabled": image_transform is not None,
         "predictions": predictions[: args.save_predictions],
     }
 

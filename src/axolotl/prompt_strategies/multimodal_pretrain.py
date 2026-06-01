@@ -354,9 +354,7 @@ def _load_images_for_lengths(
     image_transform: MMImageTransform | None = None,
 ) -> list[list[Any]]:
     loaded: list[list[Any]] = []
-    tile_cache = (
-        image_transform.new_cache() if image_transform else None
-    )
+    tile_cache = image_transform.new_cache() if image_transform else None
     for row_idx, sources in enumerate(imgs_list):
         if image_transform is not None:
             row = []
@@ -447,9 +445,7 @@ def compute_multimodal_processor_lengths(
             f"({len(texts)} text row(s), {len(imgs_list)} image row(s))."
         )
 
-    tile_cache = (
-        image_transform.new_cache() if image_transform else None
-    )
+    tile_cache = image_transform.new_cache() if image_transform else None
     if image_transform is not None:
         tiling_image_token = (
             image_token or build_image_token_spec(processor).image_token

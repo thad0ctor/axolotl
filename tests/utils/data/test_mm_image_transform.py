@@ -51,6 +51,8 @@ def test_plugin_hook_takes_precedence(monkeypatch):
         def get_mm_image_transform(self, cfg):
             return _Fake()
 
-    monkeypatch.setattr(base.PluginManager, "get_instance", staticmethod(lambda: _Mgr()))
+    monkeypatch.setattr(
+        base.PluginManager, "get_instance", staticmethod(lambda: _Mgr())
+    )
     t = resolve_mm_image_transform(DictDefault({"image_tiling": True}))
     assert isinstance(t, _Fake)

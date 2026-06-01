@@ -562,7 +562,9 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
     assert captured["kwargs"]["max_tokens"] == 4096
 
 
-def test_wrap_streaming_dataset_uses_mm_packed_encoder(smolvlm_processor, monkeypatch, mm_tiling_plugin):
+def test_wrap_streaming_dataset_uses_mm_packed_encoder(
+    smolvlm_processor, monkeypatch, mm_tiling_plugin
+):
     captured = {}
 
     def fake_partial(fn, **kwargs):

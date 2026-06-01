@@ -45,4 +45,7 @@ def test_plugin_provides_transform(_registered_plugin):
 def test_plugin_declines_without_tiling(_registered_plugin):
     from axolotl.integrations.mm_tiling import MMTilingPlugin
 
-    assert MMTilingPlugin().get_mm_image_transform(DictDefault({"image_tiling": False})) is None
+    assert (
+        MMTilingPlugin().get_mm_image_transform(DictDefault({"image_tiling": False}))
+        is None
+    )

@@ -150,7 +150,9 @@ def test_tile_cache_round_trips_from_ssd(tmp_path, monkeypatch):
     def _fail(*_args, **_kwargs):
         raise AssertionError("tile cache hit should not recreate tiles")
 
-    monkeypatch.setattr("axolotl.integrations.mm_tiling.tiling.tile_image_for_processor", _fail)
+    monkeypatch.setattr(
+        "axolotl.integrations.mm_tiling.tiling.tile_image_for_processor", _fail
+    )
     second = tile_image_source_for_processor(
         str(image_path),
         config,
