@@ -19,6 +19,18 @@ class NVFP4TrainingConfig(BaseModel):
             "Blackwell-only. The speedup only materializes under torch.compile."
         },
     )
+    backend: Literal["native", "te"] = Field(
+        default="native",
+        json_schema_extra={
+            "description": "FP4 compute backend. 'native' (default): our "
+            "torch._scaled_mm module-swap; runs the full SR+RHT convergence recipe "
+            "on any FP4-capable GPU (sm_100/sm_120), no extra build. 'te': NVIDIA "
+            "Transformer Engine NVFP4BlockScaling; faster hand-tuned kernels, but "
+            "needs `pip install axolotl[transformer-engine]` (source build) and on "
+            "consumer Blackwell (sm_120) its RHT/SR kernels do not run — TE there is "
+            "recipe-less (convergence unproven). FFT only."
+        },
+    )
     stochastic_rounding: bool = Field(
         default=True,
         json_schema_extra={

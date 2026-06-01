@@ -44,6 +44,46 @@ Software requirements:
 If any requirement is missing, Axolotl raises a validation error at config-check
 time rather than failing mid-run.
 
+### Backends
+
+`nvfp4_training.backend` selects the FP4 compute implementation:
+
+- **`native`** (default): Axolotl's own `torch._scaled_mm` module-swap. Runs the
+  full SR + RHT convergence recipe on any FP4-capable GPU (`sm_100`/`sm_120`),
+  no extra install. This is the portable default and the only path with a
+  working convergence recipe on consumer Blackwell.
+- **`te`**: NVIDIA [Transformer Engine](https://github.com/NVIDIA/TransformerEngine)
+  `NVFP4BlockScaling`. Hand-tuned CUTLASS kernels — faster GEMMs — but an
+  optional, heavier dependency, and **full-fine-tune only**.
+
+To use the TE backend, install the extra:
+
+```bash
+pip install "axolotl[transformer-engine]"
+# or with uv:
+uv pip install "axolotl[transformer-engine]"
+```
+
+Transformer Engine builds `transformer_engine_torch` from source against your
+local CUDA toolkit. On **consumer Blackwell (`sm_120`)** two extra steps are
+required (datacenter `sm_100` needs neither):
+
+1. Build for the architecture-specific target: `NVTE_CUDA_ARCHS=120` (TE ≥ 2.8;
+   the FP4 cast PTX is `sm_120a`-specific).
+2. At runtime, preload the system cuBLAS so TE finds the newer grouped-GEMM
+   symbol: `LD_PRELOAD=/usr/local/cuda/lib64/libcublasLt.so.<ver>`. The pip
+   `nvidia-cublas` wheel is too old; the toolkit's cuBLAS has the symbol.
+
+**Important `sm_120` caveat:** TE's RHT / stochastic-rounding / 2D-scaling fusion
+kernels currently do **not** run on consumer Blackwell (they error with
+`CUDA Error: invalid argument` — they are authored for `sm_100a`). On `sm_120`
+the TE backend therefore runs the core FP4 GEMM with the **convergence recipe
+disabled** (Axolotl logs a warning), which the NVFP4 paper shows diverges at
+scale. **On `sm_120`, prefer `backend: native` for real training**; use the TE
+backend on `sm_120` only for throughput experiments, or on `sm_100` (B200) where
+the full recipe runs. Measured (RTX 5090, 7B MLP): TE core ~3.2× vs bf16 (no
+recipe), native ~1.9× vs bf16 (full recipe).
+
 ## When to use it
 
 NVFP4 training is **dim-gated**: each swapped GEMM pays a fixed quantization

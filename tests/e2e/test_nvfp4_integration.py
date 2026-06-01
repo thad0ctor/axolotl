@@ -48,6 +48,16 @@ def test_schema_accepts_valid_nvfp4_config(monkeypatch):
     assert cfg.nvfp4_training.skip_first_n_blocks == 1
 
 
+def test_schema_backend_defaults_native_and_accepts_te(monkeypatch):
+    _supported(monkeypatch, True)
+    assert (
+        AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True}).nvfp4_training.backend
+        == "native"
+    )
+    cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True, "backend": "te"})
+    assert cfg.nvfp4_training.backend == "te"
+
+
 def test_gate_refuses_unsupported_hardware(monkeypatch):
     _supported(monkeypatch, False, "no Blackwell here")
     with pytest.raises(ValueError, match="no Blackwell here"):

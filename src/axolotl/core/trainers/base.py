@@ -368,6 +368,22 @@ class AxolotlTrainer(
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
+        # NVFP4 training, Transformer Engine backend: te.Linear layers only run
+        # FP4 GEMMs inside an fp8_autocast region. The recipe is stashed on the
+        # model at swap time; wrap the whole loss computation in it once.
+        recipe = getattr(self.accelerator.unwrap_model(model), "_te_nvfp4_recipe", None)
+        if recipe is not None and not getattr(self, "_in_te_autocast", False):
+            import transformer_engine.pytorch as te
+
+            self._in_te_autocast = True
+            try:
+                with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                    return self.compute_loss(
+                        model, inputs, return_outputs, num_items_in_batch
+                    )
+            finally:
+                self._in_te_autocast = False
+
         # use one's weighted cross entropy loss calc
         # if self.args.sample_packing:
         #     labels = inputs.pop("labels")

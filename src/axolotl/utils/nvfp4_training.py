@@ -572,6 +572,84 @@ def convert_to_nvfp4_training(
     return swapped
 
 
+def te_nvfp4_available() -> tuple[bool, str]:
+    """Return (ok, reason) for the Transformer Engine NVFP4 backend."""
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+        from transformer_engine.common.recipe import NVFP4BlockScaling  # noqa: F401
+    except Exception as exc:  # ImportError or the cuBLAS-symbol OSError
+        return False, (
+            f"Transformer Engine NVFP4 backend unavailable ({type(exc).__name__}: "
+            f"{exc}). Install axolotl[transformer-engine] (source build; on sm_120 "
+            "use NVTE_CUDA_ARCHS=120 and preload the system cuBLAS)."
+        )
+    return True, ""
+
+
+def te_nvfp4_recipe(recipe: "NVFP4Recipe"):
+    """Build a TE NVFP4BlockScaling recipe. On consumer Blackwell (sm_120) the
+    RHT/SR/2D fusion kernels do not run, so disable them and warn — TE there is
+    a recipe-less FP4 GEMM. On sm_100 (B200) the full recipe runs."""
+    from transformer_engine.common.recipe import NVFP4BlockScaling
+
+    cap = torch.cuda.get_device_capability()
+    if cap == (12, 0):
+        LOG.warning(
+            "TE NVFP4 on sm_120 (consumer Blackwell): RHT/stochastic-rounding/2D "
+            "kernels do not run here, disabling them — convergence recipe is OFF "
+            "(unproven at scale). Use backend=native for the full recipe on sm_120."
+        )
+        return NVFP4BlockScaling(
+            disable_rht=True,
+            disable_stochastic_rounding=True,
+            disable_2d_quantization=True,
+        )
+    return NVFP4BlockScaling(
+        disable_rht=not recipe.hadamard,
+        disable_stochastic_rounding=not recipe.stochastic_rounding,
+    )
+
+
+def convert_to_te_nvfp4_training(
+    model: nn.Module,
+    recipe: NVFP4Recipe | None = None,
+    *,
+    exclude: tuple[str, ...] = ("lm_head", "embed_tokens"),
+) -> int:
+    """Swap eligible ``nn.Linear`` for ``transformer_engine.pytorch.Linear`` so
+    they run NVFP4 GEMMs under TE's ``NVFP4BlockScaling`` recipe (FFT only).
+
+    The caller must wrap the training step in ``te.fp8_autocast(fp8_recipe=
+    te_nvfp4_recipe(recipe))``. Weights are copied into the TE linear; dims must
+    be divisible by 16.
+    """
+    import transformer_engine.pytorch as te
+
+    recipe = recipe or NVFP4Recipe()
+    swapped = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear) or any(f in name for f in exclude):
+            continue
+        if not _is_swappable(module):
+            LOG.warning("NVFP4(te): skipping %s (dims not divisible by 16)", name)
+            continue
+        te_lin = te.Linear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            params_dtype=module.weight.dtype,
+        )
+        with torch.no_grad():
+            te_lin.weight.copy_(module.weight)
+            if module.bias is not None:
+                te_lin.bias.copy_(module.bias)
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        setattr(parent, name.rsplit(".", 1)[-1], te_lin)
+        swapped += 1
+    LOG.info("NVFP4 training (te backend): swapped %d linear layers", swapped)
+    return swapped
+
+
 def convert_lora_base_to_nvfp4(
     model: nn.Module,
     recipe: NVFP4Recipe | None = None,

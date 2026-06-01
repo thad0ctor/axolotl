@@ -299,6 +299,30 @@ class PatchManager:
         )
 
         adapter = self.cfg.adapter
+
+        # Transformer Engine backend (FFT only): swap to te.Linear; the trainer
+        # wraps the step in te.fp8_autocast (set up below via a stored recipe).
+        if getattr(nvfp4, "backend", "native") == "te":
+            from axolotl.utils.nvfp4_training import (
+                convert_to_te_nvfp4_training,
+                te_nvfp4_available,
+                te_nvfp4_recipe,
+            )
+
+            ok, reason = te_nvfp4_available()
+            if not ok:
+                raise RuntimeError(reason)
+            if adapter:
+                raise ValueError(
+                    "nvfp4_training.backend: te is full-fine-tune only; use "
+                    "backend: native for LoRA/QLoRA."
+                )
+            count = convert_to_te_nvfp4_training(model, recipe, exclude=exclude)
+            model._te_nvfp4_recipe = te_nvfp4_recipe(recipe)
+            if count == 0:
+                LOG.warning("nvfp4_training(te) enabled but no nn.Linear swapped")
+            return
+
         if adapter in ("lora", "qlora"):
             # Resolve the base mode. Explicit base_mode wins; otherwise
             # qlora/quantize_base => FP4 storage, else default to FP4 compute
