@@ -501,6 +501,58 @@ def test_saved_tensor_bytes_per_block_falls_back_to_activation_sizes():
         assert proxy[BlockId(b)] == activation_bytes_per_block
 
 
+def test_saved_tensor_bytes_per_block_adds_cross_attn_for_decoder_blocks():
+    """Empty-peaks fallback must charge decoder blocks a second (cross-)attention
+    term on encoder-decoder traces, while remaining an exact no-op decoder-only.
+
+    The main ``estimate_peak`` path already adds ``cross_attn_persist_bytes`` for
+    enc-dec; this guards the analytic fallback used when per-block peaks are
+    missing, where decoder blocks would otherwise be under-counted by an entire
+    attention module.
+    """
+    from dataclasses import replace
+
+    from axolotl.integrations.protrain.cost.memory import (
+        _saved_tensor_bytes_per_block,
+        attn_activation_bytes,
+    )
+
+    n_enc, n_dec = 4, 4
+    act = 32 * MB
+    # Arch fields populate ``attn_activation_bytes``; no steady_fwd_block_peak_bytes
+    # forces the analytic fallback path.
+    enc_dec = replace(
+        _make_enc_dec_trace(n_enc=n_enc, n_dec=n_dec, activation_bytes_per_block=act),
+        hidden_size=1024,
+        num_attention_heads=16,
+        intermediate_size=4096,
+        attn_implementation="flash_attention_2",
+    )
+    internal = attn_activation_bytes(enc_dec)
+    assert internal > 0, "arch fields must yield a non-zero attention term"
+
+    proxy = _saved_tensor_bytes_per_block(enc_dec)
+    # Encoder blocks (tree index 0): output + one self-attention term.
+    for b in range(n_enc):
+        assert proxy[BlockId(b)] == act + internal
+    # Decoder blocks (tree index > 0): output + self + cross attention.
+    for b in range(n_enc, n_enc + n_dec):
+        assert proxy[BlockId(b)] == act + 2 * internal
+
+    # Decoder-only (single tree) is an exact no-op: no cross term anywhere.
+    dec_only = replace(
+        _make_trace(n_block=4, activation_bytes_per_block=act),
+        hidden_size=1024,
+        num_attention_heads=16,
+        intermediate_size=4096,
+        attn_implementation="flash_attention_2",
+    )
+    internal_d = attn_activation_bytes(dec_only)
+    proxy_d = _saved_tensor_bytes_per_block(dec_only)
+    for b in range(4):
+        assert proxy_d[BlockId(b)] == act + internal_d
+
+
 def test_estimate_peak_uses_saved_tensor_proxy_for_savings(toy_layout, toy_hw):
     """Fix 2: with all blocks CKPT, the cap must shrink by at least half
     the cumulative saved-tensor proxy.

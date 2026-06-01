@@ -44,13 +44,23 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
     # fail-closes at long seq. Backfill the internal term analytically (arch +
     # backend aware) so the fallback proxies full per-block residency.
     internal_saved = attn_activation_bytes(trace)
+    # Encoder-decoder traces: decoder blocks carry a second (cross-)attention
+    # module whose saved-for-backward tensors the single self-attention proxy
+    # misses. Add one more attn term to decoder blocks (tree index > 0), reusing
+    # the same tree signal the op-walk uses for cross_attn_persist_bytes.
+    # Decoder-only traces have a single tree, so cross_saved is 0 (exact no-op).
+    tree_index_map = block_tree_index_map(trace)
+    cross_saved = (
+        attn_activation_bytes(trace) if _has_multiple_trees(tree_index_map) else 0
+    )
 
-    def _full_residency(sz: int) -> int:
-        return int(sz) + internal_saved
+    def _full_residency(bid: BlockId, sz: int) -> int:
+        extra = cross_saved if tree_index_map.get(BlockId(int(bid)), 0) > 0 else 0
+        return int(sz) + internal_saved + extra
 
     if not per_block_peak:
         return {
-            BlockId(int(bid)): _full_residency(sz)
+            BlockId(int(bid)): _full_residency(bid, sz)
             for bid, sz in activation_sizes.items()
         }
 
@@ -60,7 +70,7 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
     sorted_bids = sorted(per_block_peak.keys())
     if not sorted_bids:
         return {
-            BlockId(int(bid)): _full_residency(sz)
+            BlockId(int(bid)): _full_residency(bid, sz)
             for bid, sz in activation_sizes.items()
         }
 
@@ -94,7 +104,7 @@ def _saved_tensor_bytes_per_block(trace: ProfilerTrace) -> dict[BlockId, int]:
     for bid_raw, act_sz in activation_sizes.items():
         bid = BlockId(int(bid_raw))
         if bid not in deltas:
-            deltas[bid] = _full_residency(act_sz)
+            deltas[bid] = _full_residency(bid, act_sz)
 
     return deltas
 
