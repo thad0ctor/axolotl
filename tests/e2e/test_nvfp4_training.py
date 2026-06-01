@@ -380,6 +380,42 @@ class TestNVFP4Training:
         compiled(x).backward()
         assert torch.isfinite(mod.weight.grad).all().item()
 
+    def test_mslk_compute_compile_opaque(self):
+        """The MSLK fused-quant compute base compiles fullgraph: its Triton quant
+        kernels stay opaque custom ops (no decompose crash, no graph break, no
+        eager fallback). suppress_errors=False so a fallback surfaces as a failure.
+        """
+        from axolotl.utils.nvfp4_training import (
+            NVFP4FastComputeBaseLinear,
+            NVFP4Recipe,
+            _mslk_available,
+        )
+
+        if not _mslk_available():
+            pytest.skip("MSLK not available")
+
+        import torch._dynamo as dyn
+
+        prev = dyn.config.suppress_errors
+        dyn.config.suppress_errors = False
+        try:
+            torch.manual_seed(0)
+            linear = nn.Linear(256, 512, bias=False).cuda().bfloat16()
+            mod = NVFP4FastComputeBaseLinear.from_linear(
+                linear, NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+            )
+            x = torch.randn(
+                64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            dyn.reset()
+            explanation = dyn.explain(lambda z: mod(z).sum())(x)
+            assert explanation.graph_break_count == 0
+            compiled = torch.compile(lambda z: mod(z).sum(), fullgraph=True)
+            compiled(x).backward()
+            assert torch.isfinite(x.grad).all().item()
+        finally:
+            dyn.config.suppress_errors = prev
+
     def test_sr_unbiased(self):
         """Averaging stochastic-rounded quant converges to the true value; RTN
         keeps a systematic bias."""
