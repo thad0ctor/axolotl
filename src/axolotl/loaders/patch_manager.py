@@ -387,6 +387,14 @@ class PatchManager:
         if count == 0:
             LOG.warning(empty_msg)
 
+        # Fuse decoder RMSNorm + activation quant into one kernel so the base
+        # linear reuses the norm's pre-quantized activation (native backend only;
+        # the fused norm emits single-level FP4, matching the compute-base path).
+        if getattr(nvfp4, "fuse_rmsnorm", True):
+            from axolotl.utils.nvfp4_training import convert_norms_to_nvfp4_fused
+
+            convert_norms_to_nvfp4_fused(model)
+
     @staticmethod
     def _nvfp4_block_exclusions(
         model: PreTrainedModel, skip_first: int, skip_last: int

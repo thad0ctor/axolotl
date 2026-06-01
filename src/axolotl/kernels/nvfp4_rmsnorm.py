@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import torch
 import triton
+from torch import nn
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from mslk.quantize.triton.fp4_quantize import (
     convert_fp32_to_fp4_packed,
@@ -23,6 +25,17 @@ from mslk.quantize.triton.fp4_quantize import (
 )
 
 import triton.language as tl
+
+# Maps a fused-norm output tensor `y` to its already-computed (fp4 qdata, e4m3
+# scales). The norm output flows unchanged into the consuming NVFP4 base linear
+# (no op between norm and projection), so identity lookup hits and the linear
+# skips re-quantizing. Weak keys so entries clear when activations are freed.
+_PREQUANT_CACHE = WeakTensorKeyDictionary()
+
+
+def get_prequant(x: torch.Tensor):
+    """Return cached (fp4, scales) for a fused-norm output, or None."""
+    return _PREQUANT_CACHE.get(x)
 
 
 @triton.jit
@@ -168,3 +181,72 @@ def fused_rmsnorm_nvfp4(
         xq.view(torch.float4_e2m1fn_x2).view(*orig_dims, N // 2),
         scales,
     )
+
+
+class _FusedRMSNormNVFP4Function(torch.autograd.Function):
+    """RMSNorm forward via the fused kernel; standard RMSNorm backward.
+
+    Forward emits the normalized bf16 activation `y` plus its NVFP4 quant; only
+    `y` is differentiable. Backward is the textbook RMSNorm gradient (the quant
+    artifacts are forward-only — the base linear's own backward handles dgrad).
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, eps):
+        y, xq, xsc = fused_rmsnorm_nvfp4(x, weight, eps)
+        x2 = x.reshape(-1, x.shape[-1])
+        r = torch.rsqrt(x2.float().pow(2).mean(-1, keepdim=True) + eps)
+        ctx.save_for_backward(x2, weight, r)
+        ctx.eps = eps
+        # Stash the fused quant keyed by the output the consuming linear sees.
+        # Returning FP4/e4m3 tensors from the Function trips autograd's zero-grad
+        # fill (unimplemented for those dtypes), so cache instead of returning them.
+        _PREQUANT_CACHE[y] = (xq.reshape(-1, xq.shape[-1]), xsc)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x2, weight, r = ctx.saved_tensors
+        K = x2.shape[-1]
+        g = grad_y.reshape(-1, K).float()
+        xf = x2.float()
+        wf = weight.float()
+        gg = g * wf
+        c = (gg * xf).sum(-1, keepdim=True)
+        grad_x = (r * (gg - (r * r) * xf * c / K)).reshape(x2.shape)
+        grad_w = None
+        if ctx.needs_input_grad[1]:
+            grad_w = (g * (xf * r)).sum(0).to(weight.dtype)
+        return grad_x.to(grad_y.dtype).reshape(grad_y.shape), grad_w, None
+
+
+class NVFP4FusedRMSNorm(nn.Module):
+    """Drop-in RMSNorm that fuses the NVFP4 activation quant into the norm.
+
+    Returns the normalized bf16 activation (autograd-tracked) and caches the fp4
+    quant of that activation so a downstream NVFP4 base linear skips re-quantizing.
+    Falls back to a plain RMSNorm when the feature dim isn't %16 (unquantizable).
+    """
+
+    def __init__(self, weight: nn.Parameter, eps: float):
+        super().__init__()
+        # Reuse the original Parameter as-is to preserve PEFT's frozen/trainable
+        # state (freezing is via requires_grad, not by un-Parametering).
+        self.weight = weight
+        self.eps = eps
+        self.quantizable = weight.shape[-1] % 16 == 0
+
+    def forward(self, x):
+        if not self.quantizable:
+            xf = x.float()
+            r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+            return (xf * r).to(x.dtype) * self.weight
+        return _FusedRMSNormNVFP4Function.apply(x, self.weight, self.eps)
+
+    @classmethod
+    def from_norm(cls, norm: nn.Module, eps_attr: str = "variance_epsilon"):
+        eps = getattr(norm, eps_attr, None)
+        if eps is None:
+            eps = getattr(norm, "eps", 1e-6)
+        return cls(norm.weight, float(eps))
+

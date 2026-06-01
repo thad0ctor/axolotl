@@ -643,6 +643,19 @@ def _mslk_scaled_mm(aq, a_scale, a_inv_gs, bq, b_scale, b_inv_gs, out_dtype):
 
 
 @torch.compiler.disable
+def _prequant_sl(x_orig: torch.Tensor, x2d: torch.Tensor):
+    """Single-level activation quant: reuse a fused-norm's pre-quantized result
+    when ``x_orig`` is that norm's output (identity cache hit), else quantize
+    ``x2d`` now. The cache stores the 2D ([M, K/2]) quant, drop-in for the
+    ``_mslk_quantize_sl`` output."""
+    from axolotl.kernels.nvfp4_rmsnorm import get_prequant
+
+    cached = get_prequant(x_orig)
+    if cached is not None:
+        return cached
+    return _mslk_quantize_sl(x2d)
+
+
 def _mslk_quantize_sl(t: torch.Tensor):
     """Single-level NVFP4 quant (``global_scale=None``): MSLK fuses the amax into
     the kernel and bakes it into the block scales, so there is no separate
@@ -681,7 +694,7 @@ class NVFP4FastComputeBaseFunction(torch.autograd.Function):
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
         # fprop: single-level activation (no per-step amax) @ two-level weight.
-        xq, xsc = _mslk_quantize_sl(x2d)
+        xq, xsc = _prequant_sl(x, x2d)
         out = _mslk_fprop_mm(xq, xsc, wq_f, wsc_f, w_inv_f, x.dtype)
         ctx.dgrad = (wq_d, wsc_d, w_inv_d)
         ctx.x_shape = orig_shape
@@ -931,6 +944,54 @@ def _is_swappable(module: nn.Linear) -> bool:
         module.in_features % _GEMM_ALIGN == 0
         and module.out_features % _GEMM_ALIGN == 0
     )
+
+
+# Decoder-block norm attributes whose output feeds an NVFP4 base linear (qkv /
+# gate-up). q_norm/k_norm (head-dim, feed attention) and the final norm (feeds
+# lm_head, not an NVFP4 base) are intentionally excluded.
+_FUSE_NORM_NAMES = frozenset(
+    {
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+    }
+)
+
+
+def convert_norms_to_nvfp4_fused(model: nn.Module) -> int:
+    """Swap decoder-block RMSNorms for the fused RMSNorm->NVFP4-quant module.
+
+    The fused norm emits the normalized activation AND its NVFP4 quant in one
+    kernel, so the consuming base linear skips re-quantizing. Gated to Llama/Qwen-
+    style RMSNorm (``weight * normed``); Gemma-style (``(1 + weight) * normed``)
+    is left untouched to avoid a silently wrong scale. No-op if MSLK is missing.
+    """
+    try:
+        from axolotl.kernels.nvfp4_rmsnorm import NVFP4FusedRMSNorm
+    except Exception as exc:  # MSLK / triton unavailable
+        LOG.warning("NVFP4 fused RMSNorm unavailable (%s); skipping norm fusion", exc)
+        return 0
+
+    parents = dict(model.named_modules())
+    swapped = 0
+    for name, module in list(model.named_modules()):
+        attr = name.rsplit(".", 1)[-1]
+        if attr not in _FUSE_NORM_NAMES:
+            continue
+        cls = type(module).__name__
+        if not cls.endswith("RMSNorm") or "Gemma" in cls:
+            continue
+        if not hasattr(module, "weight"):
+            continue
+        parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+        parent = parents.get(parent_name)
+        if parent is None:
+            continue
+        setattr(parent, attr, NVFP4FusedRMSNorm.from_norm(module))
+        swapped += 1
+    LOG.info("NVFP4 training: fused %d decoder RMSNorms", swapped)
+    return swapped
 
 
 def convert_to_nvfp4_training(

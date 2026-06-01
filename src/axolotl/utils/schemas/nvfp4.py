@@ -73,6 +73,15 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Module name fragments kept in high precision (not swapped)."
         },
     )
+    fuse_rmsnorm: bool = Field(
+        default=True,
+        json_schema_extra={
+            "description": "Native backend only. Fuse decoder RMSNorm with the NVFP4 "
+            "activation quant in one Triton kernel so the qkv/gate-up base linears "
+            "reuse the norm's pre-quantized activation (no per-linear quant prologue). "
+            "Applies to Llama/Qwen-style RMSNorm; Gemma-style norms are left untouched."
+        },
+    )
     skip_first_n_blocks: int = Field(
         default=0,
         json_schema_extra={
