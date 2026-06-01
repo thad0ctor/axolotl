@@ -108,12 +108,15 @@ class NVFP4TrainingConfig(BaseModel):
         },
     )
     fuse_rmsnorm: bool = Field(
-        default=True,
+        default=False,
         json_schema_extra={
-            "description": "Native backend only. Fuse decoder RMSNorm with the NVFP4 "
-            "activation quant in one Triton kernel so the qkv/gate-up base linears "
-            "reuse the norm's pre-quantized activation (no per-linear quant prologue). "
-            "Applies to Llama/Qwen-style RMSNorm; Gemma-style norms are left untouched."
+            "description": "EXPERIMENTAL, default off. Fuse decoder RMSNorm with the "
+            "NVFP4 activation quant in one Triton kernel so the qkv/gate-up base "
+            "linears reuse the norm's pre-quantized activation. The kernel is "
+            "numerically correct in isolation but the in-model cache->base-GEMM "
+            "integration DIVERGES training (loss ~20+ vs bf16) with the MSLK base — "
+            "under debug. Leave off until fixed (the throughput benefit was within "
+            "noise anyway)."
         },
     )
     skip_first_n_blocks: int = Field(
