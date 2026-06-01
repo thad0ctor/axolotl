@@ -441,6 +441,87 @@ class NVFP4FrozenBaseLinear(nn.Module):
         return cls(w_q, linear.bias, recipe)
 
 
+class NVFP4ComputeBaseFunction(torch.autograd.Function):
+    """Frozen-base linear with FP4 compute on BOTH base GEMMs, zero per-step
+    base-quant prologue.
+
+    The base is frozen, so its NVFP4 operands are quantized ONCE at load (not
+    per step like FFT). fprop needs the base blocked along K (contraction) and
+    dgrad needs it blocked along N (contraction), so two pre-quantized layouts
+    are stored. Each is a real ``torch._scaled_mm`` FP4 GEMM; only the activation
+    / incoming-gradient operand is quantized per step. No wgrad (frozen).
+    """
+
+    @staticmethod
+    def forward(ctx, x, w_fprop, w_dgrad, recipe):
+        from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
+        orig_shape = x.shape
+        x2d = x.reshape(-1, orig_shape[-1])
+        x2d_p, m = _pad_to_block(x2d, 0)
+        out = _addmm_nvfp4_dispatch(
+            _quantize(x2d_p, QuantPolicy()), w_fprop, torch.ops.aten.mm.default
+        )[:m]
+        ctx.w_dgrad = w_dgrad
+        ctx.recipe = recipe
+        ctx.x_shape = orig_shape
+        ctx.out_features = w_fprop.shape[1]
+        return out.reshape(*orig_shape[:-1], ctx.out_features)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            g = grad_out.reshape(-1, ctx.out_features)
+            g_p, m = _pad_to_block(g, 0)
+            # dgrad: gx[M,K] = g[M,N] @ W[N,K]; W pre-quantized along N (contraction)
+            g_q = _quantize(g_p, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding))
+            grad_x = _addmm_nvfp4_dispatch(
+                g_q, ctx.w_dgrad, torch.ops.aten.mm.default
+            )[:m]
+            grad_x = grad_x.reshape(ctx.x_shape)
+        return grad_x, None, None, None
+
+
+class NVFP4ComputeBaseLinear(nn.Module):
+    """Frozen LoRA base with FP4 compute on fprop+dgrad and no per-step base quant.
+
+    Stores two pre-quantized NVFP4 layouts of the frozen weight (fprop: blocked
+    along K; dgrad: blocked along N) as buffers. ~1.75x weight memory vs bf16
+    (two FP4 copies + scales) but the base GEMMs run pure FP4 with the quant
+    prologue paid once at load — faster than re-quantizing the base every step.
+    Adapters (added by PEFT around this base_layer) stay high-precision.
+    """
+
+    def __init__(self, w_fprop, w_dgrad, bias, recipe: NVFP4Recipe):
+        super().__init__()
+        self.register_buffer("w_fprop", w_fprop)
+        self.register_buffer("w_dgrad", w_dgrad)
+        self.bias = bias
+        self.recipe = recipe
+        self.in_features = w_fprop.shape[0]
+        self.out_features = w_fprop.shape[1]
+
+    def forward(self, x):
+        out = NVFP4ComputeBaseFunction.apply(
+            x, self.w_fprop, self.w_dgrad, self.recipe
+        )
+        return out if self.bias is None else out + self.bias
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear, recipe: NVFP4Recipe
+    ) -> "NVFP4ComputeBaseLinear":
+        w = linear.weight.detach()  # [N, K]
+        # fprop b-operand represents W.T ([K,N]): quantize W then transpose.
+        w_fprop = _quantize(w, QuantPolicy()).t()
+        # dgrad b-operand represents W ([N,K]) blocked along N: quantize W.T then transpose.
+        w_dgrad = _quantize(w.t().contiguous(), QuantPolicy()).t()
+        return cls(w_fprop, w_dgrad, linear.bias, recipe)
+
+
 def _is_swappable(module: nn.Linear) -> bool:
     return (
         module.in_features % _BLOCK_SIZE == 0
@@ -496,16 +577,24 @@ def convert_lora_base_to_nvfp4(
     recipe: NVFP4Recipe | None = None,
     *,
     quantized_storage: bool = False,
+    compute_base: bool = False,
     fsdp: bool = False,
     exclude: tuple[str, ...] = ("lm_head", "embed_tokens"),
 ) -> int:
     """Swap the FROZEN base_layer inside each PEFT ``lora.Linear`` for an NVFP4
     linear, leaving the trainable adapters in high precision.
 
-    ``quantized_storage=False`` (LoRA + FP4 compute): base_layer -> NVFP4Linear,
-    keeping the high-precision (frozen) weight — throughput only, no memory win.
-    ``quantized_storage=True`` (NVFP4-QLoRA): base_layer -> NVFP4FrozenBaseLinear,
-    storing the weight packed in FP4 — ~3.5x weight memory savings.
+    Three base modes (mutually exclusive, checked in priority order):
+
+    - ``compute_base=True`` (LoRA + FP4 compute, recommended): base_layer ->
+      NVFP4ComputeBaseLinear. The frozen base is pre-quantized ONCE into two
+      NVFP4 layouts; fprop+dgrad run as pure FP4 GEMMs with no per-step base
+      quant prologue. ~1.75x weight memory and the fastest base compute.
+    - ``quantized_storage=True`` (NVFP4-QLoRA): base_layer ->
+      NVFP4FrozenBaseLinear, base stored packed in FP4 (~2.6x weight memory);
+      backward dequantizes to bf16. Max memory, modest speed.
+    - neither (default): base_layer -> NVFP4Linear, base kept high-precision and
+      re-quantized each step. FP4 base GEMM, no memory win.
 
     Returns the number of base layers swapped. Requires PEFT-wrapped adapters.
     """
@@ -521,7 +610,9 @@ def convert_lora_base_to_nvfp4(
         base = module.base_layer
         if not isinstance(base, nn.Linear) or not _is_swappable(base):
             continue
-        if quantized_storage:
+        if compute_base:
+            module.base_layer = NVFP4ComputeBaseLinear.from_linear(base, recipe)
+        elif quantized_storage:
             module.base_layer = NVFP4FrozenBaseLinear.from_linear(
                 base, recipe, fsdp=fsdp
             )
@@ -529,9 +620,6 @@ def convert_lora_base_to_nvfp4(
             base.weight.requires_grad_(False)
             module.base_layer = NVFP4Linear.from_linear(base, recipe)
         swapped += 1
-    LOG.info(
-        "NVFP4 training: swapped %d LoRA base layers (quantized_storage=%s)",
-        swapped,
-        quantized_storage,
-    )
+    mode = "compute" if compute_base else ("storage" if quantized_storage else "hp")
+    LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
     return swapped

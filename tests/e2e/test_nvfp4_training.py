@@ -223,6 +223,45 @@ class TestNVFP4Adapters:
         l0, l1 = self._train(model)
         assert l1 < l0 and torch.isfinite(torch.tensor(l1))
 
+    def test_lora_fp4_compute_base_prequant(self):
+        """compute_base: frozen base pre-quantized into 2 FP4 layouts; fprop
+        matches per-step requant bit-exactly, base quant prologue paid once."""
+        from torch import nn
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4Linear,
+            NVFP4Recipe,
+            convert_lora_base_to_nvfp4,
+        )
+
+        # bit-identical to the per-step path (same quantization, just cached)
+        lin = nn.Linear(512, 768, bias=False).cuda().bfloat16()
+        lin.weight.requires_grad_(False)
+        x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+        oc = NVFP4ComputeBaseLinear.from_linear(lin, NVFP4Recipe())(x)
+        op = NVFP4Linear.from_linear(lin, NVFP4Recipe())(x)
+        assert torch.equal(oc, op)
+
+        # two FP4 layouts are smaller than the bf16 weight
+        cb = NVFP4ComputeBaseLinear.from_linear(lin, NVFP4Recipe())
+        fp4 = (
+            cb.w_fprop.qdata.numel()
+            + cb.w_fprop.scale.numel()
+            + cb.w_dgrad.qdata.numel()
+            + cb.w_dgrad.scale.numel()
+        )
+        assert (512 * 768 * 2) / fp4 > 1.5
+
+        model = self._lora_model()
+        n = convert_lora_base_to_nvfp4(model, NVFP4Recipe(), compute_base=True)
+        assert n > 0
+        assert sum(
+            1 for m in model.modules() if isinstance(m, NVFP4ComputeBaseLinear)
+        ) == n
+        l0, l1 = self._train(model)
+        assert l1 < l0 and torch.isfinite(torch.tensor(l1))
+
     def test_qlora_fp4_storage(self):
         """base_layer -> NVFP4FrozenBaseLinear: weight stored in FP4 (memory win)."""
         from axolotl.utils.nvfp4_training import (

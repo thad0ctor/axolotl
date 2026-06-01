@@ -4,6 +4,8 @@ Real low-precision COMPUTE (FP4 forward/backward GEMMs on Blackwell), distinct
 from the fake-quant QAT/PTQ `quantization:` block.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -39,6 +41,18 @@ class NVFP4TrainingConfig(BaseModel):
             "replacing bnb NF4 storage. This is the FP4 equivalent of QLoRA, so it "
             "conflicts with load_in_4bit/load_in_8bit (drop those). `adapter: qlora` "
             "implies this (qlora == quantized base intent)."
+        },
+    )
+    base_mode: Literal["compute", "storage", "hp"] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Adapter modes only; overrides quantize_base when set. "
+            "'compute' (recommended): the frozen base is pre-quantized once into two "
+            "NVFP4 layouts so fprop+dgrad run as pure FP4 GEMMs with no per-step base "
+            "quant prologue — fastest base compute, ~1.75x weight memory. 'storage' "
+            "(== NVFP4-QLoRA): base packed in FP4, ~2.6x memory, backward dequants to "
+            "bf16 (max memory, modest speed). 'hp': base kept high-precision, "
+            "re-quantized each step (FP4 GEMM, no memory win)."
         },
     )
     exclude_modules: list[str] = Field(

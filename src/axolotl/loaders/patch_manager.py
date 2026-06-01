@@ -300,16 +300,25 @@ class PatchManager:
 
         adapter = self.cfg.adapter
         if adapter in ("lora", "qlora"):
-            # `adapter: qlora` == quantized base intent; `quantize_base` opts a
-            # plain LoRA into FP4 storage. Either => NVFP4-QLoRA (FP4 storage);
-            # otherwise LoRA + FP4 compute (HP frozen base, throughput only).
-            quantized_storage = bool(nvfp4.quantize_base) or adapter == "qlora"
+            # Resolve the base mode. Explicit base_mode wins; otherwise
+            # qlora/quantize_base => FP4 storage, else default to FP4 compute
+            # (pre-quantized base, fastest, the recommended LoRA path).
+            base_mode = getattr(nvfp4, "base_mode", None)
+            if base_mode is None:
+                base_mode = (
+                    "storage"
+                    if (bool(nvfp4.quantize_base) or adapter == "qlora")
+                    else "compute"
+                )
+            compute_base = base_mode == "compute"
+            quantized_storage = base_mode == "storage"
             # FP4-stored base needs the NVFP4 all-gather hooks to shard under FSDP2.
             use_fsdp = quantized_storage and bool(self.cfg.fsdp_config)
             count = convert_lora_base_to_nvfp4(
                 model,
                 recipe,
                 quantized_storage=quantized_storage,
+                compute_base=compute_base,
                 fsdp=use_fsdp,
                 exclude=exclude,
             )

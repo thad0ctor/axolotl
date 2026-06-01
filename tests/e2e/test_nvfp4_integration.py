@@ -162,11 +162,15 @@ def _patch_manager(cfg_dict):
 
 
 def test_apply_selects_lora_compute_mode(monkeypatch):
-    """adapter=lora, no quantize_base -> base_layer becomes NVFP4Linear (HP frozen)."""
+    """adapter=lora default -> base_layer becomes NVFP4ComputeBaseLinear (the
+    pre-quantized FP4-compute base, the recommended default)."""
     _supported(monkeypatch, True)
     from peft.tuners.lora import Linear as LoraLinear
 
-    from axolotl.utils.nvfp4_training import NVFP4FrozenBaseLinear, NVFP4Linear
+    from axolotl.utils.nvfp4_training import (
+        NVFP4ComputeBaseLinear,
+        NVFP4FrozenBaseLinear,
+    )
 
     model = _tiny_lora_model()
     pm = _patch_manager(
@@ -177,9 +181,24 @@ def test_apply_selects_lora_compute_mode(monkeypatch):
     bases = [
         m.base_layer for m in model.modules() if isinstance(m, LoraLinear)
     ]
-    assert bases and all(isinstance(b, NVFP4Linear) for b in bases)
+    assert bases and all(isinstance(b, NVFP4ComputeBaseLinear) for b in bases)
     assert not any(isinstance(b, NVFP4FrozenBaseLinear) for b in bases)
-    # frozen base weight, no grad
+
+
+def test_apply_selects_hp_mode_when_requested(monkeypatch):
+    """base_mode: hp -> NVFP4Linear (HP frozen base, re-quantized each step)."""
+    _supported(monkeypatch, True)
+    from peft.tuners.lora import Linear as LoraLinear
+
+    from axolotl.utils.nvfp4_training import NVFP4Linear
+
+    model = _tiny_lora_model()
+    pm = _patch_manager(
+        {"adapter": "lora", "nvfp4_training": {"enabled": True, "base_mode": "hp"}}
+    )
+    pm._apply_nvfp4_training(model)
+    bases = [m.base_layer for m in model.modules() if isinstance(m, LoraLinear)]
+    assert bases and all(isinstance(b, NVFP4Linear) for b in bases)
     assert all(not b.weight.requires_grad for b in bases)
 
 
@@ -202,7 +221,7 @@ def test_apply_honors_block_exclusions(monkeypatch):
     _supported(monkeypatch, True)
     from peft.tuners.lora import Linear as LoraLinear
 
-    from axolotl.utils.nvfp4_training import NVFP4Linear
+    from axolotl.utils.nvfp4_training import NVFP4ComputeBaseLinear
 
     model = _tiny_lora_model()
     pm = _patch_manager(
@@ -214,7 +233,7 @@ def test_apply_honors_block_exclusions(monkeypatch):
     pm._apply_nvfp4_training(model)
 
     swapped = {
-        name: isinstance(m.base_layer, NVFP4Linear)
+        name: isinstance(m.base_layer, NVFP4ComputeBaseLinear)
         for name, m in model.named_modules()
         if isinstance(m, LoraLinear)
     }
