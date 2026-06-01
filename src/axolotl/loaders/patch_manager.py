@@ -284,6 +284,13 @@ class PatchManager:
         if not (nvfp4 and nvfp4.enabled):
             return
 
+        # In-process merge (legacy merge-lora) writes base_layer.weight.data +=
+        # delta; the FP4 base modules expose weight read-only, so that write
+        # would silently no-op. Keep the base in bf16 for merge — merge_and_unload
+        # then merges into the real weight. (FP4 training is irrelevant at merge.)
+        if self.cfg.merge_lora:
+            return
+
         from axolotl.utils.nvfp4_training import (
             NVFP4Recipe,
             convert_lora_base_to_nvfp4,

@@ -423,6 +423,15 @@ class NVFP4FrozenBaseLinear(nn.Module):
         out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
         return out if self.bias is None else out + self.bias
 
+    @property
+    def weight(self) -> torch.Tensor:
+        # Read-only dequantized [N,K] view for PEFT (DoRA weight-norm, delta
+        # compute, base_layer.weight reads). Writes to it (in-process merge:
+        # base_layer.weight.data += delta) do NOT persist into the FP4 store —
+        # NVFP4 LoRA bases must merge via the offline CLI (axolotl merge-lora),
+        # which the patch_manager enforces by skipping the FP4 swap under merge.
+        return self.w_q.dequantize(torch.bfloat16)
+
     @classmethod
     def from_linear(
         cls, linear: nn.Linear, recipe: NVFP4Recipe, *, fsdp: bool = False
@@ -516,6 +525,13 @@ class NVFP4ComputeBaseLinear(nn.Module):
         )
         return out if self.bias is None else out + self.bias
 
+    @property
+    def weight(self) -> torch.Tensor:
+        # Read-only dequantized [N,K] for PEFT; writes don't persist (see
+        # NVFP4FrozenBaseLinear.weight). w_fprop is _quantize(W).t() ([K,N]),
+        # so .t().dequantize() recovers [N,K].
+        return self.w_fprop.t().dequantize(torch.bfloat16)
+
     @classmethod
     def from_linear(
         cls, linear: nn.Linear, recipe: NVFP4Recipe
@@ -584,6 +600,29 @@ def _mslk_quantize(t: torch.Tensor):
         s.view(torch.float8_e4m3fn),
         (1.0 / global_scale).to(t.dtype),
     )
+
+
+def _mslk_dequant(qdata, scale, inv_gs, shape, dtype=torch.bfloat16) -> torch.Tensor:
+    """Dequantize MSLK-packed FP4 buffers back to a [*shape] hp tensor.
+
+    MSLK emits swizzled e4m3 block scales (same layout as torchao's triton
+    quant) and folds the two-level rescale into ``inv_gs = 1/global_scale``, so
+    wrap into an NVFP4Tensor with ``per_tensor_scale=inv_gs`` and reuse torchao's
+    dequant. ``shape`` is the logical [M,K] of the original hp tensor (qdata is
+    [M,K/2] packed); used only to sanity-check the unpacked size.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    t = NVFP4Tensor(
+        qdata,
+        scale,
+        _BLOCK_SIZE,
+        dtype,
+        per_tensor_scale=inv_gs.to(torch.float32),
+        is_swizzled_scales=True,
+    )
+    out = t.dequantize(dtype)
+    return out.reshape(shape)
 
 
 def _mslk_scaled_mm(aq, a_scale, a_inv_gs, bq, b_scale, b_inv_gs, out_dtype):
@@ -685,6 +724,8 @@ class NVFP4FastComputeBaseLinear(nn.Module):
         self.bias = bias
         self.recipe = recipe
         self.out_features = out_features
+        # wq_f packs the fprop layout [N, K/2]; K = in_features = 2 * packed cols.
+        self.in_features = wq_f.shape[-1] * 2
 
     def forward(self, x):
         out = NVFP4FastComputeBaseFunction.apply(
@@ -698,6 +739,14 @@ class NVFP4FastComputeBaseLinear(nn.Module):
             self.out_features,
         )
         return out if self.bias is None else out + self.bias
+
+    @property
+    def weight(self) -> torch.Tensor:
+        # Read-only dequantized [N,K] for PEFT; writes don't persist (see
+        # NVFP4FrozenBaseLinear.weight). Rebuilt from the fprop MSLK buffers.
+        return _mslk_dequant(
+            self.wq_f, self.wsc_f, self.w_inv_f, (self.out_features, self.in_features)
+        )
 
     @classmethod
     def from_linear(
