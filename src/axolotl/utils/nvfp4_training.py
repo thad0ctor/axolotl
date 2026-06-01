@@ -526,6 +526,46 @@ def _embedding_to_nvfp4(weight: torch.Tensor):
     )
 
 
+def _nvfp4_embedding_gather(w_q, input):
+    """Embedding lookup that dequantizes only the gathered rows of ``w_q``.
+
+    Avoids materializing the full [vocab, hidden] bf16 table (lm_head-sized) just
+    to gather a handful of rows. NVFP4 blocks lie along the hidden dim, so each
+    vocab row is a self-contained slice of qdata/scale; gathering the rows of the
+    packed buffers and dequantizing that subset is bit-identical to dequantizing
+    the whole table and gathering. Frozen weight, so padding_idx (gradient-only)
+    is a no-op in forward. Returns None (caller falls back) when the layout isn't
+    safe to row-slice (swizzled scales) or anything is unexpected.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    # Under torch.compile keep the plain full dequant: the subtensor rebuild and
+    # row gather graph-break, and the table dequant is what the compiled graph
+    # already fuses. The memory win matters at load/eager, not in the hot graph.
+    if torch.compiler.is_compiling():
+        return None
+
+    try:
+        names, ctx = w_q.__tensor_flatten__()
+        if ctx.get("is_swizzled_scales"):
+            return None
+        flat = input.reshape(-1)
+        sub = NVFP4Tensor.__tensor_unflatten__(
+            {
+                "qdata": w_q.qdata[flat],
+                "scale": w_q.scale[flat],
+                "per_tensor_scale": w_q.per_tensor_scale,
+            },
+            ctx,
+            None,
+            None,
+        )
+        rows = sub.dequantize(torch.bfloat16)
+        return rows.reshape(*input.shape, rows.shape[-1])
+    except Exception:  # any layout/version surprise -> full-dequant fallback
+        return None
+
+
 class NVFP4Embedding(nn.Module):
     """Input embedding whose weight is stored packed in FP4 (W4A16 lookup).
 
@@ -545,6 +585,16 @@ class NVFP4Embedding(nn.Module):
         self.padding_idx = padding_idx
 
     def forward(self, input):
+        # Dequantize ONLY the gathered rows, not the whole [vocab, hidden] table:
+        # the full bf16 dequant (+ its f32 scratch) is lm_head-sized and OOMs on a
+        # near-full card. NVFP4 blocks lie along the hidden dim so each row is
+        # self-contained — slicing qdata/scale by the unique looked-up rows and
+        # dequantizing that subset is bit-identical to gathering after a full
+        # dequant. Falls back to the full path if the scales are swizzled (row
+        # slicing would break the tile) or anything is unexpected.
+        gathered = _nvfp4_embedding_gather(self.w_q, input)
+        if gathered is not None:
+            return gathered
         w = self.w_q.dequantize(torch.bfloat16)
         return torch.nn.functional.embedding(input, w, self.padding_idx)
 
