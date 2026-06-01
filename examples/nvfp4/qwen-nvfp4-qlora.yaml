@@ -37,6 +37,13 @@ sequence_len: 1024
 sample_packing: true
 pad_to_sequence_len: true
 
+# sample_packing needs a varlen-capable backend. On Blackwell (sm_120) sdpa with
+# a packed block-diagonal mask cannot use the fused flash kernel and falls back to
+# the materialized-softmax math path (6-13x slower attention, and it leaks across
+# packed samples). flash_attention_2 does varlen packing via position_ids — fast
+# AND sample-isolated. Keep it on whenever sample_packing is true.
+attn_implementation: flash_attention_2
+
 bf16: true
 torch_compile: true
 
