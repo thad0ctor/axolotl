@@ -300,10 +300,13 @@ class PatchManager:
 
         adapter = self.cfg.adapter
 
-        # Transformer Engine backend (FFT only): swap to te.Linear; the trainer
-        # wraps the step in te.fp8_autocast (set up below via a stored recipe).
+        # Transformer Engine backend: swap eligible linears to te.Linear; the
+        # trainer wraps the step in te.fp8_autocast (set up below via a stored
+        # recipe). FFT swaps raw nn.Linear; LoRA swaps the frozen base_layer
+        # inside each lora.Linear (adapters stay high-precision).
         if getattr(nvfp4, "backend", "native") == "te":
             from axolotl.utils.nvfp4_training import (
+                convert_lora_base_to_te_nvfp4,
                 convert_to_te_nvfp4_training,
                 te_nvfp4_available,
                 te_nvfp4_recipe,
@@ -312,15 +315,23 @@ class PatchManager:
             ok, reason = te_nvfp4_available()
             if not ok:
                 raise RuntimeError(reason)
-            if adapter:
-                raise ValueError(
-                    "nvfp4_training.backend: te is full-fine-tune only; use "
-                    "backend: native for LoRA/QLoRA."
+            if adapter in ("lora", "qlora"):
+                count = convert_lora_base_to_te_nvfp4(model, recipe, exclude=exclude)
+                empty_msg = (
+                    "nvfp4_training(te) enabled but no eligible LoRA base layers "
+                    "were swapped (is the model PEFT-wrapped?)"
                 )
-            count = convert_to_te_nvfp4_training(model, recipe, exclude=exclude)
+            elif adapter:
+                raise ValueError(
+                    f"nvfp4_training.backend: te supports full fine-tune or "
+                    f"lora/qlora, not adapter={adapter}."
+                )
+            else:
+                count = convert_to_te_nvfp4_training(model, recipe, exclude=exclude)
+                empty_msg = "nvfp4_training(te) enabled but no nn.Linear swapped"
             model._te_nvfp4_recipe = te_nvfp4_recipe(recipe)
             if count == 0:
-                LOG.warning("nvfp4_training(te) enabled but no nn.Linear swapped")
+                LOG.warning(empty_msg)
             return
 
         if adapter in ("lora", "qlora"):

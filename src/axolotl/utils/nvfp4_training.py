@@ -650,6 +650,53 @@ def convert_to_te_nvfp4_training(
     return swapped
 
 
+def convert_lora_base_to_te_nvfp4(
+    model: nn.Module,
+    recipe: NVFP4Recipe | None = None,
+    *,
+    exclude: tuple[str, ...] = ("lm_head", "embed_tokens"),
+) -> int:
+    """Swap the FROZEN base_layer inside each PEFT ``lora.Linear`` for a
+    ``transformer_engine.pytorch.Linear`` so the base GEMM runs NVFP4 under TE's
+    ``fp8_autocast`` (the trainer wraps the step via ``te_nvfp4_recipe``).
+
+    The trainable LoRA adapters stay high-precision ``nn.Linear`` and are left
+    untouched; only the frozen base runs FP4, so TE computes its dgrad (input
+    gradient) but no wgrad — which also sidesteps TE's wgrad token-dim %32
+    constraint. Weights are copied in; dims must be divisible by 16.
+    """
+    import transformer_engine.pytorch as te
+
+    from peft.tuners.lora import Linear as LoraLinear
+
+    recipe = recipe or NVFP4Recipe()
+    swapped = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, LoraLinear):
+            continue
+        if any(frag in name for frag in exclude):
+            continue
+        base = module.base_layer
+        if not isinstance(base, nn.Linear) or not _is_swappable(base):
+            continue
+        te_lin = te.Linear(
+            base.in_features,
+            base.out_features,
+            bias=base.bias is not None,
+            params_dtype=base.weight.dtype,
+        )
+        with torch.no_grad():
+            te_lin.weight.copy_(base.weight)
+            if base.bias is not None:
+                te_lin.bias.copy_(base.bias)
+        for p in te_lin.parameters():
+            p.requires_grad_(False)
+        module.base_layer = te_lin
+        swapped += 1
+    LOG.info("NVFP4 training (te backend): swapped %d LoRA base layers", swapped)
+    return swapped
+
+
 def convert_lora_base_to_nvfp4(
     model: nn.Module,
     recipe: NVFP4Recipe | None = None,

@@ -1592,6 +1592,17 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 f"got adapter={self.adapter!r}."
             )
 
+        # Fused LoRA kernels read base_layer.weight directly and bypass the NVFP4
+        # base swap (silent bf16 on the te backend, crash on native).
+        if self.adapter and (
+            self.lora_mlp_kernel or self.lora_qkv_kernel or self.lora_o_kernel
+        ):
+            raise ValueError(
+                "nvfp4_training with an adapter is incompatible with the fused LoRA "
+                "kernels (they bypass the NVFP4 base layer). Set lora_mlp_kernel, "
+                "lora_qkv_kernel, lora_o_kernel to false."
+            )
+
         # `adapter: qlora` implies a quantized base; the FP4-storage path REPLACES
         # bnb NF4, so the two quant schemes on the same base layer conflict.
         wants_fp4_storage = bool(self.adapter) and (
@@ -1754,6 +1765,13 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
         # Only proceed if using LoRA or QLoRA adapter
         if data.get("rl"):
             # RL trainers not tested so don't enable kernels by default
+            return data
+        nvfp4 = data.get("nvfp4_training")
+        if nvfp4 and (
+            nvfp4.get("enabled") if isinstance(nvfp4, dict) else nvfp4.enabled
+        ):
+            # The fused LoRA kernels read base_layer.weight directly, bypassing the
+            # NVFP4 base swap — silently running bf16 (te) or crashing (native).
             return data
         if data.get("adapter") in ["lora", "qlora"]:
             # Skip if already set or using 8-bit

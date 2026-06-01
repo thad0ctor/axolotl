@@ -365,12 +365,34 @@ class AxolotlTrainer(
         # return self.accelerator.prepare(DataLoader(bench_dataset, **dataloader_params))
 
     @override
+    def training_step(self, *args, **kwargs):
+        # TE NVFP4: wrap the whole step so the te.Linear GEMMs run FP4. This must
+        # span backward too — under gradient checkpointing the recompute forward
+        # runs inside backward (outside compute_loss), so a compute_loss-only wrap
+        # would silently recompute in bf16.
+        recipe = getattr(
+            self.accelerator.unwrap_model(self.model), "_te_nvfp4_recipe", None
+        )
+        if recipe is not None and not getattr(self, "_in_te_autocast", False):
+            import transformer_engine.pytorch as te
+
+            self._in_te_autocast = True
+            try:
+                with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                    return super().training_step(*args, **kwargs)
+            finally:
+                self._in_te_autocast = False
+        return super().training_step(*args, **kwargs)
+
+    @override
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         # NVFP4 training, Transformer Engine backend: te.Linear layers only run
         # FP4 GEMMs inside an fp8_autocast region. The recipe is stashed on the
-        # model at swap time; wrap the whole loss computation in it once.
+        # model at swap time; wrap the whole loss computation in it once. (During
+        # training this is already covered by the training_step wrap above; this
+        # also covers eval, which calls compute_loss without training_step.)
         recipe = getattr(self.accelerator.unwrap_model(model), "_te_nvfp4_recipe", None)
         if recipe is not None and not getattr(self, "_in_te_autocast", False):
             import transformer_engine.pytorch as te
