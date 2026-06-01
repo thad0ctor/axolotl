@@ -1130,6 +1130,7 @@ def convert_lora_base_to_nvfp4(
 
     recipe = recipe or NVFP4Recipe()
     swapped = 0
+    skipped_offloaded = 0
     # The base is loaded fully in bf16, so on a model that nearly fills the card
     # the per-layer FP4 quant has no headroom (it OOMs before any bf16 is freed).
     # Park the large, non-swapped input/output embeddings on CPU during the swap
@@ -1177,6 +1178,13 @@ def convert_lora_base_to_nvfp4(
             continue
         base = module.base_layer
         if not isinstance(base, nn.Linear) or not _is_swappable(base):
+            continue
+        # device_map offloads some weights to meta/CPU when the model barely fits
+        # in bf16. Such weights can't be quantized (meta has no data) and aren't
+        # autograd-trainable once left bf16, so the load-then-swap path can't
+        # support this model — surface that clearly rather than crash mid-step.
+        if base.weight is None or base.weight.is_meta or not base.weight.is_cuda:
+            skipped_offloaded += 1
             continue
         if compute_base:
             fast = _mslk_available()
@@ -1231,4 +1239,13 @@ def convert_lora_base_to_nvfp4(
     else:
         mode = "hp"
     LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
+    if skipped_offloaded:
+        raise RuntimeError(
+            f"nvfp4_training: {skipped_offloaded} base weight(s) were offloaded to "
+            "meta/CPU by device_map because the bf16 model does not fully fit in "
+            "VRAM. The NVFP4 LoRA path loads the model in bf16 then swaps to FP4, "
+            "so it cannot quantize weights it can't materialize (unlike QLoRA, "
+            "which quantizes during load). Use a smaller base, add VRAM/GPUs, or "
+            "use adapter: qlora for this model."
+        )
     return swapped
