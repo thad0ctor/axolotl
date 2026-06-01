@@ -498,6 +498,7 @@ class TestNVFP4Adapters:
             NVFP4ComputeBaseLinear,
             NVFP4Linear,
             NVFP4Recipe,
+            is_nvfp4_base,
             convert_lora_base_to_nvfp4,
         )
 
@@ -522,28 +523,29 @@ class TestNVFP4Adapters:
         model = self._lora_model()
         n = convert_lora_base_to_nvfp4(model, NVFP4Recipe(), compute_base=True)
         assert n > 0
-        assert sum(
-            1 for m in model.modules() if isinstance(m, NVFP4ComputeBaseLinear)
-        ) == n
+        assert sum(1 for m in model.modules() if is_nvfp4_base(m)) == n
         l0, l1 = self._train(model)
         assert l1 < l0 and torch.isfinite(torch.tensor(l1))
 
     def test_qlora_fp4_storage(self):
         """base_layer -> NVFP4FrozenBaseLinear: weight stored in FP4 (memory win)."""
         from axolotl.utils.nvfp4_training import (
-            NVFP4FrozenBaseLinear,
             NVFP4Recipe,
             convert_lora_base_to_nvfp4,
+            is_nvfp4_base,
         )
 
         model = self._lora_model()
         n = convert_lora_base_to_nvfp4(model, NVFP4Recipe(), quantized_storage=True)
         assert n > 0
-        bases = [m for m in model.modules() if isinstance(m, NVFP4FrozenBaseLinear)]
+        bases = [m for m in model.modules() if is_nvfp4_base(m)]
         assert len(bases) == n
         # FP4 storage is materially smaller than the bf16 weight it replaced
         b = bases[0]
-        fp4_bytes = b.w_q.qdata.numel() + b.w_q.scale.numel()
+        if hasattr(b, "w_q"):  # torchao base
+            fp4_bytes = b.w_q.qdata.numel() + b.w_q.scale.numel()
+        else:  # mslk-fast base: packed qdata + e4m3 block scales
+            fp4_bytes = b.wq.numel() + b.wsc.numel()
         bf16_bytes = b.in_features * b.out_features * 2
         assert bf16_bytes / fp4_bytes > 3.0
         l0, l1 = self._train(model)
@@ -598,7 +600,8 @@ class TestNVFP4Adapters:
         model = self._lora_model()
         convert_lora_base_to_nvfp4(model, NVFP4Recipe(), quantized_storage=True)
         sd = model.state_dict()
-        assert sum(1 for k in sd if k.endswith("w_q")) > 0
+        # torchao base stores "w_q"; the mslk-fast base stores "wq"/"wsc"/"w_inv".
+        assert any(k.endswith(("w_q", "wq")) for k in sd)
 
         ids = torch.randint(0, 1000, (2, 32), device=model.device)
         opt = torch.optim.AdamW(
@@ -616,7 +619,9 @@ class TestNVFP4Adapters:
         missing, _ = reloaded.load_state_dict(
             torch.load(buf, weights_only=False), strict=False
         )
-        assert not [k for k in missing if "w_q" in k]
+        assert not [
+            k for k in missing if k.rsplit(".", 1)[-1] in ("w_q", "wq", "wsc", "w_inv")
+        ]
 
         model.eval()
         reloaded.eval()
