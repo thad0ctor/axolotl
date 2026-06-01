@@ -1130,9 +1130,49 @@ def convert_lora_base_to_nvfp4(
 
     recipe = recipe or NVFP4Recipe()
     swapped = 0
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, LoraLinear):
-            continue
+    # The base is loaded fully in bf16, so on a model that nearly fills the card
+    # the per-layer FP4 quant has no headroom (it OOMs before any bf16 is freed).
+    # Park the large, non-swapped input/output embeddings on CPU during the swap
+    # — they're excluded anyway, and freeing them (a few GB at large vocab) gives
+    # the transient quant buffers room. Restored to their original device after.
+    parked = []
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free0 = torch.cuda.mem_get_info()[0]
+        # Park the big non-swapped tensors (token embedding + lm_head) on CPU.
+        # Use module identity to dedup tied weights, and fall back to a scan so
+        # this works regardless of PEFT/model wrapping.
+        seen = set()
+        cands = []
+        for getter in ("get_input_embeddings", "get_output_embeddings"):
+            try:
+                cands.append(getattr(model, getter)())
+            except Exception:  # noqa: BLE001
+                pass
+        for mod in cands:
+            w = getattr(mod, "weight", None)
+            if w is not None and w.is_cuda and id(w) not in seen:
+                seen.add(id(w))
+                parked.append((mod, w.device))
+                mod.to("cpu")
+        torch.cuda.empty_cache()
+        free1 = torch.cuda.mem_get_info()[0]
+        LOG.info(
+            "NVFP4 swap: parked %d head module(s) to CPU, freed %.2f GiB "
+            "(%.2f -> %.2f free)",
+            len(parked),
+            (free1 - free0) / 2**30,
+            free0 / 2**30,
+            free1 / 2**30,
+        )
+    # Keep ONLY the lora.Linear references, not the full module list — a
+    # materialized named_modules() list also holds every base_layer, which keeps
+    # the bf16 weights alive and defeats the per-layer free below (FP4 copies
+    # then pile on top of the full bf16 model and OOM large models mid-swap).
+    lora_modules = [
+        (n, m) for n, m in model.named_modules() if isinstance(m, LoraLinear)
+    ]
+    for name, module in lora_modules:
         if any(frag in name for frag in exclude):
             continue
         base = module.base_layer
@@ -1162,6 +1202,28 @@ def convert_lora_base_to_nvfp4(
             base.weight.requires_grad_(False)
             module.base_layer = NVFP4Linear.from_linear(base, recipe)
         swapped += 1
+        # Free the now-replaced bf16 base immediately. Otherwise the full bf16
+        # model stays resident while the FP4 copies accumulate on top (the swap
+        # transiently doubles memory) — which OOMs large models on load even
+        # though the FP4 base itself is far smaller. hp mode keeps its weight.
+        if not (compute_base or quantized_storage):
+            continue
+        # Drop the bf16 weight now so peak stays near the FP4 footprint, not
+        # bf16's. Sync first: the quant kernels still read this weight async, and
+        # expandable_segments would hand the freed block to the next layer's
+        # quant — a use-after-free that corrupts the kernel (illegal access).
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        base.weight = None
+        base.bias = None
+        del base
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    for emb, device in parked:
+        emb.to(device)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if compute_base:
         mode = "compute (mslk-fast)" if _mslk_available() else "compute"
     elif quantized_storage:
