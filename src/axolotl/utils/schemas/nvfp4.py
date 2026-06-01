@@ -73,6 +73,17 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Module name fragments kept in high precision (not swapped)."
         },
     )
+    quantize_lm_head: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Remove lm_head from the high-precision exclusion and "
+            "quantize the output projection to NVFP4 (memory + GEMM win on a large "
+            "[vocab, hidden] tensor), at a small convergence cost (the NVFP4 paper "
+            "keeps lm_head bf16). OFF by default. embed_tokens stays excluded. "
+            "INCOMPATIBLE with tied embeddings (tie_word_embeddings): quantizing a "
+            "tied lm_head would corrupt the shared input embedding — that case raises."
+        },
+    )
     fuse_rmsnorm: bool = Field(
         default=True,
         json_schema_extra={

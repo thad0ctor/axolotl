@@ -277,6 +277,31 @@ Some layers are too sensitive to run in FP4 and are kept in high precision:
   e.g. odd-vocab projections — are **automatically skipped** with a warning; you do
   not need to list them in `exclude_modules`.
 
+### Quantizing the LM head (opt-in)
+
+By default the output projection (`lm_head`) stays in high precision — the NVFP4
+paper keeps it bf16 for convergence. Setting **`quantize_lm_head: true`** removes
+`lm_head` (and only `lm_head`; `embed_tokens` stays excluded) from the exclusion so
+the normal converter quantizes it to NVFP4. The `lm_head` is a large `[vocab,
+hidden]` tensor, so this gives a real weight-memory win (≈1.78× in `compute` base
+mode, ≈3.56× in `storage`) plus an FP4 GEMM, at a small convergence cost (measured
+CE delta on a fixed batch ≈+0.07% on a 2B model; FP4 is weakest on the flat
+lm_head weight distribution, see the MixFP4 note in *Limitations*). Off by default.
+
+Two safety guards apply:
+
+- **Tied embeddings are rejected.** When `tie_word_embeddings` is set (or the output
+  and input embedding share the same parameter), `lm_head` shares storage with the
+  input embedding; quantizing it would corrupt `tok_embd`. Axolotl raises a clear
+  error in this case — use an untied model or leave `quantize_lm_head: false`. (Many
+  small models tie; larger Qwen3 variants do not.)
+- **Cut Cross-Entropy is rejected.** `cut_cross_entropy` fuses the output projection
+  into the loss and reads the `lm_head` weight directly, bypassing the NVFP4 forward.
+  The combination is refused at config validation. Disable one of the two.
+
+If the `lm_head` dimensions are not FP4-eligible (`%32`), it is left in high
+precision with a warning rather than crashing.
+
 ::: {.callout-note}
 At the time of writing, `skip_first_n_blocks` / `skip_last_n_blocks` may be applied
 by the integration layer rather than inside `convert_to_nvfp4_training` directly
@@ -298,6 +323,7 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `hadamard` | `bool` | `true` | Random Hadamard transform on wgrad inputs. |
 | `quantize_base` | `bool` | `false` | Adapter modes only. `false` = LoRA + FP4 compute (frozen base high-precision, FP4 GEMMs, throughput only). `true` = NVFP4-QLoRA (frozen base stored packed in FP4, ~3.5× weight memory). Implied by `adapter: qlora`. Conflicts with `load_in_4bit`/`load_in_8bit`. |
 | `exclude_modules` | `list[str]` | `[lm_head, embed_tokens]` | Module name fragments kept in high precision (not swapped). |
+| `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). **Incompatible with tied embeddings and `cut_cross_entropy` (both raise).** `embed_tokens` stays excluded. |
 | `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
 | `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
 
