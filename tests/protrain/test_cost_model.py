@@ -24,7 +24,9 @@ from axolotl.integrations.protrain.cost.memory import (
     _block_internal_saved_bytes,
     _compute_ckpt_chain_bytes,
     alpha_fragmentation_for_cfg,
+    apply_gate_consistent_scaling,
     estimate_peak,
+    gate_consistent_alpha,
     set_default_ckpt_internal_residual_factor,
 )
 from axolotl.integrations.protrain.types import (
@@ -247,15 +249,49 @@ def test_reconstruct_f_bm_uses_chain_not_max():
     assert captured["chain"] == n_blocks * activation_per_block
 
 
-def test_estimate_peak_mode_c_ckpt_tighter_than_mode_a_alpha():
-    """The §7.6 anchor: Mode-C+CKPT raw peak now scales by 0.95, not 0.75.
+def test_mode_c_ckpt_alpha_is_floored_in_gate():
+    """Sub-1.0 4-bit fragmentation factors are anchors floored to 1.0 in the gate.
 
-    Synthetic stand-in for the audit row (30B-Llama, 4-bit, low-seq Mode-C):
-    the previous unconditional 0.75 alpha dragged the prediction below the
-    measured peak. With the mode split, the same raw_peak times 0.95 lands
-    19/15 = ~1.27x higher, which is exactly the direction needed to absorb
-    the 8-31% under-prediction observed at seq=512/1024/2048.
+    Post-SwiGLU-fix the 0.75 (Mode-A) / 0.95 (Mode-C-CKPT) factors are calibration
+    ANCHORS, not live multipliers: ``gate_consistent_alpha`` floors every sub-1.0
+    value to 1.0 inside ``estimate_peak`` / the searcher, because deflating the
+    now-realistic component sum would let the searcher accept configs the
+    calibrated gate rejects. This regression-guards that intentional floor (the
+    old test here asserted only an algebraic identity and proved nothing).
     """
+    cfg_ckpt = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=4)
+    cfg_none = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=0)
+
+    # The raw dispatch is genuine (used by the per-dtype diagnostic log)...
+    assert (
+        alpha_fragmentation_for_cfg(0.5, cfg_ckpt, True)
+        == ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT
+    )
+    assert (
+        alpha_fragmentation_for_cfg(0.5, cfg_none, False)
+        == ALPHA_FRAGMENTATION_4BIT_MODE_A
+    )
+
+    # ...but the gate floors every sub-1.0 factor to 1.0 and preserves >= 1.0.
+    assert gate_consistent_alpha(ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT) == 1.0
+    assert gate_consistent_alpha(ALPHA_FRAGMENTATION_4BIT_MODE_A) == 1.0
+    assert gate_consistent_alpha(ALPHA_FRAGMENTATION) == pytest.approx(
+        ALPHA_FRAGMENTATION
+    )
+
+    # End-to-end through the gate's scaling: a sub-1.0 alpha must NOT deflate the
+    # raw peak (would fail if the floor were removed), while 1.10 is preserved.
+    raw = 10 * (1 << 30)
+    scaled_c = apply_gate_consistent_scaling(raw, raw, 0, 0.95)
+    scaled_a = apply_gate_consistent_scaling(raw, raw, 0, 0.75)
+    scaled_fp16 = apply_gate_consistent_scaling(raw, raw, 0, ALPHA_FRAGMENTATION)
+    assert scaled_c == raw, "Mode-C-CKPT 0.95 alpha must not deflate the peak"
+    assert scaled_a == raw, "Mode-A 0.75 alpha must not deflate the peak"
+    assert scaled_fp16 == int(ALPHA_FRAGMENTATION * raw)
+
+
+def test_estimate_peak_mode_c_ckpt_not_deflated_vs_mode_a():
+    """estimate_peak end-to-end: 4-bit Mode-C-CKPT peak is gated, never deflated."""
     s_chunk = 1 << 28  # 256 MiB
     n_chunk = 4
     n_blocks = 4
@@ -290,23 +326,6 @@ def test_estimate_peak_mode_c_ckpt_tighter_than_mode_a_alpha():
         cfg_mode_c_ckpt, trace, layout, block_map_c, hw_4bit
     )
     assert peak_mode_a > 0 and peak_mode_c_ckpt > 0
-
-    # The Mode-C-CKPT path now uses alpha=0.95; recomputing it with the old
-    # alpha=0.75 would yield strictly lower bytes. Reverse-out via the ratio.
-    legacy_mode_c_ckpt_peak = int(
-        peak_mode_c_ckpt
-        * ALPHA_FRAGMENTATION_4BIT_MODE_A
-        / ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT
-    )
-    assert peak_mode_c_ckpt > legacy_mode_c_ckpt_peak, (
-        f"new Mode-C-CKPT prediction {peak_mode_c_ckpt} should exceed the "
-        f"legacy 0.75-alpha prediction {legacy_mode_c_ckpt_peak} by ~27%"
-    )
-    # ~27% headroom (0.95/0.75 ≈ 1.266), allow 1% rounding slack.
-    assert peak_mode_c_ckpt / max(1, legacy_mode_c_ckpt_peak) == pytest.approx(
-        ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT / ALPHA_FRAGMENTATION_4BIT_MODE_A,
-        rel=0.01,
-    )
 
 
 # Llama-30B reference (huggyllama/llama-30b) used by the section 7.6 audit row.

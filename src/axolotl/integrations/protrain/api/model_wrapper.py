@@ -325,6 +325,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
         _compute_ckpt_chain_bytes,
         _saved_tensor_bytes_per_block,
         alpha_fragmentation_for_cfg,
+        gate_consistent_alpha,
     )
     from axolotl.integrations.protrain.types import BlockMode
 
@@ -409,7 +410,14 @@ def _calibrate_peak_with_actual_chunk_bytes(
             n_persist_eff_local * S * persistent_factor
             + n_buffer_local * S * buffer_factor
         )
-        f_bm_local = max(0, int(original_peak_arg / alpha) - original_model_state_local)
+        # Reverse out f_bm using the SAME floored alpha the searcher scaled
+        # original_peak with (gate_consistent_alpha), not the raw sub-1.0 4-bit
+        # factor — dividing by 0.75/0.95 would over-recover f_bm.
+        f_bm_local = max(
+            0,
+            int(original_peak_arg / gate_consistent_alpha(alpha))
+            - original_model_state_local,
+        )
         reconstructed_local, n_ckpt_local = _reconstruct_f_bm(bmap_arg)
         if bmap_arg is not None:
             if n_ckpt_local >= max(1, len(bmap_arg) - 2):
@@ -472,7 +480,11 @@ def _calibrate_peak_with_actual_chunk_bytes(
     original_model_state = int(
         n_persist_eff * S * persistent_factor + n_buffer * S * buffer_factor
     )
-    f_bm = max(0, int(original_peak / alpha) - original_model_state)
+    # Reverse out f_bm using the SAME floored alpha the searcher scaled
+    # original_peak with (gate_consistent_alpha), not the raw sub-1.0 4-bit factor.
+    f_bm = max(
+        0, int(original_peak / gate_consistent_alpha(alpha)) - original_model_state
+    )
 
     # CKPT-dominant: cap (min); else floor (max) so activations survive both failure modes.
     reconstructed_f_bm, n_ckpt = _reconstruct_f_bm(block_map)

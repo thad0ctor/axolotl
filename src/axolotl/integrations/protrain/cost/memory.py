@@ -136,6 +136,12 @@ ALPHA_FRAGMENTATION_4BIT_MODE_A: float = ALPHA_FRAGMENTATION_4BIT
 # = 1.43 / 1.25 / 1.08 at seq=512/1024/2048 on 30B-Llama Mode-C, i.e. raw
 # predictor low by 8-31% at low seq). 0.95 narrows the gap without
 # changing the wrapper-side calibration safety semantics.
+#
+# NOTE: this is a calibration ANCHOR, not a live gate multiplier. In
+# ``estimate_peak`` and the searcher it is floored to 1.0 by
+# ``gate_consistent_alpha`` (post-SwiGLU-fix the sub-1.0 deflation factors are
+# unsafe — see that function). It survives un-floored only in the per-dtype
+# diagnostic log. Do not "fix" the floor expecting this 0.95 to take effect.
 ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT: float = 0.95
 
 
@@ -172,6 +178,9 @@ def alpha_fragmentation_for_cfg(
         return ALPHA_FRAGMENTATION
     is_ckpt = bool(cfg is not None and int(getattr(cfg, "n_checkpoint", 0)) > 0)
     if is_ckpt and is_mode_c:
+        # Floored to 1.0 by gate_consistent_alpha in estimate_peak / the searcher;
+        # this raw value reaches only the per-dtype diagnostic log. See the
+        # constant's note above and gate_consistent_alpha for why.
         return ALPHA_FRAGMENTATION_4BIT_MODE_C_CKPT
     return ALPHA_FRAGMENTATION_4BIT_MODE_A
 

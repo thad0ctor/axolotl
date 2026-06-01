@@ -23,12 +23,16 @@ from axolotl.integrations.protrain.api.model_wrapper import (
     _apply_calibrated_runtime_peak_gate,
     _calibrate_peak_with_actual_chunk_bytes,
 )
-from axolotl.integrations.protrain.cost.memory import ALPHA_FRAGMENTATION
+from axolotl.integrations.protrain.cost.memory import (
+    ALPHA_FRAGMENTATION,
+    gate_consistent_alpha,
+)
 from axolotl.integrations.protrain.types import (
     BlockId,
     ChunkId,
     ChunkLayout,
     CostConfig,
+    HardwareProfile,
     ParamId,
     ProfilerTrace,
     SearchResult,
@@ -165,6 +169,76 @@ def test_calibrate_peak_scales_persistent_by_frozen_state_factor() -> None:
     assert abs(calibrated_a - expected_a) <= 10, (
         f"calibrated_a={calibrated_a}, expected~{expected_a}"
     )
+
+
+def test_calibrate_peak_reverse_out_uses_floored_4bit_alpha() -> None:
+    """The f_bm reverse-out divides by the FLOORED alpha, not the raw 4-bit factor.
+
+    The searcher builds ``original_peak`` with ``gate_consistent_alpha`` (sub-1.0
+    4-bit factors floored to 1.0). Reversing it out with the raw 0.75/0.95 would
+    over-recover ``f_bm`` and inflate the calibrated peak. This guards that the
+    divisor matches the forward scaling.
+    """
+    layout = _layout(n_chunk=4, s_chunk=1024)  # fp16_total = 4096
+    persistent_ids = {0, 1}
+    chunk_bytes = {0: 800, 1: 700, 2: 500, 3: 600}  # actual_persistent = 1500
+    # All-frozen so the explicit trainable term is 0 and we isolate the divisor.
+    cm = _stub_chunk_manager(layout, persistent_ids, chunk_bytes, trainable_ids=set())
+    cfg = CostConfig(n_persist=2, n_buffer=1, n_swap=0, n_checkpoint=0)
+
+    # 4-bit, non-sharded -> alpha_fragmentation_for_cfg = 0.75 (Mode-A).
+    hw_4bit = HardwareProfile(
+        gpu_sku="test",
+        gpu_memory_bytes=24 * (1 << 30),
+        gpu_count=1,
+        pcie_h2d_bps=13e9,
+        pcie_d2h_bps=13e9,
+        has_nvlink=False,
+        dominant_param_bytes_per_element=0.5,
+    )
+    raw_alpha = 0.75
+    assert gate_consistent_alpha(raw_alpha) == 1.0  # searcher floored it to 1.0
+
+    fp16_total = layout.N_chunk * layout.S_chunk  # 4096
+    buffer_factor = 2.0
+    n_persist_eff = 2
+    F_BM = 5000
+
+    trace = _trace(model_state_bytes=fp16_total)  # persistent_factor 1.0
+    cost_state = int(
+        n_persist_eff * layout.S_chunk * 1.0
+        + cfg.n_buffer * layout.S_chunk * buffer_factor
+    )  # 4096
+    # original_peak as the searcher builds it: floored alpha (1.0), not 0.75.
+    original_peak = int(gate_consistent_alpha(raw_alpha) * (cost_state + F_BM))
+
+    calibrated = _calibrate_peak_with_actual_chunk_bytes(
+        original_peak=original_peak,
+        layout=layout,
+        chunk_manager=cm,
+        cfg=cfg,
+        trace=trace,
+        hw=hw_4bit,
+    )
+
+    # Floored reverse-out recovers f_bm == F_BM; calibration_alpha = 1.0.
+    actual_persistent = 1500
+    frozen_factor = 1.0  # frozen_total 2600 / 4096 -> floored to 1.0
+    expected = int(
+        actual_persistent * frozen_factor
+        + cfg.n_buffer * layout.S_chunk * buffer_factor
+        + F_BM
+    )  # 1500 + 2048 + 5000 = 8548
+    assert abs(calibrated - expected) <= 10, (
+        f"calibrated={calibrated} expected~{expected}"
+    )
+
+    # The buggy raw-0.75 divisor would over-recover f_bm and yield a larger peak.
+    buggy_f_bm = int(original_peak / raw_alpha) - cost_state
+    buggy_expected = int(
+        actual_persistent + cfg.n_buffer * layout.S_chunk * buffer_factor + buggy_f_bm
+    )
+    assert calibrated < buggy_expected
 
 
 def test_calibrate_peak_adds_optimizer_aware_trainable_state() -> None:
