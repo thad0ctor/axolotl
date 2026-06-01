@@ -599,11 +599,7 @@ def run_trace(
 
     # Warmup passes JIT-compile kernels so steady-state per-op latencies aren't cold.
     N_WARMUP = 0 if engage_on_demand else 2
-    # Best-effort: record whether SDPA dispatches flash/mem-efficient (O(seq)) or
-    # the math backend (O(seq^2)) on this model's real inputs, so the cost model
-    # budgets the right attention working set. Stays "" (treated as conservative
-    # O(seq^2)) for non-SDPA backends, the on-demand path (no warmup), or on any
-    # failure. The spy self-selects: it only records on an actual SDPA call.
+    # Probe the real SDPA dispatch; "" (non-SDPA / no warmup / failure) → cost model budgets O(seq^2).
     dispatched_sdpa_backend = ""
     if cuda_available and N_WARMUP > 0:
         import torch.nn.functional as _torch_F

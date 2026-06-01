@@ -192,9 +192,7 @@ class ProfilerTrace:
     # "flash_attention_2"/"flash_attention_3"/"sdpa"/"xformers" (O(seq), no score
     # matrix) or "eager"/"math" (O(seq^2), materializes scores). "" → eager-safe.
     attn_implementation: str = ""
-    # Actually-dispatched SDPA backend, recorded by a warmup probe when
-    # attn_implementation == "sdpa": "flash"/"mem_efficient" (O(seq)) or "math"
-    # (O(seq^2)). "" = unknown/not-probed → cost model budgets O(seq^2) (safe).
+    # Warmup-probed SDPA backend ("flash"/"mem_efficient"/"math"); "" → conservative O(seq^2).
     dispatched_sdpa_backend: str = ""
 
 

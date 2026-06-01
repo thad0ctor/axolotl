@@ -410,9 +410,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
             n_persist_eff_local * S * persistent_factor
             + n_buffer_local * S * buffer_factor
         )
-        # Reverse out f_bm using the SAME floored alpha the searcher scaled
-        # original_peak with (gate_consistent_alpha), not the raw sub-1.0 4-bit
-        # factor — dividing by 0.75/0.95 would over-recover f_bm.
+        # Floored alpha matches how the searcher built original_peak; raw 4-bit would over-recover f_bm.
         f_bm_local = max(
             0,
             int(original_peak_arg / gate_consistent_alpha(alpha))
@@ -480,8 +478,7 @@ def _calibrate_peak_with_actual_chunk_bytes(
     original_model_state = int(
         n_persist_eff * S * persistent_factor + n_buffer * S * buffer_factor
     )
-    # Reverse out f_bm using the SAME floored alpha the searcher scaled
-    # original_peak with (gate_consistent_alpha), not the raw sub-1.0 4-bit factor.
+    # Floored alpha matches how the searcher built original_peak; raw 4-bit would over-recover f_bm.
     f_bm = max(
         0, int(original_peak / gate_consistent_alpha(alpha)) - original_model_state
     )
