@@ -134,9 +134,15 @@ llmcompressor = [
 fbgemm-gpu = ["fbgemm-gpu-genai>=1.3.0"]
 # NVFP4 training with the Transformer Engine backend (nvfp4_training.backend: te).
 # Builds from source against the local CUDA toolkit; on consumer Blackwell
-# (sm_120) build with NVTE_CUDA_ARCHS=120 and preload the system cuBLAS at
-# runtime. See docs/nvfp4_training.qmd. The native backend needs none of this.
-transformer-engine = ["transformer_engine[pytorch]>=2.8.0"]
+# (sm_120) build with NVTE_CUDA_ARCHS=120. TE needs a cuBLAS that exports
+# cublasLtGroupedMatrixLayoutInit_internal (>= 13.3) — the pip wheel torch
+# bundles can be older, so pin it up; the pip 13.3 wheel keeps torch working too
+# (the CUDA-toolkit cuBLAS does NOT — it ABI-mismatches torch). See
+# docs/nvfp4_training.qmd. The native backend needs none of this.
+transformer-engine = [
+    "transformer_engine[pytorch]>=2.8.0",
+    "nvidia-cublas>=13.3.0.5",
+]
 opentelemetry = [
     "opentelemetry-api",
     "opentelemetry-sdk",

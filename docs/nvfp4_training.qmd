@@ -65,14 +65,20 @@ uv pip install "axolotl[transformer-engine]"
 ```
 
 Transformer Engine builds `transformer_engine_torch` from source against your
-local CUDA toolkit. On **consumer Blackwell (`sm_120`)** two extra steps are
-required (datacenter `sm_100` needs neither):
+local CUDA toolkit. Two setup notes:
 
-1. Build for the architecture-specific target: `NVTE_CUDA_ARCHS=120` (TE ≥ 2.8;
-   the FP4 cast PTX is `sm_120a`-specific).
-2. At runtime, preload the system cuBLAS so TE finds the newer grouped-GEMM
-   symbol: `LD_PRELOAD=/usr/local/cuda/lib64/libcublasLt.so.<ver>`. The pip
-   `nvidia-cublas` wheel is too old; the toolkit's cuBLAS has the symbol.
+1. **`sm_120` build:** on consumer Blackwell, build for the architecture-specific
+   target with `NVTE_CUDA_ARCHS=120` (TE ≥ 2.8; the FP4 cast PTX is
+   `sm_120a`-specific). Datacenter `sm_100` needs no special arch flag.
+2. **cuBLAS version:** TE's core library needs a cuBLAS that exports
+   `cublasLtGroupedMatrixLayoutInit_internal` (cuBLAS ≥ 13.3). The pip
+   `nvidia-cublas` wheel that PyTorch bundles can be older, so the
+   `transformer-engine` extra bumps it to `>= 13.3.0.5`. Use the **pip** wheel,
+   not the CUDA-toolkit's cuBLAS — the toolkit build ABI-mismatches PyTorch and
+   breaks ordinary `nn.Linear` (no `LD_PRELOAD` workaround needed or wanted).
+   PEFT probes for Transformer Engine at import, so an out-of-date cuBLAS breaks
+   *all* Axolotl runs (even `backend: native`) once TE is installed — the version
+   pin in the extra prevents that.
 
 **Important `sm_120` caveat:** TE's RHT / stochastic-rounding / 2D-scaling fusion
 kernels currently do **not** run on consumer Blackwell (they error with
