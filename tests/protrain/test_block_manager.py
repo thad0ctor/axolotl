@@ -267,45 +267,49 @@ def test_swap_forward_backward_correctness() -> None:
     swap_stream = torch.cuda.Stream()
     wrapped.attach_runtime(pool, swap_stream)
 
-    x_a = torch.randn(rows, cols, device=device, requires_grad=True)
-    x_b = x_a.detach().clone().requires_grad_(True)
-    assert x_a.numel() * x_a.element_size() >= SIZE_THRESHOLD_BYTES
+    try:
+        x_a = torch.randn(rows, cols, device=device, requires_grad=True)
+        x_b = x_a.detach().clone().requires_grad_(True)
+        assert x_a.numel() * x_a.element_size() >= SIZE_THRESHOLD_BYTES
 
-    out_wrapped = wrapped(x_a)
-    out_ref = ref_block(x_b)
+        out_wrapped = wrapped(x_a)
+        out_ref = ref_block(x_b)
 
-    # Forward outputs must match to fp32 tolerance.
-    assert torch.allclose(out_wrapped, out_ref, atol=1e-5), (
-        "SwappedBlock forward must match unwrapped block to fp32 tolerance"
-    )
+        # Forward outputs must match to fp32 tolerance.
+        assert torch.allclose(out_wrapped, out_ref, atol=1e-5), (
+            "SwappedBlock forward must match unwrapped block to fp32 tolerance"
+        )
 
-    # Backward: grad must flow through the swap wrapper.
-    out_wrapped.sum().backward()
-    out_ref.sum().backward()
+        # Backward: grad must flow through the swap wrapper.
+        out_wrapped.sum().backward()
+        out_ref.sum().backward()
 
-    # Parameter grads exist and are finite.
-    w_grad = block.weight.grad
-    assert w_grad is not None, "grad did not flow to SwappedBlock's inner param"
-    assert torch.isfinite(w_grad).all(), "SwappedBlock produced NaN/Inf grads"
+        # Parameter grads exist and are finite.
+        w_grad = block.weight.grad
+        assert w_grad is not None, "grad did not flow to SwappedBlock's inner param"
+        assert torch.isfinite(w_grad).all(), "SwappedBlock produced NaN/Inf grads"
 
-    # Parameter grads match the reference block (same init + same input).
-    assert torch.allclose(w_grad, ref_block.weight.grad, atol=1e-5), (
-        "SwappedBlock param grads must match unwrapped reference"
-    )
-    # Input grads match as well.
-    assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
+        # Parameter grads match the reference block (same init + same input).
+        assert torch.allclose(w_grad, ref_block.weight.grad, atol=1e-5), (
+            "SwappedBlock param grads must match unwrapped reference"
+        )
+        # Input grads match as well.
+        assert torch.allclose(x_a.grad, x_b.grad, atol=1e-5)  # type: ignore[arg-type]
 
-    # The activation must have actually been swapped through the pool, not
-    # silently passed through — otherwise acquire()/view()/release() regressions
-    # would go undetected.
-    assert pool.peak_used_bytes > 0, "activation never routed through the swap pool"
+        # The activation must have actually been swapped through the pool, not
+        # silently passed through — otherwise acquire()/view()/release()
+        # regressions would go undetected.
+        assert pool.peak_used_bytes > 0, "activation never routed through the swap pool"
 
-    # Pool slots must be returned to free list after backward completes.
-    torch.cuda.synchronize()
-    assert pool.inflight_count == 0, (
-        "SwappedBlock did not release pool slots after backward"
-    )
-    pool.close()
+        # Pool slots must be returned to free list after backward completes.
+        torch.cuda.synchronize()
+        assert pool.inflight_count == 0, (
+            "SwappedBlock did not release pool slots after backward"
+        )
+    finally:
+        # Deterministic pinned-host cleanup; never leak a slab to __del__ where
+        # a failing assert above would otherwise poison later GPU tests.
+        pool.close()
 
 
 # ---------------------------------------------------------------------------

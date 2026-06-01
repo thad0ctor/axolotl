@@ -1489,8 +1489,8 @@ def _construct_runtime(
         from axolotl.integrations.protrain.block.swap_pool import ActivationSwapPool
         from axolotl.integrations.protrain.cost.memory import swap_pool_capacity_bytes
 
-        capacity_bytes = swap_pool_capacity_bytes(trace, swap_block_count)
-        if capacity_bytes <= 0:
+        swap_capacity_bytes = swap_pool_capacity_bytes(trace, swap_block_count)
+        if swap_capacity_bytes <= 0:
             # Fail fast rather than skip: leaving the blocks in BlockMode.SWAP
             # with no pool attached makes their wrappers run as identity, so
             # activations stay GPU-resident while the search result still
@@ -1504,7 +1504,7 @@ def _construct_runtime(
                 "cannot size the activation-swap slab. Re-run the searcher with "
                 "n_swap=0 or repair the profiler trace."
             )
-        swap_pool = ActivationSwapPool(capacity_bytes=capacity_bytes)
+        swap_pool = ActivationSwapPool(capacity_bytes=swap_capacity_bytes)
         scheduler.swap_pool = swap_pool
         for block in blocks:
             if getattr(block, "_protrain_wrapped_mode", None) is _BM_swap.SWAP:
@@ -1512,7 +1512,7 @@ def _construct_runtime(
         LOG.info(
             "ProTrain: SWAP slab wired — %.2f GiB pinned for %d SWAP blocks "
             "(variable-size, per-tensor)",
-            capacity_bytes / (1 << 30),
+            swap_capacity_bytes / (1 << 30),
             swap_block_count,
         )
 

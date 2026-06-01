@@ -29,6 +29,12 @@ def resolve_world_size_from_env() -> int:
     """Return WORLD_SIZE env (default 1)."""
     raw = os.environ.get("WORLD_SIZE")
     if raw is None:
+        # Missing WORLD_SIZE + set RANK/LOCAL_RANK → raise; collapse to 1 only without rank vars.
+        if _in_distributed_context():
+            raise RuntimeError(
+                "WORLD_SIZE is unset but RANK / LOCAL_RANK is set; refusing to "
+                "silently collapse a distributed run to world size 1."
+            )
         return 1
     try:
         world_size = int(raw)
@@ -79,7 +85,15 @@ def _resolve_device_index() -> int:
     """Pick CUDA ordinal from LOCAL_RANK; falls back to current_device on parse/range errors."""
     import torch
 
-    raw_local_rank = os.environ.get("LOCAL_RANK", "0")
+    raw_local_rank = os.environ.get("LOCAL_RANK")
+    if raw_local_rank is None:
+        # Missing LOCAL_RANK + set RANK → fail closed: colocating ranks on cuda:0 corrupts training.
+        if _in_distributed_context():
+            raise RuntimeError(
+                "LOCAL_RANK is unset but RANK is set; refusing to default the "
+                "CUDA device index to 0 in a distributed run."
+            )
+        raw_local_rank = "0"
     try:
         local_rank = int(raw_local_rank)
     except ValueError:
