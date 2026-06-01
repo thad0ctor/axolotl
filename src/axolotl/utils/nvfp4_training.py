@@ -1131,61 +1131,34 @@ def convert_lora_base_to_nvfp4(
     recipe = recipe or NVFP4Recipe()
     swapped = 0
     skipped_offloaded = 0
-    # The base is loaded fully in bf16, so on a model that nearly fills the card
-    # the per-layer FP4 quant has no headroom (it OOMs before any bf16 is freed).
-    # Park the large, non-swapped input/output embeddings on CPU during the swap
-    # — they're excluded anyway, and freeing them (a few GB at large vocab) gives
-    # the transient quant buffers room. Restored to their original device after.
-    parked = []
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        free0 = torch.cuda.mem_get_info()[0]
-        # Park the big non-swapped tensors (token embedding + lm_head) on CPU.
-        # Use module identity to dedup tied weights, and fall back to a scan so
-        # this works regardless of PEFT/model wrapping.
-        seen = set()
-        cands = []
-        for getter in ("get_input_embeddings", "get_output_embeddings"):
-            try:
-                cands.append(getattr(model, getter)())
-            except Exception:  # noqa: BLE001
-                pass
-        for mod in cands:
-            w = getattr(mod, "weight", None)
-            if w is not None and w.is_cuda and id(w) not in seen:
-                seen.add(id(w))
-                parked.append((mod, w.device))
-                mod.to("cpu")
-        torch.cuda.empty_cache()
-        free1 = torch.cuda.mem_get_info()[0]
-        LOG.info(
-            "NVFP4 swap: parked %d head module(s) to CPU, freed %.2f GiB "
-            "(%.2f -> %.2f free)",
-            len(parked),
-            (free1 - free0) / 2**30,
-            free0 / 2**30,
-            free1 / 2**30,
-        )
-    # Keep ONLY the lora.Linear references, not the full module list — a
-    # materialized named_modules() list also holds every base_layer, which keeps
-    # the bf16 weights alive and defeats the per-layer free below (FP4 copies
-    # then pile on top of the full bf16 model and OOM large models mid-swap).
+    # Stream the swap. For the NVFP4 adapter path the loader keeps the base on
+    # CPU (so the full bf16 model never sits on the GPU and device_map can't
+    # strand weights on meta). Move each base weight to the GPU just-in-time,
+    # quantize to FP4, and free the bf16 — the GPU only ever holds the FP4 base
+    # plus one transient layer. Weights already on the GPU are quantized in place.
+    # A materialized named_modules() list would pin every base_layer and defeat
+    # the per-layer free, so keep only the lora.Linear references.
+    target = (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
     lora_modules = [
         (n, m) for n, m in model.named_modules() if isinstance(m, LoraLinear)
     ]
+    streamed = False
     for name, module in lora_modules:
         if any(frag in name for frag in exclude):
             continue
         base = module.base_layer
         if not isinstance(base, nn.Linear) or not _is_swappable(base):
             continue
-        # device_map offloads some weights to meta/CPU when the model barely fits
-        # in bf16. Such weights can't be quantized (meta has no data) and aren't
-        # autograd-trainable once left bf16, so the load-then-swap path can't
-        # support this model — surface that clearly rather than crash mid-step.
-        if base.weight is None or base.weight.is_meta or not base.weight.is_cuda:
+        # A meta weight has no data to quantize (device_map offloaded it because
+        # even the CPU-streamed load couldn't place it). Can't support it.
+        if base.weight is None or base.weight.is_meta:
             skipped_offloaded += 1
             continue
+        if base.weight.device != target:
+            base = base.to(target)  # stream this layer to the GPU
+            streamed = True
         if compute_base:
             fast = _mslk_available()
             if fast and (recipe.stochastic_rounding or recipe.hadamard):
@@ -1225,12 +1198,12 @@ def convert_lora_base_to_nvfp4(
         base.weight = None
         base.bias = None
         del base
+    # The FP4 base is in place; move the rest (embeddings, norms, lm_head, the
+    # LoRA adapters) onto the GPU now that the heavy weights are quantized.
+    if streamed:
+        model.to(target)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-    for emb, device in parked:
-        emb.to(device)
-    if torch.cuda.is_available():
         torch.cuda.empty_cache()
     if compute_base:
         mode = "compute (mslk-fast)" if _mslk_available() else "compute"
@@ -1241,11 +1214,8 @@ def convert_lora_base_to_nvfp4(
     LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
     if skipped_offloaded:
         raise RuntimeError(
-            f"nvfp4_training: {skipped_offloaded} base weight(s) were offloaded to "
-            "meta/CPU by device_map because the bf16 model does not fully fit in "
-            "VRAM. The NVFP4 LoRA path loads the model in bf16 then swaps to FP4, "
-            "so it cannot quantize weights it can't materialize (unlike QLoRA, "
-            "which quantizes during load). Use a smaller base, add VRAM/GPUs, or "
-            "use adapter: qlora for this model."
+            f"nvfp4_training: {skipped_offloaded} base weight(s) are on meta with no "
+            "data to quantize — the model didn't fully materialize even via the "
+            "CPU-streamed load. Use a smaller base, add VRAM/GPUs, or adapter: qlora."
         )
     return swapped
