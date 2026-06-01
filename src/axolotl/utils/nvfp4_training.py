@@ -1037,6 +1037,48 @@ def convert_to_nvfp4_training(
     return swapped
 
 
+def swap_frozen_linear_to_nvfp4(
+    model: nn.Module,
+    name: str,
+    recipe: NVFP4Recipe | None = None,
+    *,
+    base_mode: str = "compute",
+) -> bool:
+    """Swap a single bare frozen ``nn.Linear`` (e.g. an un-targeted lm_head in a
+    LoRA run) for the matching NVFP4 base module.
+
+    The LoRA base converter only touches ``lora.Linear`` modules; a frozen
+    lm_head that isn't a LoRA target stays a bare ``nn.Linear`` and is invisible
+    to it. This swaps that bare module in place using the same three base modes:
+    ``compute`` (default), ``storage``, or ``hp``. Returns True if swapped.
+    """
+    recipe = recipe or NVFP4Recipe()
+    try:
+        module = model.get_submodule(name)
+    except AttributeError:
+        return False
+    if not isinstance(module, nn.Linear) or not _is_swappable(module):
+        return False
+
+    if base_mode == "compute":
+        fast = _mslk_available()
+        cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
+        new_module = cls.from_linear(module, recipe)
+    elif base_mode == "storage":
+        if _mslk_available():
+            new_module = NVFP4FastFrozenBaseLinear.from_linear(module, recipe)
+        else:
+            new_module = NVFP4FrozenBaseLinear.from_linear(module, recipe, fsdp=False)
+    else:
+        module.weight.requires_grad_(False)
+        new_module = NVFP4Linear.from_linear(module, recipe)
+
+    parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+    setattr(parent, name.rsplit(".", 1)[-1], new_module)
+    LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
+    return True
+
+
 def te_nvfp4_available() -> tuple[bool, str]:
     """Return (ok, reason) for the Transformer Engine NVFP4 backend."""
     try:

@@ -323,7 +323,10 @@ class PatchManager:
             stochastic_rounding=nvfp4.stochastic_rounding,
             hadamard=nvfp4.hadamard,
         )
-        exclude = tuple(nvfp4.exclude_modules or ()) + self._nvfp4_block_exclusions(
+        exclude_modules = list(nvfp4.exclude_modules or [])
+        if getattr(nvfp4, "quantize_lm_head", False):
+            exclude_modules = self._nvfp4_unexclude_lm_head(model, exclude_modules)
+        exclude = tuple(exclude_modules) + self._nvfp4_block_exclusions(
             model, nvfp4.skip_first_n_blocks or 0, nvfp4.skip_last_n_blocks or 0
         )
 
@@ -401,6 +404,11 @@ class PatchManager:
                 "nvfp4_training enabled but no eligible LoRA base layers were "
                 "swapped (is the model PEFT-wrapped?)"
             )
+            # The LoRA base converter only swaps `lora.Linear` base_layers. A
+            # frozen lm_head that isn't a LoRA target stays a bare nn.Linear and
+            # is invisible to it, so swap it directly when quantize_lm_head is on.
+            if getattr(nvfp4, "quantize_lm_head", False) and "lm_head" not in exclude:
+                self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
         else:
             count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
             empty_msg = (
@@ -445,6 +453,107 @@ class PatchManager:
                 skip |= set(ordered[len(ordered) - skip_last :])
             fragments.extend(f"{prefix}.{i}." for i in sorted(skip))
         return tuple(fragments)
+
+    def _nvfp4_unexclude_lm_head(
+        self, model: PreTrainedModel, exclude_modules: list[str]
+    ) -> list[str]:
+        """Drop ``lm_head`` from the NVFP4 exclusion so the converter swaps it.
+
+        Guards first: tied embeddings make this destructive (the lm_head shares
+        storage with tok_embd, so quantizing it corrupts the input embedding) —
+        raise. A fused-linear cross-entropy path (cut_cross_entropy) consumes the
+        lm_head weight directly and bypasses the NVFP4 forward — raise. If the
+        lm_head dims aren't FP4-swappable (%32), leave it excluded with a warning
+        rather than crash. Only ``lm_head`` is removed; ``embed_tokens`` stays.
+        """
+        from axolotl.utils.nvfp4_training import _is_swappable
+
+        if self._model_ties_embeddings(model):
+            raise RuntimeError(
+                "nvfp4_training.quantize_lm_head is incompatible with tied "
+                "embeddings (tie_word_embeddings): the lm_head shares storage with "
+                "the input embedding, so quantizing it to NVFP4 would corrupt "
+                "tok_embd. Either set quantize_lm_head: false, or use a model whose "
+                "output embedding is untied from its input embedding."
+            )
+
+        if self.cfg.cut_cross_entropy:
+            raise RuntimeError(
+                "nvfp4_training.quantize_lm_head is incompatible with "
+                "cut_cross_entropy: the fused linear cross-entropy kernel reads the "
+                "lm_head weight directly to fuse the projection with the loss, which "
+                "bypasses the NVFP4 lm_head forward (the FP4 head would be ignored, "
+                "or the kernel would fail on the NVFP4 module's missing .weight). "
+                "Disable one of them (cut_cross_entropy: false or "
+                "quantize_lm_head: false)."
+            )
+
+        out_emb = model.get_output_embeddings()
+        if not isinstance(out_emb, torch.nn.Linear) or not _is_swappable(out_emb):
+            in_f = getattr(out_emb, "in_features", "?")
+            out_f = getattr(out_emb, "out_features", "?")
+            LOG.warning(
+                "nvfp4_training.quantize_lm_head: lm_head is not NVFP4-swappable "
+                "(in=%s out=%s, both must be divisible by 32); keeping it in high "
+                "precision.",
+                in_f,
+                out_f,
+            )
+            return exclude_modules
+
+        without_lm_head = [m for m in exclude_modules if m != "lm_head"]
+        if "lm_head" in exclude_modules:
+            LOG.info(
+                "nvfp4_training.quantize_lm_head: removing lm_head from the "
+                "high-precision exclusion (it will be quantized to NVFP4)."
+            )
+        return without_lm_head
+
+    @staticmethod
+    def _nvfp4_swap_frozen_lm_head(model, recipe, base_mode: str) -> None:
+        """Swap a bare frozen lm_head (LoRA, not a target module) to NVFP4.
+
+        Locates the output-embedding module by identity in the (possibly
+        PEFT-wrapped) tree. If it's already an NVFP4 module (e.g. the user added
+        lm_head to lora_target_modules and the LoRA converter handled it), this
+        is a no-op.
+        """
+        import torch.nn as nn
+
+        from axolotl.utils.nvfp4_training import swap_frozen_linear_to_nvfp4
+
+        out_emb = model.get_output_embeddings()
+        if not isinstance(out_emb, nn.Linear):
+            return  # already swapped (NVFP4 module) or wrapped — nothing bare to do
+        name = next(
+            (n for n, m in model.named_modules() if m is out_emb),
+            None,
+        )
+        if name is None:
+            LOG.warning(
+                "nvfp4_training.quantize_lm_head: could not locate the lm_head "
+                "module in the model tree; leaving it in high precision."
+            )
+            return
+        swap_frozen_linear_to_nvfp4(model, name, recipe, base_mode=base_mode)
+
+    @staticmethod
+    def _model_ties_embeddings(model: PreTrainedModel) -> bool:
+        """Detect weight tying between the output and input embeddings.
+
+        Checks both the config flag and weight identity — a model can tie via
+        config or via a shared parameter object even if the flag is stale.
+        """
+        if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+            return True
+        try:
+            out_emb = model.get_output_embeddings()
+            in_emb = model.get_input_embeddings()
+        except (AttributeError, NotImplementedError):
+            return False
+        out_w = getattr(out_emb, "weight", None)
+        in_w = getattr(in_emb, "weight", None)
+        return out_w is not None and in_w is not None and out_w is in_w
 
     def _apply_chunked_cross_entropy_patch(self):
         if self.cfg.chunked_cross_entropy:

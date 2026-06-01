@@ -91,6 +91,101 @@ class TestNVFP4Training:
         out.loss.backward()
         assert torch.isfinite(out.loss).item()
 
+    def test_swap_frozen_lm_head_compute_and_storage(self):
+        """A bare frozen lm_head swaps to the matching NVFP4 base and stays finite."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4FrozenBaseLinear,
+            NVFP4Recipe,
+            swap_frozen_linear_to_nvfp4,
+        )
+
+        torch.manual_seed(0)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(2048, 4096, bias=False)
+
+        for mode, cls in (
+            ("compute", NVFP4ComputeBaseLinear),
+            ("storage", NVFP4FrozenBaseLinear),
+        ):
+            m = M().cuda().bfloat16()
+            ok = swap_frozen_linear_to_nvfp4(
+                m, "lm_head", NVFP4Recipe(), base_mode=mode
+            )
+            assert ok
+            # mslk-fast variants are subclasses; both modes must not stay nn.Linear
+            assert not isinstance(m.lm_head, nn.Linear)
+            x = torch.randn(2, 16, 2048, device="cuda", dtype=torch.bfloat16)
+            out = m.lm_head(x)
+            assert out.shape == (2, 16, 4096)
+            assert torch.isfinite(out).all().item()
+
+    def test_swap_frozen_lm_head_skips_odd_dims(self):
+        """A non-%32 output dim is left in high precision (no crash)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            swap_frozen_linear_to_nvfp4,
+        )
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(2048, 4095, bias=False)  # 4095 % 32 != 0
+
+        m = M().cuda().bfloat16()
+        assert not swap_frozen_linear_to_nvfp4(m, "lm_head", NVFP4Recipe())
+        assert isinstance(m.lm_head, nn.Linear)
+
+    def test_quantize_lm_head_guard_tied_embeddings(self):
+        """The patch-manager guard raises on tied embeddings, passes when untied."""
+        from axolotl.loaders.patch_manager import PatchManager
+        from axolotl.utils.dict import DictDefault
+
+        class Cfg:
+            tie_word_embeddings = False
+
+        class TinyModel(nn.Module):
+            def __init__(self, tie):
+                super().__init__()
+                self.config = Cfg()
+                self.config.tie_word_embeddings = tie
+                self.embed = nn.Embedding(64, 32)
+                self.lm_head = nn.Linear(32, 64, bias=False)
+                if tie:
+                    self.lm_head.weight = self.embed.weight
+
+            def get_output_embeddings(self):
+                return self.lm_head
+
+            def get_input_embeddings(self):
+                return self.embed
+
+        pm = PatchManager.__new__(PatchManager)
+        pm.cfg = DictDefault({"cut_cross_entropy": False})
+
+        assert PatchManager._model_ties_embeddings(TinyModel(tie=True))
+        assert not PatchManager._model_ties_embeddings(TinyModel(tie=False))
+
+        with pytest.raises(RuntimeError, match="tied embeddings"):
+            pm._nvfp4_unexclude_lm_head(TinyModel(tie=True), ["lm_head", "embed_tokens"])
+
+        # untied: lm_head removed from exclusion, embed_tokens retained
+        out = pm._nvfp4_unexclude_lm_head(
+            TinyModel(tie=False), ["lm_head", "embed_tokens"]
+        )
+        assert out == ["embed_tokens"]
+
+        # untied + cut_cross_entropy: raises
+        pm_cce = PatchManager.__new__(PatchManager)
+        pm_cce.cfg = DictDefault({"cut_cross_entropy": True})
+        with pytest.raises(RuntimeError, match="cut_cross_entropy"):
+            pm_cce._nvfp4_unexclude_lm_head(
+                TinyModel(tie=False), ["lm_head", "embed_tokens"]
+            )
+
     def test_compile_no_graph_breaks(self):
         from axolotl.utils.nvfp4_training import NVFP4Linear, NVFP4Recipe
 
