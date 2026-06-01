@@ -522,6 +522,153 @@ class NVFP4ComputeBaseLinear(nn.Module):
         return cls(w_fprop, w_dgrad, linear.bias, recipe)
 
 
+# NVFP4 two-level global scale target: map a tensor's amax onto the product of
+# the FP4 and FP8 maxima so the per-block e4m3 scales use their full range.
+_NVFP4_GLOBAL_AMAX = 448.0 * 6.0  # F8E4M3_MAX * F4_E2M1_MAX
+_MSLK_AVAILABLE: bool | None = None
+
+
+def _mslk_available() -> bool:
+    """Whether the MSLK fused NVFP4 quant kernel is importable (cached).
+
+    MSLK lives only in the TE/perf venv, not the base experimental venv, so the
+    fast path is strictly optional — callers fall back to the torchao quantizer.
+    """
+    global _MSLK_AVAILABLE
+    if _MSLK_AVAILABLE is None:
+        try:
+            from mslk.quantize.triton.fp4_quantize import (  # noqa: F401
+                triton_quantize_nvfp4,
+            )
+
+            _MSLK_AVAILABLE = True
+        except Exception:  # ImportError or a triton/runtime probe failure
+            _MSLK_AVAILABLE = False
+    return _MSLK_AVAILABLE
+
+
+def _mslk_quantize(t: torch.Tensor):
+    """Quantize ``t`` (along its last dim) to NVFP4 via MSLK's fused Triton kernel.
+
+    Returns ``(qdata, scale, inv_global_scale)`` ready for ``torch._scaled_mm``:
+    ``qdata`` is ``float4_e2m1fn_x2`` packed, ``scale`` is the swizzled e4m3 block
+    scale, and ``inv_global_scale = 1/global_scale`` is folded back into the GEMM
+    output (two-level scaling). MSLK fuses amax + scale + pack into one launch —
+    ~30x faster than the torchao quantizer eager, which is what makes the FP4
+    base GEMM win once whole-model compile graph-breaks the quant prologue.
+    """
+    from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
+
+    t = t.contiguous()
+    amax = torch.amax(torch.abs(t)).to(torch.float32)
+    global_scale = _NVFP4_GLOBAL_AMAX / torch.clamp(amax, min=1e-12)
+    q, s = triton_quantize_nvfp4(t, global_scale)
+    return (
+        q.view(torch.float4_e2m1fn_x2),
+        s.view(torch.float8_e4m3fn),
+        (1.0 / global_scale).to(t.dtype),
+    )
+
+
+def _mslk_scaled_mm(aq, a_scale, a_inv_gs, bq, b_scale, b_inv_gs, out_dtype):
+    """``A @ B`` in FP4 from pre-quantized MSLK operands, two-level rescaled.
+
+    ``aq`` is [M, K/2], ``bq`` is the B operand quantized as [N, K/2] so ``bq.t()``
+    gives the [K, N] contraction layout ``_scaled_mm`` wants (TN).
+    """
+    out = torch._scaled_mm(
+        aq,
+        bq.t(),
+        bias=None,
+        out_dtype=out_dtype,
+        scale_a=a_scale,
+        scale_b=b_scale,
+    )
+    return out * (a_inv_gs * b_inv_gs)
+
+
+class NVFP4FastComputeBaseFunction(torch.autograd.Function):
+    """Compute-base fprop/dgrad using MSLK-quantized FP4 operands.
+
+    Same math as :class:`NVFP4ComputeBaseFunction` (frozen base, two pre-quantized
+    layouts, fprop + dgrad as ``_scaled_mm`` FP4 GEMMs, no wgrad) but the per-step
+    activation/gradient quant uses MSLK's fused Triton kernel instead of the
+    torchao quantizer — the prologue that otherwise dominates an unfused (whole-
+    model-compiled) step.
+    """
+
+    @staticmethod
+    def forward(ctx, x, wq_f, wsc_f, w_inv_f, wq_d, wsc_d, w_inv_d, out_features):
+        orig_shape = x.shape
+        x2d = x.reshape(-1, orig_shape[-1])
+        xq, xsc, x_inv = _mslk_quantize(x2d)
+        out = _mslk_scaled_mm(xq, xsc, x_inv, wq_f, wsc_f, w_inv_f, x.dtype)
+        ctx.dgrad = (wq_d, wsc_d, w_inv_d)
+        ctx.x_shape = orig_shape
+        ctx.out_features = out_features
+        return out.reshape(*orig_shape[:-1], out_features)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            wq_d, wsc_d, w_inv_d = ctx.dgrad
+            g = grad_out.reshape(-1, ctx.out_features)
+            gq, gsc, g_inv = _mslk_quantize(g)
+            grad_x = _mslk_scaled_mm(
+                gq, gsc, g_inv, wq_d, wsc_d, w_inv_d, grad_out.dtype
+            )
+            grad_x = grad_x.reshape(ctx.x_shape)
+        return grad_x, None, None, None, None, None, None, None
+
+
+class NVFP4FastComputeBaseLinear(nn.Module):
+    """Frozen LoRA base with MSLK-fused FP4 compute on fprop + dgrad.
+
+    Drop-in for :class:`NVFP4ComputeBaseLinear` (same memory: two FP4 weight
+    layouts + scales) chosen when MSLK is available. ``recipe`` SR/RHT are not
+    applied here (MSLK's plain quant is round-to-nearest); on sm_120 the recipe
+    is disabled anyway, and the win is throughput.
+    """
+
+    def __init__(self, w_f, w_d, bias, out_features, recipe: NVFP4Recipe):
+        super().__init__()
+        wq_f, wsc_f, w_inv_f = w_f
+        wq_d, wsc_d, w_inv_d = w_d
+        self.register_buffer("wq_f", wq_f)
+        self.register_buffer("wsc_f", wsc_f)
+        self.register_buffer("w_inv_f", w_inv_f)
+        self.register_buffer("wq_d", wq_d)
+        self.register_buffer("wsc_d", wsc_d)
+        self.register_buffer("w_inv_d", w_inv_d)
+        self.bias = bias
+        self.recipe = recipe
+        self.out_features = out_features
+
+    def forward(self, x):
+        out = NVFP4FastComputeBaseFunction.apply(
+            x,
+            self.wq_f,
+            self.wsc_f,
+            self.w_inv_f,
+            self.wq_d,
+            self.wsc_d,
+            self.w_inv_d,
+            self.out_features,
+        )
+        return out if self.bias is None else out + self.bias
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear, recipe: NVFP4Recipe
+    ) -> "NVFP4FastComputeBaseLinear":
+        w = linear.weight.detach()  # [N, K]
+        # fprop B = wq_f.t(): quantize W ([N,K]); dgrad B = wq_d.t(): quantize W.T.
+        w_f = _mslk_quantize(w)
+        w_d = _mslk_quantize(w.t().contiguous())
+        return cls(w_f, w_d, linear.bias, w.shape[0], recipe)
+
+
 def _is_swappable(module: nn.Linear) -> bool:
     return (
         module.in_features % _BLOCK_SIZE == 0
@@ -736,7 +883,9 @@ def convert_lora_base_to_nvfp4(
         if not isinstance(base, nn.Linear) or not _is_swappable(base):
             continue
         if compute_base:
-            module.base_layer = NVFP4ComputeBaseLinear.from_linear(base, recipe)
+            fast = _mslk_available()
+            cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
+            module.base_layer = cls.from_linear(base, recipe)
         elif quantized_storage:
             module.base_layer = NVFP4FrozenBaseLinear.from_linear(
                 base, recipe, fsdp=fsdp
@@ -745,6 +894,11 @@ def convert_lora_base_to_nvfp4(
             base.weight.requires_grad_(False)
             module.base_layer = NVFP4Linear.from_linear(base, recipe)
         swapped += 1
-    mode = "compute" if compute_base else ("storage" if quantized_storage else "hp")
+    if compute_base:
+        mode = "compute (mslk-fast)" if _mslk_available() else "compute"
+    elif quantized_storage:
+        mode = "storage"
+    else:
+        mode = "hp"
     LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
     return swapped
