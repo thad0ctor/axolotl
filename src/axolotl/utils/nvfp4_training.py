@@ -603,6 +603,30 @@ def _mslk_scaled_mm(aq, a_scale, a_inv_gs, bq, b_scale, b_inv_gs, out_dtype):
     return out * (a_inv_gs * b_inv_gs)
 
 
+@torch.compiler.disable
+def _mslk_quantize_sl(t: torch.Tensor):
+    """Single-level NVFP4 quant (``global_scale=None``): MSLK fuses the amax into
+    the kernel and bakes it into the block scales, so there is no separate
+    per-tensor scale to compute (no amax reduction) or fold. ~3.6x faster than
+    the two-level path. Safe ONLY for the forward ACTIVATION — its magnitudes are
+    large enough that the e4m3 block scales don't underflow. Small weights and
+    gradients DO underflow single-level, so they keep two-level."""
+    from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
+
+    q, s = triton_quantize_nvfp4(t.contiguous(), None)
+    return q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn)
+
+
+def _mslk_fprop_mm(aq, a_scale, bq, b_scale, b_inv_gs, out_dtype):
+    """fprop GEMM: single-level activation (``aq``/``a_scale``, no per-tensor
+    scale) @ two-level weight (``bq``/``b_scale``/``b_inv_gs``). Only the weight's
+    per-tensor scale is folded post-GEMM (the activation has none)."""
+    out = torch._scaled_mm(
+        aq, bq.t(), bias=None, out_dtype=out_dtype, scale_a=a_scale, scale_b=b_scale
+    )
+    return out * b_inv_gs
+
+
 class NVFP4FastComputeBaseFunction(torch.autograd.Function):
     """Compute-base fprop/dgrad using MSLK-quantized FP4 operands.
 
@@ -617,8 +641,9 @@ class NVFP4FastComputeBaseFunction(torch.autograd.Function):
     def forward(ctx, x, wq_f, wsc_f, w_inv_f, wq_d, wsc_d, w_inv_d, out_features):
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
-        xq, xsc, x_inv = _mslk_quantize(x2d)
-        out = _mslk_scaled_mm(xq, xsc, x_inv, wq_f, wsc_f, w_inv_f, x.dtype)
+        # fprop: single-level activation (no per-step amax) @ two-level weight.
+        xq, xsc = _mslk_quantize_sl(x2d)
+        out = _mslk_fprop_mm(xq, xsc, wq_f, wsc_f, w_inv_f, x.dtype)
         ctx.dgrad = (wq_d, wsc_d, w_inv_d)
         ctx.x_shape = orig_shape
         ctx.out_features = out_features
@@ -649,8 +674,8 @@ class NVFP4FastComputeBaseLinear(nn.Module):
 
     def __init__(self, w_f, w_d, bias, out_features, recipe: NVFP4Recipe):
         super().__init__()
-        wq_f, wsc_f, w_inv_f = w_f
-        wq_d, wsc_d, w_inv_d = w_d
+        wq_f, wsc_f, w_inv_f = w_f  # fprop weight: two-level
+        wq_d, wsc_d, w_inv_d = w_d  # dgrad weight: two-level
         self.register_buffer("wq_f", wq_f)
         self.register_buffer("wsc_f", wsc_f)
         self.register_buffer("w_inv_f", w_inv_f)
@@ -679,7 +704,8 @@ class NVFP4FastComputeBaseLinear(nn.Module):
         cls, linear: nn.Linear, recipe: NVFP4Recipe
     ) -> "NVFP4FastComputeBaseLinear":
         w = linear.weight.detach()  # [N, K]
-        # fprop B = wq_f.t(): quantize W ([N,K]); dgrad B = wq_d.t(): quantize W.T.
+        # Both layouts two-level (small weights underflow single-level). fprop
+        # B = wq_f.t(): quant W ([N,K]); dgrad B = wq_d.t(): quant W.T.
         w_f = _mslk_quantize(w)
         w_d = _mslk_quantize(w.t().contiguous())
         return cls(w_f, w_d, linear.bias, w.shape[0], recipe)
@@ -712,10 +738,8 @@ def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
 
     xp, m = _pad_to_block(x, 0)
     if isinstance(base, NVFP4FastComputeBaseLinear):
-        xq, xsc, x_inv = _mslk_quantize(xp)
-        out = _mslk_scaled_mm(
-            xq, xsc, x_inv, base.wq_f, base.wsc_f, base.w_inv_f, x.dtype
-        )
+        xq, xsc = _mslk_quantize_sl(xp)
+        out = _mslk_fprop_mm(xq, xsc, base.wq_f, base.wsc_f, base.w_inv_f, x.dtype)
     elif isinstance(base, NVFP4ComputeBaseLinear):
         out = _addmm_nvfp4_dispatch(
             _quantize(xp, QuantPolicy()), base.w_fprop, torch.ops.aten.mm.default
