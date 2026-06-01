@@ -438,6 +438,16 @@ class PatchManager:
 
         self._nvfp4_load_packed_sidecar(model)
 
+        # Fused FP4 lm_head + cross-entropy: skip materializing the [M, vocab]
+        # logits (memory win). Opt-in and only when the lm_head became an FP4
+        # store above; falls back to the materialized CE path otherwise.
+        if getattr(nvfp4, "fused_fp4_cross_entropy", False) and getattr(
+            nvfp4, "quantize_lm_head", False
+        ):
+            from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
+
+            patch_model_fused_fp4_ce(model)
+
     def _nvfp4_load_packed_sidecar(self, model: PreTrainedModel):
         """Restore FP4-packed weights from a save_nvfp4 sidecar, if one exists.
 
@@ -519,7 +529,9 @@ class PatchManager:
             # irrelevant for the tied path, so return unchanged.
             return exclude_modules
 
-        if self.cfg.cut_cross_entropy:
+        nvfp4_cfg = self.cfg.nvfp4_training
+        want_fused_ce = bool(getattr(nvfp4_cfg, "fused_fp4_cross_entropy", False))
+        if self.cfg.cut_cross_entropy and not want_fused_ce:
             raise RuntimeError(
                 "nvfp4_training.quantize_lm_head is incompatible with "
                 "cut_cross_entropy: the fused linear cross-entropy kernel reads the "
@@ -527,7 +539,9 @@ class PatchManager:
                 "bypasses the NVFP4 lm_head forward (the FP4 head would be ignored, "
                 "or the kernel would fail on the NVFP4 module's missing .weight). "
                 "Disable one of them (cut_cross_entropy: false or "
-                "quantize_lm_head: false)."
+                "quantize_lm_head: false), or set "
+                "nvfp4_training.fused_fp4_cross_entropy: true to use the FP4-aware "
+                "fused cross-entropy (reads the NVFP4-packed lm_head directly)."
             )
 
         out_emb = model.get_output_embeddings()
@@ -648,7 +662,21 @@ class PatchManager:
             return
 
         if want_lm_head:
-            self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
+            # The fused FP4 cross-entropy needs a row-sliceable (non-swizzled)
+            # lm_head store; force the torchao storage class for it. Otherwise use
+            # the requested base mode (compute/storage/hp).
+            if bool(getattr(nvfp4, "fused_fp4_cross_entropy", False)):
+                from axolotl.utils.nvfp4_training import swap_frozen_lm_head_tileable
+
+                import torch.nn as _nn
+
+                out_emb = model.get_output_embeddings()
+                if isinstance(out_emb, _nn.Linear):
+                    name = self._module_name(model, out_emb)
+                    if name:
+                        swap_frozen_lm_head_tileable(model, name, recipe)
+            else:
+                self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
 
         if want_embed:
             in_emb = model.get_input_embeddings()

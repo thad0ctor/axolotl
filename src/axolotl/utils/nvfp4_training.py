@@ -1358,6 +1358,37 @@ def swap_frozen_linear_to_nvfp4(
     return True
 
 
+def swap_frozen_lm_head_tileable(
+    model: nn.Module,
+    name: str,
+    recipe: NVFP4Recipe | None = None,
+) -> bool:
+    """Swap a bare frozen lm_head to the row-sliceable torchao FP4 store.
+
+    The fused FP4 cross-entropy reads the packed lm_head weight tile by tile, which
+    is only bit-exact when the e4m3 block scales are row-major (NOT swizzled). The
+    MSLK-fast storage class keeps swizzled scales, so force the torchao
+    :class:`NVFP4FrozenBaseLinear` (non-swizzled) here regardless of MSLK
+    availability. lm_head is one frozen layer and the fused path dequantizes it
+    itself, so skipping the MSLK fast-quant for it costs nothing.
+    """
+    recipe = recipe or NVFP4Recipe()
+    try:
+        module = model.get_submodule(name)
+    except AttributeError:
+        return False
+    if not isinstance(module, nn.Linear) or not _is_swappable(module):
+        return False
+    _stream_quantize_swap(
+        model,
+        name,
+        module,
+        lambda src: NVFP4FrozenBaseLinear.from_linear(src, recipe, fsdp=False),
+    )
+    LOG.info("NVFP4 training: swapped frozen %s (tileable storage for fused CE)", name)
+    return True
+
+
 def _set_submodule(model: nn.Module, name: str, new_module: nn.Module) -> None:
     parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
     setattr(parent, name.rsplit(".", 1)[-1], new_module)
