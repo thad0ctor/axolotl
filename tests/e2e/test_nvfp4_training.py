@@ -358,3 +358,112 @@ class TestNVFP4Adapters:
             o1 = model(input_ids=ids).logits
             o2 = reloaded(input_ids=ids).logits
         assert torch.equal(o1, o2)
+
+    def test_compute_base_checkpoint_roundtrip(self):
+        """NVFP4ComputeBaseLinear: the two FP4 layouts (float4_e2m1fn_x2 qdata +
+        float8_e4m3fn scales) must survive state_dict save/load bit-exactly,
+        else compute-base resume reinitializes the base."""
+        import io
+
+        from torch import nn
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4Recipe,
+        )
+
+        torch.manual_seed(0)
+        lin = nn.Linear(512, 256, bias=True).cuda().bfloat16()
+        mod = NVFP4ComputeBaseLinear.from_linear(lin, NVFP4Recipe())
+        x = torch.randn(48, 512, device="cuda", dtype=torch.bfloat16)
+        ref = mod(x)
+
+        sd = mod.state_dict()
+        assert any(k.endswith("w_fprop") for k in sd)
+        assert any(k.endswith("w_dgrad") for k in sd)
+
+        buf = io.BytesIO()
+        torch.save(sd, buf)
+        buf.seek(0)
+        fresh = NVFP4ComputeBaseLinear.from_linear(
+            nn.Linear(512, 256, bias=True).cuda().bfloat16(), NVFP4Recipe()
+        )
+        fresh.load_state_dict(torch.load(buf, weights_only=False))
+        assert torch.equal(fresh.w_fprop.qdata, mod.w_fprop.qdata)
+        assert torch.equal(fresh.w_fprop.scale, mod.w_fprop.scale)
+        assert torch.equal(fresh(x), ref)
+
+    def test_fast_compute_base_checkpoint_roundtrip(self):
+        """NVFP4FastComputeBaseLinear (MSLK): the packed FP4 qdata + swizzled e4m3
+        scale + inv-global buffers must survive state_dict save/load bit-exactly."""
+        import io
+
+        from torch import nn
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4FastComputeBaseLinear,
+            NVFP4Recipe,
+            _mslk_available,
+        )
+
+        if not _mslk_available():
+            pytest.skip("MSLK fused FP4 quant kernel not available")
+
+        torch.manual_seed(0)
+        lin = nn.Linear(512, 256, bias=True).cuda().bfloat16()
+        mod = NVFP4FastComputeBaseLinear.from_linear(lin, NVFP4Recipe())
+        x = torch.randn(48, 512, device="cuda", dtype=torch.bfloat16)
+        ref = mod(x)
+
+        sd = mod.state_dict()
+        assert any(k.endswith("wq_f") for k in sd)
+        assert any(k.endswith("wq_d") for k in sd)
+
+        buf = io.BytesIO()
+        torch.save(sd, buf)
+        buf.seek(0)
+        fresh = NVFP4FastComputeBaseLinear.from_linear(
+            nn.Linear(512, 256, bias=True).cuda().bfloat16(), NVFP4Recipe()
+        )
+        fresh.load_state_dict(torch.load(buf, weights_only=False))
+        assert fresh.wq_f.dtype == torch.float4_e2m1fn_x2
+        assert fresh.wsc_f.dtype == torch.float8_e4m3fn
+        assert torch.equal(fresh.wq_f, mod.wq_f)
+        assert torch.equal(fresh.wsc_f, mod.wsc_f)
+        assert torch.equal(fresh(x), ref)
+
+    def test_fast_storage_base_checkpoint_roundtrip(self):
+        """NVFP4FastFrozenBaseLinear (MSLK storage): single FP4 weight layout
+        survives save/load and reproduces forward bit-exactly."""
+        import io
+
+        from torch import nn
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4FastFrozenBaseLinear,
+            NVFP4Recipe,
+            _mslk_available,
+        )
+
+        if not _mslk_available():
+            pytest.skip("MSLK fused FP4 quant kernel not available")
+
+        torch.manual_seed(0)
+        lin = nn.Linear(512, 256, bias=True).cuda().bfloat16()
+        mod = NVFP4FastFrozenBaseLinear.from_linear(lin, NVFP4Recipe())
+        x = torch.randn(48, 512, device="cuda", dtype=torch.bfloat16)
+        ref = mod(x)
+
+        sd = mod.state_dict()
+        assert any(k.endswith("wq") for k in sd)
+
+        buf = io.BytesIO()
+        torch.save(sd, buf)
+        buf.seek(0)
+        fresh = NVFP4FastFrozenBaseLinear.from_linear(
+            nn.Linear(512, 256, bias=True).cuda().bfloat16(), NVFP4Recipe()
+        )
+        fresh.load_state_dict(torch.load(buf, weights_only=False))
+        assert fresh.wq.dtype == torch.float4_e2m1fn_x2
+        assert torch.equal(fresh.wq, mod.wq)
+        assert torch.equal(fresh(x), ref)
