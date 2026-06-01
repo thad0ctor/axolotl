@@ -235,6 +235,121 @@ class TestNVFP4Training:
                 TinyModel(tie=False), ["lm_head", "embed_tokens"]
             )
 
+        # untied + cut_cross_entropy + fused_fp4_cross_entropy: the guard is
+        # relaxed for THIS path (the FP4-aware fused CE reads the packed lm_head
+        # directly), so it no longer raises and lm_head leaves the exclusion.
+        pm_fused = PatchManager.__new__(PatchManager)
+        pm_fused.cfg = DictDefault(
+            {
+                "cut_cross_entropy": True,
+                "nvfp4_training": {"fused_fp4_cross_entropy": True},
+            }
+        )
+        out = pm_fused._nvfp4_unexclude_lm_head(
+            TinyModel(tie=False), ["lm_head", "embed_tokens"]
+        )
+        assert out == ["embed_tokens"]
+
+    def test_fused_fp4_cross_entropy_matches_materialized(self):
+        """Fused FP4 lm_head + CE loss & dL/dhidden match the same-weight
+        materialized reference; the [M, V] logits are never built."""
+        from axolotl.kernels.nvfp4_fused_ce import (
+            _nvfp4_lm_head_store,
+            fused_fp4_cross_entropy,
+        )
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4FrozenBaseLinear,
+            NVFP4Recipe,
+        )
+
+        torch.manual_seed(0)
+        M, H, V = 192, 256, 4096 + 512  # crosses a vocab-tile boundary
+        lin = nn.Linear(H, V, bias=False).cuda().bfloat16()
+
+        for cls in (NVFP4FrozenBaseLinear, NVFP4ComputeBaseLinear):
+            mod = cls.from_linear(lin, NVFP4Recipe())
+            store = _nvfp4_lm_head_store(mod)
+            assert store is not None  # row-sliceable (non-swizzled torchao store)
+            for num_items in (None, 137.0):
+                hidden = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
+                labels = torch.randint(0, V, (M,), device="cuda")
+                labels[::7] = -100  # mask some tokens
+
+                # reference: dequant the SAME store once, bf16 logits, standard CE
+                weight = store.dequantize(torch.bfloat16)
+                h_ref = hidden.clone().requires_grad_(True)
+                logits = (h_ref @ weight.t()).float()
+                reduction = "sum" if num_items is not None else "mean"
+                ref = torch.nn.functional.cross_entropy(
+                    logits, labels, ignore_index=-100, reduction=reduction
+                )
+                if num_items is not None:
+                    ref = ref / num_items
+                ref.backward()
+
+                # fused (shift=False to align with the un-shifted reference)
+                h_fused = hidden.clone().requires_grad_(True)
+                fused = fused_fp4_cross_entropy(
+                    h_fused, mod, labels, num_items_in_batch=num_items, shift=False
+                )
+                fused.backward()
+
+                loss_rel = (fused - ref).abs() / (ref.abs() + 1e-9)
+                grad_rel = (h_fused.grad - h_ref.grad).float().norm() / (
+                    h_ref.grad.float().norm() + 1e-9
+                )
+                assert loss_rel < 1e-3, (cls.__name__, num_items, loss_rel.item())
+                assert grad_rel < 2e-2, (cls.__name__, num_items, grad_rel.item())
+
+    def test_fused_fp4_cross_entropy_skips_materialization(self):
+        """The fused path's peak memory stays near a single tile, far below the
+        full [M, V] logit tensor of the materialized path."""
+        from axolotl.kernels.nvfp4_fused_ce import (
+            _nvfp4_lm_head_store,
+            fused_fp4_cross_entropy,
+        )
+        from axolotl.utils.nvfp4_training import NVFP4FrozenBaseLinear, NVFP4Recipe
+
+        torch.manual_seed(0)
+        M, H, V = 4096, 2048, 128256
+        lin = nn.Linear(H, V, bias=False).cuda().bfloat16()
+        mod = NVFP4FrozenBaseLinear.from_linear(lin, NVFP4Recipe())
+        store = _nvfp4_lm_head_store(mod)
+        del lin
+        torch.cuda.empty_cache()
+        labels = torch.randint(0, V, (M,), device="cuda")
+
+        def peak(fn):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+            fn()
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated()
+
+        def materialized():
+            h = torch.randn(
+                M, H, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            weight = store.dequantize(torch.bfloat16)
+            logits = (h @ weight.t()).float()
+            torch.nn.functional.cross_entropy(
+                logits.view(-1, V), labels, ignore_index=-100
+            ).backward()
+
+        def fused():
+            h = torch.randn(
+                M, H, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            fused_fp4_cross_entropy(h, mod, labels, shift=False).backward()
+
+        mat_peak = peak(materialized)
+        fused_peak = peak(fused)
+        # The [M, V] fp32 logits alone are M*V*4 bytes; the fused path must stay
+        # well under that (it only ever holds one [M, V_BLOCK] tile).
+        assert fused_peak < 0.25 * mat_peak, (fused_peak, mat_peak)
+
     def test_embedding_quant_forward_and_memory(self):
         """NVFP4Embedding lookup matches bf16 F.embedding within FP4 tolerance and
         the weight memory drops ~3.5x."""

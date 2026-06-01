@@ -87,6 +87,23 @@ class NVFP4TrainingConfig(BaseModel):
             "still RAISES (FP4-storing it would corrupt training)."
         },
     )
+    fused_fp4_cross_entropy: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Requires quantize_lm_head. Fuse the FP4 lm_head "
+            "projection with the cross-entropy loss so the full [batch*seq, vocab] "
+            "logit tensor is never materialized (~1 GiB at vocab 152k / seq 8k): "
+            "the loss is computed by tiling over the vocab, dequantizing each FP4 "
+            "weight tile on read, and accumulating logsumexp in fp32 (like "
+            "cut_cross_entropy, but reading the NVFP4-packed weight directly). "
+            "This is a MEMORY win (no logit materialization), not an FP4-GEMM "
+            "throughput win — the per-tile matmul runs in bf16/fp32, so the lm_head "
+            "does not hit FP4 tensor cores. Frozen lm_head only (returns dL/dhidden, "
+            "no weight grad). Falls back to the materialized path if the lm_head "
+            "store isn't row-sliceable (MSLK-swizzled scales) or carries a bias. "
+            "OFF by default."
+        },
+    )
     quantize_embeddings: bool = Field(
         default=False,
         json_schema_extra={
