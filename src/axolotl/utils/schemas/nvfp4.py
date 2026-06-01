@@ -137,3 +137,18 @@ class NVFP4TrainingConfig(BaseModel):
             "NVFP4 training paper (the tail blocks matter most)."
         },
     )
+    save_nvfp4: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Store eligible weights NVFP4-packed (qdata + scales) in "
+            "a torch.save sidecar (nvfp4_packed.pt) on every checkpoint/final save, "
+            "for ~3.5x smaller weight files. safetensors cannot serialize the FP4 "
+            "tensor subclass, so the packed weights go to a sidecar and the bf16 "
+            "weights are dropped from the safetensors shard. For FROZEN weights "
+            "(LoRA/QLoRA base, lm_head, embeddings) the FP4 IS the faithful stored "
+            "form — load-back is bit-exact. For FFT (NVFP4Linear keeps a bf16 master) "
+            "this is LOSSY for resume: only the FP4 packing is kept, no bf16 master, "
+            "so a save_nvfp4 FFT checkpoint is for storage/inference export, not exact "
+            "resume. OFF by default (bf16 save, unchanged)."
+        },
+    )

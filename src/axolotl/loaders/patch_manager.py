@@ -436,6 +436,31 @@ class PatchManager:
 
             convert_norms_to_nvfp4_fused(model)
 
+        self._nvfp4_load_packed_sidecar(model)
+
+    def _nvfp4_load_packed_sidecar(self, model: PreTrainedModel):
+        """Restore FP4-packed weights from a save_nvfp4 sidecar, if one exists.
+
+        Looks in resume_from_checkpoint first (resume), then the base model dir
+        (loading a save_nvfp4-exported model). No-op when no sidecar is present —
+        the frozen base otherwise reconstructs deterministically from the bf16
+        weights, so this only matters for save_nvfp4 exports / exact FP4 reload.
+        """
+        import os
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4_PACKED_SIDECAR,
+            load_nvfp4_packed,
+        )
+
+        candidates = [self.cfg.resume_from_checkpoint, self.cfg.base_model]
+        for cand in candidates:
+            if not cand or not isinstance(cand, str):
+                continue
+            if os.path.isfile(os.path.join(cand, NVFP4_PACKED_SIDECAR)):
+                load_nvfp4_packed(model, cand)
+                return
+
     @staticmethod
     def _nvfp4_block_exclusions(
         model: PreTrainedModel, skip_first: int, skip_last: int

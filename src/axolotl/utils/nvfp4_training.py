@@ -1837,3 +1837,143 @@ def convert_lora_base_to_nvfp4(
             "CPU-streamed load. Use a smaller base, add VRAM/GPUs, or adapter: qlora."
         )
     return swapped
+
+
+# --- NVFP4-packed save/load (opt-in nvfp4_training.save_nvfp4) -----------------
+#
+# safetensors cannot serialize the NVFP4Tensor subclass nor the packed FP4
+# buffers (invalid python storage on the float4/uint8 inner tensors), so the
+# packed weights go to a torch.save sidecar next to the standard save. The bf16
+# weights of the FP4 modules are then dropped from the main (safetensors) shard
+# to realize the disk win.
+
+NVFP4_PACKED_SIDECAR = "nvfp4_packed.pt"
+
+
+def _all_nvfp4_modules(model: nn.Module):
+    """Yield (name, module) for every NVFP4 module that owns an FP4 store.
+
+    NVFP4TiedLMHead is intentionally excluded: it has no buffer of its own and
+    reads the NVFP4Embedding's ``w_q`` (saved once via the embedding).
+    """
+    owning = _nvfp4_base_classes() + (NVFP4Embedding,)
+    for name, module in model.named_modules():
+        if isinstance(module, owning):
+            yield name, module
+
+
+def collect_nvfp4_packed_state(model: nn.Module) -> tuple[dict, set[str]]:
+    """Build the FP4-packed sidecar dict and the set of bf16 keys it supersedes.
+
+    Returns ``(packed, drop_keys)`` where ``packed`` maps ``"<module>.<buffer>"``
+    to the FP4 tensor (NVFP4Tensor subclass or plain packed buffer) and
+    ``drop_keys`` are the full-model state_dict keys whose bf16 form is now
+    redundant (the FP4 modules' weights) and should be omitted from the main
+    safetensors shard.
+
+    For frozen modules the FP4 buffers are already the stored form (bit-exact).
+    For the FFT NVFP4Linear (bf16 master) the weight is packed to FP4 here —
+    LOSSY: no bf16 master is kept, so this is for storage/inference export, not
+    exact resume.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import (
+        QuantizeTensorToNVFP4Kwargs,
+        per_tensor_amax_to_scale,
+    )
+
+    packed: dict = {}
+    drop: set[str] = set()
+    for name, module in _all_nvfp4_modules(model):
+        prefix = f"{name}." if name else ""
+        if isinstance(module, NVFP4Linear):
+            # FFT: pack the bf16 master to FP4 (lossy for resume).
+            w = module.weight.detach()
+            pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
+            w_q = _to_nvfp4_chunked(
+                w.contiguous(), pts, QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE)
+            )
+            packed[f"{prefix}w_q"] = w_q
+            drop.add(f"{prefix}weight")
+        else:
+            # Frozen modules: the FP4 buffers ARE the stored form (bit-exact).
+            for bname, buf in module.named_buffers(recurse=False):
+                packed[f"{prefix}{bname}"] = buf
+                drop.add(f"{prefix}{bname}")
+    return packed, drop
+
+
+def save_nvfp4_packed(model: nn.Module, output_dir) -> int:
+    """Write the FP4-packed sidecar for ``model`` into ``output_dir``.
+
+    Returns the number of packed tensors written (0 => no NVFP4 modules, no
+    sidecar). The sidecar is consumed by :func:`load_nvfp4_packed` at load.
+    """
+    import os
+
+    packed, _ = collect_nvfp4_packed_state(model)
+    if not packed:
+        return 0
+    cpu = {k: (v.cpu() if hasattr(v, "cpu") else v) for k, v in packed.items()}
+    path = os.path.join(str(output_dir), NVFP4_PACKED_SIDECAR)
+    torch.save(cpu, path)
+    has_fft = any(isinstance(m, NVFP4Linear) for _, m in _all_nvfp4_modules(model))
+    LOG.info(
+        "NVFP4 save_nvfp4: wrote %d packed tensor(s) to %s%s",
+        len(packed),
+        path,
+        " (FFT weights are FP4-only — LOSSY for exact resume)" if has_fft else "",
+    )
+    return len(packed)
+
+
+def load_nvfp4_packed(model: nn.Module, model_dir) -> int:
+    """Restore FP4-packed weights from a sidecar into the converted ``model``.
+
+    Run AFTER the nvfp4 module conversion (so the FP4 modules exist). Frozen
+    modules load their FP4 buffers bit-exactly; the FFT NVFP4Linear has its bf16
+    master replaced by the dequantized FP4 (export fidelity, not exact). Returns
+    the number of tensors restored (0 => no sidecar found).
+    """
+    import os
+
+    path = os.path.join(str(model_dir), NVFP4_PACKED_SIDECAR)
+    if not os.path.isfile(path):
+        return 0
+    packed = torch.load(path, weights_only=False, map_location="cpu")
+    by_module: dict[str, dict] = {}
+    for key, tensor in packed.items():
+        mod_name, buf_name = key.rsplit(".", 1)
+        by_module.setdefault(mod_name, {})[buf_name] = tensor
+
+    restored = 0
+    for mod_name, buffers in by_module.items():
+        try:
+            module = model.get_submodule(mod_name)
+        except AttributeError:
+            continue
+        device = next(
+            (b.device for b in module.buffers()),
+            next((p.device for p in module.parameters()), torch.device("cpu")),
+        )
+        if isinstance(module, NVFP4Linear) and "w_q" in buffers:
+            # FFT load-back: dequantize the FP4 into the bf16 master (lossy).
+            w_q = buffers["w_q"].to(device)
+            with torch.no_grad():
+                module.weight.copy_(w_q.dequantize(module.weight.dtype))
+            restored += 1
+            continue
+        for bname, tensor in buffers.items():
+            if not hasattr(module, bname):
+                continue
+            tensor = tensor.to(device)
+            existing = getattr(module, bname)
+            if existing is not None and isinstance(existing, nn.Parameter):
+                with torch.no_grad():
+                    existing.copy_(tensor)
+            else:
+                module.register_buffer(bname, tensor)
+            restored += 1
+    LOG.info(
+        "NVFP4 save_nvfp4: restored %d packed tensor(s) from %s", restored, path
+    )
+    return restored

@@ -858,12 +858,37 @@ class AxolotlTrainer(
 
         return result
 
+    def _nvfp4_save_packed(self, output_dir, state_dict):
+        """When nvfp4_training.save_nvfp4 is on, write the FP4-packed sidecar and
+        return a state_dict with the redundant bf16 FP4-module weights dropped.
+
+        Returns the (possibly filtered) state_dict; a no-op (returns the input
+        unchanged) when the flag is off or there are no NVFP4 modules.
+        """
+        nvfp4 = getattr(self.axolotl_cfg, "nvfp4_training", None)
+        if not (nvfp4 and nvfp4.enabled and getattr(nvfp4, "save_nvfp4", False)):
+            return state_dict
+        from axolotl.utils.nvfp4_training import (
+            collect_nvfp4_packed_state,
+            save_nvfp4_packed,
+        )
+
+        model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        if save_nvfp4_packed(model, output_dir) == 0:
+            return state_dict
+        _, drop = collect_nvfp4_packed_state(model)
+        if state_dict is None:
+            state_dict = model.state_dict()
+        return {k: v for k, v in state_dict.items() if k not in drop}
+
     # TODO(wing): remove once https://github.com/huggingface/transformers/pull/39866/files is merged
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         LOG.info(f"Saving model checkpoint to {output_dir}")
+
+        state_dict = self._nvfp4_save_packed(output_dir, state_dict)
 
         # fix for Context Parallel save: CP eval invalidates tensor storage
         # pointers, so clone to CPU to get fresh valid storage for safetensors

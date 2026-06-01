@@ -848,3 +848,92 @@ class TestNVFP4Adapters:
         head = NVFP4TiedLMHead(nvemb, None, NVFP4Recipe())
         assert head.w_q is nvemb.w_q  # same object => quantized once
         assert torch.equal(head.weight, nvemb.weight)
+
+    def test_save_nvfp4_frozen_base_size_and_bit_exact(self, tmp_path):
+        """save_nvfp4 sidecar for a FROZEN storage base: materially smaller than
+        the bf16 weight AND bit-exact on load (same FP4 buffers)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4FrozenBaseLinear,
+            NVFP4Recipe,
+            load_nvfp4_packed,
+            save_nvfp4_packed,
+        )
+
+        class Wrap(nn.Module):
+            def __init__(self, m):
+                super().__init__()
+                self.layer = m
+
+        torch.manual_seed(0)
+        lin = nn.Linear(512, 256, bias=False).cuda().bfloat16()
+        model = Wrap(NVFP4FrozenBaseLinear.from_linear(lin, NVFP4Recipe()))
+        x = torch.randn(32, 512, device="cuda", dtype=torch.bfloat16)
+        ref = model.layer(x)
+
+        n = save_nvfp4_packed(model, tmp_path)
+        assert n == 1
+        sidecar = tmp_path / "nvfp4_packed.pt"
+        bf16_bytes = lin.weight.numel() * 2
+        assert sidecar.stat().st_size < bf16_bytes / 3  # ~3.4x smaller
+
+        fresh = Wrap(
+            NVFP4FrozenBaseLinear.from_linear(
+                nn.Linear(512, 256, bias=False).cuda().bfloat16(), NVFP4Recipe()
+            )
+        )
+        load_nvfp4_packed(fresh, tmp_path)
+        assert torch.equal(fresh.layer.w_q.qdata, model.layer.w_q.qdata)
+        assert torch.equal(fresh.layer(x), ref)  # frozen FP4 => bit-exact
+
+    def test_save_nvfp4_fft_lossy_roundtrip(self, tmp_path):
+        """save_nvfp4 for an FFT NVFP4Linear (bf16 master): packs the weight to
+        FP4 (lossy), ~3x smaller, load-back forward within FP4 tolerance."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Linear,
+            NVFP4Recipe,
+            load_nvfp4_packed,
+            save_nvfp4_packed,
+        )
+
+        class Wrap(nn.Module):
+            def __init__(self, m):
+                super().__init__()
+                self.layer = m
+
+        torch.manual_seed(0)
+        lin = nn.Linear(512, 256, bias=False).cuda().bfloat16()
+        model = Wrap(NVFP4Linear.from_linear(lin, NVFP4Recipe()))
+        x = torch.randn(32, 512, device="cuda", dtype=torch.bfloat16)
+        ref = model.layer(x)
+
+        save_nvfp4_packed(model, tmp_path)
+        bf16_bytes = lin.weight.numel() * 2
+        assert (tmp_path / "nvfp4_packed.pt").stat().st_size < bf16_bytes / 3
+
+        fresh = Wrap(
+            NVFP4Linear.from_linear(
+                nn.Linear(512, 256, bias=False).cuda().bfloat16(), NVFP4Recipe()
+            )
+        )
+        load_nvfp4_packed(fresh, tmp_path)
+        out = fresh.layer(x)
+        cos = torch.nn.functional.cosine_similarity(
+            out.flatten().float(), ref.flatten().float(), dim=0
+        )
+        assert cos.item() > 0.99
+
+    def test_save_nvfp4_drops_bf16_keys(self, tmp_path):
+        """collect_nvfp4_packed_state reports the bf16 state_dict keys that the FP4
+        sidecar supersedes, so the main shard drops them (the disk win)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            collect_nvfp4_packed_state,
+            convert_lora_base_to_nvfp4,
+        )
+
+        model = self._lora_model()
+        convert_lora_base_to_nvfp4(model, NVFP4Recipe(), quantized_storage=True)
+        packed, drop = collect_nvfp4_packed_state(model)
+        assert packed and drop
+        sd = model.state_dict()
+        assert drop <= set(sd)  # every dropped key really exists in the state_dict

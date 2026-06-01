@@ -326,6 +326,31 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). **Incompatible with tied embeddings and `cut_cross_entropy` (both raise).** `embed_tokens` stays excluded. |
 | `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
 | `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
+| `save_nvfp4` | `bool` | `false` | Opt-in. Store eligible weights NVFP4-packed (qdata + scales) in a `torch.save` sidecar for ~3.5× smaller weight files. See [FP4-packed save](#fp4-packed-save-save_nvfp4) below. **Lossy for FFT resume** (no bf16 master kept); bit-exact for frozen weights. Off by default (bf16 save, unchanged). |
+
+## FP4-packed save (`save_nvfp4`) {#fp4-packed-save-save_nvfp4}
+
+By default the saved model/checkpoint stores weights in bf16: FFT keeps a bf16
+master (`NVFP4Linear` is GEMM-operands-only), and LoRA/QLoRA saves only the
+adapter (the frozen FP4 base is reconstructed deterministically at load).
+
+Set `save_nvfp4: true` to store eligible weights NVFP4-packed for ~3.5× smaller
+weight files. `safetensors` cannot serialize the FP4 tensor subclass (the packed
+`float4_e2m1fn_x2` qdata / `float8_e4m3fn` scales have no safetensors storage),
+so the packed weights are written to a `torch.save` **sidecar**
+(`nvfp4_packed.pt`) next to the standard save, and the now-redundant bf16 weights
+are dropped from the safetensors shard. The packed tensors compress ~3.5× versus
+their bf16 form (measured 3.53× on the swapped linears).
+
+Load-back: the NVFP4 module conversion runs at load (as during training); the
+loader then fills the FP4 buffers from the sidecar found in `resume_from_checkpoint`
+or the base model dir — no re-quantization. For **frozen** weights (LoRA/QLoRA
+base, quantized `lm_head`/embeddings) the FP4 *is* the faithful stored form, so
+load-back is **bit-exact**. For **FFT** (`NVFP4Linear`, bf16 master) `save_nvfp4`
+packs the weight to FP4 on save with **no bf16 master kept** — this is **lossy**
+for exact resume (it is for storage / inference export). The log line and the
+schema description both call this out. LoRA resume stays bit-faithful (the adapter
+loads from the checkpoint and the frozen base reconstructs/reloads identically).
 
 ## Limitations
 
