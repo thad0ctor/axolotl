@@ -186,26 +186,43 @@ class ProTrainArgs(BaseModel):
         ge=0,
         json_schema_extra={
             "description": (
-                "Debug override: force the number of persistent chunks. "
-                "Bypasses the exhaustive searcher when set alongside the other "
-                "three overrides."
+                "Debug override: force the number of persistent chunks. The "
+                "searcher is bypassed only when all four of "
+                "n_persist/n_buffer/n_swap/n_checkpoint are set; a partial set "
+                "is auto-completed with defaults (n_persist=0, n_buffer=2, "
+                "n_swap=0, n_checkpoint=0) and logs a warning."
             )
         },
     )
     protrain_n_buffer_override: int | None = Field(
         default=None,
         ge=0,
-        json_schema_extra={"description": "Debug override for n_buffer."},
+        json_schema_extra={
+            "description": (
+                "Debug override for n_buffer. Effective only as part of the full "
+                "4-knob override set (see protrain_n_persist_override)."
+            )
+        },
     )
     protrain_n_swap_override: int | None = Field(
         default=None,
         ge=0,
-        json_schema_extra={"description": "Debug override for n_swap."},
+        json_schema_extra={
+            "description": (
+                "Debug override for n_swap. Effective only as part of the full "
+                "4-knob override set (see protrain_n_persist_override)."
+            )
+        },
     )
     protrain_n_checkpoint_override: int | None = Field(
         default=None,
         ge=0,
-        json_schema_extra={"description": "Debug override for n_checkpoint."},
+        json_schema_extra={
+            "description": (
+                "Debug override for n_checkpoint. Effective only as part of the "
+                "full 4-knob override set (see protrain_n_persist_override)."
+            )
+        },
     )
     protrain_n_offload_override: int | None = Field(
         default=None,
@@ -503,6 +520,17 @@ class ProTrainArgs(BaseModel):
                 "NVLink). Explicit True/False overrides the auto-decision. "
                 "Skipped when Mode C bypass fired (chunk_manager owns sync "
                 "there) or when world_size == 1."
+            )
+        },
+    )
+    protrain_lora_mlp_forbid_offload: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": (
+                "Re-enable the conservative pin that refuses n_offload>0 "
+                "candidates when lora_mlp_kernel is on. Off by default since "
+                "shape-preserving placeholders let the fused MLP kernel compose "
+                "with offload."
             )
         },
     )
