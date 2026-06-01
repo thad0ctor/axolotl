@@ -155,6 +155,55 @@ def _sr_dither(t: torch.Tensor, per_tensor_scale: torch.Tensor) -> torch.Tensor:
     return (x + u).reshape(t.shape).to(t.dtype)
 
 
+# Row-chunk size for the load-time quant of large frozen weights. torchao's
+# to_nvfp4 upcasts the WHOLE tensor to f32 at once (~2x the bf16 size of scratch),
+# which OOMs lm_head/embedding-sized weights on a near-full card. Quantizing in
+# row blocks (with a globally-fixed per-tensor scale so the result is bit-
+# identical) bounds that scratch to one block. 128 = torchao's swizzle row tile,
+# so block-row qdata/scale concatenate exactly to the whole-tensor layout.
+_QUANT_CHUNK_ROWS = 8192
+_QUANT_CHUNK_MIN_ROWS = 2 * _QUANT_CHUNK_ROWS  # below this the scratch is small
+
+
+def _to_nvfp4_chunked(t, per_tensor_scale, act_quant_kwargs):
+    """``NVFP4Tensor.to_nvfp4`` over a 2D weight, row-block by row-block.
+
+    The f32 quant scratch is bounded to ``_QUANT_CHUNK_ROWS`` rows instead of the
+    whole tensor. Bit-identical to the single-shot quant: NVFP4 blocks lie along
+    the last dim (rows are independent) and the per-tensor scale is fixed across
+    blocks, so concatenating the per-block qdata/scale reproduces the full layout
+    (block rows align to the 128-row swizzle tile). Falls back to a single call
+    for small tensors / non-2D inputs.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    def _one(x):
+        return NVFP4Tensor.to_nvfp4(
+            x.contiguous(),
+            block_size=_BLOCK_SIZE,
+            per_tensor_scale=per_tensor_scale,
+            act_quant_kwargs=act_quant_kwargs,
+        )
+
+    if t.dim() != 2 or t.shape[0] < _QUANT_CHUNK_MIN_ROWS:
+        return _one(t)
+
+    qparts, sparts, ctx = [], [], None
+    for i in range(0, t.shape[0], _QUANT_CHUNK_ROWS):
+        c = _one(t[i : i + _QUANT_CHUNK_ROWS])
+        if ctx is None:
+            ctx = c.__tensor_flatten__()[1]
+        qparts.append(c.qdata)
+        sparts.append(c.scale)
+        del c
+    inner = {
+        "qdata": torch.cat(qparts, dim=0),
+        "scale": torch.cat(sparts, dim=0),
+        "per_tensor_scale": per_tensor_scale,
+    }
+    return NVFP4Tensor.__tensor_unflatten__(inner, ctx, None, None)
+
+
 def _quantize(t: torch.Tensor, policy: QuantPolicy):
     """Quantize a high-precision tensor to an NVFP4Tensor (along its last dim).
 
@@ -174,9 +223,13 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
     per_tensor_scale = per_tensor_amax_to_scale(torch.max(torch.abs(t)))
     if policy.stochastic:
         t = _sr_dither(t, per_tensor_scale).contiguous()
-    return NVFP4Tensor.to_nvfp4(
-        t, block_size=_BLOCK_SIZE, per_tensor_scale=per_tensor_scale
-    )
+    # RHT/SR rewrite the whole tensor up front (no per-block-row independence), so
+    # only the plain frozen-weight quant takes the memory-bounded chunked path.
+    if policy.hadamard or policy.stochastic:
+        return NVFP4Tensor.to_nvfp4(
+            t, block_size=_BLOCK_SIZE, per_tensor_scale=per_tensor_scale
+        )
+    return _to_nvfp4_chunked(t, per_tensor_scale, None)
 
 
 def _fp4_mm(a_hp: torch.Tensor, b_hp: torch.Tensor, a_pol, b_pol) -> torch.Tensor:
@@ -437,18 +490,16 @@ class NVFP4FrozenBaseLinear(nn.Module):
         cls, linear: nn.Linear, recipe: NVFP4Recipe, *, fsdp: bool = False
     ) -> "NVFP4FrozenBaseLinear":
         from torchao.prototype.mx_formats.nvfp4_tensor import (
-            NVFP4Tensor,
             QuantizeTensorToNVFP4Kwargs,
             per_tensor_amax_to_scale,
         )
 
         w = linear.weight.detach()
         pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
-        w_q = NVFP4Tensor.to_nvfp4(
+        w_q = _to_nvfp4_chunked(
             w.contiguous(),
-            block_size=_BLOCK_SIZE,
-            per_tensor_scale=pts,
-            act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE),
+            pts,
+            QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE),
         )
         # FSDP2 needs the all-gather hooks to shard the FP4 base by row.
         if fsdp:
@@ -464,19 +515,55 @@ def _embedding_to_nvfp4(weight: torch.Tensor):
     embedding lookup and (when tied) the lm_head GEMM.
     """
     from torchao.prototype.mx_formats.nvfp4_tensor import (
-        NVFP4Tensor,
         QuantizeTensorToNVFP4Kwargs,
         per_tensor_amax_to_scale,
     )
 
     w = weight.detach().contiguous()
     pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
-    return NVFP4Tensor.to_nvfp4(
-        w,
-        block_size=_BLOCK_SIZE,
-        per_tensor_scale=pts,
-        act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE),
+    return _to_nvfp4_chunked(
+        w, pts, QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE)
     )
+
+
+def _nvfp4_embedding_gather(w_q, input):
+    """Embedding lookup that dequantizes only the gathered rows of ``w_q``.
+
+    Avoids materializing the full [vocab, hidden] bf16 table (lm_head-sized) just
+    to gather a handful of rows. NVFP4 blocks lie along the hidden dim, so each
+    vocab row is a self-contained slice of qdata/scale; gathering the rows of the
+    packed buffers and dequantizing that subset is bit-identical to dequantizing
+    the whole table and gathering. Frozen weight, so padding_idx (gradient-only)
+    is a no-op in forward. Returns None (caller falls back) when the layout isn't
+    safe to row-slice (swizzled scales) or anything is unexpected.
+    """
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    # Under torch.compile keep the plain full dequant: the subtensor rebuild and
+    # row gather graph-break, and the table dequant is what the compiled graph
+    # already fuses. The memory win matters at load/eager, not in the hot graph.
+    if torch.compiler.is_compiling():
+        return None
+
+    try:
+        names, ctx = w_q.__tensor_flatten__()
+        if ctx.get("is_swizzled_scales"):
+            return None
+        flat = input.reshape(-1)
+        sub = NVFP4Tensor.__tensor_unflatten__(
+            {
+                "qdata": w_q.qdata[flat],
+                "scale": w_q.scale[flat],
+                "per_tensor_scale": w_q.per_tensor_scale,
+            },
+            ctx,
+            None,
+            None,
+        )
+        rows = sub.dequantize(torch.bfloat16)
+        return rows.reshape(*input.shape, rows.shape[-1])
+    except Exception:  # any layout/version surprise -> full-dequant fallback
+        return None
 
 
 class NVFP4Embedding(nn.Module):
@@ -498,6 +585,16 @@ class NVFP4Embedding(nn.Module):
         self.padding_idx = padding_idx
 
     def forward(self, input):
+        # Dequantize ONLY the gathered rows, not the whole [vocab, hidden] table:
+        # the full bf16 dequant (+ its f32 scratch) is lm_head-sized and OOMs on a
+        # near-full card. NVFP4 blocks lie along the hidden dim so each row is
+        # self-contained — slicing qdata/scale by the unique looked-up rows and
+        # dequantizing that subset is bit-identical to gathering after a full
+        # dequant. Falls back to the full path if the scales are swizzled (row
+        # slicing would break the tile) or anything is unexpected.
+        gathered = _nvfp4_embedding_gather(self.w_q, input)
+        if gathered is not None:
+            return gathered
         w = self.w_q.dequantize(torch.bfloat16)
         return torch.nn.functional.embedding(input, w, self.padding_idx)
 
@@ -1235,21 +1332,28 @@ def swap_frozen_linear_to_nvfp4(
     if not isinstance(module, nn.Linear) or not _is_swappable(module):
         return False
 
+    fast = _mslk_available()
     if base_mode == "compute":
-        fast = _mslk_available()
         cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
-        new_module = cls.from_linear(module, recipe)
+        build = lambda src: cls.from_linear(src, recipe)  # noqa: E731
     elif base_mode == "storage":
-        if _mslk_available():
-            new_module = NVFP4FastFrozenBaseLinear.from_linear(module, recipe)
+        if fast:
+            build = lambda src: NVFP4FastFrozenBaseLinear.from_linear(  # noqa: E731
+                src, recipe
+            )
         else:
-            new_module = NVFP4FrozenBaseLinear.from_linear(module, recipe, fsdp=False)
+            build = lambda src: NVFP4FrozenBaseLinear.from_linear(  # noqa: E731
+                src, recipe, fsdp=False
+            )
     else:
+        # hp mode keeps a high-precision trainable master weight (no quant), so
+        # there is no FP4 transient to stream around; swap in place.
         module.weight.requires_grad_(False)
-        new_module = NVFP4Linear.from_linear(module, recipe)
+        _set_submodule(model, name, NVFP4Linear.from_linear(module, recipe))
+        LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
+        return True
 
-    parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
-    setattr(parent, name.rsplit(".", 1)[-1], new_module)
+    _stream_quantize_swap(model, name, module, build)
     LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
     return True
 
@@ -1257,6 +1361,44 @@ def swap_frozen_linear_to_nvfp4(
 def _set_submodule(model: nn.Module, name: str, new_module: nn.Module) -> None:
     parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
     setattr(parent, name.rsplit(".", 1)[-1], new_module)
+
+
+def _reclaim_gpu() -> None:
+    """Sync then release freed GPU blocks back to the allocator.
+
+    Sync first: the quant kernels still read the source weight async, and
+    expandable_segments would otherwise hand a freed-but-in-flight block to the
+    next allocation (use-after-free / illegal access).
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def _stream_quantize_swap(model, name, source, build):
+    """Quantize ``source`` to its NVFP4 module keeping the transient peak small.
+
+    The lm_head/embed/vision swaps run AFTER the full model is on the GPU, so on a
+    near-full card the source bf16 + the new FP4 layouts (+ quant scratch) coexist
+    and OOM. The torchao quant scratch is already bounded by the chunked quantizer
+    (see ``_to_nvfp4_chunked``); this drops the bf16 source the moment it is no
+    longer needed and reclaims it before the next swap, so the resident bf16 isn't
+    carried alongside the FP4 copies — mirroring the LoRA base streaming. Quant
+    stays on the GPU (CPU quant is NOT bit-identical: torchao's e2m1 rounding
+    diverges between CPU and CUDA).
+    """
+    new_module = build(source)
+    _set_submodule(model, name, new_module)
+    # Free the now-replaced bf16 source. Sync first: the quant kernels may still
+    # read it async, and expandable_segments would otherwise hand the freed block
+    # to the next allocation (use-after-free / illegal access).
+    if isinstance(source, nn.Module) and source is not new_module:
+        if getattr(source, "weight", None) is not None:
+            source.weight = None
+        if getattr(source, "bias", None) is not None:
+            source.bias = None
+    _reclaim_gpu()
+    return new_module
 
 
 def swap_frozen_embedding_to_nvfp4(
@@ -1290,8 +1432,9 @@ def swap_frozen_embedding_to_nvfp4(
             _BLOCK_SIZE,
         )
         return None
-    new_module = NVFP4Embedding.from_embedding(module)
-    _set_submodule(model, name, new_module)
+    new_module = _stream_quantize_swap(
+        model, name, module, lambda src: NVFP4Embedding.from_embedding(src)
+    )
     LOG.info("NVFP4 training: swapped frozen embedding %s", name)
     return new_module
 
@@ -1324,10 +1467,17 @@ def swap_tied_embedding_and_lm_head_to_nvfp4(
             "(hidden %%16 and lm_head %%32); keeping both in high precision."
         )
         return False
-    new_embed = NVFP4Embedding.from_embedding(embed)
-    _set_submodule(model, embed_name, new_embed)
+    # Capture the lm_head bias before streaming frees the shared weight, then
+    # quantize the shared weight ONCE via the embedding and route the lm_head GEMM
+    # at the SAME store. The shared weight is held by BOTH modules, so drop the
+    # lm_head's reference too — otherwise streaming the embedding can't reclaim it.
+    lm_head_bias = lm_head.bias
+    lm_head.weight = None
+    new_embed = _stream_quantize_swap(
+        model, embed_name, embed, lambda src: NVFP4Embedding.from_embedding(src)
+    )
     _set_submodule(
-        model, lm_head_name, NVFP4TiedLMHead(new_embed, lm_head.bias, recipe)
+        model, lm_head_name, NVFP4TiedLMHead(new_embed, lm_head_bias, recipe)
     )
     LOG.info(
         "NVFP4 training: tied embedding/lm_head quantized once (shared FP4 store)"
@@ -1411,23 +1561,25 @@ def convert_vision_tower_to_nvfp4(
                 _GEMM_ALIGN,
             )
             continue
+        fast = _mslk_available()
         if base_mode == "compute":
-            cls = (
-                NVFP4FastComputeBaseLinear
-                if _mslk_available()
-                else NVFP4ComputeBaseLinear
-            )
-            new_module = cls.from_linear(module, recipe)
+            cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
+            build = lambda src, cls=cls: cls.from_linear(src, recipe)  # noqa: E731
         elif base_mode == "storage":
-            new_module = (
-                NVFP4FastFrozenBaseLinear.from_linear(module, recipe)
-                if _mslk_available()
-                else NVFP4FrozenBaseLinear.from_linear(module, recipe, fsdp=False)
-            )
+            if fast:
+                build = lambda src: NVFP4FastFrozenBaseLinear.from_linear(  # noqa: E731
+                    src, recipe
+                )
+            else:
+                build = lambda src: NVFP4FrozenBaseLinear.from_linear(  # noqa: E731
+                    src, recipe, fsdp=False
+                )
         else:
             module.weight.requires_grad_(False)
-            new_module = NVFP4Linear.from_linear(module, recipe)
-        _set_submodule(vt, name, new_module)
+            _set_submodule(vt, name, NVFP4Linear.from_linear(module, recipe))
+            swapped += 1
+            continue
+        _stream_quantize_swap(vt, name, module, build)
         swapped += 1
     LOG.info(
         "nvfp4_training.quantize_vision_tower: swapped %d linears under %s "
