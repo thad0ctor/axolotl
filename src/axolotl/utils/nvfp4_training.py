@@ -786,6 +786,12 @@ def _swizzled_scale_shape(m: int, k: int) -> tuple[int, int]:
 # box it compiles AROUND (no decompose, no graph break, no eager fallback). The
 # concrete impl runs the kernel eagerly under compile — only the GEMM and the
 # surrounding pointwise ops fuse, which is the win (the quant is already ~0.03ms).
+# Profiled (sm_120, compiled compute-base LoRA step): the fprop activation quant
+# is already 100% fused by Inductor into the preceding SiLU/RMSNorm epilogue, so a
+# fused quant+GEMM prologue would only move that work out of mandatory pointwise
+# ops it currently overlaps — net wash, not worth a custom MMA kernel. The only
+# separable quant launch is the two-level dgrad quant (~30% of quant, <5% of step),
+# which a fprop quant-GEMM does not touch.
 @torch.library.custom_op("axolotl_nvfp4::quantize_two_level", mutates_args=())
 def _mslk_quantize_op(
     t: torch.Tensor,
