@@ -292,10 +292,10 @@ class TestNVFP4Training:
         vision module — merger/patch-embed/non-%32 dims and the language head are
         left untouched."""
         from axolotl.utils.nvfp4_training import (
-            NVFP4FrozenBaseLinear,
             NVFP4Recipe,
             _find_vision_tower,
             convert_vision_tower_to_nvfp4,
+            is_nvfp4_base,
         )
 
         class VisionBlock(nn.Module):
@@ -333,8 +333,8 @@ class TestNVFP4Training:
         n = convert_vision_tower_to_nvfp4(m, NVFP4Recipe(), base_mode="storage")
         # qkv + proj per block (fc1/fc2 skipped for %32), 2 blocks => 4
         assert n == 4, n
-        assert isinstance(m.model.visual.blocks[0].attn.qkv, NVFP4FrozenBaseLinear)
-        assert isinstance(m.model.visual.blocks[0].attn.proj, NVFP4FrozenBaseLinear)
+        assert is_nvfp4_base(m.model.visual.blocks[0].attn.qkv)
+        assert is_nvfp4_base(m.model.visual.blocks[0].attn.proj)
         assert isinstance(m.model.visual.blocks[0].mlp.fc1, nn.Linear)
         assert isinstance(m.model.visual.merger.linear_fc1, nn.Linear)
         assert isinstance(m.lm_head, nn.Linear)
