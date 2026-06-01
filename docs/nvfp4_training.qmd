@@ -356,6 +356,24 @@ loads from the checkpoint and the frozen base reconstructs/reloads identically).
 
 - **`torch.compile` is required.** Eager mode is slower than bf16 (0.1–0.25×).
   Always set `torch_compile: true`.
+- **Variable sequence length: a bounded burst of recompiles, then steady state —
+  but `pad_to_sequence_len: true` is the recommended lever.** The token dim is
+  padded to a multiple of 32 inside the FP4 GEMM path, so an unaligned batch length
+  is a symbolic (dynamic) shape under `torch.compile`. PyTorch's automatic-dynamic
+  keeps the graph **count** small (≈6 distinct graphs over a 33–512 length range, not
+  one-per-length), and a clustered length distribution amortizes these in the first
+  few steps (measured end-to-end on Qwen2.5-7B, `sample_packing: false`,
+  `pad_to_sequence_len: false`, full SR+RHT recipe: a ~2-step compile warm-up, then
+  steps run at the compiled steady-state). The residual recompiles are **not** the
+  input seq-length guard — they come from torchao's `to_blocked` scale-swizzle, which
+  re-specializes whenever the padded token count crosses a 128-block boundary. Two
+  consequences: (1) `torch._dynamo.mark_dynamic` / `dynamic=True` on the sequence dim
+  does **not** remove them (it saves at most one graph, and on a fully-symbolic length
+  the fused RHT+SR quant kernels can hit an inductor scheduler limit, `CantSplit`); and
+  (2) a *wide, evenly-spread* length distribution can scatter the (individually
+  expensive) recompiles across more steps before they amortize. The clean fix for both
+  is `pad_to_sequence_len: true` (or `sample_packing: true`): one static shape, one
+  graph, zero recompiles — recommended whenever `torch_compile` is on.
 - **Slower below ~hidden 1024.** Do not use on sub-3B models — the per-GEMM quant
   prologue dominates and you regress versus bf16.
 - **No DeepSpeed.** There is no ZeRO path for the FP4-GEMM module swap; the config
