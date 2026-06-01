@@ -924,9 +924,12 @@ def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
 
 
 def _is_swappable(module: nn.Linear) -> bool:
+    # Both in and out are contraction dims across fprop/dgrad, so both must meet
+    # the _scaled_mm packed-contraction rule (logical %32, not just block %16) —
+    # an out_features of 16 packs to 8 and trips "trailing dim divisible by 16".
     return (
-        module.in_features % _BLOCK_SIZE == 0
-        and module.out_features % _BLOCK_SIZE == 0
+        module.in_features % _GEMM_ALIGN == 0
+        and module.out_features % _GEMM_ALIGN == 0
     )
 
 
@@ -960,7 +963,7 @@ def convert_to_nvfp4_training(
             continue
         if not _is_swappable(module):
             LOG.warning(
-                "NVFP4: skipping %s (in=%d out=%d not both divisible by 16)",
+                "NVFP4: skipping %s (in=%d out=%d not both divisible by 32)",
                 name,
                 module.in_features,
                 module.out_features,
