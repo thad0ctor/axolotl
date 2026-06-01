@@ -243,3 +243,43 @@ class TestNVFP4Adapters:
         assert bf16_bytes / fp4_bytes > 3.0
         l0, l1 = self._train(model)
         assert l1 < l0 and torch.isfinite(torch.tensor(l1))
+
+    def test_qlora_checkpoint_roundtrip(self):
+        """The FP4-packed base must survive save/load (buffer in state_dict),
+        else QLoRA resume silently reinitializes the base."""
+        import io
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            convert_lora_base_to_nvfp4,
+        )
+
+        model = self._lora_model()
+        convert_lora_base_to_nvfp4(model, NVFP4Recipe(), quantized_storage=True)
+        sd = model.state_dict()
+        assert sum(1 for k in sd if k.endswith("w_q")) > 0
+
+        ids = torch.randint(0, 1000, (2, 32), device=model.device)
+        opt = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=1e-3
+        )
+        opt.zero_grad()
+        model(input_ids=ids, labels=ids).loss.backward()
+        opt.step()
+
+        buf = io.BytesIO()
+        torch.save(model.state_dict(), buf)
+        buf.seek(0)
+        reloaded = self._lora_model()
+        convert_lora_base_to_nvfp4(reloaded, NVFP4Recipe(), quantized_storage=True)
+        missing, _ = reloaded.load_state_dict(
+            torch.load(buf, weights_only=False), strict=False
+        )
+        assert not [k for k in missing if "w_q" in k]
+
+        model.eval()
+        reloaded.eval()
+        with torch.no_grad():
+            o1 = model(input_ids=ids).logits
+            o2 = reloaded(input_ids=ids).logits
+        assert torch.equal(o1, o2)

@@ -352,8 +352,11 @@ class NVFP4FrozenBaseLinear(nn.Module):
 
     def __init__(self, w_q, bias, recipe: NVFP4Recipe):
         super().__init__()
-        self.w_q = w_q  # NVFP4Tensor, frozen (not an nn.Parameter)
-        self.bias = bias
+        # Buffer (not Parameter): frozen/no-grad, but still enters state_dict so
+        # the FP4-packed base survives save/load — otherwise resume silently
+        # reinitializes the base. NVFP4Tensor round-trips through torch.save.
+        self.register_buffer("w_q", w_q)
+        self.bias = bias  # already an nn.Parameter from the source linear
         self.recipe = recipe
         self.in_features = w_q.shape[1]
         self.out_features = w_q.shape[0]
