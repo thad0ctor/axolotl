@@ -257,12 +257,17 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 - **No DeepSpeed.** There is no ZeRO path for the FP4-GEMM module swap; the config
   validator rejects `deepspeed` when NVFP4 training is enabled. Use FSDP or
   single-GPU instead.
-- **Multi-GPU FSDP2: single-process validated only.** Because the master weight
-  stays a plain bf16 `nn.Parameter` (only GEMM operands are quantized inside
-  forward), FSDP2 shards params as normal DTensors, and single-process
-  (`world_size=1`) forward + backward + step is finite with gradient checkpointing
-  on and off. Cross-rank collectives have **not** yet been exercised in a
-  multi-GPU loss-curve A/B — treat multi-GPU FSDP2 as unvalidated for now.
+- **Multi-GPU FSDP2: single-process validated only.** FFT and LoRA+FP4-compute
+  keep a plain bf16 `nn.Parameter` master weight, which FSDP2 shards as a normal
+  DTensor. NVFP4-QLoRA (FP4-stored base) ships custom `fsdp_pre/post_all_gather`
+  hooks that shard the packed FP4 weight by row (the global per-tensor scale is
+  replicated) and reconstruct it bit-exactly. All three modes pass single-process
+  (`world_size=1`) forward + backward + step with gradient checkpointing on and
+  off. Cross-rank collectives have **not** yet been exercised across physical
+  ranks (single Blackwell available) — treat multi-rank FSDP2 as plumbing-verified
+  but not loss-validated; check loss parity on your cluster.
+- **Checkpoint resume:** the FP4-stored QLoRA base is registered as a buffer, so
+  it is saved in `state_dict` and reloads bit-exactly — resume works.
 - **Full fine-tune has the most validation coverage.** The convergence and
   throughput numbers above were measured on the full fine-tune path; the LoRA
   (mode 2) and NVFP4-QLoRA (mode 3) paths share the same FP4 GEMM machinery but have
