@@ -59,7 +59,10 @@ echo "[ok] launcher=python gpu=$GPU(PCI_BUS_ID) N1=$N1 N2=$N2 src=$SRC"
 LOGDIR="$(mktemp -d /tmp/bench_nvfp4.XXXXXX)"
 runwall(){ # $1=cfg $2=steps -> echoes train_runtime (or empty on fail); writes $3 log
   local cfg="$1" steps="$2" log="$3"
-  sed "s/max_steps: .*/max_steps: $steps/" "$cfg" > "$LOGDIR/run.yaml"
+  sed "s/^max_steps:.*/max_steps: $steps/" "$cfg" > "$LOGDIR/run.yaml"
+  # if the config had no max_steps line, sed leaves it absent -> the run would do
+  # a FULL EPOCH and the marginal math is wrong. Force it.
+  grep -q "^max_steps:" "$LOGDIR/run.yaml" || echo "max_steps: $steps" >> "$LOGDIR/run.yaml"
   "$AX" train "$LOGDIR/run.yaml" --launcher python > "$log" 2>&1 || true
   grep -oE "train_runtime': '([0-9.]+)'" "$log" | grep -oE "[0-9.]+" | tail -1
 }
