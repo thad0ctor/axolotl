@@ -30,6 +30,8 @@ from torch import nn
 from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attention_packed
 from axolotl.kernels.nvfp4_fused_producers import (
     fused_rope_quant_qk,
+    fused_vproj_quant_v_keyaxis,
+    prepack_vproj_weight,
     quant_v_keyaxis,
 )
 from axolotl.utils.logging import get_logger
@@ -37,6 +39,13 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 _BLOCK_N = 128
+
+# Fuse the V NVFP4-quant into a native-NVFP4 v_proj GEMM epilogue (no bf16 V, no
+# transpose copy, no standalone quant read). Makes v_proj itself FP4, so it trades a
+# little parity (attn-op cos ~0.979 -> ~0.967) for ~1.4-1.5x on the V producer and
+# +0.1-0.2x end-to-end (v_proj counted). Real-model logit cos stays >=0.998. OFF by
+# default; flip via patch_qwen3_5_nvfp4_attention(model, fuse_vproj=True).
+_FUSE_VPROJ = False
 
 
 def _mask_is_dense_causal_or_full(
@@ -72,6 +81,16 @@ def _mask_is_dense_causal_or_full(
     return None
 
 
+def _get_vproj_packed(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lazily prepack (and cache on the module) the v_proj weight to NVFP4."""
+    cached = getattr(module, "_nvfp4_vproj_packed", None)
+    if cached is None:
+        wnv, wsc = prepack_vproj_weight(module.v_proj.weight.data)
+        module._nvfp4_vproj_packed = (wnv, wsc)
+        cached = (wnv, wsc)
+    return cached
+
+
 def _nvfp4_attention(
     module: nn.Module,
     query_states: torch.Tensor,   # [Z, H, S, D]  post q_norm, PRE-RoPE
@@ -81,6 +100,7 @@ def _nvfp4_attention(
     sin: torch.Tensor,
     scaling: float,
     causal: bool,
+    hidden_states: torch.Tensor | None = None,  # [Z, S, hidden], for fused v_proj
 ) -> torch.Tensor:
     """Fused-producer NVFP4 attention. Returns ``[Z, S, H, D]`` (HF attn_output)."""
     z, h, s_q, d = query_states.shape
@@ -89,7 +109,14 @@ def _nvfp4_attention(
 
     qnv, qsc = fused_rope_quant_qk(query_states, cos, sin)
     knv, ksc = fused_rope_quant_qk(key_states, cos, sin)
-    vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
+    if hidden_states is not None:
+        # fuse the V quant into a native-NVFP4 v_proj GEMM epilogue (no bf16 V)
+        wnv, wsc = _get_vproj_packed(module)
+        vnv, vsc, _ = fused_vproj_quant_v_keyaxis(
+            hidden_states, wnv, wsc, hk=hk, d=d, block_n=_BLOCK_N
+        )
+    else:
+        vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
 
     out = nvfp4_flash_attention_packed(
         qnv, qsc, knv, ksc, vnv, vsc,
@@ -137,7 +164,6 @@ def make_nvfp4_forward(orig_forward):
         key_states = self.k_norm(
             self.k_proj(hidden_states).view(hidden_shape)
         ).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         q_len = query_states.shape[2]
@@ -160,6 +186,17 @@ def make_nvfp4_forward(orig_forward):
                 apply_rotary_pos_emb,
             )
 
+            # Fuse V's quant into a native-NVFP4 v_proj GEMM only when no cache write
+            # is needed (the cache stores bf16 V; a cache write forces the bf16 v_proj).
+            fuse_v = (
+                getattr(self, "_nvfp4_fuse_vproj", _FUSE_VPROJ)
+                and past_key_values is None
+            )
+            value_states = None
+            if not fuse_v:
+                value_states = (
+                    self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                )
             if past_key_values is not None:
                 k_roped, _ = apply_rotary_pos_emb(
                     key_states, key_states, cos, sin
@@ -169,6 +206,7 @@ def make_nvfp4_forward(orig_forward):
             attn_output = _nvfp4_attention(
                 self, query_states, key_states, value_states, cos, sin,
                 self.scaling, causal=(kind == "causal"),
+                hidden_states=hidden_states if fuse_v else None,
             )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = attn_output * torch.sigmoid(gate)
@@ -182,11 +220,17 @@ def make_nvfp4_forward(orig_forward):
     return forward
 
 
-def patch_qwen3_5_nvfp4_attention(model: nn.Module) -> int:
+def patch_qwen3_5_nvfp4_attention(
+    model: nn.Module, fuse_vproj: bool = _FUSE_VPROJ
+) -> int:
     """Patch every Qwen3.5 FULL-attention layer's forward to use NVFP4 attention.
 
     Leaves linear-attention layers untouched. Returns the count of patched layers.
     Idempotent: re-patching a model is a no-op on already-patched modules.
+
+    ``fuse_vproj``: run v_proj as a native-NVFP4 GEMM with a fused key-axis pack
+    epilogue (no bf16 V / transpose / standalone quant). Faster V producer at a
+    small parity cost (v_proj goes FP4); only active on the cache-free prefill path.
     """
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
@@ -195,12 +239,17 @@ def patch_qwen3_5_nvfp4_attention(model: nn.Module) -> int:
     for module in model.modules():
         if isinstance(module, Qwen3_5Attention):
             if getattr(module, "_nvfp4_patched", False):
+                module._nvfp4_fuse_vproj = fuse_vproj
                 continue
             orig = type(module).forward
             if seen_forward is None:
                 seen_forward = make_nvfp4_forward(orig)
             module.forward = seen_forward.__get__(module, type(module))
             module._nvfp4_patched = True
+            module._nvfp4_fuse_vproj = fuse_vproj
             patched += 1
-    LOG.info("nvfp4 attention: patched %d Qwen3.5 full-attention layers", patched)
+    LOG.info(
+        "nvfp4 attention: patched %d Qwen3.5 full-attention layers (fuse_vproj=%s)",
+        patched, fuse_vproj,
+    )
     return patched

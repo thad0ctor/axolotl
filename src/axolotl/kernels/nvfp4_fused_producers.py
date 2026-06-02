@@ -172,3 +172,151 @@ def quant_v_keyaxis(
     s_kv_pad = _next_mult(s_kv, block_n)
     vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
     return vnv, vsc, s_kv_pad
+
+
+# ---------------------------------------------------------------------------
+# Fused v_proj GEMM with a key-axis NVFP4-pack epilogue. One program owns a
+# [BLOCK_S, D] output tile of one (z, kv-head): it runs y = x @ Wv^T as a native
+# NVFP4 tl.dot_scaled GEMM (x packed along K=hidden once by the caller, Wv prepacked
+# per head), then packs the [BLOCK_S, D] result along the SEQ axis (group-16, the key
+# axis the PV-GEMM contracts) and writes it transposed to vnv[zhk, D, S_pad//2] /
+# vsc[zhk, D, S_pad//16]. This collapses {bf16 v_proj output + transpose + standalone
+# key-axis quant read} into one pass: V never materializes in bf16 HBM and the quant
+# is the GEMM's own epilogue. BLOCK_S must be a multiple of 16 (the pack group).
+# Padded seq rows beyond S land in [S, S_pad): they get amax 0 -> eps scale / zero
+# packed nibbles, contributing nothing to the eps-scaled PV columns.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _vproj_pack_keyaxis_kernel(
+    xnv_ptr, xsc_ptr,          # [Z, S, K//2] uint8, [Z, S, K//16] e4m3  (activation)
+    wnv_ptr, wsc_ptr,          # [HK*D, K//2] uint8, [HK*D, K//16] e4m3  (Wv, [HK*D,K])
+    vnv_ptr, vsc_ptr,          # [Z*HK, D, S_pad//2] uint8, [Z*HK, D, S_pad//16] e4m3
+    S, S_pad, K,
+    sx_z, sx_s,                # x packed: per-z, per-row(seq) strides
+    ssc_z, ssc_s,              # x scale: per-z, per-row strides
+    sw_n,                      # weight packed row stride (= K//2); scale row = K//16
+    sv_d, svsc_d,              # vnv/vsc per-row(D) strides (= S_pad//2, S_pad//16)
+    HK: tl.constexpr, D: tl.constexpr,
+    BLOCK_S: tl.constexpr, BLOCK_K: tl.constexpr,
+    KP2: tl.constexpr, KP16: tl.constexpr,
+    SP2: tl.constexpr, SP16: tl.constexpr,   # BLOCK_S//2, BLOCK_S//16
+):
+    pid_z = tl.program_id(0)
+    pid_hk = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    zhk = pid_z * HK + pid_hk
+
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    smask = offs_s < S
+    offs_d = tl.arange(0, D)              # this head's D output cols = W rows [hk*D, (hk+1)*D)
+    wrow = pid_hk * D + offs_d
+
+    acc = tl.zeros((BLOCK_S, D), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offk2 = k0 // 2 + tl.arange(0, KP2)
+        offk16 = k0 // 16 + tl.arange(0, KP16)
+        a = tl.load(
+            xnv_ptr + pid_z * sx_z + offs_s[:, None] * sx_s + offk2[None, :],
+            mask=smask[:, None], other=0,
+        )
+        asc = tl.load(
+            xsc_ptr + pid_z * ssc_z + offs_s[:, None] * ssc_s + offk16[None, :],
+            mask=smask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
+        w = tl.load(wnv_ptr + wrow[:, None] * sw_n + offk2[None, :])
+        wsc = tl.load(
+            wsc_ptr + wrow[:, None] * (K // 16) + offk16[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
+        acc = tl.dot_scaled(a, asc, "e2m1", w.T, wsc, "e2m1", acc=acc)
+
+    # zero the padded seq rows so they pack to amax 0 (eps scale, zero nibbles).
+    acc = tl.where(smask[:, None], acc, 0.0)
+
+    # pack along the SEQ axis (group-16): transpose the [BLOCK_S, D] tile to [D, BLOCK_S]
+    # so groups of 16 run down the seq axis, matching the V^T key-axis layout.
+    accT = tl.trans(acc)                     # [D, BLOCK_S]
+    NG: tl.constexpr = BLOCK_S // 16
+    xb = accT.reshape(D, NG, 16)
+    amax = tl.max(tl.abs(xb), axis=2)
+    sc = tl.clamp(amax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    xn = xb / sc.to(tl.float32)[:, :, None]
+    pairs = xn.reshape(D * SP2, 2).split()
+    qpk = convert_fp32_to_fp4_packed(pairs).reshape(D, SP2)
+
+    offs_sp = pid_s * SP2 + tl.arange(0, SP2)
+    tl.store(
+        vnv_ptr + zhk * (D * sv_d) + offs_d[:, None] * sv_d + offs_sp[None, :],
+        qpk,
+    )
+    offs_ssc = pid_s * SP16 + tl.arange(0, SP16)
+    tl.store(
+        vsc_ptr + zhk * (D * svsc_d) + offs_d[:, None] * svsc_d + offs_ssc[None, :],
+        sc.to(tl.uint8, bitcast=True),
+    )
+
+
+def prepack_vproj_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a v_proj weight ``[HK*D, hidden]`` to NVFP4 once (along hidden=K).
+
+    Returns ``(wnv [HK*D, K//2] uint8, wsc [HK*D, K//16] e4m3)`` in the row-major
+    tl.dot_scaled layout. K (hidden) must be a multiple of 16.
+    """
+    from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
+
+    n, k = weight.shape
+    assert k % 16 == 0
+    wnv, wsc = _quant_nvfp4(weight.unsqueeze(0).contiguous())
+    return wnv[0], wsc[0]
+
+
+def fused_vproj_quant_v_keyaxis(
+    hidden_states: torch.Tensor,   # [Z, S, hidden]
+    wnv: torch.Tensor,             # [HK*D, hidden//2] uint8  (prepacked v_proj weight)
+    wsc: torch.Tensor,             # [HK*D, hidden//16] e4m3
+    hk: int,
+    d: int,
+    block_n: int = 128,
+    block_s: int = 64,
+    block_k: int = 256,
+    num_warps: int = 8,
+    num_stages: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Fused native-NVFP4 v_proj GEMM emitting V already key-axis-packed (V^T layout).
+
+    Computes ``V = hidden_states @ Wv^T`` in NVFP4 and packs the result along the
+    SEQ (key) axis in the kernel's epilogue — no bf16 V, no transpose copy, no
+    standalone quant read. Returns ``(vnv [Z*HK, D, S_pad//2], vsc [Z*HK, D,
+    S_pad//16] e4m3, S_pad)`` matching ``quant_v_keyaxis`` (S_pad a multiple of
+    ``block_n``). The activation is quantized along hidden once (single-level,
+    group-16). ``block_s`` is the pack group span and must be a multiple of 16.
+    """
+    from axolotl.kernels.attn_nvfp4_flash import _next_mult, _quant_nvfp4
+
+    z, s, k = hidden_states.shape
+    assert k % 16 == 0 and block_s % 16 == 0
+    s_pad = _next_mult(s, block_n)
+
+    # quantize x along K once (shared across heads).
+    xnv, xsc = _quant_nvfp4(hidden_states.reshape(z, s, k))
+    xsc = xsc.view(torch.uint8)
+
+    vnv = hidden_states.new_empty(z * hk, d, s_pad // 2, dtype=torch.uint8)
+    vsc = hidden_states.new_zeros(z * hk, d, s_pad // 16, dtype=torch.uint8)
+
+    grid = (z, hk, triton.cdiv(s, block_s))
+    _vproj_pack_keyaxis_kernel[grid](
+        xnv.view(torch.uint8), xsc,
+        wnv.view(torch.uint8), wsc.view(torch.uint8),
+        vnv, vsc,
+        s, s_pad, k,
+        xnv.stride(0), xnv.stride(1),
+        xsc.stride(0), xsc.stride(1),
+        wnv.stride(0),
+        vnv.stride(1), vsc.stride(1),
+        HK=hk, D=d,
+        BLOCK_S=block_s, BLOCK_K=block_k,
+        KP2=block_k // 2, KP16=block_k // 16,
+        SP2=block_s // 2, SP16=block_s // 16,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return vnv, vsc.view(torch.float8_e4m3fn), s_pad
