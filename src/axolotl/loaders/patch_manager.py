@@ -517,6 +517,9 @@ class PatchManager:
                     "qwen3_5_native_attention_backward_dkdv_scratch_bf16",
                     False,
                 ),
+                compile_custom_op=getattr(
+                    nvfp4, "qwen3_5_native_attention_compile_custom_op", False
+                ),
                 layer_autograd=getattr(
                     nvfp4, "qwen3_5_native_attention_layer_autograd", False
                 ),

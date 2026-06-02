@@ -250,6 +250,16 @@ class NVFP4TrainingConfig(BaseModel):
             "Experimental and OFF by default."
         },
     )
+    qwen3_5_native_attention_compile_custom_op: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention inference only. Route the "
+            "packed NVFP4 flash-attention call through an opaque torch custom op "
+            "so torch.compile can keep surrounding producer/epilogue ops in graph "
+            "without recompiling the internal Triton tl.dot_scaled kernel. OFF by "
+            "default."
+        },
+    )
     qwen3_5_native_attention_layer_autograd: bool = Field(
         default=False,
         json_schema_extra={

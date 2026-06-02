@@ -54,12 +54,19 @@ _BLOCK_N = 128
 # default; flip via patch_qwen3_5_nvfp4_attention(model, fuse_vproj=True).
 _FUSE_VPROJ = False
 _LAYER_AUTOGRAD_ENV = "AXOLOTL_NVFP4_QWEN35_LAYER_AUTOGRAD"
+_CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
 
 
 def _layer_autograd_enabled(module: nn.Module) -> bool:
     if getattr(module, "_nvfp4_layer_autograd", False):
         return True
     return os.environ.get(_LAYER_AUTOGRAD_ENV, "").lower() in {"1", "true", "yes"}
+
+
+def _custom_op_enabled(module: nn.Module) -> bool:
+    if getattr(module, "_nvfp4_compile_custom_op", False):
+        return True
+    return os.environ.get(_CUSTOM_OP_ENV, "").lower() in {"1", "true", "yes"}
 
 
 def _mask_is_dense_causal_or_full(
@@ -140,7 +147,15 @@ def _nvfp4_attention(
     else:
         vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
 
-    out = nvfp4_flash_attention_packed(
+    flash_attention_packed = nvfp4_flash_attention_packed
+    if _custom_op_enabled(module):
+        from axolotl.kernels.attn_nvfp4_custom_op import (
+            nvfp4_flash_attention_packed_custom_op,
+        )
+
+        flash_attention_packed = nvfp4_flash_attention_packed_custom_op
+
+    out = flash_attention_packed(
         qnv, qsc, knv, ksc, vnv, vsc,
         z=z, h=h, hk=hk, s_q=s_q, s_kv=s_kv, d=d,
         scaling=scaling,
@@ -319,6 +334,7 @@ def patch_qwen3_5_nvfp4_attention(
     backward_dv_dot_rtn: bool = False,
     backward_dq_ds_rtn: bool = False,
     backward_dkdv_scratch_bf16: bool = False,
+    compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
     layer_autograd: bool = False,
 ) -> int:
@@ -346,6 +362,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_backward_dv_dot_rtn = backward_dv_dot_rtn
                 module._nvfp4_backward_dq_ds_rtn = backward_dq_ds_rtn
                 module._nvfp4_backward_dkdv_scratch_bf16 = backward_dkdv_scratch_bf16
+                module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
                 module._nvfp4_layer_autograd = layer_autograd
                 continue
@@ -361,6 +378,7 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_backward_dv_dot_rtn = backward_dv_dot_rtn
             module._nvfp4_backward_dq_ds_rtn = backward_dq_ds_rtn
             module._nvfp4_backward_dkdv_scratch_bf16 = backward_dkdv_scratch_bf16
+            module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
             module._nvfp4_layer_autograd = layer_autograd
             patched += 1
@@ -369,9 +387,9 @@ def patch_qwen3_5_nvfp4_attention(
         "(fuse_vproj=%s, train_backward=%s, save_backward_packs=%s, "
         "backward_dv_p_rtn=%s, backward_dv_dot_rtn=%s, "
         "backward_dq_ds_rtn=%s, backward_dkdv_scratch_bf16=%s, "
-        "layer_autograd=%s)",
+        "compile_custom_op=%s, layer_autograd=%s)",
         patched, fuse_vproj, train_backward, save_backward_packs,
         backward_dv_p_rtn, backward_dv_dot_rtn, backward_dq_ds_rtn,
-        backward_dkdv_scratch_bf16, layer_autograd,
+        backward_dkdv_scratch_bf16, compile_custom_op, layer_autograd,
     )
     return patched
