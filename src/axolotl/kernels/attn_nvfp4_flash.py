@@ -345,6 +345,25 @@ def _next_mult(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
+# Forward flash-tile defaults per head_dim, swept (parity-gated) on sm_120 across
+# S=2048/4096/8192. D=256 is SMEM-tight: BLOCK_M64/BLOCK_N128/warps8/stages3 already
+# wins (wider M-tiles or shallower pipelines spill or regress). D=128 has SMEM
+# headroom — a full BLOCK_M128/BLOCK_N128 tile with 2 pipeline stages is 1.5x (S2048)
+# to 2.0x (S8192) the D=256-style narrow default. (block_m, block_n, num_warps, num_stages).
+_FWD_TILE = {256: (64, 128, 8, 3), 128: (128, 128, 8, 2)}
+_FWD_TILE_DEFAULT = (64, 128, 8, 3)
+
+
+def _resolve_fwd_tiles(d, block_m, block_n, num_warps, num_stages):
+    """Pick head_dim-tuned forward tiles when the caller left the generic defaults.
+
+    Explicit non-default tiles are honored as-is (autotune / manual override).
+    """
+    if (block_m, block_n, num_warps, num_stages) == _FWD_TILE_DEFAULT:
+        return _FWD_TILE.get(d, _FWD_TILE_DEFAULT)
+    return block_m, block_n, num_warps, num_stages
+
+
 # ---------------------------------------------------------------------------
 # Backward prep: LSE + D_i.  One program per (z, h, query-block m). Loops over all
 # keys (FP4 QK^T recompute) to get the row logsumexp, then D_i = rowsum(dO * O).
@@ -931,6 +950,9 @@ def nvfp4_flash_attention_packed(
     bias = None
     if key_pad_bias is not None:
         bias = key_pad_bias.to(torch.float32).contiguous()
+    block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
+        d, block_m, block_n, num_warps, num_stages
+    )
     out = torch.empty(z * h, s_q, d, device=qnv.device, dtype=out_dtype)
     _run_flash_packed(
         qnv, qsc, knv, ksc, vnv, vsc,
@@ -976,6 +998,9 @@ def nvfp4_flash_attention(
     _, hk, s_kv, _ = key.shape
     assert h % hk == 0 and h // hk == num_key_value_groups
     assert d % 16 == 0 and d in (128, 256)
+    block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
+        d, block_m, block_n, num_warps, num_stages
+    )
     out_dtype = query.dtype
 
     q2 = query.reshape(z * h, s_q, d)
