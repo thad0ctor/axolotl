@@ -64,9 +64,10 @@ def _layer_autograd_enabled(module: nn.Module) -> bool:
 
 
 def _custom_op_enabled(module: nn.Module) -> bool:
-    if getattr(module, "_nvfp4_compile_custom_op", False):
-        return True
-    return os.environ.get(_CUSTOM_OP_ENV, "").lower() in {"1", "true", "yes"}
+    requested = getattr(
+        module, "_nvfp4_compile_custom_op", False
+    ) or os.environ.get(_CUSTOM_OP_ENV, "").lower() in {"1", "true", "yes"}
+    return bool(requested) and torch.compiler.is_compiling()
 
 
 def _mask_is_dense_causal_or_full(
