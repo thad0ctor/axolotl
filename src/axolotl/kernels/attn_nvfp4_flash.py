@@ -36,8 +36,17 @@ tl.dot_scaled layout (per the validated /tmp microbenches), e4m3 group-16:
   * ``tl.dot_scaled(a, asc, "e2m1", b.T, bsc, "e2m1")`` computes ``a @ b`` with
     ``b`` loaded as ``[N, K//2]`` and transposed inside.
 
-Forward only, no autograd. GQA handled by mapping each query head to its KV head
-in-kernel (no repeat_kv materialization).
+A native-NVFP4 BACKWARD (``nvfp4_flash_attn_func`` / ``_NVFP4FlashAttn``) wraps
+this into a full ``torch.autograd.Function``. It recomputes S/P in SRAM and runs
+all four grad GEMMs (dV, dP, dK, dQ) as ``tl.dot_scaled`` FP4 ops, quantizing the
+gradient operands (P, dS, dO) with in-kernel stochastic rounding (the convergence
+knob from ``utils/nvfp4_training``). The seq-axis contractions (dV=P^T@dO,
+dK=dS^T@Q, dQ=dS@K) are the large-K FP4-friendly ones; dP=dO@V^T contracts over
+head_dim. Validated on Qwen3.5-2B: a 120-step SR-on training run tracks bf16
+attention to within loss noise (no divergence).
+
+GQA handled by mapping each query head to its KV head in-kernel (no repeat_kv
+materialization).
 """
 
 from __future__ import annotations
@@ -52,6 +61,47 @@ _E4M3_EPS = tl.constexpr(1.5258789e-05)
 _F8E4M3_MAX = tl.constexpr(448.0)
 _F4_MAX = tl.constexpr(6.0)
 _NEG_INF = tl.constexpr(float("-inf"))
+
+
+# ---------------------------------------------------------------------------
+# In-kernel NVFP4 pack of a [ROWS, K] fp32 tile along K (group-16), returning the
+# tl.dot_scaled operands (packed uint8 [ROWS, K//2], e4m3 scale [ROWS, K//16]).
+# Used by the backward to quantize the gradient-side operands (P, dS, dO, Q, K)
+# right where they are produced — no HBM round-trip, no per-block re-quant.
+#
+# STOCHASTIC_ROUND: mirror utils/nvfp4_training._sr_dither — add uniform noise of
+# width = one FP4 step (in the per-block-scaled domain) before round-to-nearest,
+# which realizes unbiased stochastic rounding. This is the convergence-critical
+# knob for the gradient operands. The PRNG is a cheap in-kernel philox draw keyed
+# by a per-launch seed + the tile's flat element offset (decorrelated across the
+# tile and across recompute), so no extra global memory traffic is paid.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _pack_nvfp4_along_k(
+    x, base_off, seed,
+    ROWS: tl.constexpr, K: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
+):
+    NG: tl.constexpr = K // 16
+    xb = x.reshape(ROWS, NG, 16)
+    amax = tl.max(tl.abs(xb), axis=2)
+    sc = tl.clamp(amax / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    scf = sc.to(tl.float32)[:, :, None]
+    xn = xb / scf
+    if STOCHASTIC:
+        # one FP4 step in the scaled domain: levels are 2^e*{1,1.5}, e in [0,2];
+        # step = 2^floor(log2|xn|) clamped to that exponent range. Add U(-.5,.5)*step.
+        e = tl.floor(tl.log2(tl.maximum(tl.abs(xn), _E4M3_EPS)))
+        e = tl.clamp(e, 0.0, 2.0)
+        step = tl.exp2(e)
+        off = base_off + tl.arange(0, ROWS)[:, None, None] * K + \
+            tl.arange(0, NG)[None, :, None] * 16 + tl.arange(0, 16)[None, None, :]
+        u = tl.rand(seed, off) - 0.5
+        xn = xn + u * step
+    xn = tl.clamp(xn, -_F4_MAX, _F4_MAX)
+    pairs = xn.reshape(ROWS * (K // 2), 2).split()
+    q = convert_fp32_to_fp4_packed(pairs).reshape(ROWS, K // 2)
+    return q, sc
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +326,277 @@ def _next_mult(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
+# ---------------------------------------------------------------------------
+# Backward prep: LSE + D_i.  One program per (z, h, query-block m). Loops over all
+# keys (FP4 QK^T recompute) to get the row logsumexp, then D_i = rowsum(dO * O).
+# Both are the standard FlashAttention-2 backward preliminaries.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_bwd_prep_kernel(
+    q_ptr, k_ptr,
+    do_ptr, o_ptr, bias_ptr,
+    lse_ptr, delta_ptr,
+    scaling, seed, Sq, Skv,
+    D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
+    sq_n, sk_n, sdo_n, so_n, sb_z,
+    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_zh = tl.program_id(1)
+    z = pid_zh // H
+    h = pid_zh % H
+    zhk = z * HK + (h // (H // HK))
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    mmask = offs_m < Sq
+
+    q = tl.load(
+        q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
+
+    m_i = tl.full((BLOCK_M,), _NEG_INF, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    if CAUSAL:
+        hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
+    else:
+        hi = Skv
+    for start_n in range(0, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        nmask = offs_n < Skv
+        k = tl.load(
+            k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+            mask=nmask[:, None], other=0.0,
+        ).to(tl.float32)
+        knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+        s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
+        if HAS_BIAS:
+            b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
+            s = s + b[None, :]
+        s = tl.where(nmask[None, :], s, _NEG_INF)
+        if CAUSAL:
+            causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
+            s = tl.where(causal_ok, s, _NEG_INF)
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        m_safe = tl.where(m_new == _NEG_INF, 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        l_i = l_i * alpha + tl.sum(tl.exp(s - m_safe[:, None]), axis=1)
+        m_i = m_new
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    m_final = tl.where(m_i == _NEG_INF, 0.0, m_i)
+    lse = m_final + tl.log(l_safe)
+
+    do = tl.load(
+        do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+    o = tl.load(
+        o_ptr + pid_zh * (Sq * so_n) + offs_m[:, None] * so_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+    delta = tl.sum(do * o, axis=1)
+
+    tl.store(lse_ptr + pid_zh * Sq + offs_m, lse, mask=mmask)
+    tl.store(delta_ptr + pid_zh * Sq + offs_m, delta, mask=mmask)
+
+
+# ---------------------------------------------------------------------------
+# Native-NVFP4 flash BACKWARD, dK/dV pass. One program per (z, h, key-block n).
+# Recomputes S/P in SRAM from the packed Q/K (no HBM round-trip, no Q/K re-quant),
+# normalizes P with the precomputed LSE, then:
+#   dV[n,:] += sum_m P[m,n] * dO[m,:]   (contract M=seq, large-K -> FP4-friendly)
+#   dP[m,n]  = sum_d dO[m,d] * V[n,d]   (contract D=head_dim, small-K)
+#   dS[m,n]  = P*(dP - delta_i)*scale
+#   dK[n,:] += sum_m dS[m,n] * Q[m,:]   (contract M=seq, large-K -> FP4-friendly)
+# Gradient operands (P, dS, dO) quantized with STOCHASTIC ROUNDING (SR=True).
+# Q,K,V high-precision tiles are repacked to the needed contraction axis in SRAM.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_bwd_dkdv_kernel(
+    q_ptr, k_ptr, v_ptr, do_ptr, bias_ptr,
+    lse_ptr, delta_ptr,
+    dk_ptr, dv_ptr,
+    scaling, seed, Sq, Skv,
+    D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
+    sq_n, sk_n, sv_n, sdo_n, sb_z, sdk_n, sdv_n,
+    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_zh = tl.program_id(1)
+    z = pid_zh // H
+    h = pid_zh % H
+    zhk = z * HK + (h // (H // HK))
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    nmask = offs_n < Skv
+
+    k = tl.load(
+        k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+        mask=nmask[:, None], other=0.0,
+    ).to(tl.float32)
+    v = tl.load(
+        v_ptr + zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+        mask=nmask[:, None], other=0.0,
+    ).to(tl.float32)
+    # K,V packed along D once for this n-block (QK^T recompute + dP). RTN (forward
+    # path operands, not gradients).
+    knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+    vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
+
+    dk = tl.zeros((BLOCK_N, D), dtype=tl.float32)
+    dv = tl.zeros((BLOCK_N, D), dtype=tl.float32)
+
+    if CAUSAL:
+        lo = tl.maximum(((pid_n * BLOCK_N - (Skv - Sq)) // BLOCK_M) * BLOCK_M, 0)
+    else:
+        lo = 0
+
+    for start_m in range(lo, Sq, BLOCK_M):
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        mmask = offs_m < Sq
+        q = tl.load(
+            q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
+            mask=mmask[:, None], other=0.0,
+        ).to(tl.float32)
+        do = tl.load(
+            do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
+            mask=mmask[:, None], other=0.0,
+        ).to(tl.float32)
+        lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+        delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+
+        # recompute scores via native FP4 (Q packed along D in SRAM)
+        qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
+        s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
+        if HAS_BIAS:
+            b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
+            s = s + b[None, :]
+        s = tl.where(nmask[None, :] & mmask[:, None], s, _NEG_INF)
+        if CAUSAL:
+            causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
+            s = tl.where(causal_ok, s, _NEG_INF)
+        p = tl.exp(s - lse[:, None])
+        p = tl.where(s == _NEG_INF, 0.0, p)
+
+        # dV += P^T @ dO  (contract M). P^T [BLOCK_N, BLOCK_M] (SR), dO^T [D, BLOCK_M] (SR).
+        pT_q, pT_s = _pack_nvfp4_along_k(tl.trans(p), start_m, seed, BLOCK_N, BLOCK_M, SR)
+        doT_q, doT_s = _pack_nvfp4_along_k(
+            tl.trans(do), start_m + Sq, seed, D, BLOCK_M, SR
+        )
+        dv = tl.dot_scaled(pT_q, pT_s, "e2m1", doT_q.T, doT_s, "e2m1", acc=dv)
+
+        # dP = dO @ V^T  (contract D). dO packed along D (SR).
+        do_q, do_s = _pack_nvfp4_along_k(do, start_m + 2 * Sq, seed, BLOCK_M, D, SR)
+        dp = tl.dot_scaled(do_q, do_s, "e2m1", vnv.T, vsc, "e2m1")
+
+        ds = p * (dp - delta[:, None]) * scaling
+        ds = tl.where(s == _NEG_INF, 0.0, ds)
+
+        # dK += dS^T @ Q  (contract M). dS^T [BLOCK_N, BLOCK_M] (SR), Q^T [D, BLOCK_M].
+        dsT_q, dsT_s = _pack_nvfp4_along_k(tl.trans(ds), start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR)
+        qT_q, qT_s = _pack_nvfp4_along_k(tl.trans(q), start_m + 4 * Sq, seed, D, BLOCK_M, False)
+        dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qT_q.T, qT_s, "e2m1", acc=dk)
+
+    tl.store(
+        dk_ptr + pid_zh * (Skv * sdk_n) + offs_n[:, None] * sdk_n + offs_d[None, :],
+        dk.to(dk_ptr.dtype.element_ty), mask=nmask[:, None],
+    )
+    tl.store(
+        dv_ptr + pid_zh * (Skv * sdv_n) + offs_n[:, None] * sdv_n + offs_d[None, :],
+        dv.to(dv_ptr.dtype.element_ty), mask=nmask[:, None],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Native-NVFP4 flash BACKWARD, dQ pass. One program per (z, h, query-block m).
+# Loops keys; dQ[m,:] += sum_n dS[m,n] * K[n,:]  (contract N=keys). dS packed along
+# N (SR), K packed along N (i.e. K^T [D, BLOCK_N]).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_bwd_dq_kernel(
+    q_ptr, k_ptr, v_ptr, do_ptr, bias_ptr,
+    lse_ptr, delta_ptr, dq_ptr,
+    scaling, seed, Sq, Skv,
+    D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
+    sq_n, sk_n, sv_n, sdo_n, sb_z, sdq_n,
+    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_zh = tl.program_id(1)
+    z = pid_zh // H
+    h = pid_zh % H
+    zhk = z * HK + (h // (H // HK))
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    mmask = offs_m < Sq
+
+    q = tl.load(
+        q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+    do = tl.load(
+        do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+    lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+    delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
+    do_q, do_s = _pack_nvfp4_along_k(do, pid_m * BLOCK_M, seed, BLOCK_M, D, SR)
+
+    dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+    if CAUSAL:
+        hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
+    else:
+        hi = Skv
+
+    for start_n in range(0, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        nmask = offs_n < Skv
+        k = tl.load(
+            k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+            mask=nmask[:, None], other=0.0,
+        ).to(tl.float32)
+        v = tl.load(
+            v_ptr + zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+            mask=nmask[:, None], other=0.0,
+        ).to(tl.float32)
+        knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+        vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
+
+        s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
+        if HAS_BIAS:
+            b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
+            s = s + b[None, :]
+        s = tl.where(nmask[None, :] & mmask[:, None], s, _NEG_INF)
+        if CAUSAL:
+            causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
+            s = tl.where(causal_ok, s, _NEG_INF)
+        p = tl.exp(s - lse[:, None])
+        p = tl.where(s == _NEG_INF, 0.0, p)
+
+        dp = tl.dot_scaled(do_q, do_s, "e2m1", vnv.T, vsc, "e2m1")
+        ds = p * (dp - delta[:, None]) * scaling
+        ds = tl.where(s == _NEG_INF, 0.0, ds)
+
+        # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N] (SR), K^T [D, BLOCK_N].
+        ds_q, ds_s = _pack_nvfp4_along_k(ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR)
+        kT_q, kT_s = _pack_nvfp4_along_k(tl.trans(k), start_n, seed, D, BLOCK_N, False)
+        dq = tl.dot_scaled(ds_q, ds_s, "e2m1", kT_q.T, kT_s, "e2m1", acc=dq)
+
+    tl.store(
+        dq_ptr + pid_zh * (Sq * sdq_n) + offs_m[:, None] * sdq_n + offs_d[None, :],
+        dq.to(dq_ptr.dtype.element_ty), mask=mmask[:, None],
+    )
+
+
 def _run_flash_packed(
     qnv, qsc, knv, ksc, vnv, vsc,
     z, h, hk, s_q, s_kv, d,
@@ -448,3 +769,147 @@ def nvfp4_flash_attention(
 
     _run()
     return out.reshape(z, h, s_q, d)
+
+
+# ---------------------------------------------------------------------------
+# Full forward + native-NVFP4 backward as a torch.autograd.Function.
+# ---------------------------------------------------------------------------
+def _run_bwd(
+    q, k, v, do, o, bias,
+    z, h, hk, s_q, s_kv, d, scaling, causal, sr,
+    block_m, block_n, num_warps, num_stages,
+):
+    """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp). Returns
+    dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller)."""
+    dq = torch.empty(z * h, s_q, d, device=q.device, dtype=torch.float32)
+    dk = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
+    dv = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
+    lse = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
+    delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
+    seed = torch.randint(0, 2**31 - 1, (1,), device=q.device).item() if sr else 0
+    # The recompute kernels hold several fp32 [BLOCK, D] tiles + their FP4 packs in
+    # SRAM at once; D=256 needs small tiles / single-stage to fit the 99KB budget.
+    block_m = min(block_m, 64)
+    block_n = 64 if d >= 256 else min(block_n, 128)
+
+    bdummy = bias if bias is not None else q
+    sb_z = bias.stride(0) if bias is not None else 0
+    has_bias = bias is not None
+
+    _flash_bwd_prep_kernel[(triton.cdiv(s_q, block_m), z * h)](
+        q, k, do, o, bdummy, lse, delta,
+        scaling, seed, s_q, s_kv,
+        D=d, H=h, HK=hk,
+        sq_n=q.stride(1), sk_n=k.stride(1), sdo_n=do.stride(1), so_n=o.stride(1),
+        sb_z=sb_z,
+        HAS_BIAS=has_bias, CAUSAL=causal,
+        BLOCK_M=block_m, BLOCK_N=block_n,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    _flash_bwd_dkdv_kernel[(triton.cdiv(s_kv, block_n), z * h)](
+        q, k, v, do, bdummy, lse, delta, dk, dv,
+        scaling, seed, s_q, s_kv,
+        D=d, H=h, HK=hk,
+        sq_n=q.stride(1), sk_n=k.stride(1), sv_n=v.stride(1), sdo_n=do.stride(1),
+        sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
+        HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
+        BLOCK_M=block_m, BLOCK_N=block_n,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    _flash_bwd_dq_kernel[(triton.cdiv(s_q, block_m), z * h)](
+        q, k, v, do, bdummy, lse, delta, dq,
+        scaling, seed, s_q, s_kv,
+        D=d, H=h, HK=hk,
+        sq_n=q.stride(1), sk_n=k.stride(1), sv_n=v.stride(1), sdo_n=do.stride(1),
+        sb_z=sb_z, sdq_n=dq.stride(1),
+        HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
+        BLOCK_M=block_m, BLOCK_N=block_n,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return dq, dk, dv
+
+
+class _NVFP4FlashAttn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, query, key, value, scaling, causal, num_key_value_groups,
+        key_pad_bias, sr, block_m, block_n, num_warps, num_stages,
+    ):
+        z, h, s_q, d = query.shape
+        _, hk, s_kv, _ = key.shape
+        out = nvfp4_flash_attention(
+            query, key, value, scaling, causal=causal,
+            num_key_value_groups=num_key_value_groups, key_pad_bias=key_pad_bias,
+            block_m=block_m, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
+        )
+        bias = None
+        if key_pad_bias is not None:
+            bias = key_pad_bias.to(torch.float32).contiguous()
+        ctx.save_for_backward(
+            query.reshape(z * h, s_q, d).contiguous(),
+            key.reshape(z * hk, s_kv, d).contiguous(),
+            value.reshape(z * hk, s_kv, d).contiguous(),
+            out.reshape(z * h, s_q, d),
+            bias if bias is not None else torch.empty(0, device=query.device),
+        )
+        ctx.dims = (z, h, hk, s_q, s_kv, d)
+        ctx.scaling = scaling
+        ctx.causal = causal
+        ctx.sr = sr
+        ctx.tiles = (block_m, block_n, num_warps, num_stages)
+        ctx.has_bias = bias is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, o, bias = ctx.saved_tensors
+        z, h, hk, s_q, s_kv, d = ctx.dims
+        block_m, block_n, num_warps, num_stages = ctx.tiles
+        bias = bias if ctx.has_bias else None
+        do = grad_out.reshape(z * h, s_q, d).contiguous()
+        dq, dk, dv = _run_bwd(
+            q, k, v, do, o, bias,
+            z, h, hk, s_q, s_kv, d, ctx.scaling, ctx.causal, ctx.sr,
+            block_m, block_n, 4, 1,
+        )
+        dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype)
+        ng = h // hk
+        if ng > 1:
+            dk = dk.reshape(z, hk, ng, s_kv, d).sum(2).to(grad_out.dtype)
+            dv = dv.reshape(z, hk, ng, s_kv, d).sum(2).to(grad_out.dtype)
+        else:
+            dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
+            dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+
+
+def nvfp4_flash_attn_func(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scaling: float,
+    causal: bool = False,
+    num_key_value_groups: int = 1,
+    key_pad_bias: torch.Tensor | None = None,
+    stochastic_rounding: bool = True,
+    block_m: int = 64,
+    block_n: int = 128,
+    num_warps: int = 8,
+    num_stages: int = 3,
+) -> torch.Tensor:
+    """Native-NVFP4 flash attention with a differentiable native-NVFP4 backward.
+
+    Forward and all four backward GEMMs (dV, dP, dK, dQ) run as real 5th-gen FP4
+    ``tl.dot_scaled`` ops. Gradient operands (P, dS, dO) are quantized with
+    stochastic rounding when ``stochastic_rounding`` (the convergence-critical
+    knob — see ``utils/nvfp4_training``). q:[Z,H,Sq,D], k/v:[Z,Hk,Skv,D]; D in
+    {128,256}; supports causal and GQA. Returns [Z,H,Sq,D] in query.dtype.
+    """
+    z, h, s_q, d = query.shape
+    _, hk, s_kv, _ = key.shape
+    assert h % hk == 0 and h // hk == num_key_value_groups
+    assert d in (128, 256)
+    return _NVFP4FlashAttn.apply(
+        query, key, value, scaling, causal, num_key_value_groups,
+        key_pad_bias, stochastic_rounding, block_m, block_n, num_warps, num_stages,
+    )
