@@ -474,14 +474,6 @@ class PatchManager:
 
             patch_model_fused_fp4_ce(model)
 
-        if getattr(nvfp4, "fp8_lm_head", False):
-            from axolotl.kernels.fp8_lm_head import patch_model_fp8_lm_head
-
-            patch_model_fp8_lm_head(
-                model,
-                granularity=getattr(nvfp4, "fp8_lm_head_granularity", "rowwise"),
-            )
-
     def _apply_qwen3_5_native_nvfp4_patches(self, model: PreTrainedModel):
         nvfp4 = self.cfg.nvfp4_training
         if not (nvfp4 and nvfp4.enabled):

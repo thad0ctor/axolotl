@@ -104,23 +104,6 @@ class NVFP4TrainingConfig(BaseModel):
             "OFF by default."
         },
     )
-    fp8_lm_head: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Patch a plain frozen lm_head to use torch FP8 scaled "
-            "matmul in eval/no-grad forward only. Training forwards still use the "
-            "original high-precision Linear until convergence is validated. OFF by "
-            "default."
-        },
-    )
-    fp8_lm_head_granularity: Literal["tensorwise", "rowwise"] = Field(
-        default="rowwise",
-        json_schema_extra={
-            "description": "Scaling granularity for fp8_lm_head. Rowwise keeps one "
-            "scale per vocab row and had the best real-model argmax parity in the "
-            "Qwen3.5 sweep."
-        },
-    )
     quantize_embeddings: bool = Field(
         default=False,
         json_schema_extra={
