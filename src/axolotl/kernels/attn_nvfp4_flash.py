@@ -1180,6 +1180,7 @@ def _run_bwd(
     block_m, block_n, num_warps, num_stages,
     lse=None,
     sr_p_dv=None, sr_dot_dv=None, sr_ds_dq=None,
+    dkdv_scratch_bf16=False,
     qnv_saved=None, qsc_saved=None, qtnv_saved=None, qtsc_saved=None,
     knv_saved=None, ksc_saved=None, vnv_saved=None, vsc_saved=None,
     ktnv_saved=None, ktsc_saved=None,
@@ -1196,8 +1197,9 @@ def _run_bwd(
     reuse_v_pack = vnv_saved is not None and vsc_saved is not None
     reuse_kt_pack = ktnv_saved is not None and ktsc_saved is not None
     dq = torch.empty(z * h, s_q, d, device=q.device, dtype=torch.float32)
-    dk = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
-    dv = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
+    dkdv_scratch_dtype = torch.bfloat16 if dkdv_scratch_bf16 else torch.float32
+    dk = torch.empty(z * h, s_kv, d, device=q.device, dtype=dkdv_scratch_dtype)
+    dv = torch.empty(z * h, s_kv, d, device=q.device, dtype=dkdv_scratch_dtype)
     if not have_lse:
         lse = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
@@ -1353,6 +1355,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         ctx, query, key, value, scaling, causal, num_key_value_groups,
         key_pad_bias, sr, save_backward_packs,
         backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr,
+        dkdv_scratch_bf16,
         block_m, block_n, num_warps, num_stages,
     ):
         z, h, s_q, d = query.shape
@@ -1405,6 +1408,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             sr if backward_dot_dv_sr is None else backward_dot_dv_sr
         )
         ctx.backward_ds_dq_sr = sr if backward_ds_dq_sr is None else backward_ds_dq_sr
+        ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
         ctx.tiles = (block_m, block_n, num_warps, num_stages)
         ctx.has_bias = bias is not None
         return out
@@ -1427,6 +1431,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             sr_p_dv=ctx.backward_p_dv_sr,
             sr_dot_dv=ctx.backward_dot_dv_sr,
             sr_ds_dq=ctx.backward_ds_dq_sr,
+            dkdv_scratch_bf16=ctx.dkdv_scratch_bf16,
             qnv_saved=qnv if qnv.numel() else None,
             qsc_saved=qsc if qsc.numel() else None,
             qtnv_saved=qtnv if qtnv.numel() else None,
@@ -1449,7 +1454,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             dq, dk, dv,
             None, None, None, None, None,
             None, None, None, None, None,
-            None, None, None,
+            None, None, None, None,
         )
 
 
@@ -1466,6 +1471,7 @@ def nvfp4_flash_attn_func(
     backward_p_dv_stochastic_rounding: bool | None = None,
     backward_dot_dv_stochastic_rounding: bool | None = None,
     backward_ds_dq_stochastic_rounding: bool | None = None,
+    dkdv_scratch_bf16: bool = False,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -1488,5 +1494,6 @@ def nvfp4_flash_attn_func(
         key_pad_bias, stochastic_rounding, save_backward_packs,
         backward_p_dv_stochastic_rounding, backward_dot_dv_stochastic_rounding,
         backward_ds_dq_stochastic_rounding,
+        dkdv_scratch_bf16,
         block_m, block_n, num_warps, num_stages,
     )

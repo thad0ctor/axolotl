@@ -270,6 +270,9 @@ def make_nvfp4_forward(orig_forward):
                         getattr(self, "_nvfp4_stochastic_rounding", True)
                         and not getattr(self, "_nvfp4_backward_dq_ds_rtn", False)
                     ),
+                    dkdv_scratch_bf16=getattr(
+                        self, "_nvfp4_backward_dkdv_scratch_bf16", False
+                    ),
                 ).transpose(1, 2)
             else:
                 # Write roped K/V to the cache so subsequent decode steps see prefill
@@ -315,6 +318,7 @@ def patch_qwen3_5_nvfp4_attention(
     backward_dv_p_rtn: bool = False,
     backward_dv_dot_rtn: bool = False,
     backward_dq_ds_rtn: bool = False,
+    backward_dkdv_scratch_bf16: bool = False,
     stochastic_rounding: bool = True,
     layer_autograd: bool = False,
 ) -> int:
@@ -341,6 +345,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_backward_dv_p_rtn = backward_dv_p_rtn
                 module._nvfp4_backward_dv_dot_rtn = backward_dv_dot_rtn
                 module._nvfp4_backward_dq_ds_rtn = backward_dq_ds_rtn
+                module._nvfp4_backward_dkdv_scratch_bf16 = backward_dkdv_scratch_bf16
                 module._nvfp4_stochastic_rounding = stochastic_rounding
                 module._nvfp4_layer_autograd = layer_autograd
                 continue
@@ -355,6 +360,7 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_backward_dv_p_rtn = backward_dv_p_rtn
             module._nvfp4_backward_dv_dot_rtn = backward_dv_dot_rtn
             module._nvfp4_backward_dq_ds_rtn = backward_dq_ds_rtn
+            module._nvfp4_backward_dkdv_scratch_bf16 = backward_dkdv_scratch_bf16
             module._nvfp4_stochastic_rounding = stochastic_rounding
             module._nvfp4_layer_autograd = layer_autograd
             patched += 1
@@ -362,9 +368,10 @@ def patch_qwen3_5_nvfp4_attention(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, save_backward_packs=%s, "
         "backward_dv_p_rtn=%s, backward_dv_dot_rtn=%s, "
-        "backward_dq_ds_rtn=%s, layer_autograd=%s)",
+        "backward_dq_ds_rtn=%s, backward_dkdv_scratch_bf16=%s, "
+        "layer_autograd=%s)",
         patched, fuse_vproj, train_backward, save_backward_packs,
         backward_dv_p_rtn, backward_dv_dot_rtn, backward_dq_ds_rtn,
-        layer_autograd,
+        backward_dkdv_scratch_bf16, layer_autograd,
     )
     return patched

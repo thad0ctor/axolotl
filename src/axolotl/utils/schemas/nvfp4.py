@@ -104,6 +104,23 @@ class NVFP4TrainingConfig(BaseModel):
             "OFF by default."
         },
     )
+    fp8_lm_head: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Patch a plain frozen lm_head to use torch FP8 scaled "
+            "matmul in eval/no-grad forward only. Training forwards still use the "
+            "original high-precision Linear until convergence is validated. OFF by "
+            "default."
+        },
+    )
+    fp8_lm_head_granularity: Literal["tensorwise", "rowwise"] = Field(
+        default="rowwise",
+        json_schema_extra={
+            "description": "Scaling granularity for fp8_lm_head. Rowwise keeps one "
+            "scale per vocab row and had the best real-model argmax parity in the "
+            "Qwen3.5 sweep."
+        },
+    )
     quantize_embeddings: bool = Field(
         default=False,
         json_schema_extra={
@@ -221,6 +238,15 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Qwen3.5 native attention training only. Use deterministic "
             "round-to-nearest for the dS FP4 pack consumed by the dQ pass, while "
             "leaving the dK routing-gradient dS pack governed by stochastic_rounding. "
+            "Experimental and OFF by default."
+        },
+    )
+    qwen3_5_native_attention_backward_dkdv_scratch_bf16: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention training only. Store the "
+            "per-query-head dK/dV scratch buffer in bf16 before GQA reduction. "
+            "This reduces backward HBM traffic at a small gradient-precision cost. "
             "Experimental and OFF by default."
         },
     )
