@@ -469,7 +469,7 @@ def _flash_bwd_packprep_kernel(
     seed, Sq, Sq_pad,
     D: tl.constexpr,
     sq_n, sdo_n, so_n,
-    SR: tl.constexpr, WRITE_DELTA: tl.constexpr,
+    SR_DO: tl.constexpr, SR_DOT: tl.constexpr, WRITE_DELTA: tl.constexpr,
     STORE_Q: tl.constexpr, STORE_QT: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -534,9 +534,9 @@ def _flash_bwd_packprep_kernel(
         tl.store(delta_ptr + pid_zh * Sq + offs_m, delta, mask=mmask)
 
     mblk = pid_m * (BLOCK_M * D)
-    donv, dosc = _pack_nvfp4_along_k(do, 2 * Sq + mblk, seed, BLOCK_M, D, SR)
+    donv, dosc = _pack_nvfp4_along_k(do, 2 * Sq + mblk, seed, BLOCK_M, D, SR_DO)
     dotnv, dotsc = _pack_nvfp4_along_k(
-        tl.trans(do), Sq + mblk, seed, D, BLOCK_M, SR
+        tl.trans(do), Sq + mblk, seed, D, BLOCK_M, SR_DOT
     )
 
     tl.store(
@@ -663,7 +663,8 @@ def _flash_bwd_dkdv_kernel(
     scaling, seed, Sq, Sq_pad, Skv,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
     sb_z, sdk_n, sdv_n,
-    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
+    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr,
+    SR: tl.constexpr, SR_P_DV: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -742,7 +743,9 @@ def _flash_bwd_dkdv_kernel(
         pT = tl.where(sT == _NEG_INF, 0.0, pT)
 
         # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M] (SR), dO^T precomputed.
-        pT_q, pT_s = _pack_nvfp4_along_k(pT, start_m, seed, BLOCK_N, BLOCK_M, SR)
+        pT_q, pT_s = _pack_nvfp4_along_k(
+            pT, start_m, seed, BLOCK_N, BLOCK_M, SR_P_DV
+        )
         dotnv = tl.load(
             dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
         )
@@ -783,6 +786,7 @@ def _flash_bwd_dkdv_kernel(
         dv_ptr + pid_zh * (Skv * sdv_n) + offs_n[:, None] * sdv_n + offs_d[None, :],
         dv.to(dv_ptr.dtype.element_ty), mask=nmask[:, None],
     )
+
 
 # ---------------------------------------------------------------------------
 # Native-NVFP4 flash BACKWARD, dQ pass. One program per (z, h, query-block m).
@@ -1173,12 +1177,13 @@ def _run_bwd(
     z, h, hk, s_q, s_kv, d, scaling, causal, sr,
     block_m, block_n, num_warps, num_stages,
     lse=None,
+    sr_p_dv=None, sr_dot_dv=None,
     qnv_saved=None, qsc_saved=None, qtnv_saved=None, qtsc_saved=None,
     knv_saved=None, ksc_saved=None, vnv_saved=None, vsc_saved=None,
     ktnv_saved=None, ktsc_saved=None,
 ):
-    """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp). Returns
-    dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
+    """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp).
+    Returns dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
 
     If ``lse`` (the forward's per-row logsumexp, [Z*H,Sq]) is supplied, the prep
     kernel reuses it instead of recomputing it with a full FP4 QK^T pass."""
@@ -1194,6 +1199,8 @@ def _run_bwd(
     if not have_lse:
         lse = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
+    sr_p_dv = sr if sr_p_dv is None else bool(sr_p_dv)
+    sr_dot_dv = sr if sr_dot_dv is None else bool(sr_dot_dv)
     seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item() if sr else 0
     # The recompute kernels hold several fp32 [BLOCK, D] tiles + their FP4 packs in
     # SRAM at once; D=256 needs small query tiles to fit the 99KB budget.
@@ -1265,7 +1272,7 @@ def _run_bwd(
         donv_p, dosc_p, dotnv_p, dotsc_p,
         seed, s_q, s_q_pad,
         D=d, sq_n=q.stride(1), sdo_n=do.stride(1), so_n=o.stride(1),
-        SR=sr, WRITE_DELTA=have_lse,
+        SR_DO=sr, SR_DOT=sr_dot_dv, WRITE_DELTA=have_lse,
         STORE_Q=not reuse_q_pack, STORE_QT=not reuse_qt_pack, BLOCK_M=pp_block_m,
         num_warps=8, num_stages=2,
     )
@@ -1319,7 +1326,7 @@ def _run_bwd(
         scaling, seed, s_q, s_q_pad, s_kv,
         D=d, H=h, HK=hk,
         sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
-        HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
+        HAS_BIAS=has_bias, CAUSAL=causal, SR=sr, SR_P_DV=sr_p_dv,
         BLOCK_M=block_m, BLOCK_N=dkdv_block_n,
         num_warps=dkdv_warps, num_stages=dkdv_stages,
     )
@@ -1341,7 +1348,9 @@ class _NVFP4FlashAttn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, query, key, value, scaling, causal, num_key_value_groups,
-        key_pad_bias, sr, save_backward_packs, block_m, block_n, num_warps, num_stages,
+        key_pad_bias, sr, save_backward_packs,
+        backward_p_dv_sr, backward_dot_dv_sr,
+        block_m, block_n, num_warps, num_stages,
     ):
         z, h, s_q, d = query.shape
         _, hk, s_kv, _ = key.shape
@@ -1388,6 +1397,10 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         ctx.scaling = scaling
         ctx.causal = causal
         ctx.sr = sr
+        ctx.backward_p_dv_sr = sr if backward_p_dv_sr is None else backward_p_dv_sr
+        ctx.backward_dot_dv_sr = (
+            sr if backward_dot_dv_sr is None else backward_dot_dv_sr
+        )
         ctx.tiles = (block_m, block_n, num_warps, num_stages)
         ctx.has_bias = bias is not None
         return out
@@ -1407,6 +1420,8 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             q, k, v, do, o, bias,
             z, h, hk, s_q, s_kv, d, ctx.scaling, ctx.causal, ctx.sr,
             block_m, block_n, 4, 1, lse=lse,
+            sr_p_dv=ctx.backward_p_dv_sr,
+            sr_dot_dv=ctx.backward_dot_dv_sr,
             qnv_saved=qnv if qnv.numel() else None,
             qsc_saved=qsc if qsc.numel() else None,
             qtnv_saved=qtnv if qtnv.numel() else None,
@@ -1425,7 +1440,12 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         else:
             dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
             dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq, dk, dv,
+            None, None, None, None, None,
+            None, None, None, None, None,
+            None, None,
+        )
 
 
 def nvfp4_flash_attn_func(
@@ -1438,6 +1458,8 @@ def nvfp4_flash_attn_func(
     key_pad_bias: torch.Tensor | None = None,
     stochastic_rounding: bool = True,
     save_backward_packs: bool = False,
+    backward_p_dv_stochastic_rounding: bool | None = None,
+    backward_dot_dv_stochastic_rounding: bool | None = None,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -1458,5 +1480,6 @@ def nvfp4_flash_attn_func(
     return _NVFP4FlashAttn.apply(
         query, key, value, scaling, causal, num_key_value_groups,
         key_pad_bias, stochastic_rounding, save_backward_packs,
+        backward_p_dv_stochastic_rounding, backward_dot_dv_stochastic_rounding,
         block_m, block_n, num_warps, num_stages,
     )

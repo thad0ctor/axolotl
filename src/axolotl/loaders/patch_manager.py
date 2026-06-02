@@ -495,6 +495,15 @@ class PatchManager:
                 save_backward_packs=getattr(
                     nvfp4, "qwen3_5_native_attention_save_backward_packs", False
                 ),
+                backward_dv_p_rtn=getattr(
+                    nvfp4, "qwen3_5_native_attention_backward_dv_p_rtn", False
+                ),
+                backward_dv_dot_rtn=getattr(
+                    nvfp4, "qwen3_5_native_attention_backward_dv_dot_rtn", False
+                ),
+                layer_autograd=getattr(
+                    nvfp4, "qwen3_5_native_attention_layer_autograd", False
+                ),
                 stochastic_rounding=nvfp4.stochastic_rounding,
             )
 
