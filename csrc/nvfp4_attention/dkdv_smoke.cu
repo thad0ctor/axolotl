@@ -9,6 +9,8 @@
 #if __has_include(<cutlass/cutlass.h>) && __has_include(<cute/config.hpp>)
 #include <cutlass/cutlass.h>
 #include <cute/config.hpp>
+#include <cute/arch/mma_sm120.hpp>
+#include <cute/numeric/numeric_types.hpp>
 #define AXOLOTL_NVFP4_HAS_CUTLASS 1
 #endif
 #endif
@@ -25,6 +27,63 @@ __global__ void add_one_kernel(const float* in, float* out, int64_t n) {
         out[idx] = in[idx] + 1.0f;
     }
 }
+
+#if AXOLOTL_NVFP4_HAS_CUTLASS
+__global__ void fp4_mma_compile_capability_kernel(uint8_t* out) {
+    if (threadIdx.x == 0) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(CUTLASS_ARCH_MMA_SM120A_ENABLED)
+        out[0] = 1;
+#else
+        out[0] = 0;
+#endif
+    }
+}
+
+__global__ void fp4_mma_microbench_kernel(float* out, int64_t iterations) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && \
+    (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(CUTLASS_ARCH_MMA_SM120A_ENABLED))
+    using Mma = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
+        cute::float_e2m1_t,
+        cute::float_e2m1_t,
+        float,
+        cute::float_ue4m3_t,
+        16>;
+
+    const uint32_t lane = static_cast<uint32_t>(threadIdx.x & 31);
+    const uint32_t tile = static_cast<uint32_t>(blockIdx.x);
+    const uint32_t seed = 0x9e3779b9u * (tile + 1u) ^ (lane * 0x7f4a7c15u);
+    const uint32_t a0 = seed ^ 0x11111111u;
+    const uint32_t a1 = seed ^ 0x22222222u;
+    const uint32_t a2 = seed ^ 0x44444444u;
+    const uint32_t a3 = seed ^ 0x88888888u;
+    const uint32_t b0 = seed ^ 0x13579bdfu;
+    const uint32_t b1 = seed ^ 0x2468ace0u;
+    const uint32_t sf = 0x38383838u;
+
+    float c0 = 0.0f;
+    float c1 = 0.0f;
+    float c2 = 0.0f;
+    float c3 = 0.0f;
+    for (int64_t i = 0; i < iterations; ++i) {
+        float d0;
+        float d1;
+        float d2;
+        float d3;
+        Mma::fma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, sf, sf);
+        c0 = d0;
+        c1 = d1;
+        c2 = d2;
+        c3 = d3;
+    }
+    out[static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x] =
+        c0 + c1 + c2 + c3;
+#else
+    if (threadIdx.x == 0) {
+        out[static_cast<int64_t>(blockIdx.x) * blockDim.x] = 0.0f;
+    }
+#endif
+}
+#endif
 
 torch::Tensor smoke_add_one(torch::Tensor input) {
     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
@@ -44,6 +103,56 @@ torch::Tensor smoke_add_one(torch::Tensor input) {
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+bool sm120_mxf4nvf4_ue4m3_available() {
+#if AXOLOTL_NVFP4_HAS_CUTLASS
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    if (prop.major < 12) {
+        return false;
+    }
+    auto flag = torch::empty(
+        {1},
+        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kUInt8)
+    );
+    fp4_mma_compile_capability_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+        flag.data_ptr<uint8_t>()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto host_flag = flag.cpu();
+    return host_flag.item<uint8_t>() != 0;
+#else
+    return false;
+#endif
+}
+
+torch::Tensor fp4_mma_microbench(int64_t tiles, int64_t iterations) {
+    TORCH_CHECK(tiles > 0, "tiles must be positive");
+    TORCH_CHECK(iterations > 0, "iterations must be positive");
+    TORCH_CHECK(
+        sm120_mxf4nvf4_ue4m3_available(),
+        "SM120 mxf4nvf4 ue4m3 MMA requires CUTLASS/CuTe headers and a compute capability 12.x CUDA device"
+    );
+
+    auto output = torch::empty(
+        {tiles, 32},
+        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32)
+    );
+#if AXOLOTL_NVFP4_HAS_CUTLASS
+    fp4_mma_microbench_kernel<<<
+        static_cast<unsigned int>(tiles),
+        32,
+        0,
+        at::cuda::getCurrentCUDAStream()
+    >>>(output.data_ptr<float>(), iterations);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+#else
+    return output;
+#endif
 }
 
 __global__ void dkdv_signature_probe_kernel(
@@ -273,4 +382,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("smoke_add_one", &smoke_add_one);
     m.def("dkdv_signature_probe", &dkdv_signature_probe);
     m.def("has_cutlass_headers", &has_cutlass_headers);
+    m.def("sm120_mxf4nvf4_ue4m3_available", &sm120_mxf4nvf4_ue4m3_available);
+    m.def("fp4_mma_microbench", &fp4_mma_microbench);
 }
