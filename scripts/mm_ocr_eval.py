@@ -202,13 +202,10 @@ def prepare_generation_inputs(
 
 def evaluate(args) -> dict[str, Any]:
     cfg = load_config(args.config)
-    dataset_cfg = (cfg.get("pretraining_dataset") or [{}])[0]
+    dataset_cfg = (cfg.get("pretraining_dataset") or cfg.get("datasets") or [{}])[0]
     model_path = str(args.model or cfg["base_model"])
-    data_file = (
-        Path(args.data_file)
-        if args.data_file
-        else first_data_file(dataset_cfg["data_files"])
-    )
+    data_source = dataset_cfg.get("data_files") or dataset_cfg.get("path")
+    data_file = Path(args.data_file) if args.data_file else first_data_file(data_source)
     text_column = args.text_column or dataset_cfg.get("text_column") or "text"
     image_column = args.image_column or dataset_cfg.get("image_column") or "images"
     image_base_dir = args.image_base_dir or dataset_cfg.get("image_base_dir")

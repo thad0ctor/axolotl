@@ -122,7 +122,9 @@ def _pad_to_canvas(
         max(1, int(round(height * scale))),
     )
     fitted = image if new_size == image.size else image.resize(new_size, method)
-    canvas = Image.new(fitted.mode, (target_w, target_h), color)
+    canvas = Image.new(
+        fitted.mode, (target_w, target_h), _canvas_color(fitted.mode, color)
+    )
     offset = ((target_w - fitted.width) // 2, (target_h - fitted.height) // 2)
     canvas.paste(fitted, offset)
     return canvas
@@ -134,3 +136,11 @@ def _normalize_pad_color(value: Any | None) -> Any:
     if isinstance(value, list):
         return tuple(value)
     return value
+
+
+def _canvas_color(mode: str, color: Any) -> Any:
+    # Single-band modes (e.g. "L") reject an RGB tuple; collapse it to one value.
+    if mode in ("RGB", "RGBA") or not isinstance(color, (tuple, list)):
+        return color
+    bands = [c for c in tuple(color)[:3] if isinstance(c, (int, float))]
+    return int(round(sum(bands) / len(bands))) if bands else 0

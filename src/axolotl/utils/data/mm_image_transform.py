@@ -75,7 +75,9 @@ def resolve_mm_image_transform(cfg: Any) -> MMImageTransform | None:
     """
     try:
         from axolotl.integrations.base import PluginManager
-
-        return PluginManager.get_instance().get_mm_image_transform(cfg)
-    except Exception:  # noqa: BLE001 - manager may be uninitialized in tooling
+    except (ImportError, AttributeError):
         return None
+
+    # A plugin transform raising here is a real misconfiguration/bug; let it
+    # surface rather than silently downgrading to the non-tiling path.
+    return PluginManager.get_instance().get_mm_image_transform(cfg)

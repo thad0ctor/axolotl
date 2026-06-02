@@ -1369,6 +1369,11 @@ class PretrainingValidationMixin:
                 return entry.get("type") == "multimodal_pretrain"
             return getattr(entry, "type", None) == "multimodal_pretrain"
 
+        def _entry_get(entry, key):
+            if isinstance(entry, dict):
+                return entry.get(key)
+            return getattr(entry, key, None)
+
         pd = data.get("pretraining_dataset")
         pd_list = pd if isinstance(pd, list) else ([pd] if pd else [])
         datasets = data.get("datasets") or []
@@ -1387,8 +1392,7 @@ class PretrainingValidationMixin:
         train_is_mm = pd_is_mm or datasets_is_mm
 
         test_datasets = data.get("test_datasets") or []
-        test_dicts = [t for t in test_datasets if isinstance(t, dict)]
-        mm_flags = [_entry_is_mm(t) for t in test_dicts]
+        mm_flags = [_entry_is_mm(t) for t in test_datasets]
         if mm_flags:
             if any(mm_flags) != all(mm_flags):
                 raise ValueError(
@@ -1516,10 +1520,10 @@ class PretrainingValidationMixin:
             data["remove_unused_columns"] = False
 
         test_datasets = data.get("test_datasets") or []
-        mm_test = [t for t in test_datasets if isinstance(t, dict) and _entry_is_mm(t)]
+        mm_test = [t for t in test_datasets if _entry_is_mm(t)]
         if len(mm_test) > 1:
             for key in ("image_base_dir", "image_token"):
-                values = {t.get(key) for t in mm_test}
+                values = {_entry_get(t, key) for t in mm_test}
                 if len(values) > 1:
                     raise ValueError(
                         f"Multimodal CPT eval requires `{key}` to be either "

@@ -305,7 +305,8 @@ def process_real_batch(
         loaded: list[Image.Image] = []
         sizes: list[tuple[int, int]] = []
         for path in resolved:
-            image = Image.open(path).convert("RGB")
+            with Image.open(path) as opened:
+                image = opened.convert("RGB")
             loaded.append(image)
             sizes.append(image.size)
         texts.append(

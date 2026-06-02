@@ -319,14 +319,14 @@ def wrap_streaming_dataset(
                 tokenizer,
                 return_tensors="pt",
                 padding=True,
-                pad_to_multiple_of=cfg.sequence_len,
+                pad_to_multiple_of=effective_seq_len,
                 multipack_attn=multipack_attn,
             )
             encode = functools.partial(
                 encode_packed_streaming,
                 collate_fn,
                 ds_wrapper_fn,
-                max_seq_length=cfg.sequence_len,
+                max_seq_length=effective_seq_len,
                 batch_size=cfg.micro_batch_size,
                 multipack_attn=multipack_attn,
                 bin_size=cfg.sample_packing_bin_size,

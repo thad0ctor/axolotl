@@ -215,6 +215,7 @@ def _pretraining_config_from_entry(entry: dict) -> DictDefault:
         {
             "path": entry["path"],
             "name": entry.get("name"),
+            "revision": entry.get("revision"),
             "skip": entry.get("skip"),
             "split": entry.get("split", "train"),
             "data_files": entry.get("data_files"),
@@ -241,6 +242,7 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
         {
             "path": cfg.pretraining_dataset,
             "name": None,
+            "revision": None,
             "skip": 0,
             "split": "train",
             "data_files": None,
@@ -295,6 +297,7 @@ def _build_mm_pretrain_cache(
             pretraining_config["path"],
             split=pretraining_config["split"],
             name=pretraining_config["name"],
+            revision=pretraining_config.get("revision"),
             data_files=pretraining_config["data_files"],
             trust_remote_code=pretraining_config.get("trust_remote_code", False),
         )
@@ -416,6 +419,7 @@ def _load_streaming_dataset(
                 streaming=True,
                 split=pretraining_config["split"],
                 name=pretraining_config["name"],
+                revision=pretraining_config.get("revision"),
                 data_files=pretraining_config["data_files"],
                 trust_remote_code=pretraining_config.get("trust_remote_code", False),
             )

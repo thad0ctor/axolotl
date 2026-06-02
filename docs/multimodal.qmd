@@ -438,7 +438,7 @@ pretraining_dataset:
 
 streaming: true
 sequence_len: 2048
-sample_packing: false                  # REQUIRED — see below
+sample_packing: false                  # optional — set true for packing (see below)
 remove_unused_columns: false           # auto-set by validator
 
 max_steps: 10000
@@ -483,7 +483,7 @@ datasets:
 streaming: false
 dataset_prepared_path: ./data/prepared
 sequence_len: 2048
-sample_packing: false                  # REQUIRED — see below
+sample_packing: false                  # optional — set true for packing (see below)
 remove_unused_columns: false           # auto-set by validator
 
 num_epochs: 1                           # max_steps is optional in this path
@@ -561,8 +561,11 @@ without images.
 
 The following combinations are rejected at config-load time with a clear error:
 
-- `sample_packing: true` — cross-row packing would break the 1-to-1 alignment
-  between text placeholders and `pixel_values`.
+- `sample_packing: true` together with a streaming `pretraining_dataset` **and**
+  `dataset_prepared_path` — online lookahead packing can't also build a prepared
+  cache from the streaming path. Drop `dataset_prepared_path` (or set
+  `multimodal_sample_packing_cache_path` for the SSD metadata cache), or use the
+  non-streaming `datasets:` route. Packing itself is supported either way.
 - `chat_template` set to anything — defeats the purpose of the CPT path.
 - `processor_type` unset — no processor means no image tensors.
 - Multiple MM `test_datasets` entries with mismatched `image_base_dir` or `image_token`.

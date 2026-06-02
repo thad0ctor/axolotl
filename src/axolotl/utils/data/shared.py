@@ -516,14 +516,14 @@ def _dataset_hash_component(dataset_config) -> str:
         return getattr(dataset_config, key, default)
 
     component = (
-        f"{_get('path')}:{_get('type')}:{_get('shards')}:"
+        f"{_get('path')}:{_get('name')}:{_get('revision')}:{_get('data_files')}:"
+        f"{_get('type')}:{_get('ds_type')}:{_get('shards')}:"
         f"{_get('conversation')}:{_get('split')}:{_get('temperature') or 1.0}"
     )
     if _get("type") == "multimodal_pretrain" or bool(_get("multimodal")):
         component += (
             f":{_get('text_column')}:{_get('image_column')}:"
-            f"{_get('image_base_dir')}:{_get('image_token')}:"
-            f"{_get('data_files')}:{_get('ds_type')}"
+            f"{_get('image_base_dir')}:{_get('image_token')}"
         )
     return component
 
@@ -567,7 +567,8 @@ def generate_pretraining_dataset_hash(
 ) -> str:
     """Hash that pins the prepared mm-pretraining cache to the inputs that produced it."""
     if cfg.get("added_tokens_overrides"):
-        tokenizer_fingerprint = f"{cfg.tokenizer_config}+overrides:" + ",".join(
+        tokenizer_source = cfg.tokenizer_config or tokenizer_name
+        tokenizer_fingerprint = f"{tokenizer_source}+overrides:" + ",".join(
             f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
         )
     else:
@@ -577,6 +578,7 @@ def generate_pretraining_dataset_hash(
     keys = (
         "path",
         "name",
+        "revision",
         "split",
         "data_files",
         "ds_type",
@@ -616,7 +618,8 @@ def generate_dataset_hash_from_config(
     # When added_tokens_overrides is set, tokenizer.name_or_path contains output_dir.
     # Use the canonical tokenizer config + overrides content so the hash is stable across output_dir changes.
     if cfg.get("added_tokens_overrides"):
-        tokenizer_fingerprint = f"{cfg.tokenizer_config}+overrides:" + ",".join(
+        tokenizer_source = cfg.tokenizer_config or tokenizer_name
+        tokenizer_fingerprint = f"{tokenizer_source}+overrides:" + ",".join(
             f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
         )
     else:

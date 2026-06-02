@@ -282,12 +282,16 @@ def build_baseline_rows(
         enforce_max_length=True,
     )
     features = []
+    # Per-row metadata maps 1:1 only when not packed; packed features aggregate
+    # multiple source rows, so skip the annotation in that case.
+    one_to_one = len(encoded["_mm_text"]) == len(rows)
     for idx in range(len(encoded["_mm_text"])):
         feature = {key: encoded[key][idx] for key in encoded}
-        if "_bench_row_index" in rows[idx]:
-            feature["_bench_row_index"] = rows[idx]["_bench_row_index"]
-        if "_tile_count" in rows[idx]:
-            feature["_tile_count"] = rows[idx]["_tile_count"]
+        if one_to_one:
+            if "_bench_row_index" in rows[idx]:
+                feature["_bench_row_index"] = rows[idx]["_bench_row_index"]
+            if "_tile_count" in rows[idx]:
+                feature["_tile_count"] = rows[idx]["_tile_count"]
         features.append(feature)
     return features
 
@@ -333,12 +337,16 @@ def build_packed_rows(
         image_resize_pad_color=image_resize_pad_color,
     )
     features = []
+    # Per-row metadata maps 1:1 only when not packed; packed features aggregate
+    # multiple source rows, so skip the annotation in that case.
+    one_to_one = len(encoded["_mm_text"]) == len(rows)
     for idx in range(len(encoded["_mm_text"])):
         feature = {key: encoded[key][idx] for key in encoded}
-        if "_bench_row_index" in rows[idx]:
-            feature["_bench_row_index"] = rows[idx]["_bench_row_index"]
-        if "_tile_count" in rows[idx]:
-            feature["_tile_count"] = rows[idx]["_tile_count"]
+        if one_to_one:
+            if "_bench_row_index" in rows[idx]:
+                feature["_bench_row_index"] = rows[idx]["_bench_row_index"]
+            if "_tile_count" in rows[idx]:
+                feature["_tile_count"] = rows[idx]["_tile_count"]
         features.append(feature)
     return features
 

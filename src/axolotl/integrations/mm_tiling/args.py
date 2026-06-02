@@ -219,19 +219,13 @@ class MMTilingArgs(BaseModel):
     @model_validator(mode="after")
     def warn_unused_image_tiling_fields(self):
         if not self.image_tiling:
-            set_fields = [
+            # model_fields_set catches explicitly-set fields regardless of their
+            # default, so bool flags (tile_labels, no_upscale, ...) warn too.
+            set_fields = sorted(
                 name
-                for name in (
-                    "image_tiling_tile_size",
-                    "image_tiling_grid",
-                    "image_tiling_overview_size",
-                    "image_tiling_overview_buckets",
-                    "image_tiling_pad_color",
-                    "image_tiling_cache_path",
-                    "image_tiling_shape_buckets",
-                )
-                if getattr(self, name) is not None
-            ]
+                for name in self.model_fields_set
+                if name.startswith("image_tiling_")
+            )
             if set_fields:
                 LOG.warning(
                     "image_tiling is disabled but these tiling fields are set and "
