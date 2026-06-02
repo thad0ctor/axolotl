@@ -171,3 +171,45 @@ class NVFP4TrainingConfig(BaseModel):
             "resume. OFF by default (bf16 save, unchanged)."
         },
     )
+    qwen3_5_native_attention: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only. Patch full softmax-attention layers to use "
+            "the native NVFP4 attention path on dense causal/full batches. Forward "
+            "falls back to the model's configured attention for unsupported masks or "
+            "cache states. OFF by default."
+        },
+    )
+    qwen3_5_native_attention_backward: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only; requires qwen3_5_native_attention. Use the "
+            "native NVFP4 autograd attention path while training. This is validated "
+            "for convergence but can be slower than bf16 at short sequence lengths, "
+            "so it stays explicitly opt-in."
+        },
+    )
+    qwen3_5_fuse_vproj: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention only. Run v_proj as a native "
+            "NVFP4 GEMM with key-axis pack epilogue on inference/cache-free prefill. "
+            "Skipped automatically for adapter-wrapped v_proj modules."
+        },
+    )
+    qwen3_5_native_linear_attn: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only. Patch GatedDeltaNet's large projection GEMMs "
+            "to native NVFP4 in no-grad forward/eval. Training forwards fall back to "
+            "the original implementation."
+        },
+    )
+    qwen3_5_native_mlp: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only. Patch dense SwiGLU MLP GEMMs to native NVFP4 "
+            "in no-grad forward/eval. Training forwards fall back to the original "
+            "implementation."
+        },
+    )

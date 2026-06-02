@@ -26,7 +26,9 @@ removing a redundant activation round-trip. ``in_proj_a/b`` (N=32, memory-bound)
 ``out_proj`` (a different activation, post delta-rule) keep their own paths.
 
 Forward/inference only (no autograd). Opt-in: call
-``patch_qwen3_5_nvfp4_linear_attn(model)``; default OFF.
+``patch_qwen3_5_nvfp4_linear_attn(model)``; default OFF. Adapter-wrapped
+projection modules are skipped; plain trainable weights are re-packed after
+optimizer updates when no-grad eval next uses the fast path.
 """
 
 from __future__ import annotations
@@ -46,6 +48,59 @@ from axolotl.utils.logging import get_logger
 import triton
 
 LOG = get_logger(__name__)
+
+
+def _is_plain_linear(module: nn.Module) -> bool:
+    return type(module) is nn.Linear
+
+
+def _get_packed_weight(
+    owner: nn.Module, cache_attr: str, linear: nn.Linear
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weight = linear.weight
+    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+    cached = getattr(owner, cache_attr, None)
+    if cached is None or cached[0] != key:
+        wnv, wsc = prepack_weight_nvfp4(weight.detach())
+        setattr(owner, cache_attr, (key, wnv, wsc))
+        cached = getattr(owner, cache_attr)
+    return cached[1], cached[2]
+
+
+def _position_ids_are_dense_unpacked(
+    position_ids: torch.Tensor | None, seq_len: int
+) -> bool:
+    if position_ids is None:
+        return True
+    if position_ids.ndim == 3:
+        position_ids = position_ids[0]
+    if position_ids.ndim != 2 or position_ids.shape[-1] != seq_len:
+        return False
+    ref = torch.arange(seq_len, device=position_ids.device, dtype=position_ids.dtype)
+    return bool(torch.equal(position_ids, ref.expand_as(position_ids)))
+
+
+def _call_orig_forward(
+    orig_forward,
+    module,
+    hidden_states,
+    cache_params,
+    attention_mask,
+    cache_position,
+    position_ids,
+    kwargs,
+):
+    if cache_position is None and position_ids is None and not kwargs:
+        return orig_forward(module, hidden_states, cache_params, attention_mask)
+    return orig_forward(
+        module,
+        hidden_states,
+        cache_params=cache_params,
+        attention_mask=attention_mask,
+        cache_position=cache_position,
+        position_ids=position_ids,
+        **kwargs,
+    )
 
 
 def _gemm_from_packed_act(anv, asc, wnv, wsc, m, n_out, k, out_dtype):
@@ -79,12 +134,34 @@ def make_nvfp4_gdn_forward(orig_forward):
     GEMM cost dominates and parity is straightforward.
     """
 
-    def forward(self, hidden_states, cache_params=None, attention_mask=None):
+    def forward(
+        self,
+        hidden_states,
+        cache_params=None,
+        attention_mask=None,
+        cache_position=None,
+        position_ids=None,
+        **kwargs,
+    ):
         use_cache = cache_params is not None and cache_params.has_previous_state(
             self.layer_idx
         )
-        if torch.is_grad_enabled() or use_cache:
-            return orig_forward(self, hidden_states, cache_params, attention_mask)
+        if (
+            torch.is_grad_enabled()
+            or use_cache
+            or kwargs
+            or not _position_ids_are_dense_unpacked(position_ids, hidden_states.shape[1])
+        ):
+            return _call_orig_forward(
+                orig_forward,
+                self,
+                hidden_states,
+                cache_params,
+                attention_mask,
+                cache_position,
+                position_ids,
+                kwargs,
+            )
 
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
             apply_mask_to_padding_states,
@@ -102,12 +179,14 @@ def make_nvfp4_gdn_forward(orig_forward):
         anv = anv[0]
         asc = asc[0]
         out_dtype = hidden_states.dtype
+        qkv_wnv, qkv_wsc = _get_packed_weight(self, "_qkv_packed", self.in_proj_qkv)
+        z_wnv, z_wsc = _get_packed_weight(self, "_z_packed", self.in_proj_z)
 
         mixed_qkv = _gemm_from_packed_act(
-            anv, asc, self._qkv_wnv, self._qkv_wsc, m, self.conv_dim, k, out_dtype
+            anv, asc, qkv_wnv, qkv_wsc, m, self.conv_dim, k, out_dtype
         ).reshape(batch_size, seq_len, self.conv_dim)
         z = _gemm_from_packed_act(
-            anv, asc, self._z_wnv, self._z_wsc, m, self.value_dim, k, out_dtype
+            anv, asc, z_wnv, z_wsc, m, self.value_dim, k, out_dtype
         ).reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -162,8 +241,9 @@ def make_nvfp4_gdn_forward(orig_forward):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         # out_proj: separate activation (post delta-rule), its own NVFP4 path.
+        out_wnv, out_wsc = _get_packed_weight(self, "_out_packed", self.out_proj)
         output = nvfp4_linear(
-            core_attn_out, self._out_wnv, self._out_wsc, self.hidden_size
+            core_attn_out, out_wnv, out_wsc, self.hidden_size
         )
         return output
 
@@ -183,15 +263,12 @@ def patch_qwen3_5_nvfp4_linear_attn(model: nn.Module) -> int:
         if isinstance(module, Qwen3_5GatedDeltaNet):
             if getattr(module, "_nvfp4_patched", False):
                 continue
-            module._qkv_wnv, module._qkv_wsc = prepack_weight_nvfp4(
-                module.in_proj_qkv.weight
-            )
-            module._z_wnv, module._z_wsc = prepack_weight_nvfp4(
-                module.in_proj_z.weight
-            )
-            module._out_wnv, module._out_wsc = prepack_weight_nvfp4(
-                module.out_proj.weight
-            )
+            if not (
+                _is_plain_linear(module.in_proj_qkv)
+                and _is_plain_linear(module.in_proj_z)
+                and _is_plain_linear(module.out_proj)
+            ):
+                continue
             orig = type(module).forward
             if seen_forward is None:
                 seen_forward = make_nvfp4_gdn_forward(orig)
