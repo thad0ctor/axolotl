@@ -11,6 +11,8 @@ from torch.utils.cpp_extension import CUDA_HOME, load
 
 
 ENV_FLAG = "AXOLOTL_NVFP4_DKDV_CUDA"
+ENV_REFERENCE_FLAG = "AXOLOTL_NVFP4_DKDV_CUDA_REFERENCE"
+ENV_MMA_FLAG = "AXOLOTL_NVFP4_DKDV_CUDA_MMA"
 ENV_SRC = "AXOLOTL_NVFP4_DKDV_CUDA_SRC"
 ENV_ARCH_LIST = "TORCH_CUDA_ARCH_LIST"
 DEFAULT_ARCH_LIST = "12.0a"
@@ -19,6 +21,19 @@ EXTENSION_NAME = "axolotl_nvfp4_dkdv"
 
 def enabled() -> bool:
     return os.environ.get(ENV_FLAG, "").lower() in {"1", "true", "yes", "on"}
+
+
+def reference_enabled() -> bool:
+    return os.environ.get(ENV_REFERENCE_FLAG, "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def mma_enabled() -> bool:
+    return os.environ.get(ENV_MMA_FLAG, "").lower() in {"1", "true", "yes", "on"}
 
 
 def _repo_root() -> Path:
@@ -296,6 +311,148 @@ def dkdv_backward(
         bool(sr_p_dv),
         int(block_m),
         int(block_n),
+    )
+
+
+def dkdv_backward_reference(
+    qnv: torch.Tensor,
+    qsc: torch.Tensor,
+    donv: torch.Tensor,
+    dosc: torch.Tensor,
+    knv: torch.Tensor,
+    ksc: torch.Tensor,
+    vnv: torch.Tensor,
+    vsc: torch.Tensor,
+    bias: torch.Tensor | None,
+    lse: torch.Tensor,
+    delta: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    scaling: float,
+    sq: int,
+    skv: int,
+    *,
+    D: int,
+    H: int,
+    HK: int,
+    sb_z: int,
+    sdk_n: int,
+    sdv_n: int,
+    has_bias: bool,
+    causal: bool,
+) -> None:
+    """Correctness-first CUDA dK/dV implementation; scalar, not yet tensor-core."""
+    extension = load_extension()
+    if extension is None:
+        raise RuntimeError(
+            f"set {ENV_FLAG}=1 before calling the experimental NVFP4 dK/dV backend"
+        )
+    bias_arg = (
+        bias
+        if bias is not None
+        else torch.empty(0, device=qnv.device, dtype=torch.float32)
+    )
+    extension.dkdv_reference(
+        qnv,
+        qsc.view(torch.uint8),
+        donv,
+        dosc.view(torch.uint8),
+        knv,
+        ksc.view(torch.uint8),
+        vnv,
+        vsc.view(torch.uint8),
+        bias_arg,
+        lse,
+        delta,
+        dk,
+        dv,
+        float(scaling),
+        int(sq),
+        int(skv),
+        int(D),
+        int(H),
+        int(HK),
+        int(sb_z),
+        int(sdk_n),
+        int(sdv_n),
+        bool(has_bias),
+        bool(causal),
+    )
+
+
+def dkdv_backward_mma_rtn(
+    qnv: torch.Tensor,
+    qsc: torch.Tensor,
+    qtnv: torch.Tensor,
+    qtsc: torch.Tensor,
+    donv: torch.Tensor,
+    dosc: torch.Tensor,
+    dotnv: torch.Tensor,
+    dotsc: torch.Tensor,
+    knv: torch.Tensor,
+    ksc: torch.Tensor,
+    vnv: torch.Tensor,
+    vsc: torch.Tensor,
+    bias: torch.Tensor | None,
+    lse: torch.Tensor,
+    delta: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    scaling: float,
+    sq: int,
+    sq_pad: int,
+    skv: int,
+    *,
+    D: int,
+    H: int,
+    HK: int,
+    sb_z: int,
+    sdk_n: int,
+    sdv_n: int,
+    has_bias: bool,
+    causal: bool,
+) -> None:
+    """Experimental SM120 native-FP4 MMA dK/dV backend; RTN-only, D=256."""
+    extension = load_extension()
+    if extension is None:
+        raise RuntimeError(
+            f"set {ENV_FLAG}=1 before calling the experimental NVFP4 dK/dV backend"
+        )
+    bias_arg = (
+        bias
+        if bias is not None
+        else torch.empty(0, device=qnv.device, dtype=torch.float32)
+    )
+    extension.dkdv_mma_rtn(
+        qnv,
+        qsc.view(torch.uint8),
+        qtnv,
+        qtsc.view(torch.uint8),
+        donv,
+        dosc.view(torch.uint8),
+        dotnv,
+        dotsc.view(torch.uint8),
+        knv,
+        ksc.view(torch.uint8),
+        vnv,
+        vsc.view(torch.uint8),
+        bias_arg,
+        lse,
+        delta,
+        dk,
+        dv,
+        float(scaling),
+        int(sq),
+        int(sq_pad),
+        int(skv),
+        int(D),
+        int(H),
+        int(HK),
+        int(sb_z),
+        int(sdk_n),
+        int(sdv_n),
+        bool(has_bias),
+        bool(causal),
     )
 
 

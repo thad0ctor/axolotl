@@ -61,6 +61,8 @@ materialization).
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -71,6 +73,10 @@ _E4M3_EPS = tl.constexpr(1.5258789e-05)
 _F8E4M3_MAX = tl.constexpr(448.0)
 _F4_MAX = tl.constexpr(6.0)
 _NEG_INF = tl.constexpr(-3.4028234663852886e38)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -1324,17 +1330,69 @@ def _run_bwd(
     vsc_pv = vsc_p.view(torch.uint8)
     ktsc_pv = ktsc_p.view(torch.uint8)
 
-    _flash_bwd_dkdv_kernel[(triton.cdiv(s_kv, dkdv_block_n), z * h)](
-        qnv_p, qsc_p.view(torch.uint8), qtnv_p, qtsc_p.view(torch.uint8),
-        donv_p, dosc_p.view(torch.uint8), dotnv_p, dotsc_p.view(torch.uint8),
-        knv_p, ksc_pv, vnv_p, vsc_pv, bdummy, lse, delta, dk, dv,
-        scaling, seed, s_q, s_q_pad, s_kv,
-        D=d, H=h, HK=hk,
-        sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
-        HAS_BIAS=has_bias, CAUSAL=causal, SR=sr, SR_P_DV=sr_p_dv,
-        BLOCK_M=block_m, BLOCK_N=dkdv_block_n,
-        num_warps=dkdv_warps, num_stages=dkdv_stages,
-    )
+    use_cuda_dkdv_reference = False
+    use_cuda_dkdv_mma = False
+    try:
+        from axolotl.kernels.cuda_ext import nvfp4_dkdv
+
+        use_cuda_dkdv_reference = (
+            nvfp4_dkdv.reference_enabled()
+            and dk.dtype is torch.float32
+            and dv.dtype is torch.float32
+        )
+        if nvfp4_dkdv.mma_enabled():
+            unsupported = []
+            if d != 256:
+                unsupported.append("D must be 256")
+            if sr or sr_p_dv:
+                unsupported.append("MMA dK/dV is RTN-only for now")
+            if dk.dtype is not torch.float32 or dv.dtype is not torch.float32:
+                unsupported.append("dK/dV scratch must be fp32")
+            if block_m != 64:
+                unsupported.append("BLOCK_M must be 64")
+            if unsupported:
+                raise RuntimeError(
+                    "AXOLOTL_NVFP4_DKDV_CUDA_MMA=1 unsupported: "
+                    + ", ".join(unsupported)
+                )
+            use_cuda_dkdv_mma = True
+    except Exception:
+        if _env_truthy("AXOLOTL_NVFP4_DKDV_CUDA_REFERENCE") or _env_truthy(
+            "AXOLOTL_NVFP4_DKDV_CUDA_MMA"
+        ):
+            raise
+        use_cuda_dkdv_reference = False
+        use_cuda_dkdv_mma = False
+    if use_cuda_dkdv_reference:
+        nvfp4_dkdv.dkdv_backward_reference(
+            qnv_p, qsc_p, donv_p, dosc_p, knv_p, ksc_p, vnv_p, vsc_p,
+            bias, lse, delta, dk, dv, scaling, s_q, s_kv,
+            D=d, H=h, HK=hk,
+            sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
+            has_bias=has_bias, causal=causal,
+        )
+    elif use_cuda_dkdv_mma:
+        nvfp4_dkdv.dkdv_backward_mma_rtn(
+            qnv_p, qsc_p, qtnv_p, qtsc_p,
+            donv_p, dosc_p, dotnv_p, dotsc_p,
+            knv_p, ksc_pv, vnv_p, vsc_pv,
+            bias, lse, delta, dk, dv, scaling, s_q, s_q_pad, s_kv,
+            D=d, H=h, HK=hk,
+            sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
+            has_bias=has_bias, causal=causal,
+        )
+    else:
+        _flash_bwd_dkdv_kernel[(triton.cdiv(s_kv, dkdv_block_n), z * h)](
+            qnv_p, qsc_p.view(torch.uint8), qtnv_p, qtsc_p.view(torch.uint8),
+            donv_p, dosc_p.view(torch.uint8), dotnv_p, dotsc_p.view(torch.uint8),
+            knv_p, ksc_pv, vnv_p, vsc_pv, bdummy, lse, delta, dk, dv,
+            scaling, seed, s_q, s_q_pad, s_kv,
+            D=d, H=h, HK=hk,
+            sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
+            HAS_BIAS=has_bias, CAUSAL=causal, SR=sr, SR_P_DV=sr_p_dv,
+            BLOCK_M=block_m, BLOCK_N=dkdv_block_n,
+            num_warps=dkdv_warps, num_stages=dkdv_stages,
+        )
     _flash_bwd_dq_kernel[(triton.cdiv(s_q, dq_block_m), z * h)](
         qnv_p, qsc_p.view(torch.uint8), donv_p, dosc_p.view(torch.uint8), bdummy,
         knv_p, ksc_pv, vnv_p, vsc_pv, ktnv_p, ktsc_pv,
