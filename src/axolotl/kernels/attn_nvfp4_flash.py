@@ -801,7 +801,7 @@ def _flash_bwd_dq_kernel(
     scaling, seed, Sq, Skv, Skv_pad,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
     sb_z, sdq_n,
-    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
+    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR_DS_DQ: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -887,7 +887,9 @@ def _flash_bwd_dq_kernel(
         ds = tl.where(p == 0.0, 0.0, ds)
 
         # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N] (SR), K^T precomputed.
-        ds_q, ds_s = _pack_nvfp4_along_k(ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR)
+        ds_q, ds_s = _pack_nvfp4_along_k(
+            ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR_DS_DQ
+        )
         np_ = (start_n // 2) + offs_np0
         nsc = (start_n // 16) + offs_nsc0
         kTnv = tl.load(
@@ -1177,7 +1179,7 @@ def _run_bwd(
     z, h, hk, s_q, s_kv, d, scaling, causal, sr,
     block_m, block_n, num_warps, num_stages,
     lse=None,
-    sr_p_dv=None, sr_dot_dv=None,
+    sr_p_dv=None, sr_dot_dv=None, sr_ds_dq=None,
     qnv_saved=None, qsc_saved=None, qtnv_saved=None, qtsc_saved=None,
     knv_saved=None, ksc_saved=None, vnv_saved=None, vsc_saved=None,
     ktnv_saved=None, ktsc_saved=None,
@@ -1201,6 +1203,7 @@ def _run_bwd(
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     sr_p_dv = sr if sr_p_dv is None else bool(sr_p_dv)
     sr_dot_dv = sr if sr_dot_dv is None else bool(sr_dot_dv)
+    sr_ds_dq = sr if sr_ds_dq is None else bool(sr_ds_dq)
     seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item() if sr else 0
     # The recompute kernels hold several fp32 [BLOCK, D] tiles + their FP4 packs in
     # SRAM at once; D=256 needs small query tiles to fit the 99KB budget.
@@ -1337,7 +1340,7 @@ def _run_bwd(
         scaling, seed, s_q, s_kv, s_kv_pad,
         D=d, H=h, HK=hk,
         sb_z=sb_z, sdq_n=dq.stride(1),
-        HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
+        HAS_BIAS=has_bias, CAUSAL=causal, SR_DS_DQ=sr_ds_dq,
         BLOCK_M=dq_block_m, BLOCK_N=dq_block_n,
         num_warps=dq_warps, num_stages=dq_stages,
     )
@@ -1349,7 +1352,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
     def forward(
         ctx, query, key, value, scaling, causal, num_key_value_groups,
         key_pad_bias, sr, save_backward_packs,
-        backward_p_dv_sr, backward_dot_dv_sr,
+        backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr,
         block_m, block_n, num_warps, num_stages,
     ):
         z, h, s_q, d = query.shape
@@ -1401,6 +1404,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         ctx.backward_dot_dv_sr = (
             sr if backward_dot_dv_sr is None else backward_dot_dv_sr
         )
+        ctx.backward_ds_dq_sr = sr if backward_ds_dq_sr is None else backward_ds_dq_sr
         ctx.tiles = (block_m, block_n, num_warps, num_stages)
         ctx.has_bias = bias is not None
         return out
@@ -1422,6 +1426,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             block_m, block_n, 4, 1, lse=lse,
             sr_p_dv=ctx.backward_p_dv_sr,
             sr_dot_dv=ctx.backward_dot_dv_sr,
+            sr_ds_dq=ctx.backward_ds_dq_sr,
             qnv_saved=qnv if qnv.numel() else None,
             qsc_saved=qsc if qsc.numel() else None,
             qtnv_saved=qtnv if qtnv.numel() else None,
@@ -1444,7 +1449,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             dq, dk, dv,
             None, None, None, None, None,
             None, None, None, None, None,
-            None, None,
+            None, None, None,
         )
 
 
@@ -1460,6 +1465,7 @@ def nvfp4_flash_attn_func(
     save_backward_packs: bool = False,
     backward_p_dv_stochastic_rounding: bool | None = None,
     backward_dot_dv_stochastic_rounding: bool | None = None,
+    backward_ds_dq_stochastic_rounding: bool | None = None,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -1481,5 +1487,6 @@ def nvfp4_flash_attn_func(
         query, key, value, scaling, causal, num_key_value_groups,
         key_pad_bias, stochastic_rounding, save_backward_packs,
         backward_p_dv_stochastic_rounding, backward_dot_dv_stochastic_rounding,
+        backward_ds_dq_stochastic_rounding,
         block_m, block_n, num_warps, num_stages,
     )

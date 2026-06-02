@@ -215,6 +215,15 @@ class NVFP4TrainingConfig(BaseModel):
             "Experimental and OFF by default."
         },
     )
+    qwen3_5_native_attention_backward_dq_ds_rtn: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention training only. Use deterministic "
+            "round-to-nearest for the dS FP4 pack consumed by the dQ pass, while "
+            "leaving the dK routing-gradient dS pack governed by stochastic_rounding. "
+            "Experimental and OFF by default."
+        },
+    )
     qwen3_5_native_attention_layer_autograd: bool = Field(
         default=False,
         json_schema_extra={

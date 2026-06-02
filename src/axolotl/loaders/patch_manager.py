@@ -501,6 +501,9 @@ class PatchManager:
                 backward_dv_dot_rtn=getattr(
                     nvfp4, "qwen3_5_native_attention_backward_dv_dot_rtn", False
                 ),
+                backward_dq_ds_rtn=getattr(
+                    nvfp4, "qwen3_5_native_attention_backward_dq_ds_rtn", False
+                ),
                 layer_autograd=getattr(
                     nvfp4, "qwen3_5_native_attention_layer_autograd", False
                 ),

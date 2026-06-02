@@ -52,6 +52,7 @@ def _forward_impl(
     save_backward_packs: bool,
     backward_p_dv_stochastic_rounding: bool,
     backward_dot_dv_stochastic_rounding: bool,
+    backward_ds_dq_stochastic_rounding: bool,
 ) -> torch.Tensor:
     from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
@@ -95,6 +96,7 @@ def _forward_impl(
         save_backward_packs=save_backward_packs,
         backward_p_dv_stochastic_rounding=backward_p_dv_stochastic_rounding,
         backward_dot_dv_stochastic_rounding=backward_dot_dv_stochastic_rounding,
+        backward_ds_dq_stochastic_rounding=backward_ds_dq_stochastic_rounding,
     ).transpose(1, 2)
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -128,6 +130,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
         save_backward_packs: bool,
         backward_p_dv_stochastic_rounding: bool,
         backward_dot_dv_stochastic_rounding: bool,
+        backward_ds_dq_stochastic_rounding: bool,
     ) -> torch.Tensor:
         ctx.save_for_backward(
             hidden_states,
@@ -154,6 +157,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
             save_backward_packs,
             backward_p_dv_stochastic_rounding,
             backward_dot_dv_stochastic_rounding,
+            backward_ds_dq_stochastic_rounding,
         )
         ctx.cpu_rng_state = torch.get_rng_state()
         if hidden_states.is_cuda:
@@ -185,6 +189,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
             save_backward_packs,
             backward_p_dv_stochastic_rounding,
             backward_dot_dv_stochastic_rounding,
+            backward_ds_dq_stochastic_rounding,
         )
 
     @staticmethod
@@ -200,6 +205,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
             save_backward_packs,
             backward_p_dv_stochastic_rounding,
             backward_dot_dv_stochastic_rounding,
+            backward_ds_dq_stochastic_rounding,
         ) = ctx.meta
 
         detached = [
@@ -236,6 +242,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
                     save_backward_packs,
                     backward_p_dv_stochastic_rounding,
                     backward_dot_dv_stochastic_rounding,
+                    backward_ds_dq_stochastic_rounding,
                 )
                 grads = torch.autograd.grad(
                     output,
@@ -244,7 +251,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
                     allow_unused=True,
                 )
 
-        result: list[torch.Tensor | None] = [None] * 22
+        result: list[torch.Tensor | None] = [None] * 23
         for idx, grad in zip(grad_target_indices, grads):
             result[idx] = grad
         return tuple(result)
@@ -311,5 +318,9 @@ def qwen35_nvfp4_layer_attention(
         (
             bool(getattr(module, "_nvfp4_stochastic_rounding", True))
             and not bool(getattr(module, "_nvfp4_backward_dv_dot_rtn", False))
+        ),
+        (
+            bool(getattr(module, "_nvfp4_stochastic_rounding", True))
+            and not bool(getattr(module, "_nvfp4_backward_dq_ds_rtn", False))
         ),
     )
