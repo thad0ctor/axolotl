@@ -75,7 +75,7 @@ for cfg in "${CFGS[@]}"; do
   # cache -> the marginal subtraction is corrupted (can go negative). Warm THIS
   # config first (throwaway) so both measured runs hit the warm cache.
   require_idle "$name:warm"
-  runwall "$cfg" 8 "$LOGDIR/$name.warm.log" >/dev/null
+  runwall "$cfg" 8 "$LOGDIR/$name.warm.log" >/dev/null || true  # OOM here must not kill the driver (set -e)
   require_idle "$name:short"
   w1=$(runwall "$cfg" "$N1" "$LOGDIR/$name.short.log")
   require_idle "$name:long"
