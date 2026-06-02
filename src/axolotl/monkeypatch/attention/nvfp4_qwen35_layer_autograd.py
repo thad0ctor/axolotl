@@ -17,6 +17,9 @@ from axolotl.kernels.attn_nvfp4_flash import (
 )
 
 _MANUAL_BWD_ENV = "AXOLOTL_NVFP4_QWEN35_LAYER_AUTOGRAD_MANUAL_BWD"
+_SAVE_ATTN_ARTIFACTS_ENV = (
+    "AXOLOTL_NVFP4_QWEN35_LAYER_AUTOGRAD_SAVE_ATTN_ARTIFACTS"
+)
 
 
 def _empty_bias_like(x: torch.Tensor) -> torch.Tensor:
@@ -29,6 +32,14 @@ def _bias_or_none(bias: torch.Tensor) -> torch.Tensor | None:
 
 def _manual_backward_enabled() -> bool:
     return os.environ.get(_MANUAL_BWD_ENV, "").lower() in {"1", "true", "yes"}
+
+
+def _save_attention_artifacts_enabled() -> bool:
+    return os.environ.get(_SAVE_ATTN_ARTIFACTS_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _qwen3_5_rms_norm(
@@ -197,7 +208,8 @@ def _forward_impl(
     backward_dot_dv_stochastic_rounding: bool,
     backward_ds_dq_stochastic_rounding: bool,
     dkdv_scratch_bf16: bool,
-) -> torch.Tensor:
+    return_attention_artifacts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, head_dim)
 
@@ -225,24 +237,77 @@ def _forward_impl(
     )
 
     query_roped, key_roped = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
-    attn_output = nvfp4_flash_attn_func(
-        query_roped,
-        key_roped,
-        value_states,
-        scaling,
-        causal=causal,
-        num_key_value_groups=query_states.shape[1] // key_states.shape[1],
-        stochastic_rounding=stochastic_rounding,
-        save_backward_packs=save_backward_packs,
-        backward_p_dv_stochastic_rounding=backward_p_dv_stochastic_rounding,
-        backward_dot_dv_stochastic_rounding=backward_dot_dv_stochastic_rounding,
-        backward_ds_dq_stochastic_rounding=backward_ds_dq_stochastic_rounding,
-        dkdv_scratch_bf16=dkdv_scratch_bf16,
-    ).transpose(1, 2)
+    num_key_value_groups = query_states.shape[1] // key_states.shape[1]
+    if return_attention_artifacts:
+        if save_backward_packs:
+            attn_heads, lse, packs = nvfp4_flash_attention(
+                query_roped,
+                key_roped,
+                value_states,
+                scaling,
+                causal=causal,
+                num_key_value_groups=num_key_value_groups,
+                return_lse=True,
+                return_packs=True,
+            )
+        else:
+            attn_heads, lse = nvfp4_flash_attention(
+                query_roped,
+                key_roped,
+                value_states,
+                scaling,
+                causal=causal,
+                num_key_value_groups=num_key_value_groups,
+                return_lse=True,
+            )
+            empty = hidden_states.new_empty(0)
+            packs = (empty,) * 10
+        attn_output = attn_heads.transpose(1, 2)
+    else:
+        attn_heads = lse = None
+        packs = ()
+        attn_output = nvfp4_flash_attn_func(
+            query_roped,
+            key_roped,
+            value_states,
+            scaling,
+            causal=causal,
+            num_key_value_groups=num_key_value_groups,
+            stochastic_rounding=stochastic_rounding,
+            save_backward_packs=save_backward_packs,
+            backward_p_dv_stochastic_rounding=backward_p_dv_stochastic_rounding,
+            backward_dot_dv_stochastic_rounding=backward_dot_dv_stochastic_rounding,
+            backward_ds_dq_stochastic_rounding=backward_ds_dq_stochastic_rounding,
+            dkdv_scratch_bf16=dkdv_scratch_bf16,
+        ).transpose(1, 2)
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
-    return F.linear(attn_output, o_weight, _bias_or_none(o_bias))
+    output = F.linear(attn_output, o_weight, _bias_or_none(o_bias))
+    if return_attention_artifacts:
+        return output, (attn_heads, lse, *packs)
+    return output
+
+
+def _saved_attention_artifacts(
+    ctx,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor | None, ...]] | None:
+    if not getattr(ctx, "save_forward_attention_artifacts", False):
+        return None
+
+    saved = ctx.saved_tensors
+    if len(saved) < 15:
+        return None
+
+    attn_heads = saved[13]
+    lse = saved[14]
+    if attn_heads.numel() == 0 or lse.numel() == 0:
+        return None
+
+    packs = tuple(tensor if tensor.numel() != 0 else None for tensor in saved[15:25])
+    if len(packs) != 10:
+        packs = (None,) * 10
+    return attn_heads, lse, packs
 
 
 def _backward_recompute_autograd(ctx, grad_output: torch.Tensor):
@@ -326,7 +391,7 @@ def _backward_native_attention(ctx, grad_output: torch.Tensor):
         o_bias,
         q_norm_weight,
         k_norm_weight,
-    ) = ctx.saved_tensors
+    ) = ctx.saved_tensors[:13]
     (
         head_dim,
         q_norm_eps,
@@ -386,7 +451,11 @@ def _backward_native_attention(ctx, grad_output: torch.Tensor):
     s_kv = key_roped.shape[2]
     num_key_value_groups = h // hk
 
-    if save_backward_packs:
+    saved_attention = _saved_attention_artifacts(ctx)
+    if saved_attention is not None:
+        attn_heads, lse, packs = saved_attention
+        qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc = packs
+    elif save_backward_packs:
         attn_heads, lse, packs = nvfp4_flash_attention(
             query_roped,
             key_roped,
@@ -627,21 +696,10 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
         backward_ds_dq_stochastic_rounding: bool,
         dkdv_scratch_bf16: bool,
     ) -> torch.Tensor:
-        ctx.save_for_backward(
-            hidden_states,
-            cos,
-            sin,
-            q_weight,
-            q_bias,
-            k_weight,
-            k_bias,
-            v_weight,
-            v_bias,
-            o_weight,
-            o_bias,
-            q_norm_weight,
-            k_norm_weight,
+        save_forward_attention_artifacts = (
+            _manual_backward_enabled() and _save_attention_artifacts_enabled()
         )
+        ctx.save_forward_attention_artifacts = save_forward_attention_artifacts
         ctx.meta = (
             head_dim,
             q_norm_eps,
@@ -662,7 +720,7 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
         else:
             ctx.cuda_device = None
             ctx.cuda_rng_state = None
-        return _forward_impl(
+        forward_result = _forward_impl(
             hidden_states,
             cos,
             sin,
@@ -687,7 +745,30 @@ class _Qwen35NVFP4LayerAttention(torch.autograd.Function):
             backward_dot_dv_stochastic_rounding,
             backward_ds_dq_stochastic_rounding,
             dkdv_scratch_bf16,
+            return_attention_artifacts=save_forward_attention_artifacts,
         )
+        if save_forward_attention_artifacts:
+            output, attention_artifacts = forward_result
+        else:
+            output = forward_result
+            attention_artifacts = ()
+        ctx.save_for_backward(
+            hidden_states,
+            cos,
+            sin,
+            q_weight,
+            q_bias,
+            k_weight,
+            k_bias,
+            v_weight,
+            v_bias,
+            o_weight,
+            o_bias,
+            q_norm_weight,
+            k_norm_weight,
+            *attention_artifacts,
+        )
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
