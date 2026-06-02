@@ -276,9 +276,7 @@ class PatchManager:
             sage_cfg = self.cfg.sage_attention
             configure_sage_fp4(
                 per_block_mean=sage_cfg.per_block_mean if sage_cfg else True,
-                allow_sdpa_fallback=(
-                    sage_cfg.allow_sdpa_fallback if sage_cfg else True
-                ),
+                allow_fallback=(sage_cfg.allow_fallback if sage_cfg else True),
             )
             register_sage_fp4_attn()
 

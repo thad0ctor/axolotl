@@ -19,13 +19,15 @@ class SageAttentionConfig(BaseModel):
             "default and improves accuracy on outlier-heavy activations."
         },
     )
-    allow_sdpa_fallback: bool = Field(
+    allow_fallback: bool = Field(
         default=True,
         json_schema_extra={
             "description": "When an input can't use the FP4 kernel (per-key padding, "
-            "sliding window, custom softmax scale, or head_dim>=256) fall back to SDPA "
-            "for a correct result (default). Set false to RAISE instead — useful when "
-            "benchmarking to guarantee every call actually runs the FP4 kernel rather "
-            "than silently degrading to bf16 SDPA."
+            "sliding window, custom softmax scale, or head_dim>=256) fall back to a "
+            "high-precision kernel for a correct result (default): flash attention for "
+            "dense causal/full masks (covers head_dim<=256, so Qwen3.5 causal prefill), "
+            "SDPA only for masks flash can't represent. Set false to RAISE instead — "
+            "useful when benchmarking to guarantee every call runs the FP4 kernel "
+            "rather than silently degrading to high precision."
         },
     )

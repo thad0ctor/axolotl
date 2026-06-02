@@ -104,14 +104,23 @@ def sage_attention_forward(
 
         batch_size = query.size(0)
 
-        from transformers.modeling_flash_attention_utils import (
-            prepare_fa2_from_position_ids,
-        )
-
         if cu_seqlens_q is None or cu_seqlens_k is None:
-            query, key, value, indices_q, cu_seq_lens, max_seq_lens = (
-                prepare_fa2_from_position_ids(query, key, value, position_ids)
-            )
+            try:
+                from transformers.modeling_flash_attention_utils import (
+                    prepare_fa2_from_position_ids,
+                )
+
+                query, key, value, _, cu_seq_lens, max_seq_lens = (
+                    prepare_fa2_from_position_ids(query, key, value, position_ids)
+                )
+            except ImportError:
+                from transformers.modeling_flash_attention_utils import (
+                    _prepare_from_posids,
+                )
+
+                query, key, value, cu_seq_lens, max_seq_lens = _prepare_from_posids(
+                    query, key, value, position_ids
+                )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_length_q, max_length_k = max_seq_lens

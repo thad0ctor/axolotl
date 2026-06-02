@@ -31,18 +31,18 @@ SAGE_FP4_IMPL_NAME = "sage_fp4"
 _MAX_HEAD_DIM = 256  # Sage-3 kernel is undefined at/above this; SDPA handles it
 
 _PER_BLOCK_MEAN = True
-_ALLOW_SDPA_FALLBACK = True
+_ALLOW_FALLBACK = True
 
 sageattn3_blackwell = None  # pylint: disable=invalid-name
 
 
 def configure_sage_fp4(
-    per_block_mean: bool = True, allow_sdpa_fallback: bool = True
+    per_block_mean: bool = True, allow_fallback: bool = True
 ) -> None:
     """Set the runtime knobs read by ``sage_fp4_attention_forward``."""
-    global _PER_BLOCK_MEAN, _ALLOW_SDPA_FALLBACK  # pylint: disable=global-statement
+    global _PER_BLOCK_MEAN, _ALLOW_FALLBACK  # pylint: disable=global-statement
     _PER_BLOCK_MEAN = per_block_mean
-    _ALLOW_SDPA_FALLBACK = allow_sdpa_fallback
+    _ALLOW_FALLBACK = allow_fallback
 
 
 def _is_sage_fp4_available() -> bool:
@@ -56,6 +56,45 @@ def _is_sage_fp4_available() -> bool:
 
 if _is_sage_fp4_available():
     from sageattn3 import sageattn3_blackwell
+
+
+def _flash_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _fallback_kind(
+    attention_mask: torch.Tensor | None, q_len: int, kv_len: int
+) -> str:
+    """Classify the fallback for inputs the FP4 kernel can't serve.
+
+    ``"causal"`` / ``"full"`` are flash-attention-eligible (dense, no per-key
+    padding); ``"sdpa"`` is everything flash can't represent as a dense causal/full
+    mask (per-key padding, sliding window, arbitrary additive bias)."""
+    if attention_mask is None:
+        return "causal" if q_len == kv_len else "full"
+    if attention_mask.dim() != 4:
+        return "sdpa"
+    m = attention_mask[..., :kv_len]
+    if m.shape[-1] != kv_len:
+        return "sdpa"
+    neg = torch.finfo(m.dtype).min
+    keep = m > neg / 2
+    if keep.shape[1] != 1:
+        if not bool((keep == keep[:, :1]).all()):
+            return "sdpa"
+        keep = keep[:, :1]
+    keep = keep[:, 0]
+    if bool(keep.all()):
+        return "full"
+    if q_len == kv_len:
+        causal = torch.tril(
+            torch.ones(q_len, kv_len, dtype=torch.bool, device=keep.device)
+        )[None]
+        if bool((keep == causal).all()):
+            return "causal"
+    return "sdpa"
 
 
 def _check_available() -> None:
@@ -168,31 +207,50 @@ def sage_fp4_attention_forward(
         )
         return out.transpose(1, 2).contiguous(), None
 
-    if not _ALLOW_SDPA_FALLBACK:
+    if not _ALLOW_FALLBACK:
         raise RuntimeError(
             "sage_fp4: input cannot use the FP4 kernel (per-key padding, sliding "
             "window, custom softmax scale, head_dim>=%d, or dropout) and "
-            "allow_sdpa_fallback is false. Pad to a uniform length / use a model "
-            "with standard scaling, or enable the SDPA fallback." % _MAX_HEAD_DIM
+            "allow_fallback is false. Pad to a uniform length / use a model with "
+            "standard scaling, or enable the fallback." % _MAX_HEAD_DIM
         )
+
+    kind = _fallback_kind(attention_mask, q_len, kv_len)
+
+    # Prefer flash attention (FA2 covers head_dim<=256, so it serves Qwen3.5 causal
+    # prefill fast); SDPA only for masks flash can't represent densely (per-key
+    # padding, sliding window, arbitrary additive bias).
+    if kind in ("causal", "full") and dropout == 0.0 and _flash_available():
+        from flash_attn import flash_attn_func
+
+        if not getattr(sage_fp4_attention_forward, "_flash_logged", False):
+            LOG.info("sage_fp4: falling back to flash_attn (kind=%s)", kind)
+            sage_fp4_attention_forward._flash_logged = True
+        out = flash_attn_func(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            dropout_p=dropout,
+            softmax_scale=scaling,
+            causal=(kind == "causal"),
+        )
+        return out, None  # flash returns [B, S, H, D]
 
     if not getattr(sage_fp4_attention_forward, "_sdpa_logged", False):
         LOG.info(
-            "sage_fp4: falling back to SDPA (padding/sliding-window/custom-scale/"
-            "head_dim>=%d or dropout); FP4 kernel only covers dense standard-scale "
-            "attention.",
-            _MAX_HEAD_DIM,
+            "sage_fp4: falling back to SDPA (kind=%s; flash can't represent this "
+            "mask densely or flash_attn is unavailable).",
+            kind,
         )
         sage_fp4_attention_forward._sdpa_logged = True
 
-    is_causal_sdpa = attention_mask is None and q_len == kv_len
     out = F.scaled_dot_product_attention(
         query,
         key,
         value,
         attn_mask=attention_mask[..., :kv_len] if attention_mask is not None else None,
         dropout_p=dropout,
-        is_causal=is_causal_sdpa,
+        is_causal=(attention_mask is None and q_len == kv_len),
         scale=scaling,
     )
     return out.transpose(1, 2).contiguous(), None
