@@ -492,6 +492,9 @@ class PatchManager:
                 train_backward=getattr(
                     nvfp4, "qwen3_5_native_attention_backward", False
                 ),
+                save_backward_packs=getattr(
+                    nvfp4, "qwen3_5_native_attention_save_backward_packs", False
+                ),
                 stochastic_rounding=nvfp4.stochastic_rounding,
             )
 

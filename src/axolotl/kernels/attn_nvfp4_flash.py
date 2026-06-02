@@ -470,6 +470,7 @@ def _flash_bwd_packprep_kernel(
     D: tl.constexpr,
     sq_n, sdo_n, so_n,
     SR: tl.constexpr, WRITE_DELTA: tl.constexpr,
+    STORE_Q: tl.constexpr, STORE_QT: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -477,11 +478,6 @@ def _flash_bwd_packprep_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
     mmask = offs_m < Sq
-
-    q = tl.load(
-        q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
-        mask=mmask[:, None], other=0.0,
-    ).to(tl.float32)
 
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
@@ -492,27 +488,38 @@ def _flash_bwd_packprep_kernel(
     offs_mp = pid_m * MP2 + tl.arange(0, MP2)
     offs_msc = pid_m * MP16 + tl.arange(0, MP16)
 
-    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
-    qtnv, qtsc = _pack_nvfp4_along_k(tl.trans(q), 4 * Sq, seed, D, BLOCK_M, False)
+    if STORE_Q or STORE_QT:
+        q = tl.load(
+            q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
+            mask=mmask[:, None], other=0.0,
+        ).to(tl.float32)
+        if STORE_Q:
+            qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
+        if STORE_QT:
+            qtnv, qtsc = _pack_nvfp4_along_k(
+                tl.trans(q), 4 * Sq, seed, D, BLOCK_M, False
+            )
 
-    tl.store(
-        qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
-        qnv, mask=mmask[:, None],
-    )
-    tl.store(
-        qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
-        qsc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
-    )
+    if STORE_Q:
+        tl.store(
+            qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+            qnv, mask=mmask[:, None],
+        )
+        tl.store(
+            qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+            qsc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
+        )
     sq2 = Sq_pad // 2
     sq16 = Sq_pad // 16
-    tl.store(
-        qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
-        qtnv,
-    )
-    tl.store(
-        qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
-        qtsc.to(tl.uint8, bitcast=True),
-    )
+    if STORE_QT:
+        tl.store(
+            qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
+            qtnv,
+        )
+        tl.store(
+            qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
+            qtsc.to(tl.uint8, bitcast=True),
+        )
 
     do = tl.load(
         do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
@@ -563,6 +570,7 @@ def _flash_bwd_kprep_kernel(
     seed, Skv, Skv_pad,
     D: tl.constexpr,
     sk_n, sv_n,
+    STORE_K: tl.constexpr, STORE_V: tl.constexpr, STORE_KT: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -571,17 +579,21 @@ def _flash_bwd_kprep_kernel(
     offs_d = tl.arange(0, D)
     nmask = offs_n < Skv
 
-    k = tl.load(
-        k_ptr + pid_zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
-        mask=nmask[:, None], other=0.0,
-    ).to(tl.float32)
-    knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
-    kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
-    v = tl.load(
-        v_ptr + pid_zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
-        mask=nmask[:, None], other=0.0,
-    ).to(tl.float32)
-    vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
+    if STORE_K or STORE_KT:
+        k = tl.load(
+            k_ptr + pid_zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+            mask=nmask[:, None], other=0.0,
+        ).to(tl.float32)
+        if STORE_K:
+            knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+        if STORE_KT:
+            kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
+    if STORE_V:
+        v = tl.load(
+            v_ptr + pid_zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+            mask=nmask[:, None], other=0.0,
+        ).to(tl.float32)
+        vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
 
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
@@ -592,32 +604,35 @@ def _flash_bwd_kprep_kernel(
     offs_np = pid_n * NP2 + tl.arange(0, NP2)
     offs_nsc = pid_n * NP16 + tl.arange(0, NP16)
 
-    tl.store(
-        knv_ptr + pid_zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
-        knv, mask=nmask[:, None],
-    )
-    tl.store(
-        ksc_ptr + pid_zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
-        ksc.to(tl.uint8, bitcast=True), mask=nmask[:, None],
-    )
-    tl.store(
-        vnv_ptr + pid_zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
-        vnv, mask=nmask[:, None],
-    )
-    tl.store(
-        vsc_ptr + pid_zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
-        vsc.to(tl.uint8, bitcast=True), mask=nmask[:, None],
-    )
+    if STORE_K:
+        tl.store(
+            knv_ptr + pid_zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+            knv, mask=nmask[:, None],
+        )
+        tl.store(
+            ksc_ptr + pid_zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+            ksc.to(tl.uint8, bitcast=True), mask=nmask[:, None],
+        )
+    if STORE_V:
+        tl.store(
+            vnv_ptr + pid_zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+            vnv, mask=nmask[:, None],
+        )
+        tl.store(
+            vsc_ptr + pid_zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+            vsc.to(tl.uint8, bitcast=True), mask=nmask[:, None],
+        )
     sk2 = Skv_pad // 2
     sk16 = Skv_pad // 16
-    tl.store(
-        ktnv_ptr + pid_zhk * (D * sk2) + offs_d[:, None] * sk2 + offs_np[None, :],
-        kTnv,
-    )
-    tl.store(
-        ktsc_ptr + pid_zhk * (D * sk16) + offs_d[:, None] * sk16 + offs_nsc[None, :],
-        kTsc.to(tl.uint8, bitcast=True),
-    )
+    if STORE_KT:
+        tl.store(
+            ktnv_ptr + pid_zhk * (D * sk2) + offs_d[:, None] * sk2 + offs_np[None, :],
+            kTnv,
+        )
+        tl.store(
+            ktsc_ptr + pid_zhk * (D * sk16) + offs_d[:, None] * sk16 + offs_nsc[None, :],
+            kTsc.to(tl.uint8, bitcast=True),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +783,6 @@ def _flash_bwd_dkdv_kernel(
         dv_ptr + pid_zh * (Skv * sdv_n) + offs_n[:, None] * sdv_n + offs_d[None, :],
         dv.to(dv_ptr.dtype.element_ty), mask=nmask[:, None],
     )
-
 
 # ---------------------------------------------------------------------------
 # Native-NVFP4 flash BACKWARD, dQ pass. One program per (z, h, query-block m).
@@ -1047,6 +1061,7 @@ def nvfp4_flash_attention(
     num_warps: int = 8,
     num_stages: int = 3,
     return_lse: bool = False,
+    return_packs: bool = False,
 ):
     """Fused native-NVFP4 flash attention, forward only.
 
@@ -1061,6 +1076,7 @@ def nvfp4_flash_attention(
         block_m, block_n: flash tile sizes.
         return_lse: also return the per-row logsumexp ``[Z*H, Sq]`` (fp32) so the
             backward can skip recomputing it (the FA2 backward prep's QK^T pass).
+        return_packs: also return backward-reusable Q/K/V NVFP4 packs for autograd.
 
     Returns:
         ``[Z, H, Sq, D]`` in ``query.dtype`` (and the LSE tensor if ``return_lse``).
@@ -1086,6 +1102,15 @@ def nvfp4_flash_attention(
     knv, ksc = _quant_nvfp4(k2)
     s_kv_pad = _next_mult(s_kv, block_n)
     vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
+    packs = None
+    if return_packs:
+        bwd_block_m = min(block_m, 64)
+        s_q_bwd_pad = _next_mult(s_q, max(bwd_block_m, 32))
+        s_kv_bwd_pad = _next_mult(s_kv, 64)
+        qtnv, qtsc = _quant_nvfp4(q2, transpose=True, k_pad=s_q_bwd_pad)
+        vdnv, vdsc = _quant_nvfp4(v2)
+        ktnv, ktsc = _quant_nvfp4(k2, transpose=True, k_pad=s_kv_bwd_pad)
+        packs = (qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc)
 
     bias = None
     if key_pad_bias is not None:
@@ -1131,8 +1156,12 @@ def nvfp4_flash_attention(
         )
 
     _run()
+    if return_lse and return_packs:
+        return out.reshape(z, h, s_q, d), lse, packs
     if return_lse:
         return out.reshape(z, h, s_q, d), lse
+    if return_packs:
+        return out.reshape(z, h, s_q, d), packs
     return out.reshape(z, h, s_q, d)
 
 
@@ -1144,6 +1173,9 @@ def _run_bwd(
     z, h, hk, s_q, s_kv, d, scaling, causal, sr,
     block_m, block_n, num_warps, num_stages,
     lse=None,
+    qnv_saved=None, qsc_saved=None, qtnv_saved=None, qtsc_saved=None,
+    knv_saved=None, ksc_saved=None, vnv_saved=None, vsc_saved=None,
+    ktnv_saved=None, ktsc_saved=None,
 ):
     """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp). Returns
     dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
@@ -1151,6 +1183,11 @@ def _run_bwd(
     If ``lse`` (the forward's per-row logsumexp, [Z*H,Sq]) is supplied, the prep
     kernel reuses it instead of recomputing it with a full FP4 QK^T pass."""
     have_lse = lse is not None
+    reuse_q_pack = qnv_saved is not None and qsc_saved is not None
+    reuse_qt_pack = qtnv_saved is not None and qtsc_saved is not None
+    reuse_k_pack = knv_saved is not None and ksc_saved is not None
+    reuse_v_pack = vnv_saved is not None and vsc_saved is not None
+    reuse_kt_pack = ktnv_saved is not None and ktsc_saved is not None
     dq = torch.empty(z * h, s_q, d, device=q.device, dtype=torch.float32)
     dk = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
     dv = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
@@ -1206,12 +1243,20 @@ def _run_bwd(
     # them at its own BLOCK_M). ~7x faster than the wide-tile config.
     pp_block_m = 32
     s_q_pad = _next_mult(s_q, max(block_m, pp_block_m))
-    qnv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
-    qsc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
+    if reuse_q_pack:
+        qnv_p = qnv_saved.view(torch.uint8)
+        qsc_p = qsc_saved
+    else:
+        qnv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
+        qsc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
     donv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
     dosc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
-    qtnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
-    qtsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+    if reuse_qt_pack:
+        qtnv_p = qtnv_saved.view(torch.uint8)
+        qtsc_p = qtsc_saved
+    else:
+        qtnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
+        qtsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
     dotnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
     dotsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
     _flash_bwd_packprep_kernel[(triton.cdiv(s_q, pp_block_m), z * h)](
@@ -1220,32 +1265,49 @@ def _run_bwd(
         donv_p, dosc_p, dotnv_p, dotsc_p,
         seed, s_q, s_q_pad,
         D=d, sq_n=q.stride(1), sdo_n=do.stride(1), so_n=o.stride(1),
-        SR=sr, WRITE_DELTA=have_lse, BLOCK_M=pp_block_m,
+        SR=sr, WRITE_DELTA=have_lse,
+        STORE_Q=not reuse_q_pack, STORE_QT=not reuse_qt_pack, BLOCK_M=pp_block_m,
         num_warps=8, num_stages=2,
     )
-    qsc_p = qsc_p.view(torch.float8_e4m3fn)
+    if not reuse_q_pack:
+        qsc_p = qsc_p.view(torch.float8_e4m3fn)
     dosc_p = dosc_p.view(torch.float8_e4m3fn)
-    qtsc_p = qtsc_p.view(torch.float8_e4m3fn)
+    if not reuse_qt_pack:
+        qtsc_p = qtsc_p.view(torch.float8_e4m3fn)
     dotsc_p = dotsc_p.view(torch.float8_e4m3fn)
 
     # K-side pack-prep: pack K/V once per kv-head (knv/vnv along D, K^T along N) so
     # backward passes load them instead of re-quantizing inside their loops.
     kprep_block_n = 64
     s_kv_pad = _next_mult(s_kv, kprep_block_n)
-    knv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
-    ksc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
-    vnv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
-    vsc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
-    ktnv_p = k.new_empty(z * hk, d, s_kv_pad // 2, dtype=torch.uint8)
-    ktsc_p = k.new_zeros(z * hk, d, s_kv_pad // 16, dtype=torch.uint8)
-    _flash_bwd_kprep_kernel[(triton.cdiv(s_kv, kprep_block_n), z * hk)](
-        k, v,
-        knv_p, ksc_p, vnv_p, vsc_p, ktnv_p, ktsc_p,
-        seed, s_kv, s_kv_pad,
-        D=d, sk_n=k.stride(1), sv_n=v.stride(1),
-        BLOCK_N=kprep_block_n,
-        num_warps=dq_warps, num_stages=num_stages,
-    )
+    if reuse_k_pack:
+        knv_p = knv_saved.view(torch.uint8)
+        ksc_p = ksc_saved
+    else:
+        knv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
+        ksc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
+    if reuse_v_pack:
+        vnv_p = vnv_saved.view(torch.uint8)
+        vsc_p = vsc_saved
+    else:
+        vnv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
+        vsc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
+    if reuse_kt_pack:
+        ktnv_p = ktnv_saved.view(torch.uint8)
+        ktsc_p = ktsc_saved
+    else:
+        ktnv_p = k.new_empty(z * hk, d, s_kv_pad // 2, dtype=torch.uint8)
+        ktsc_p = k.new_zeros(z * hk, d, s_kv_pad // 16, dtype=torch.uint8)
+    if not (reuse_k_pack and reuse_v_pack and reuse_kt_pack):
+        _flash_bwd_kprep_kernel[(triton.cdiv(s_kv, kprep_block_n), z * hk)](
+            k, v,
+            knv_p, ksc_p, vnv_p, vsc_p, ktnv_p, ktsc_p,
+            seed, s_kv, s_kv_pad,
+            D=d, sk_n=k.stride(1), sv_n=v.stride(1),
+            STORE_K=not reuse_k_pack, STORE_V=not reuse_v_pack, STORE_KT=not reuse_kt_pack,
+            BLOCK_N=kprep_block_n,
+            num_warps=dq_warps, num_stages=num_stages,
+        )
     ksc_pv = ksc_p.view(torch.uint8)
     vsc_pv = vsc_p.view(torch.uint8)
     ktsc_pv = ktsc_p.view(torch.uint8)
@@ -1279,16 +1341,28 @@ class _NVFP4FlashAttn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, query, key, value, scaling, causal, num_key_value_groups,
-        key_pad_bias, sr, block_m, block_n, num_warps, num_stages,
+        key_pad_bias, sr, save_backward_packs, block_m, block_n, num_warps, num_stages,
     ):
         z, h, s_q, d = query.shape
         _, hk, s_kv, _ = key.shape
-        out, lse = nvfp4_flash_attention(
-            query, key, value, scaling, causal=causal,
-            num_key_value_groups=num_key_value_groups, key_pad_bias=key_pad_bias,
-            block_m=block_m, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
-            return_lse=True,
-        )
+        if save_backward_packs:
+            out, lse, packs = nvfp4_flash_attention(
+                query, key, value, scaling, causal=causal,
+                num_key_value_groups=num_key_value_groups, key_pad_bias=key_pad_bias,
+                block_m=block_m, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
+                return_lse=True, return_packs=True,
+            )
+            qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc = packs
+        else:
+            out, lse = nvfp4_flash_attention(
+                query, key, value, scaling, causal=causal,
+                num_key_value_groups=num_key_value_groups, key_pad_bias=key_pad_bias,
+                block_m=block_m, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
+                return_lse=True,
+            )
+            qnv = qsc = qtnv = qtsc = knv = ksc = vdnv = vdsc = ktnv = ktsc = (
+                torch.empty(0, device=query.device)
+            )
         bias = None
         if key_pad_bias is not None:
             bias = key_pad_bias.to(torch.float32).contiguous()
@@ -1299,6 +1373,16 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             out.reshape(z * h, s_q, d),
             bias if bias is not None else torch.empty(0, device=query.device),
             lse,
+            qnv,
+            qsc,
+            qtnv,
+            qtsc,
+            knv,
+            ksc,
+            vdnv,
+            vdsc,
+            ktnv,
+            ktsc,
         )
         ctx.dims = (z, h, hk, s_q, s_kv, d)
         ctx.scaling = scaling
@@ -1310,7 +1394,11 @@ class _NVFP4FlashAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, o, bias, lse = ctx.saved_tensors
+        (
+            q, k, v, o, bias, lse,
+            qnv, qsc, qtnv, qtsc,
+            knv, ksc, vdnv, vdsc, ktnv, ktsc,
+        ) = ctx.saved_tensors
         z, h, hk, s_q, s_kv, d = ctx.dims
         block_m, block_n, num_warps, num_stages = ctx.tiles
         bias = bias if ctx.has_bias else None
@@ -1319,6 +1407,16 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             q, k, v, do, o, bias,
             z, h, hk, s_q, s_kv, d, ctx.scaling, ctx.causal, ctx.sr,
             block_m, block_n, 4, 1, lse=lse,
+            qnv_saved=qnv if qnv.numel() else None,
+            qsc_saved=qsc if qsc.numel() else None,
+            qtnv_saved=qtnv if qtnv.numel() else None,
+            qtsc_saved=qtsc if qtsc.numel() else None,
+            knv_saved=knv if knv.numel() else None,
+            ksc_saved=ksc if ksc.numel() else None,
+            vnv_saved=vdnv if vdnv.numel() else None,
+            vsc_saved=vdsc if vdsc.numel() else None,
+            ktnv_saved=ktnv if ktnv.numel() else None,
+            ktsc_saved=ktsc if ktsc.numel() else None,
         )
         dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype)
         ng = h // hk
@@ -1327,7 +1425,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         else:
             dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
             dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def nvfp4_flash_attn_func(
@@ -1339,6 +1437,7 @@ def nvfp4_flash_attn_func(
     num_key_value_groups: int = 1,
     key_pad_bias: torch.Tensor | None = None,
     stochastic_rounding: bool = True,
+    save_backward_packs: bool = False,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -1358,5 +1457,6 @@ def nvfp4_flash_attn_func(
     assert d in (128, 256)
     return _NVFP4FlashAttn.apply(
         query, key, value, scaling, causal, num_key_value_groups,
-        key_pad_bias, stochastic_rounding, block_m, block_n, num_warps, num_stages,
+        key_pad_bias, stochastic_rounding, save_backward_packs,
+        block_m, block_n, num_warps, num_stages,
     )

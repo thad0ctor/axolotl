@@ -189,6 +189,15 @@ class NVFP4TrainingConfig(BaseModel):
             "so it stays explicitly opt-in."
         },
     )
+    qwen3_5_native_attention_save_backward_packs: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention training only. Save extra NVFP4 "
+            "Q/K/V layouts from forward so backward can skip repacking them. This "
+            "improves backward-only timing but can move cost into forward, so it is "
+            "experimental and OFF by default."
+        },
+    )
     qwen3_5_fuse_vproj: bool = Field(
         default=False,
         json_schema_extra={

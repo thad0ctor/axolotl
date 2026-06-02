@@ -223,6 +223,9 @@ def make_nvfp4_forward(orig_forward):
                     stochastic_rounding=getattr(
                         self, "_nvfp4_stochastic_rounding", True
                     ),
+                    save_backward_packs=getattr(
+                        self, "_nvfp4_save_backward_packs", False
+                    ),
                 ).transpose(1, 2)
             else:
                 # Write roped K/V to the cache so subsequent decode steps see prefill
@@ -264,6 +267,7 @@ def patch_qwen3_5_nvfp4_attention(
     model: nn.Module,
     fuse_vproj: bool = _FUSE_VPROJ,
     train_backward: bool = False,
+    save_backward_packs: bool = False,
     stochastic_rounding: bool = True,
 ) -> int:
     """Patch every Qwen3.5 FULL-attention layer's forward to use NVFP4 attention.
@@ -285,6 +289,7 @@ def patch_qwen3_5_nvfp4_attention(
             if getattr(module, "_nvfp4_patched", False):
                 module._nvfp4_fuse_vproj = fuse_vproj
                 module._nvfp4_train_backward = train_backward
+                module._nvfp4_save_backward_packs = save_backward_packs
                 module._nvfp4_stochastic_rounding = stochastic_rounding
                 continue
             orig = type(module).forward
@@ -294,11 +299,12 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_patched = True
             module._nvfp4_fuse_vproj = fuse_vproj
             module._nvfp4_train_backward = train_backward
+            module._nvfp4_save_backward_packs = save_backward_packs
             module._nvfp4_stochastic_rounding = stochastic_rounding
             patched += 1
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
-        "(fuse_vproj=%s, train_backward=%s)",
-        patched, fuse_vproj, train_backward,
+        "(fuse_vproj=%s, train_backward=%s, save_backward_packs=%s)",
+        patched, fuse_vproj, train_backward, save_backward_packs,
     )
     return patched
