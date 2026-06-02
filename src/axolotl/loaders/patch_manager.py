@@ -446,7 +446,12 @@ class PatchManager:
         ):
             from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
 
-            patch_model_fused_fp4_ce(model)
+            patch_model_fused_fp4_ce(
+                model,
+                fp4_matmul=True
+                if getattr(nvfp4, "fused_fp4_cross_entropy_fp4_matmul", False)
+                else None,
+            )
 
     def _nvfp4_load_packed_sidecar(self, model: PreTrainedModel):
         """Restore FP4-packed weights from a save_nvfp4 sidecar, if one exists.

@@ -104,6 +104,19 @@ class NVFP4TrainingConfig(BaseModel):
             "OFF by default."
         },
     )
+    fused_fp4_cross_entropy_fp4_matmul: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Experimental. When fused_fp4_cross_entropy is enabled, "
+            "use per-tile FP4 torch._scaled_mm for lm_head logits before the tiled "
+            "online logsumexp. This hits Blackwell FP4 tensor cores for the matmul, "
+            "but still materializes each [tokens, vocab_block] tile and still uses "
+            "a dequantized weight tile for dhidden in backward. Early microbenchmarks "
+            "show it is faster than the memory-only FP4 CE path but slower than "
+            "materialized bf16/Liger CE; keep this off unless benchmarking the "
+            "next native CE-epilogue design."
+        },
+    )
     quantize_embeddings: bool = Field(
         default=False,
         json_schema_extra={
