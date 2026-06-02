@@ -138,6 +138,7 @@ class NVFP4TrainingConfig(BaseModel):
     )
     skip_first_n_blocks: int = Field(
         default=0,
+        ge=0,
         json_schema_extra={
             "description": "Keep the first N transformer blocks in high precision. "
             "The NVFP4 paper keeps ~15% of linear layers in bf16 (embeddings/lm_head "
@@ -148,6 +149,7 @@ class NVFP4TrainingConfig(BaseModel):
     )
     skip_last_n_blocks: int = Field(
         default=0,
+        ge=0,
         json_schema_extra={
             "description": "Keep the last N transformer blocks in high precision. "
             "See skip_first_n_blocks for the ~15% high-precision policy from the "

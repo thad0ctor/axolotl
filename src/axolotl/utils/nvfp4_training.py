@@ -70,7 +70,10 @@ def nvfp4_supported() -> tuple[bool, str]:
         )
     except ImportError as exc:
         return False, f"NVFP4 training requires torchao >= 0.18 ({exc})"
-    if torch.__version__ < "2.8":
+    from packaging import version as _v
+
+    # parse() not string compare: "2.12" < "2.8" lexicographically (wrong for >=2.10)
+    if _v.parse(torch.__version__.split("+")[0]) < _v.parse("2.8"):
         return False, "NVFP4 training requires torch >= 2.8"
     return True, ""
 

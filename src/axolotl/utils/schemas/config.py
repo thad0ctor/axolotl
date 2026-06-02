@@ -578,8 +578,8 @@ class AxolotlInputConfig(
     nvfp4_training: NVFP4TrainingConfig | None = Field(
         default=None,
         json_schema_extra={
-            "description": "NVFP4-GEMM training (real FP4 compute on Blackwell). Full "
-            "fine-tune only; the speedup requires torch.compile."
+            "description": "NVFP4-GEMM training (real FP4 compute on Blackwell). "
+            "Full fine-tune or LoRA/QLoRA adapters; the speedup requires torch.compile."
         },
     )
     bfloat16: bool | None = Field(
@@ -1634,7 +1634,9 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
         # `adapter: qlora` implies a quantized base; the FP4-storage path REPLACES
         # bnb NF4, so the two quant schemes on the same base layer conflict.
         wants_fp4_storage = bool(self.adapter) and (
-            self.nvfp4_training.quantize_base or self.adapter == "qlora"
+            self.nvfp4_training.quantize_base
+            or self.adapter == "qlora"
+            or self.nvfp4_training.base_mode == "storage"
         )
         if wants_fp4_storage and (self.load_in_4bit or self.load_in_8bit):
             raise ValueError(
