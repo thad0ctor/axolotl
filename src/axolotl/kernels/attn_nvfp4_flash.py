@@ -39,11 +39,20 @@ tl.dot_scaled layout (per the validated /tmp microbenches), e4m3 group-16:
 A native-NVFP4 BACKWARD (``nvfp4_flash_attn_func`` / ``_NVFP4FlashAttn``) wraps
 this into a full ``torch.autograd.Function``. It recomputes S/P in SRAM and runs
 all four grad GEMMs (dV, dP, dK, dQ) as ``tl.dot_scaled`` FP4 ops, quantizing the
-gradient operands (P, dS, dO) with in-kernel stochastic rounding (the convergence
-knob from ``utils/nvfp4_training``). The seq-axis contractions (dV=P^T@dO,
-dK=dS^T@Q, dQ=dS@K) are the large-K FP4-friendly ones; dP=dO@V^T contracts over
-head_dim. Validated on Qwen3.5-2B: a 120-step SR-on training run tracks bf16
-attention to within loss noise (no divergence).
+gradient operands (P, dS, dO) with stochastic rounding (the convergence knob from
+``utils/nvfp4_training``). The seq-axis contractions (dV=P^T@dO, dK=dS^T@Q,
+dQ=dS@K) are the large-K FP4-friendly ones; dP=dO@V^T contracts over head_dim.
+
+The FP4 packs that are reused across the score-recompute loops are quantized ONCE
+in two cheap pack-prep passes instead of being re-quantized every loop iteration
+(the round of per-iter SR philox draws was the backward's dominant cost):
+  * pack-prep (m-block): Q/dO and their transposes -> dK/dV pass operands.
+  * K-side pack-prep (n-block): K/V along D and K^T along N -> dQ pass operands.
+Only the two genuinely (n,m)-dependent SR packs (pT, dSt) remain in the dK/dV
+loop. With the loop footprint shrunk, both passes run narrow key tiles + deep
+pipelining. Net: backward ~2x (S=2048) / ~1.45x (S=4096) slower than bf16 cuDNN
+on sm_120, down from ~10x. Validated on Qwen3.5-2B: a 120-step SR-on training run
+tracks bf16 attention to within loss noise (no divergence).
 
 GQA handled by mapping each query head to its KV head in-kernel (no repeat_kv
 materialization).
@@ -407,6 +416,176 @@ def _flash_bwd_prep_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Backward pack-prep: quantize the m-block-local operands of the dK/dV pass ONCE
+# per (z, h, query-block m) and store the FP4 packs to HBM, so the dK/dV pass
+# (which loops query blocks for every key block) loads them instead of
+# re-quantizing each one ~Skv/BLOCK_N times. Hoists 4 of the 6 per-iteration packs
+# — including 2 of the 4 stochastic-rounding (philox) packs that dominated the
+# kernel — out of the n*m loop into an m-only pass:
+#   q  along D (RTN)   -> sT recompute operand
+#   qT along M (RTN)   -> dK GEMM operand (Q^T)
+#   do along D (SR)    -> dPt GEMM operand
+#   doT along M (SR)   -> dV GEMM operand (dO^T)
+# The two genuinely (n,m)-dependent SR packs (pT, dSt) stay in the dK/dV loop.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_bwd_packprep_kernel(
+    q_ptr, do_ptr,
+    qnv_ptr, qsc_ptr, qtnv_ptr, qtsc_ptr,
+    donv_ptr, dosc_ptr, dotnv_ptr, dotsc_ptr,
+    seed, Sq, Sq_pad,
+    D: tl.constexpr,
+    sq_n, sdo_n,
+    SR: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_zh = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    mmask = offs_m < Sq
+
+    q = tl.load(
+        q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+    do = tl.load(
+        do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
+        mask=mmask[:, None], other=0.0,
+    ).to(tl.float32)
+
+    # Distinct philox stream per (m-block, operand) so the SR noise on dO is
+    # decorrelated across query blocks. Without the pid_m term every m-block would
+    # draw the same dither pattern (a hidden bias in the gradient estimate).
+    mblk = pid_m * (BLOCK_M * D)
+    # along D (rows = m tile)
+    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
+    donv, dosc = _pack_nvfp4_along_k(do, 2 * Sq + mblk, seed, BLOCK_M, D, SR)
+    # along M (rows = D): transpose the tile in SRAM, pack the BLOCK_M axis
+    qT = tl.trans(q)
+    doT = tl.trans(do)
+    qtnv, qtsc = _pack_nvfp4_along_k(qT, 4 * Sq, seed, D, BLOCK_M, False)
+    dotnv, dotsc = _pack_nvfp4_along_k(doT, Sq + mblk, seed, D, BLOCK_M, SR)
+
+    DP2: tl.constexpr = D // 2
+    DP16: tl.constexpr = D // 16
+    MP2: tl.constexpr = BLOCK_M // 2
+    MP16: tl.constexpr = BLOCK_M // 16
+    offs_dp = tl.arange(0, DP2)
+    offs_dsc = tl.arange(0, DP16)
+    offs_mp = pid_m * MP2 + tl.arange(0, MP2)
+    offs_msc = pid_m * MP16 + tl.arange(0, MP16)
+
+    # store along-D packs: [zh, Sq, D//2] + [zh, Sq, D//16]
+    tl.store(
+        qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+        qnv, mask=mmask[:, None],
+    )
+    tl.store(
+        qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+        qsc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
+    )
+    tl.store(
+        donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+        donv, mask=mmask[:, None],
+    )
+    tl.store(
+        dosc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+        dosc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
+    )
+    # store along-M packs: [zh, D, Sq_pad//2] + [zh, D, Sq_pad//16]
+    sq2 = Sq_pad // 2
+    sq16 = Sq_pad // 16
+    tl.store(
+        qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
+        qtnv,
+    )
+    tl.store(
+        qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
+        qtsc.to(tl.uint8, bitcast=True),
+    )
+    tl.store(
+        dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
+        dotnv,
+    )
+    tl.store(
+        dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
+        dotsc.to(tl.uint8, bitcast=True),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backward K-side pack-prep: quantize K/V ONCE per (z, kv-head, key-block) so the
+# dQ pass (which re-packs K along D, V along D, and K^T along N for every query
+# block it loops over) and the dK/dV pass load them instead. All RTN (forward-path
+# operands). knv/vnv: [z*hk, Skv, D//2]+scale along D; kTnv: [z*hk, D, Skv_pad//2]
+# +scale along N (K^T for the dQ GEMM, padded to a multiple of BLOCK_N).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_bwd_kprep_kernel(
+    k_ptr, v_ptr,
+    knv_ptr, ksc_ptr, vnv_ptr, vsc_ptr, ktnv_ptr, ktsc_ptr,
+    seed, Skv, Skv_pad,
+    D: tl.constexpr,
+    sk_n, sv_n,
+    BLOCK_N: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_zhk = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    nmask = offs_n < Skv
+
+    k = tl.load(
+        k_ptr + pid_zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+        mask=nmask[:, None], other=0.0,
+    ).to(tl.float32)
+    v = tl.load(
+        v_ptr + pid_zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
+        mask=nmask[:, None], other=0.0,
+    ).to(tl.float32)
+    knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+    vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
+    kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
+
+    DP2: tl.constexpr = D // 2
+    DP16: tl.constexpr = D // 16
+    NP2: tl.constexpr = BLOCK_N // 2
+    NP16: tl.constexpr = BLOCK_N // 16
+    offs_dp = tl.arange(0, DP2)
+    offs_dsc = tl.arange(0, DP16)
+    offs_np = pid_n * NP2 + tl.arange(0, NP2)
+    offs_nsc = pid_n * NP16 + tl.arange(0, NP16)
+
+    tl.store(
+        knv_ptr + pid_zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+        knv, mask=nmask[:, None],
+    )
+    tl.store(
+        ksc_ptr + pid_zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+        ksc.to(tl.uint8, bitcast=True), mask=nmask[:, None],
+    )
+    tl.store(
+        vnv_ptr + pid_zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+        vnv, mask=nmask[:, None],
+    )
+    tl.store(
+        vsc_ptr + pid_zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+        vsc.to(tl.uint8, bitcast=True), mask=nmask[:, None],
+    )
+    sk2 = Skv_pad // 2
+    sk16 = Skv_pad // 16
+    tl.store(
+        ktnv_ptr + pid_zhk * (D * sk2) + offs_d[:, None] * sk2 + offs_np[None, :],
+        kTnv,
+    )
+    tl.store(
+        ktsc_ptr + pid_zhk * (D * sk16) + offs_d[:, None] * sk16 + offs_nsc[None, :],
+        kTsc.to(tl.uint8, bitcast=True),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Native-NVFP4 flash BACKWARD, dK/dV pass. One program per (z, h, key-block n).
 # Works entirely in the TRANSPOSED [N, M] score frame so NOT A SINGLE operand is
 # transposed in-kernel (the old [M,N] frame paid four tl.trans of fp32 tiles per
@@ -426,12 +605,14 @@ def _flash_bwd_prep_kernel(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _flash_bwd_dkdv_kernel(
-    q_ptr, qt_ptr, k_ptr, v_ptr, do_ptr, dot_ptr, bias_ptr,
+    qnv_ptr, qsc_ptr, qtnv_ptr, qtsc_ptr,
+    donv_ptr, dosc_ptr, dotnv_ptr, dotsc_ptr,
+    k_ptr, v_ptr, bias_ptr,
     lse_ptr, delta_ptr,
     dk_ptr, dv_ptr,
-    scaling, seed, Sq, Skv,
+    scaling, seed, Sq, Sq_pad, Skv,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
-    sq_n, sqt_d, sk_n, sv_n, sdo_n, sdot_d, sb_z, sdk_n, sdv_n,
+    sk_n, sv_n, sb_z, sdk_n, sdv_n,
     HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
@@ -466,33 +647,54 @@ def _flash_bwd_dkdv_kernel(
     else:
         lo = 0
 
-    qt_base = pid_zh * (D * sqt_d)
-    dot_base = pid_zh * (D * sdot_d)
+    DP2: tl.constexpr = D // 2
+    DP16: tl.constexpr = D // 16
+    MP2: tl.constexpr = BLOCK_M // 2
+    MP16: tl.constexpr = BLOCK_M // 16
+    offs_dp = tl.arange(0, DP2)
+    offs_dsc = tl.arange(0, DP16)
+    offs_mp0 = tl.arange(0, MP2)
+    offs_msc0 = tl.arange(0, MP16)
+    sq2 = Sq_pad // 2
+    sq16 = Sq_pad // 16
     for start_m in range(lo, Sq, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mmask = offs_m < Sq
-        q = tl.load(
-            q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
-            mask=mmask[:, None], other=0.0,
-        ).to(tl.float32)
-        do = tl.load(
-            do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
-            mask=mmask[:, None], other=0.0,
-        ).to(tl.float32)
-        # pre-transposed Q^T, dO^T tiles [D, BLOCK_M] (contract-M packings, no in-kernel trans)
-        qT = tl.load(
-            qt_ptr + qt_base + offs_d[:, None] * sqt_d + offs_m[None, :],
-            mask=mmask[None, :], other=0.0,
-        ).to(tl.float32)
-        doT = tl.load(
-            dot_ptr + dot_base + offs_d[:, None] * sdot_d + offs_m[None, :],
-            mask=mmask[None, :], other=0.0,
-        ).to(tl.float32)
+        # load precomputed FP4 packs (quantized once in the pack-prep pass)
+        qnv = tl.load(
+            qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+            mask=mmask[:, None], other=0,
+        )
+        qsc = tl.load(
+            qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+            mask=mmask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
+        mp = (start_m // 2) + offs_mp0
+        msc = (start_m // 16) + offs_msc0
+        qtnv = tl.load(
+            qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
+        )
+        qtsc = tl.load(
+            qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
+        donv = tl.load(
+            donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+            mask=mmask[:, None], other=0,
+        )
+        dosc = tl.load(
+            dosc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+            mask=mmask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
+        dotnv = tl.load(
+            dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
+        )
+        dotsc = tl.load(
+            dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
         lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
         delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
 
         # recompute scores transposed: sT[n,m] = scale * K[n,:] . Q[m,:]
-        qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
         sT = tl.dot_scaled(knv, ksc, "e2m1", qnv.T, qsc, "e2m1") * scaling
         if HAS_BIAS:
             b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
@@ -504,22 +706,19 @@ def _flash_bwd_dkdv_kernel(
         pT = tl.exp(sT - lse[None, :])
         pT = tl.where(sT == _NEG_INF, 0.0, pT)
 
-        # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M] (SR), dO^T [D, BLOCK_M] (SR).
+        # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M] (SR), dO^T precomputed.
         pT_q, pT_s = _pack_nvfp4_along_k(pT, start_m, seed, BLOCK_N, BLOCK_M, SR)
-        doT_q, doT_s = _pack_nvfp4_along_k(doT, start_m + Sq, seed, D, BLOCK_M, SR)
-        dv = tl.dot_scaled(pT_q, pT_s, "e2m1", doT_q.T, doT_s, "e2m1", acc=dv)
+        dv = tl.dot_scaled(pT_q, pT_s, "e2m1", dotnv.T, dotsc, "e2m1", acc=dv)
 
-        # dPt[n,m] = sum_d V[n,d] dO[m,d]  (contract D). dO packed along D (SR).
-        do_q, do_s = _pack_nvfp4_along_k(do, start_m + 2 * Sq, seed, BLOCK_M, D, SR)
-        dpT = tl.dot_scaled(vnv, vsc, "e2m1", do_q.T, do_s, "e2m1")
+        # dPt[n,m] = sum_d V[n,d] dO[m,d]  (contract D). dO precomputed (SR).
+        dpT = tl.dot_scaled(vnv, vsc, "e2m1", donv.T, dosc, "e2m1")
 
         dsT = pT * (dpT - delta[None, :]) * scaling
         dsT = tl.where(sT == _NEG_INF, 0.0, dsT)
 
-        # dK += dSt @ Q^T.T  (contract M). dSt [BLOCK_N, BLOCK_M] (SR), Q^T [D, BLOCK_M] (RTN).
+        # dK += dSt @ Q^T.T  (contract M). dSt [BLOCK_N, BLOCK_M] (SR), Q^T precomputed (RTN).
         dsT_q, dsT_s = _pack_nvfp4_along_k(dsT, start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR)
-        qT_q, qT_s = _pack_nvfp4_along_k(qT, start_m + 4 * Sq, seed, D, BLOCK_M, False)
-        dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qT_q.T, qT_s, "e2m1", acc=dk)
+        dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qtnv.T, qtsc, "e2m1", acc=dk)
 
     tl.store(
         dk_ptr + pid_zh * (Skv * sdk_n) + offs_n[:, None] * sdk_n + offs_d[None, :],
@@ -538,11 +737,12 @@ def _flash_bwd_dkdv_kernel(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _flash_bwd_dq_kernel(
-    q_ptr, k_ptr, v_ptr, do_ptr, bias_ptr,
+    q_ptr, do_ptr, bias_ptr,
+    knv_ptr, ksc_ptr, vnv_ptr, vsc_ptr, ktnv_ptr, ktsc_ptr,
     lse_ptr, delta_ptr, dq_ptr,
-    scaling, seed, Sq, Skv,
+    scaling, seed, Sq, Skv, Skv_pad,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
-    sq_n, sk_n, sv_n, sdo_n, sb_z, sdq_n,
+    sq_n, sdo_n, sb_z, sdq_n,
     HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
@@ -569,6 +769,17 @@ def _flash_bwd_dq_kernel(
     qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
     do_q, do_s = _pack_nvfp4_along_k(do, pid_m * BLOCK_M, seed, BLOCK_M, D, SR)
 
+    DP2: tl.constexpr = D // 2
+    DP16: tl.constexpr = D // 16
+    NP2: tl.constexpr = BLOCK_N // 2
+    NP16: tl.constexpr = BLOCK_N // 16
+    offs_dp = tl.arange(0, DP2)
+    offs_dsc = tl.arange(0, DP16)
+    offs_np0 = tl.arange(0, NP2)
+    offs_nsc0 = tl.arange(0, NP16)
+    sk2 = Skv_pad // 2
+    sk16 = Skv_pad // 16
+
     dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
     if CAUSAL:
         hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
@@ -578,16 +789,31 @@ def _flash_bwd_dq_kernel(
     for start_n in range(0, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         nmask = offs_n < Skv
-        k = tl.load(
-            k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
-            mask=nmask[:, None], other=0.0,
-        ).to(tl.float32)
-        v = tl.load(
-            v_ptr + zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
-            mask=nmask[:, None], other=0.0,
-        ).to(tl.float32)
-        knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
-        vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
+        # precomputed K/V packs (K-side pack-prep): knv/vnv along D, K^T along N
+        knv = tl.load(
+            knv_ptr + zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+            mask=nmask[:, None], other=0,
+        )
+        ksc = tl.load(
+            ksc_ptr + zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+            mask=nmask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
+        vnv = tl.load(
+            vnv_ptr + zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+            mask=nmask[:, None], other=0,
+        )
+        vsc = tl.load(
+            vsc_ptr + zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+            mask=nmask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
+        np_ = (start_n // 2) + offs_np0
+        nsc = (start_n // 16) + offs_nsc0
+        kTnv = tl.load(
+            ktnv_ptr + zhk * (D * sk2) + offs_d[:, None] * sk2 + np_[None, :],
+        )
+        kTsc = tl.load(
+            ktsc_ptr + zhk * (D * sk16) + offs_d[:, None] * sk16 + nsc[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
 
         s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
         if HAS_BIAS:
@@ -604,10 +830,9 @@ def _flash_bwd_dq_kernel(
         ds = p * (dp - delta[:, None]) * scaling
         ds = tl.where(s == _NEG_INF, 0.0, ds)
 
-        # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N] (SR), K^T [D, BLOCK_N].
+        # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N] (SR), K^T precomputed.
         ds_q, ds_s = _pack_nvfp4_along_k(ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR)
-        kT_q, kT_s = _pack_nvfp4_along_k(tl.trans(k), start_n, seed, D, BLOCK_N, False)
-        dq = tl.dot_scaled(ds_q, ds_s, "e2m1", kT_q.T, kT_s, "e2m1", acc=dq)
+        dq = tl.dot_scaled(ds_q, ds_s, "e2m1", kTnv.T, kTsc, "e2m1", acc=dq)
 
     tl.store(
         dq_ptr + pid_zh * (Sq * sdq_n) + offs_m[:, None] * sdq_n + offs_d[None, :],
@@ -808,20 +1033,19 @@ def _run_bwd(
     # The recompute kernels hold several fp32 [BLOCK, D] tiles + their FP4 packs in
     # SRAM at once; D=256 needs small query tiles to fit the 99KB budget.
     block_m = min(block_m, 64)
-    # dkdv loops over query blocks and is the backward hotspot: a wider key tile
-    # (BLOCK_N=128) + 8 warps halves the program count, enlarges the dV/dK GEMMs and
-    # amortizes the per-iter Q recompute — ~2.5x faster than the 64/4-warp default,
-    # and still fits SMEM (K/V are the only N-resident tiles, packed once along D).
-    dkdv_block_n = 128 if d <= 256 else 64
-    dkdv_warps = 16
+    # dkdv loops over query blocks and is the backward hotspot. With the m-block
+    # operands (Q/dO and their transposes) pre-packed once in the pack-prep pass,
+    # the loop body only holds the per-n K/V packs plus two small in-loop SR packs
+    # (pT, dSt), so a NARROW key tile (BLOCK_N=32) + 8 warps + deep pipelining
+    # (3 stages) is dramatically faster than the old wide-tile config: the small
+    # footprint lets the scheduler overlap the SR-pack ALU with the FP4 GEMMs and
+    # the K/V loads instead of spilling. ~8x faster than BLOCK_N=128 / 16 warps.
+    dkdv_block_n = 32 if d <= 256 else 32
+    dkdv_warps = 8
+    dkdv_stages = 3
     # dq loops over key blocks (already cheap); keep the conservative key tile.
     dq_block_n = 64 if d >= 256 else min(block_n, 128)
     dq_warps = max(num_warps, 8)
-
-    # dkdv consumes Q and dO in the contract-M layout too (Q^T, dO^T [.,D,Sq]); the
-    # transpose is paid once in HBM instead of four times per inner step in-kernel.
-    qt = q.transpose(1, 2).contiguous()
-    dot = do.transpose(1, 2).contiguous()
 
     bdummy = bias if bias is not None else q
     sb_z = bias.stride(0) if bias is not None else 0
@@ -837,22 +1061,81 @@ def _run_bwd(
         BLOCK_M=block_m, BLOCK_N=dq_block_n,
         num_warps=dq_warps, num_stages=num_stages,
     )
+
+    # Pack-prep: quantize the dK/dV pass's m-block-local operands ONCE here (q/qT
+    # RTN, do/doT SR) instead of re-quantizing each Skv/BLOCK_N times in the loop.
+    # Along-M (qT/doT) buffers are padded to a multiple of BLOCK_M so the dkdv loop
+    # can load full m-tiles without M-axis masking; padded rows are masked out of
+    # every GEMM via the sT==-inf (pT/dsT=0) path.
+    # A narrow BLOCK_M (32) + 2 pipeline stages packs the most elements/SM and keeps
+    # the philox SR ALU overlapped with the stores; the along-M/along-D pack layouts
+    # are group-16 so independent of this producing tile size (the dkdv loop reads
+    # them at its own BLOCK_M). ~7x faster than the wide-tile config.
+    pp_block_m = 32
+    s_q_pad = _next_mult(s_q, max(block_m, pp_block_m))
+    qnv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
+    qsc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
+    donv_p = q.new_empty(z * h, s_q, d // 2, dtype=torch.uint8)
+    dosc_p = q.new_zeros(z * h, s_q, d // 16, dtype=torch.uint8)
+    qtnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
+    qtsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+    dotnv_p = q.new_empty(z * h, d, s_q_pad // 2, dtype=torch.uint8)
+    dotsc_p = q.new_zeros(z * h, d, s_q_pad // 16, dtype=torch.uint8)
+    _flash_bwd_packprep_kernel[(triton.cdiv(s_q, pp_block_m), z * h)](
+        q, do,
+        qnv_p, qsc_p, qtnv_p, qtsc_p,
+        donv_p, dosc_p, dotnv_p, dotsc_p,
+        seed, s_q, s_q_pad,
+        D=d, sq_n=q.stride(1), sdo_n=do.stride(1),
+        SR=sr, BLOCK_M=pp_block_m,
+        num_warps=8, num_stages=2,
+    )
+    qsc_p = qsc_p.view(torch.float8_e4m3fn)
+    dosc_p = dosc_p.view(torch.float8_e4m3fn)
+    qtsc_p = qtsc_p.view(torch.float8_e4m3fn)
+    dotsc_p = dotsc_p.view(torch.float8_e4m3fn)
+
+    # K-side pack-prep: pack K/V once per kv-head (knv/vnv along D, K^T along N) so
+    # the dQ pass loads them instead of re-quantizing K/V/K^T for every query block.
+    kprep_block_n = 64
+    s_kv_pad = _next_mult(s_kv, kprep_block_n)
+    knv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
+    ksc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
+    vnv_p = k.new_empty(z * hk, s_kv, d // 2, dtype=torch.uint8)
+    vsc_p = k.new_zeros(z * hk, s_kv, d // 16, dtype=torch.uint8)
+    ktnv_p = k.new_empty(z * hk, d, s_kv_pad // 2, dtype=torch.uint8)
+    ktsc_p = k.new_zeros(z * hk, d, s_kv_pad // 16, dtype=torch.uint8)
+    _flash_bwd_kprep_kernel[(triton.cdiv(s_kv, kprep_block_n), z * hk)](
+        k, v,
+        knv_p, ksc_p, vnv_p, vsc_p, ktnv_p, ktsc_p,
+        seed, s_kv, s_kv_pad,
+        D=d, sk_n=k.stride(1), sv_n=v.stride(1),
+        BLOCK_N=kprep_block_n,
+        num_warps=dq_warps, num_stages=num_stages,
+    )
+    ksc_pv = ksc_p.view(torch.uint8)
+    vsc_pv = vsc_p.view(torch.uint8)
+    ktsc_pv = ktsc_p.view(torch.uint8)
+
     _flash_bwd_dkdv_kernel[(triton.cdiv(s_kv, dkdv_block_n), z * h)](
-        q, qt, k, v, do, dot, bdummy, lse, delta, dk, dv,
-        scaling, seed, s_q, s_kv,
+        qnv_p, qsc_p.view(torch.uint8), qtnv_p, qtsc_p.view(torch.uint8),
+        donv_p, dosc_p.view(torch.uint8), dotnv_p, dotsc_p.view(torch.uint8),
+        k, v, bdummy, lse, delta, dk, dv,
+        scaling, seed, s_q, s_q_pad, s_kv,
         D=d, H=h, HK=hk,
-        sq_n=q.stride(1), sqt_d=qt.stride(1), sk_n=k.stride(1), sv_n=v.stride(1),
-        sdo_n=do.stride(1), sdot_d=dot.stride(1),
+        sk_n=k.stride(1), sv_n=v.stride(1),
         sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
         HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
         BLOCK_M=block_m, BLOCK_N=dkdv_block_n,
-        num_warps=dkdv_warps, num_stages=num_stages,
+        num_warps=dkdv_warps, num_stages=dkdv_stages,
     )
     _flash_bwd_dq_kernel[(triton.cdiv(s_q, block_m), z * h)](
-        q, k, v, do, bdummy, lse, delta, dq,
-        scaling, seed, s_q, s_kv,
+        q, do, bdummy,
+        knv_p, ksc_pv, vnv_p, vsc_pv, ktnv_p, ktsc_pv,
+        lse, delta, dq,
+        scaling, seed, s_q, s_kv, s_kv_pad,
         D=d, H=h, HK=hk,
-        sq_n=q.stride(1), sk_n=k.stride(1), sv_n=v.stride(1), sdo_n=do.stride(1),
+        sq_n=q.stride(1), sdo_n=do.stride(1),
         sb_z=sb_z, sdq_n=dq.stride(1),
         HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
         BLOCK_M=block_m, BLOCK_N=dq_block_n,
