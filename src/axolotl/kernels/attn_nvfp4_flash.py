@@ -216,6 +216,7 @@ def _flash_fwd_kernel(
     vnv_ptr, vsc_ptr,          # [Z*Hk, D, Skv//2], [Z*Hk, D, Skv//16]  (V^T, quant on key)
     bias_ptr,                  # [Z, Skv] fp32 additive key-pad bias, or 0
     out_ptr,                   # [Z*H, Sq, D]  out_dtype
+    lse_ptr,                   # [Z*H, Sq] fp32 logsumexp, written iff STORE_LSE
     scaling,
     Sq, Skv,
     D: tl.constexpr,
@@ -227,6 +228,7 @@ def _flash_fwd_kernel(
     so_n,
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
+    STORE_LSE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     DP2: tl.constexpr, DP16: tl.constexpr,   # D//2, D//16
     NP2: tl.constexpr, NP16: tl.constexpr,   # BLOCK_N//2, BLOCK_N//16
@@ -331,6 +333,12 @@ def _flash_fwd_kernel(
         out_ptr + obase + offs_m[:, None] * so_n + offs_d[None, :],
         acc.to(out_ptr.dtype.element_ty), mask=mmask[:, None],
     )
+    if STORE_LSE:
+        # Persist logsumexp so the backward prep can skip its full QK^T recompute.
+        # Match the prep kernel's safe handling for all-masked rows (l_i==0).
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+        m_fin = tl.where(m_i == _NEG_INF, 0.0, m_i)
+        tl.store(lse_ptr + pid_zh * Sq + offs_m, m_fin + tl.log(l_safe), mask=mmask)
 
 
 def _next_mult(n: int, m: int) -> int:
@@ -350,7 +358,7 @@ def _flash_bwd_prep_kernel(
     scaling, seed, Sq, Skv,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
     sq_n, sk_n, sdo_n, so_n, sb_z,
-    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr,
+    HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, HAVE_LSE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -363,43 +371,48 @@ def _flash_bwd_prep_kernel(
     offs_d = tl.arange(0, D)
     mmask = offs_m < Sq
 
-    q = tl.load(
-        q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
-        mask=mmask[:, None], other=0.0,
-    ).to(tl.float32)
-    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
-
-    m_i = tl.full((BLOCK_M,), _NEG_INF, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    if CAUSAL:
-        hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
+    # LSE is either reused from the forward (HAVE_LSE) or recomputed here via a full
+    # FP4 QK^T pass. Reuse skips that pass entirely (the forward already had m_i/l_i).
+    if HAVE_LSE:
+        lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
     else:
-        hi = Skv
-    for start_n in range(0, hi, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        nmask = offs_n < Skv
-        k = tl.load(
-            k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
-            mask=nmask[:, None], other=0.0,
+        q = tl.load(
+            q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
+            mask=mmask[:, None], other=0.0,
         ).to(tl.float32)
-        knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
-        s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
-        if HAS_BIAS:
-            b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
-            s = s + b[None, :]
-        s = tl.where(nmask[None, :], s, _NEG_INF)
-        if CAUSAL:
-            causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
-            s = tl.where(causal_ok, s, _NEG_INF)
-        m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        m_safe = tl.where(m_new == _NEG_INF, 0.0, m_new)
-        alpha = tl.exp(m_i - m_safe)
-        l_i = l_i * alpha + tl.sum(tl.exp(s - m_safe[:, None]), axis=1)
-        m_i = m_new
+        qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
 
-    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    m_final = tl.where(m_i == _NEG_INF, 0.0, m_i)
-    lse = m_final + tl.log(l_safe)
+        m_i = tl.full((BLOCK_M,), _NEG_INF, dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        if CAUSAL:
+            hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
+        else:
+            hi = Skv
+        for start_n in range(0, hi, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            nmask = offs_n < Skv
+            k = tl.load(
+                k_ptr + zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
+                mask=nmask[:, None], other=0.0,
+            ).to(tl.float32)
+            knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+            s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
+            if HAS_BIAS:
+                b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
+                s = s + b[None, :]
+            s = tl.where(nmask[None, :], s, _NEG_INF)
+            if CAUSAL:
+                causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
+                s = tl.where(causal_ok, s, _NEG_INF)
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            m_safe = tl.where(m_new == _NEG_INF, 0.0, m_new)
+            alpha = tl.exp(m_i - m_safe)
+            l_i = l_i * alpha + tl.sum(tl.exp(s - m_safe[:, None]), axis=1)
+            m_i = m_new
+
+        l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+        m_final = tl.where(m_i == _NEG_INF, 0.0, m_i)
+        lse = m_final + tl.log(l_safe)
 
     do = tl.load(
         do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
@@ -864,6 +877,7 @@ def _run_flash_packed(
         qnv_v, qsc_v, knv_v, ksc_v, vnv_v, vsc_v,
         bias if bias is not None else qnv_v,
         out,
+        out,  # dummy lse ptr (STORE_LSE=False)
         scaling,
         s_q, s_kv,
         D=d,
@@ -875,6 +889,7 @@ def _run_flash_packed(
         so_n=out.stride(1),
         HAS_BIAS=bias is not None,
         CAUSAL=causal,
+        STORE_LSE=False,
         BLOCK_M=block_m, BLOCK_N=block_n,
         DP2=d // 2, DP16=d // 16,
         NP2=block_n // 2, NP16=block_n // 16,
@@ -938,6 +953,7 @@ def nvfp4_flash_attention(
     block_n: int = 128,
     num_warps: int = 8,
     num_stages: int = 3,
+    return_lse: bool = False,
 ):
     """Fused native-NVFP4 flash attention, forward only.
 
@@ -950,9 +966,11 @@ def nvfp4_flash_attention(
         key_pad_bias: optional ``[Z, Skv]`` additive bias on the key axis
             (0 for real tokens, -inf for padding), broadcast over heads/queries.
         block_m, block_n: flash tile sizes.
+        return_lse: also return the per-row logsumexp ``[Z*H, Sq]`` (fp32) so the
+            backward can skip recomputing it (the FA2 backward prep's QK^T pass).
 
     Returns:
-        ``[Z, H, Sq, D]`` in ``query.dtype``.
+        ``[Z, H, Sq, D]`` in ``query.dtype`` (and the LSE tensor if ``return_lse``).
     """
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
@@ -978,6 +996,10 @@ def nvfp4_flash_attention(
         bias = key_pad_bias.to(torch.float32).contiguous()
 
     out = torch.empty(z * h, s_q, d, device=query.device, dtype=out_dtype)
+    lse = (
+        torch.empty(z * h, s_q, device=query.device, dtype=torch.float32)
+        if return_lse else out
+    )
 
     qnv_v = qnv.view(torch.uint8)
     knv_v = knv.view(torch.uint8)
@@ -993,6 +1015,7 @@ def nvfp4_flash_attention(
             qnv_v, qsc_v, knv_v, ksc_v, vnv_v, vsc_v,
             bias if bias is not None else qnv_v,  # dummy ptr when no bias
             out,
+            lse,
             scaling,
             s_q, s_kv,
             D=d,
@@ -1004,6 +1027,7 @@ def nvfp4_flash_attention(
             so_n=out.stride(1),
             HAS_BIAS=bias is not None,
             CAUSAL=causal,
+            STORE_LSE=return_lse,
             BLOCK_M=block_m, BLOCK_N=block_n,
             DP2=d // 2, DP16=d // 16,
             NP2=block_n // 2, NP16=block_n // 16,
@@ -1011,6 +1035,8 @@ def nvfp4_flash_attention(
         )
 
     _run()
+    if return_lse:
+        return out.reshape(z, h, s_q, d), lse
     return out.reshape(z, h, s_q, d)
 
 
@@ -1021,13 +1047,19 @@ def _run_bwd(
     q, k, v, do, o, bias,
     z, h, hk, s_q, s_kv, d, scaling, causal, sr,
     block_m, block_n, num_warps, num_stages,
+    lse=None,
 ):
     """Native-NVFP4 backward. q/do/o: [Z*H,Sq,D]; k/v: [Z*Hk,Skv,D] (hp). Returns
-    dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller)."""
+    dq [Z*H,Sq,D], dk/dv [Z*H,Skv,D] (per query head; GQA-reduced by the caller).
+
+    If ``lse`` (the forward's per-row logsumexp, [Z*H,Sq]) is supplied, the prep
+    kernel reuses it instead of recomputing it with a full FP4 QK^T pass."""
+    have_lse = lse is not None
     dq = torch.empty(z * h, s_q, d, device=q.device, dtype=torch.float32)
     dk = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
     dv = torch.empty(z * h, s_kv, d, device=q.device, dtype=torch.float32)
-    lse = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
+    if not have_lse:
+        lse = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     seed = torch.randint(0, 2**31 - 1, (1,), device=q.device).item() if sr else 0
     # The recompute kernels hold several fp32 [BLOCK, D] tiles + their FP4 packs in
@@ -1057,7 +1089,7 @@ def _run_bwd(
         D=d, H=h, HK=hk,
         sq_n=q.stride(1), sk_n=k.stride(1), sdo_n=do.stride(1), so_n=o.stride(1),
         sb_z=sb_z,
-        HAS_BIAS=has_bias, CAUSAL=causal,
+        HAS_BIAS=has_bias, CAUSAL=causal, HAVE_LSE=have_lse,
         BLOCK_M=block_m, BLOCK_N=dq_block_n,
         num_warps=dq_warps, num_stages=num_stages,
     )
@@ -1152,10 +1184,11 @@ class _NVFP4FlashAttn(torch.autograd.Function):
     ):
         z, h, s_q, d = query.shape
         _, hk, s_kv, _ = key.shape
-        out = nvfp4_flash_attention(
+        out, lse = nvfp4_flash_attention(
             query, key, value, scaling, causal=causal,
             num_key_value_groups=num_key_value_groups, key_pad_bias=key_pad_bias,
             block_m=block_m, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
+            return_lse=True,
         )
         bias = None
         if key_pad_bias is not None:
@@ -1166,6 +1199,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
             value.reshape(z * hk, s_kv, d).contiguous(),
             out.reshape(z * h, s_q, d),
             bias if bias is not None else torch.empty(0, device=query.device),
+            lse,
         )
         ctx.dims = (z, h, hk, s_q, s_kv, d)
         ctx.scaling = scaling
@@ -1177,7 +1211,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, o, bias = ctx.saved_tensors
+        q, k, v, o, bias, lse = ctx.saved_tensors
         z, h, hk, s_q, s_kv, d = ctx.dims
         block_m, block_n, num_warps, num_stages = ctx.tiles
         bias = bias if ctx.has_bias else None
@@ -1185,7 +1219,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         dq, dk, dv = _run_bwd(
             q, k, v, do, o, bias,
             z, h, hk, s_q, s_kv, d, ctx.scaling, ctx.causal, ctx.sr,
-            block_m, block_n, 4, 1,
+            block_m, block_n, 4, 1, lse=lse,
         )
         dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype)
         ng = h // hk
