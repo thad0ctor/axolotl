@@ -1355,11 +1355,14 @@ def swap_frozen_linear_to_nvfp4(
         # hp mode keeps a high-precision trainable master weight (no quant), so
         # there is no FP4 transient to stream around; swap in place.
         module.weight.requires_grad_(False)
-        _set_submodule(model, name, NVFP4Linear.from_linear(module, recipe))
+        hp = NVFP4Linear.from_linear(module, recipe)
+        _set_submodule(model, name, hp)
+        _dynamo_disable_forward(hp)
         LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
         return True
 
-    _stream_quantize_swap(model, name, module, build)
+    new_module = _stream_quantize_swap(model, name, module, build)
+    _dynamo_disable_forward(new_module)
     LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
     return True
 
@@ -1385,12 +1388,13 @@ def swap_frozen_lm_head_tileable(
         return False
     if not isinstance(module, nn.Linear) or not _is_swappable(module):
         return False
-    _stream_quantize_swap(
+    new_module = _stream_quantize_swap(
         model,
         name,
         module,
         lambda src: NVFP4FrozenBaseLinear.from_linear(src, recipe, fsdp=False),
     )
+    _dynamo_disable_forward(new_module)
     LOG.info("NVFP4 training: swapped frozen %s (tileable storage for fused CE)", name)
     return True
 
@@ -1398,6 +1402,29 @@ def swap_frozen_lm_head_tileable(
 def _set_submodule(model: nn.Module, name: str, new_module: nn.Module) -> None:
     parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
     setattr(parent, name.rsplit(".", 1)[-1], new_module)
+
+
+def _dynamo_disable_forward(module: nn.Module) -> None:
+    """Force ``module.forward`` to run eager under torch.compile.
+
+    The FP4 lm_head sits at the tail of the graph between the final RMSNorm and
+    cross-entropy. With gradient_checkpointing OFF (activations saved, not
+    recomputed) + flash-attention-2 + torch.compile, Inductor fuses the
+    flash-attn backward with the FP4 lm_head dgrad into a graph that produces a
+    NaN input gradient on the very first step (the loss is briefly finite, then
+    collapses to ln(vocab)). Any one of {gc-on, sdpa, eager, bf16 lm_head}
+    avoids it, so the FP4 lm_head GEMM math itself is correct — the failure is
+    that specific fused region. Breaking the graph around the one lm_head module
+    keeps it out of that fusion (it is a single frozen layer; eager costs
+    nothing) while the rest of the model stays compiled.
+    """
+    inner = module.forward
+
+    @torch._dynamo.disable
+    def _eager_forward(*args, **kwargs):
+        return inner(*args, **kwargs)
+
+    module.forward = _eager_forward
 
 
 def _reclaim_gpu() -> None:
@@ -1513,9 +1540,9 @@ def swap_tied_embedding_and_lm_head_to_nvfp4(
     new_embed = _stream_quantize_swap(
         model, embed_name, embed, lambda src: NVFP4Embedding.from_embedding(src)
     )
-    _set_submodule(
-        model, lm_head_name, NVFP4TiedLMHead(new_embed, lm_head_bias, recipe)
-    )
+    tied_head = NVFP4TiedLMHead(new_embed, lm_head_bias, recipe)
+    _set_submodule(model, lm_head_name, tied_head)
+    _dynamo_disable_forward(tied_head)
     LOG.info(
         "NVFP4 training: tied embedding/lm_head quantized once (shared FP4 store)"
     )

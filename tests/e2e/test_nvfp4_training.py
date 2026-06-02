@@ -123,6 +123,55 @@ class TestNVFP4Training:
             assert out.shape == (2, 16, 4096)
             assert torch.isfinite(out).all().item()
 
+    def test_lm_head_forward_dynamo_disabled(self):
+        """The swapped FP4 lm_head runs eager under torch.compile.
+
+        Regression: gc-off + quantize_lm_head + torch.compile + flash_attention_2
+        fused the flash-attn backward with the FP4 lm_head dgrad into a NaN-
+        producing graph (loss collapses to ln(vocab) at step ~4). Breaking the
+        graph around the lm_head forward avoids that fused region. Assert the
+        marker so the disable can't silently regress.
+        """
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            swap_frozen_linear_to_nvfp4,
+            swap_tied_embedding_and_lm_head_to_nvfp4,
+        )
+
+        for mode in ("compute", "storage", "hp"):
+
+            class Untied(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.lm_head = nn.Linear(2048, 4096, bias=False)
+                    self.lm_head.weight.requires_grad_(False)
+
+            m = Untied().cuda().bfloat16()
+            assert swap_frozen_linear_to_nvfp4(
+                m, "lm_head", NVFP4Recipe(), base_mode=mode
+            )
+            assert getattr(m.lm_head.forward, "_torchdynamo_disable", False), mode
+            # the eager wrapper must still compute the head
+            out = m.lm_head(
+                torch.randn(2, 16, 2048, device="cuda", dtype=torch.bfloat16)
+            )
+            assert out.shape == (2, 16, 4096) and torch.isfinite(out).all().item()
+
+        class Tied(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(2048, 512)
+                self.lm_head = nn.Linear(512, 2048, bias=False)
+                self.lm_head.weight = self.embed.weight
+                for p in self.parameters():
+                    p.requires_grad_(False)
+
+        m = Tied().cuda().bfloat16()
+        assert swap_tied_embedding_and_lm_head_to_nvfp4(
+            m, "embed", "lm_head", NVFP4Recipe()
+        )
+        assert getattr(m.lm_head.forward, "_torchdynamo_disable", False)
+
     def test_fused_rmsnorm_matches_both_gamma_conventions(self):
         """from_norm must reproduce the norm regardless of gamma convention —
         plain ``weight`` (Llama) AND zero-centered ``1 + weight`` (Gemma/Qwen3.x).
