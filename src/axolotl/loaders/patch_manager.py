@@ -265,6 +265,23 @@ class PatchManager:
 
             register_sage_attn()
 
+        if self.cfg.attn_implementation == "sage_fp4":
+            from axolotl.monkeypatch.attention import register_sage_fp4_attn
+            from axolotl.monkeypatch.attention.sage_fp4_attn import (
+                configure_sage_fp4,
+                patch_sage_fp4_attn,
+            )
+
+            patch_sage_fp4_attn()
+            sage_cfg = self.cfg.sage_attention
+            configure_sage_fp4(
+                per_block_mean=sage_cfg.per_block_mean if sage_cfg else True,
+                allow_sdpa_fallback=(
+                    sage_cfg.allow_sdpa_fallback if sage_cfg else True
+                ),
+            )
+            register_sage_fp4_attn()
+
     def _apply_fp8_attention_patches(self, model):
         """Apply FP8 low-precision attention via torchao."""
         if self.cfg.attn_implementation == "fp8":

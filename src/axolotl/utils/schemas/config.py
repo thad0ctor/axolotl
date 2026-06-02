@@ -59,6 +59,7 @@ from axolotl.utils.schemas.model import (
 )
 from axolotl.utils.schemas.multimodal import MultiModalConfig
 from axolotl.utils.schemas.nvfp4 import NVFP4TrainingConfig
+from axolotl.utils.schemas.sage import SageAttentionConfig
 from axolotl.utils.schemas.peft import LoraConfig, ReLoRAConfig
 from axolotl.utils.schemas.quantization import PTQConfig, QATConfig
 from axolotl.utils.schemas.training import HyperparametersConfig, JaggedLRConfig
@@ -838,10 +839,19 @@ class AxolotlInputConfig(
         json_schema_extra={
             "description": (
                 "Attention backend. Canonical values: eager, sdpa, flash_attention_2, "
-                "flash_attention_3, flex_attention, xformers, sage, fp8. Hub-kernel "
-                "paths (e.g. kernels-community/flash-attn3) are also accepted and passed "
-                "through to transformers."
+                "flash_attention_3, flex_attention, xformers, sage, sage_fp4, fp8. "
+                "Hub-kernel paths (e.g. kernels-community/flash-attn3) are also accepted "
+                "and passed through to transformers. 'sage_fp4' is the SageAttention-3 "
+                "FP4 microscaling attention (Blackwell sm_120, INFERENCE only)."
             )
+        },
+    )
+
+    sage_attention: SageAttentionConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Settings for `attn_implementation: sage_fp4` (SageAttention-3 "
+            "FP4 inference backend). Ignored for other backends."
         },
     )
 
@@ -1519,6 +1529,17 @@ class AxolotlInputConfig(
             )
         return self
 
+    @model_validator(mode="after")
+    def check_sage_fp4_inference_only(self):
+        if self.attn_implementation == "sage_fp4":
+            LOG.warning(
+                "attn_implementation: sage_fp4 (SageAttention-3 FP4) is INFERENCE only "
+                "— the FP4 kernel has no backward and will raise during a training "
+                "step. Use it for `axolotl inference`/eval or serving; for FP4-aware "
+                "training use `fp4_attention_qat` instead."
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def check_save_strategy_best_requires_metric(cls, data):
@@ -1742,6 +1763,21 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             raise ValueError(
                 "SageAttention supports compute capability between sm_80 and sm_120. "
                 "Please use a different attention implementation."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_compute_capability_w_sage_fp4(self):
+        if (
+            self.attn_implementation == "sage_fp4"
+            and self.capabilities
+            and self.capabilities.compute_capability
+            not in ["sm_100", "sm_120", "sm_121"]
+        ):
+            raise ValueError(
+                "attn_implementation: sage_fp4 (SageAttention-3 FP4) requires a "
+                "Blackwell GPU (sm_100/sm_120/sm_121). Use `sage` (INT8/FP8) or "
+                "another attention implementation on this device."
             )
         return self
 

@@ -58,6 +58,14 @@ def sage_attention_forward(
 
     _check_sageattn_imported()
 
+    head_dim = query.shape[-1]
+    if head_dim > 128:
+        raise ValueError(
+            f"attn_implementation: sage (SageAttention-2) supports head_dim <= 128, "
+            f"but this model has head_dim={head_dim} (e.g. Qwen3.5/Gemma3 use 256). "
+            f"Use flash_attention_2/sdpa, or fp4_attention_qat for FP4-aware attention."
+        )
+
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         raise NotImplementedError(
             "SageAttention does not support `output_attentions=True` or `head_mask`."
