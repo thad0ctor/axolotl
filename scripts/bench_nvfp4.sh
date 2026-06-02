@@ -70,6 +70,12 @@ runwall(){ # $1=cfg $2=steps -> echoes train_runtime (or empty on fail); writes 
 printf '\n%-26s %12s %10s %10s %9s\n' CONFIG "s/step(marg)" "warmup s" "loss" "act GiB"
 for cfg in "${CFGS[@]}"; do
   name="$(basename "$cfg" .yaml)"
+  # Per-config compile warm-up: each config compiles its OWN inductor/triton graph.
+  # Without this the short run compiles cold and the long run reuses the warm disk
+  # cache -> the marginal subtraction is corrupted (can go negative). Warm THIS
+  # config first (throwaway) so both measured runs hit the warm cache.
+  require_idle "$name:warm"
+  runwall "$cfg" 8 "$LOGDIR/$name.warm.log" >/dev/null
   require_idle "$name:short"
   w1=$(runwall "$cfg" "$N1" "$LOGDIR/$name.short.log")
   require_idle "$name:long"
