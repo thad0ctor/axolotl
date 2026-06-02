@@ -382,8 +382,13 @@ class AxolotlTrainer(
 
         # Accelerator.free_memory() will destroy the references, so
         # we need to store the non-prepared version for eval dataloaders.
+        # Use the effective flag: MM overrides can enable persistent workers
+        # even when self.args.dataloader_persistent_workers is False.
         # fmt: off
-        if dataloader_key is not None and self.args.dataloader_persistent_workers:
+        effective_persistent_workers = dataloader_params.get(
+            "persistent_workers", self.args.dataloader_persistent_workers
+        )
+        if dataloader_key is not None and effective_persistent_workers:
             if hasattr(self, "_eval_dataloaders"):
                 self._eval_dataloaders[dataloader_key] = dataloader  # type: ignore
             else:

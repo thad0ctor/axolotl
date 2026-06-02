@@ -1453,6 +1453,18 @@ class PretrainingValidationMixin:
                 "Without a processor, images in the dataset cannot be turned "
                 "into pixel tensors."
             )
+        mm_tiling_plugin = "axolotl.integrations.mm_tiling.MMTilingPlugin"
+        if (
+            data.get("image_tiling")
+            or data.get("image_tiling_shape_buckets")
+            or data.get("image_tiling_native_resolution")
+            or data.get("image_tiling_min_area") is not None
+        ) and mm_tiling_plugin not in set(data.get("plugins") or []):
+            raise ValueError(
+                "Image tiling is configured but the plugin that owns it is not "
+                "loaded, so tiling would be silently dropped. Add "
+                f"`plugins: [{mm_tiling_plugin}]`."
+            )
         if (
             data.get("sample_packing")
             and pd_is_mm

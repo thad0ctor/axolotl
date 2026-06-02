@@ -2,7 +2,6 @@
 
 import functools
 import os
-import tempfile
 from typing import Literal
 
 from datasets import (
@@ -455,15 +454,11 @@ def _create_placeholder_dataset(
         if is_mm:
             image_column = pretraining_config.get("image_column") or "images"
 
-    if image_column is None:
-        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
-            f.write(f"{text_column}\n")
-            f.write("lorem ipsum dolor sit amet\n")
-            f.seek(0)
-            return load_dataset("csv", data_files=f.name, split="train", streaming=True)
-
     def _gen():
-        yield {text_column: "lorem ipsum dolor sit amet", image_column: []}
+        row = {text_column: "lorem ipsum dolor sit amet"}
+        if image_column is not None:
+            row[image_column] = []
+        yield row
 
     return IterableDataset.from_generator(_gen)
 

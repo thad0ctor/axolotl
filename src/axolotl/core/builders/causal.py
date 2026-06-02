@@ -545,13 +545,24 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             "image_resize_buckets": self.cfg.get("image_resize_buckets"),
             "image_resize_no_upscale": bool(self.cfg.get("image_resize_no_upscale")),
             "image_resize_pad_color": self.cfg.get("image_resize_pad_color"),
-            "image_transform": resolve_mm_image_transform(self.cfg),
+            "image_transform": self._resolve_mm_image_transform_checked(),
         }
         if pad_to_multiple_of is not None:
             if self.cfg.pad_to_sequence_len:
                 pad_to_multiple_of = max_length
             collator_kwargs["pad_to_multiple_of"] = pad_to_multiple_of
         return MultiModalPretrainDataCollator(**collator_kwargs)
+
+    def _resolve_mm_image_transform_checked(self):
+        transform = resolve_mm_image_transform(self.cfg)
+        if transform is None and self.cfg.get("image_tiling"):
+            raise ValueError(
+                "image_tiling is enabled but no image transform could be "
+                "resolved, so the run would train untiled. Ensure "
+                "`plugins: [axolotl.integrations.mm_tiling.MMTilingPlugin]` is "
+                "set and the tiling config is valid."
+            )
+        return transform
 
     def build_collator(
         self,
@@ -652,11 +663,20 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 role_boundaries_override = list(self.cfg.role_boundaries)
 
             # Deduped union of per-dataset `field_messages` for the MM collator.
+            # Each entry may be a str or a list/tuple of names; flatten so the
+            # strategy receives flat string names, not nested lists.
             field_messages = []
             for dataset_cfg in ds_entries:
                 field_message = _ds_get(dataset_cfg, "field_messages")
-                if field_message and field_message not in field_messages:
-                    field_messages.append(field_message)
+                if isinstance(field_message, str):
+                    candidates = [field_message]
+                elif isinstance(field_message, (list, tuple)):
+                    candidates = [name for name in field_message if name]
+                else:
+                    candidates = []
+                for name in candidates:
+                    if name not in field_messages:
+                        field_messages.append(name)
 
             # build() calls build_collator twice (eval + train); log once.
             if not is_eval:
@@ -678,7 +698,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 image_resize_buckets=training_args.image_resize_buckets,
                 image_resize_no_upscale=bool(training_args.image_resize_no_upscale),
                 image_resize_pad_color=training_args.image_resize_pad_color,
-                image_transform=resolve_mm_image_transform(self.cfg),
+                image_transform=self._resolve_mm_image_transform_checked(),
                 train_on_inputs=bool(self.cfg.train_on_inputs),
                 roles_to_train=roles_to_train,
                 train_on_eos=train_on_eos,

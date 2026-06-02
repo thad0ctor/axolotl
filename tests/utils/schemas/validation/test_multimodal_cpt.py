@@ -154,6 +154,15 @@ class TestMultimodalCPTGates:
         assert validated.image_tiling_pad_color == (255, 255, 255)
         assert validated.image_tiling_shape_buckets == "ocr_pages"
 
+    def test_image_tiling_without_plugin_rejected(self, min_base_cfg):
+        cfg = _mm_cpt_cfg(
+            min_base_cfg,
+            image_tiling=True,
+            image_tiling_shape_buckets="ocr_pages",
+        )
+        with pytest.raises(ValueError, match="plugin that owns it is not loaded"):
+            validate_config(cfg)
+
     def test_chat_template_rejected(self, min_base_cfg):
         cfg = _mm_cpt_cfg(min_base_cfg, chat_template="tokenizer_default")
         with pytest.raises(ValueError, match="chat_template"):
