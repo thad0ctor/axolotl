@@ -58,6 +58,54 @@ def test_schema_backend_defaults_native_and_accepts_te(monkeypatch):
     assert cfg.nvfp4_training.backend == "te"
 
 
+def test_schema_accepts_fp8_lm_head_eval_knobs(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        nvfp4_training={
+            "enabled": True,
+            "fp8_lm_head": True,
+            "fp8_lm_head_granularity": "rowwise",
+        },
+    )
+    assert cfg.nvfp4_training.fp8_lm_head is True
+    assert cfg.nvfp4_training.fp8_lm_head_granularity == "rowwise"
+
+
+def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        model_config_type="qwen3_5",
+        nvfp4_training={
+            "enabled": True,
+            "qwen3_5_native_attention": True,
+            "qwen3_5_native_attention_backward": True,
+            "qwen3_5_native_attention_backward_rtn_grad_packs": True,
+            "qwen3_5_fuse_vproj": True,
+            "qwen3_5_native_linear_attn": True,
+            "qwen3_5_native_mlp": True,
+        },
+    )
+    assert cfg.nvfp4_training.qwen3_5_native_attention is True
+    assert cfg.nvfp4_training.qwen3_5_native_attention_backward is True
+    assert cfg.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs is True
+
+
+def test_gate_refuses_qwen3_5_switch_on_other_model(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="model_config_type"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen2",
+            nvfp4_training={
+                "enabled": True,
+                "qwen3_5_native_attention": True,
+            },
+        )
+
+
 def test_gate_refuses_unsupported_hardware(monkeypatch):
     _supported(monkeypatch, False, "no Blackwell here")
     with pytest.raises(ValueError, match="no Blackwell here"):
@@ -137,6 +185,34 @@ def test_disabled_nvfp4_skips_gate(monkeypatch):
     assert cfg.nvfp4_training.enabled is False
 
 
+def test_gate_refuses_qwen3_5_backward_without_attention(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="qwen3_5_native_attention"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            nvfp4_training={
+                "enabled": True,
+                "qwen3_5_native_attention_backward": True,
+            },
+        )
+
+
+def test_gate_refuses_qwen3_5_rtn_without_backward(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="qwen3_5_native_attention_backward"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "qwen3_5_native_attention": True,
+                "qwen3_5_native_attention_backward_rtn_grad_packs": True,
+            },
+        )
+
+
 def _tiny_lora_model():
     """A 2-layer toy model wrapped with a PEFT LoRA adapter (CPU-friendly)."""
     import torch
@@ -172,14 +248,16 @@ def _patch_manager(cfg_dict):
 
 
 def test_apply_selects_lora_compute_mode(monkeypatch):
-    """adapter=lora default -> base_layer becomes NVFP4ComputeBaseLinear (the
+    """adapter=lora default -> base_layer becomes an FP4 compute base (the
     pre-quantized FP4-compute base, the recommended default)."""
     _supported(monkeypatch, True)
     from peft.tuners.lora import Linear as LoraLinear
 
     from axolotl.utils.nvfp4_training import (
         NVFP4ComputeBaseLinear,
+        NVFP4FastComputeBaseLinear,
         NVFP4FrozenBaseLinear,
+        NVFP4FastFrozenBaseLinear,
     )
 
     model = _tiny_lora_model()
@@ -191,8 +269,14 @@ def test_apply_selects_lora_compute_mode(monkeypatch):
     bases = [
         m.base_layer for m in model.modules() if isinstance(m, LoraLinear)
     ]
-    assert bases and all(isinstance(b, NVFP4ComputeBaseLinear) for b in bases)
-    assert not any(isinstance(b, NVFP4FrozenBaseLinear) for b in bases)
+    assert bases and all(
+        isinstance(b, (NVFP4ComputeBaseLinear, NVFP4FastComputeBaseLinear))
+        for b in bases
+    )
+    assert not any(
+        isinstance(b, (NVFP4FrozenBaseLinear, NVFP4FastFrozenBaseLinear))
+        for b in bases
+    )
 
 
 def test_apply_selects_hp_mode_when_requested(monkeypatch):
@@ -231,7 +315,10 @@ def test_apply_honors_block_exclusions(monkeypatch):
     _supported(monkeypatch, True)
     from peft.tuners.lora import Linear as LoraLinear
 
-    from axolotl.utils.nvfp4_training import NVFP4ComputeBaseLinear
+    from axolotl.utils.nvfp4_training import (
+        NVFP4ComputeBaseLinear,
+        NVFP4FastComputeBaseLinear,
+    )
 
     model = _tiny_lora_model()
     pm = _patch_manager(
@@ -243,7 +330,9 @@ def test_apply_honors_block_exclusions(monkeypatch):
     pm._apply_nvfp4_training(model)
 
     swapped = {
-        name: isinstance(m.base_layer, NVFP4ComputeBaseLinear)
+        name: isinstance(
+            m.base_layer, (NVFP4ComputeBaseLinear, NVFP4FastComputeBaseLinear)
+        )
         for name, m in model.named_modules()
         if isinstance(m, LoraLinear)
     }
@@ -290,6 +379,8 @@ def test_e2e_lora_swap_and_train_step(quantize_base):
 
     from axolotl.utils.nvfp4_training import (
         NVFP4FrozenBaseLinear,
+        NVFP4FastFrozenBaseLinear,
+        NVFP4FastComputeBaseLinear,
         NVFP4Linear,
         NVFP4Recipe,
         convert_lora_base_to_nvfp4,
@@ -306,7 +397,11 @@ def test_e2e_lora_swap_and_train_step(quantize_base):
     )
     assert count > 0
 
-    expected = NVFP4FrozenBaseLinear if quantize_base else NVFP4Linear
+    expected = (
+        (NVFP4FrozenBaseLinear, NVFP4FastFrozenBaseLinear)
+        if quantize_base
+        else (NVFP4Linear, NVFP4FastComputeBaseLinear)
+    )
     bases = [m.base_layer for m in model.modules() if isinstance(m, LoraLinear)]
     assert any(isinstance(b, expected) for b in bases)
 

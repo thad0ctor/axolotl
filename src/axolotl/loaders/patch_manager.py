@@ -169,6 +169,7 @@ class PatchManager:
         self._apply_fp8_attention_patches(model)
         self._apply_fp4_attention_qat(model)
         self._apply_nvfp4_training(model)
+        self._apply_qwen3_5_native_nvfp4_patches(model)
 
     def _apply_gemma_hybrid_attention(self, model: PreTrainedModel):
         """Apply hybrid attention: FA2 for sliding window layers, SDPA for global layers.
@@ -272,8 +273,18 @@ class PatchManager:
                 patch_sage_fp4_attn,
             )
 
+            if not self.inference:
+                raise ValueError(
+                    "attn_implementation: sage_fp4 is inference-only and cannot "
+                    "be used by axolotl train. For Qwen3.5 native FP4 attention "
+                    "training, keep a training-capable attention backend such as "
+                    "flash_attention_2 and enable nvfp4_training with "
+                    "qwen3_5_native_attention plus "
+                    "qwen3_5_native_attention_backward."
+                )
+
             patch_sage_fp4_attn()
-            sage_cfg = self.cfg.sage_attention
+            sage_cfg = self.cfg.sage_fp4_attention
             configure_sage_fp4(
                 per_block_mean=sage_cfg.per_block_mean if sage_cfg else True,
                 allow_fallback=(sage_cfg.allow_fallback if sage_cfg else True),
@@ -462,6 +473,57 @@ class PatchManager:
             from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
 
             patch_model_fused_fp4_ce(model)
+
+        if getattr(nvfp4, "fp8_lm_head", False):
+            from axolotl.kernels.fp8_lm_head import patch_model_fp8_lm_head
+
+            patch_model_fp8_lm_head(
+                model,
+                granularity=getattr(nvfp4, "fp8_lm_head_granularity", "rowwise"),
+            )
+
+    def _apply_qwen3_5_native_nvfp4_patches(self, model: PreTrainedModel):
+        nvfp4 = self.cfg.nvfp4_training
+        if not (nvfp4 and nvfp4.enabled):
+            return
+        if self.cfg.model_config_type not in ("qwen3_5", "qwen3_5_moe"):
+            return
+
+        if getattr(nvfp4, "qwen3_5_native_attention", False):
+            from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
+                patch_qwen3_5_nvfp4_attention,
+            )
+
+            patch_qwen3_5_nvfp4_attention(
+                model,
+                fuse_vproj=getattr(nvfp4, "qwen3_5_fuse_vproj", False),
+                train_backward=getattr(
+                    nvfp4, "qwen3_5_native_attention_backward", False
+                ),
+                backward_rtn_grad_packs=getattr(
+                    nvfp4,
+                    "qwen3_5_native_attention_backward_rtn_grad_packs",
+                    False,
+                ),
+                compile_custom_op=getattr(
+                    nvfp4, "qwen3_5_native_attention_compile_custom_op", False
+                ),
+                stochastic_rounding=nvfp4.stochastic_rounding,
+            )
+
+        if getattr(nvfp4, "qwen3_5_native_linear_attn", False):
+            from axolotl.monkeypatch.attention.nvfp4_linear_attn import (
+                patch_qwen3_5_nvfp4_linear_attn,
+            )
+
+            patch_qwen3_5_nvfp4_linear_attn(model)
+
+        if getattr(nvfp4, "qwen3_5_native_mlp", False):
+            from axolotl.monkeypatch.attention.nvfp4_mlp import (
+                patch_qwen3_5_nvfp4_mlp,
+            )
+
+            patch_qwen3_5_nvfp4_mlp(model)
 
     def _nvfp4_load_packed_sidecar(self, model: PreTrainedModel):
         """Restore FP4-packed weights from a save_nvfp4 sidecar, if one exists.

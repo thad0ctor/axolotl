@@ -20,7 +20,9 @@ own NVFP4 path.
 
 Forward/inference only (no autograd). Opt-in: call
 ``patch_qwen3_5_nvfp4_mlp(model)``; default OFF. Falls back to the stock forward
-for grad/training and any K not divisible by 16.
+for grad/training and any K not divisible by 16. Adapter-wrapped projections are
+skipped; plain trainable weights are re-packed after optimizer updates when
+no-grad eval next uses the fast path.
 """
 
 from __future__ import annotations
@@ -29,11 +31,12 @@ import torch
 from torch import nn
 
 from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
-from axolotl.kernels.nvfp4_linear import (
-    nvfp4_linear,
-    prepack_weight_nvfp4,
+from axolotl.kernels.nvfp4_linear import nvfp4_linear
+from axolotl.monkeypatch.attention.nvfp4_linear_attn import (
+    _gemm_from_packed_act,
+    _get_packed_weight,
+    _is_plain_linear,
 )
-from axolotl.monkeypatch.attention.nvfp4_linear_attn import _gemm_from_packed_act
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -63,17 +66,20 @@ def make_nvfp4_mlp_forward(orig_forward):
         anv = anv[0]
         asc = asc[0]
 
+        gate_wnv, gate_wsc = _get_packed_weight(self, "_gate_packed", self.gate_proj)
+        up_wnv, up_wsc = _get_packed_weight(self, "_up_packed", self.up_proj)
         gate = _gemm_from_packed_act(
-            anv, asc, self._gate_wnv, self._gate_wsc, m, self._inter, k, out_dtype
+            anv, asc, gate_wnv, gate_wsc, m, self._inter, k, out_dtype
         )
         up = _gemm_from_packed_act(
-            anv, asc, self._up_wnv, self._up_wsc, m, self._inter, k, out_dtype
+            anv, asc, up_wnv, up_wsc, m, self._inter, k, out_dtype
         )
 
         inter = self.act_fn(gate) * up
 
         # down_proj: separate activation (post-SwiGLU), K=intermediate, own path.
-        out = nvfp4_linear(inter, self._down_wnv, self._down_wsc, self._hidden)
+        down_wnv, down_wsc = _get_packed_weight(self, "_down_packed", self.down_proj)
+        out = nvfp4_linear(inter, down_wnv, down_wsc, self._hidden)
         return out.reshape(*lead, self._hidden)
 
     return forward
@@ -92,19 +98,16 @@ def patch_qwen3_5_nvfp4_mlp(model: nn.Module) -> int:
         if isinstance(module, Qwen3_5MLP):
             if getattr(module, "_nvfp4_patched", False):
                 continue
+            if not (
+                _is_plain_linear(module.gate_proj)
+                and _is_plain_linear(module.up_proj)
+                and _is_plain_linear(module.down_proj)
+            ):
+                continue
             hidden = module.gate_proj.in_features
             inter = module.gate_proj.out_features
             if hidden % 16 != 0 or inter % 16 != 0:
                 continue
-            module._gate_wnv, module._gate_wsc = prepack_weight_nvfp4(
-                module.gate_proj.weight
-            )
-            module._up_wnv, module._up_wsc = prepack_weight_nvfp4(
-                module.up_proj.weight
-            )
-            module._down_wnv, module._down_wsc = prepack_weight_nvfp4(
-                module.down_proj.weight
-            )
             module._inter = inter
             module._hidden = hidden
             orig = type(module).forward

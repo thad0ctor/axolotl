@@ -104,6 +104,24 @@ class NVFP4TrainingConfig(BaseModel):
             "OFF by default."
         },
     )
+    fp8_lm_head: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Patch a plain frozen lm_head to use torch FP8 scaled "
+            "matmul in eval/no-grad forward only. Training forwards still use the "
+            "original high-precision Linear. This is for eval/scoring/logprob "
+            "throughput; greedy generation can diverge after the first changed "
+            "argmax token. OFF by default."
+        },
+    )
+    fp8_lm_head_granularity: Literal["tensorwise", "rowwise"] = Field(
+        default="rowwise",
+        json_schema_extra={
+            "description": "Scaling granularity for fp8_lm_head. Rowwise keeps one "
+            "scale per vocab row and had the best Qwen3.5 real-hidden-state argmax "
+            "parity in the validation sweep."
+        },
+    )
     quantize_embeddings: bool = Field(
         default=False,
         json_schema_extra={
@@ -169,5 +187,68 @@ class NVFP4TrainingConfig(BaseModel):
             "this is LOSSY for resume: only the FP4 packing is kept, no bf16 master, "
             "so a save_nvfp4 FFT checkpoint is for storage/inference export, not exact "
             "resume. OFF by default (bf16 save, unchanged)."
+        },
+    )
+    qwen3_5_native_attention: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only. Patch full softmax-attention layers to use "
+            "the native NVFP4 attention path on dense causal/full batches. Forward "
+            "falls back to the model's configured attention for unsupported masks or "
+            "cache states. OFF by default."
+        },
+    )
+    qwen3_5_native_attention_backward: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only; requires qwen3_5_native_attention. Use the "
+            "native NVFP4 autograd attention path while training. This is validated "
+            "for convergence but can be slower than bf16 at short sequence lengths, "
+            "so it stays explicitly opt-in."
+        },
+    )
+    qwen3_5_native_attention_backward_rtn_grad_packs: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention training only. Use "
+            "deterministic round-to-nearest for the measured-safe gradient packs "
+            "(softmax P and transposed dO for dV, and dS for dQ) while leaving the "
+            "dK routing-gradient dS pack governed by stochastic_rounding. This "
+            "collapsed mode was faster in backward microbenchmarks; convergence "
+            "validation is still required for production training. OFF by default."
+        },
+    )
+    qwen3_5_native_attention_compile_custom_op: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention inference only. Route the "
+            "packed NVFP4 flash-attention call through an opaque torch custom op "
+            "as a torch.compile compatibility escape hatch when the internal "
+            "Triton tl.dot_scaled kernel cannot be captured. This is not a proven "
+            "speed knob; OFF by default."
+        },
+    )
+    qwen3_5_fuse_vproj: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention only. Run v_proj as a native "
+            "NVFP4 GEMM with key-axis pack epilogue on inference/cache-free prefill. "
+            "Skipped automatically for adapter-wrapped v_proj modules."
+        },
+    )
+    qwen3_5_native_linear_attn: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only. Patch GatedDeltaNet's large projection GEMMs "
+            "to native NVFP4 in no-grad forward/eval. Training forwards fall back to "
+            "the original implementation."
+        },
+    )
+    qwen3_5_native_mlp: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 only. Patch dense SwiGLU MLP GEMMs to native NVFP4 "
+            "in no-grad forward/eval. Training forwards fall back to the original "
+            "implementation."
         },
     )

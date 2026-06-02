@@ -10,12 +10,14 @@ Replaces the full softmax-attention forward with a fused-producer NVFP4 pipeline
 
 The fused producers eliminate the standalone Q/K pre-quant round-trips (the trap
 that made the materialized-attention pipeline lose to bf16): the pack rides along
-with the RoPE pass Q/K already pay. V is still a separate key-axis quant pass (the
-real v_proj GEMM epilogue would absorb it; here it is a standalone read).
+with the RoPE pass Q/K already pay. V can optionally be produced by a native-NVFP4
+v_proj GEMM with a key-axis pack epilogue.
 
 Qwen3.5 is HYBRID — only ``full_attention`` layers (head_dim 256 softmax GQA) are
-patched; ``linear_attention`` layers are left untouched. Inference/forward only
-(no backward). Opt-in: call ``patch_qwen3_5_nvfp4_attention(model)``; default OFF.
+patched; ``linear_attention`` layers are left untouched. The fast fused-producer
+path is inference/forward-only; an explicitly enabled training path uses
+``nvfp4_flash_attn_func`` with native NVFP4 backward. Opt-in: call
+``patch_qwen3_5_nvfp4_attention(model)``; default OFF.
 
 Per-key padding / non-causal-with-mask batches fall back to the model's original
 forward (correctness over speed). The fast path serves dense causal prefill and
@@ -24,10 +26,15 @@ single-step / full decode.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
-from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attention_packed
+from axolotl.kernels.attn_nvfp4_flash import (
+    nvfp4_flash_attention_packed,
+    nvfp4_flash_attn_func,
+)
 from axolotl.kernels.nvfp4_fused_producers import (
     fused_rope_quant_qk,
     fused_vproj_quant_v_keyaxis,
@@ -46,6 +53,14 @@ _BLOCK_N = 128
 # +0.1-0.2x end-to-end (v_proj counted). Real-model logit cos stays >=0.998. OFF by
 # default; flip via patch_qwen3_5_nvfp4_attention(model, fuse_vproj=True).
 _FUSE_VPROJ = False
+_CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
+
+
+def _custom_op_enabled(module: nn.Module) -> bool:
+    requested = getattr(
+        module, "_nvfp4_compile_custom_op", False
+    ) or os.environ.get(_CUSTOM_OP_ENV, "").lower() in {"1", "true", "yes"}
+    return bool(requested) and torch.compiler.is_compiling()
 
 
 def _mask_is_dense_causal_or_full(
@@ -82,13 +97,21 @@ def _mask_is_dense_causal_or_full(
 
 
 def _get_vproj_packed(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-    """Lazily prepack (and cache on the module) the v_proj weight to NVFP4."""
+    """Lazily prepack v_proj and refresh if an optimizer updated the weight."""
+    if type(module.v_proj) is not nn.Linear:
+        raise TypeError("NVFP4 fused v_proj requires a plain nn.Linear v_proj")
+    weight = module.v_proj.weight
+    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
     cached = getattr(module, "_nvfp4_vproj_packed", None)
-    if cached is None:
-        wnv, wsc = prepack_vproj_weight(module.v_proj.weight.data)
-        module._nvfp4_vproj_packed = (wnv, wsc)
-        cached = (wnv, wsc)
-    return cached
+    if cached is None or cached[0] != key:
+        wnv, wsc = prepack_vproj_weight(weight.detach())
+        module._nvfp4_vproj_packed = (key, wnv, wsc)
+        cached = module._nvfp4_vproj_packed
+    return cached[1], cached[2]
+
+
+def _can_fuse_vproj(module: nn.Module) -> bool:
+    return type(module.v_proj) is nn.Linear
 
 
 def _nvfp4_attention(
@@ -118,7 +141,15 @@ def _nvfp4_attention(
     else:
         vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
 
-    out = nvfp4_flash_attention_packed(
+    flash_attention_packed = nvfp4_flash_attention_packed
+    if _custom_op_enabled(module):
+        from axolotl.kernels.attn_nvfp4_custom_op import (
+            nvfp4_flash_attention_packed_custom_op,
+        )
+
+        flash_attention_packed = nvfp4_flash_attention_packed_custom_op
+
+    out = flash_attention_packed(
         qnv, qsc, knv, ksc, vnv, vsc,
         z=z, h=h, hk=hk, s_q=s_q, s_kv=s_kv, d=d,
         scaling=scaling,
@@ -133,9 +164,9 @@ def make_nvfp4_forward(orig_forward):
     """Build a patched ``Qwen3_5Attention.forward`` that uses NVFP4 attention.
 
     Mirrors the stock forward (chunk q/gate, q_norm/k_norm, RoPE, attention, gate,
-    o_proj) but routes the attention through the fused-producer NVFP4 path. Falls
-    back to ``orig_forward`` for: grad enabled, KV-cache use (decode with cache),
-    per-key padding, or output_attentions.
+    o_proj). In no-grad mode it routes through the fused-producer NVFP4 path. If
+    ``train_backward`` was enabled at patch time, grad-enabled dense prefill uses
+    the differentiable native-NVFP4 attention function.
     """
     def forward(
         self,
@@ -145,7 +176,8 @@ def make_nvfp4_forward(orig_forward):
         past_key_values=None,
         **kwargs,
     ):
-        if torch.is_grad_enabled() or kwargs.get("output_attentions"):
+        grad_enabled = torch.is_grad_enabled()
+        if kwargs.get("output_attentions"):
             return orig_forward(
                 self, hidden_states, position_embeddings, attention_mask,
                 past_key_values, **kwargs,
@@ -153,6 +185,18 @@ def make_nvfp4_forward(orig_forward):
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        q_len = input_shape[-1]
+
+        # NVFP4 fast path: prefill only (no prior cached context) on a dense
+        # causal/full mask. Cached decode reuses prior roped K/V from the cache,
+        # which the fused-RoPE producer can't reconstruct, so it goes to stock.
+        has_cache_context = (
+            past_key_values is not None
+            and past_key_values.get_seq_length(self.layer_idx) > 0
+        )
+        kind = None
+        if not has_cache_context:
+            kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
 
         query_states, gate = torch.chunk(
             self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
@@ -166,48 +210,74 @@ def make_nvfp4_forward(orig_forward):
         ).transpose(1, 2)
 
         cos, sin = position_embeddings
-        q_len = query_states.shape[2]
-
-        # NVFP4 fast path: prefill only (no prior cached context) on a dense
-        # causal/full mask. Cached decode reuses prior roped K/V from the cache,
-        # which the fused-RoPE producer can't reconstruct, so it goes to stock.
-        has_cache_context = (
-            past_key_values is not None
-            and past_key_values.get_seq_length(self.layer_idx) > 0
-        )
-        kind = None
-        if not has_cache_context:
-            kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
 
         if kind is not None:
-            # write the (roped) K/V to the cache so subsequent decode steps see
-            # prefill context, then run NVFP4 on the same roped K/V.
             from transformers.models.qwen3_5.modeling_qwen3_5 import (
                 apply_rotary_pos_emb,
             )
 
-            # Fuse V's quant into a native-NVFP4 v_proj GEMM only when no cache write
-            # is needed (the cache stores bf16 V; a cache write forces the bf16 v_proj).
-            fuse_v = (
-                getattr(self, "_nvfp4_fuse_vproj", _FUSE_VPROJ)
-                and past_key_values is None
-            )
-            value_states = None
-            if not fuse_v:
+            if grad_enabled:
+                if (
+                    not getattr(self, "_nvfp4_train_backward", False)
+                    or past_key_values is not None
+                ):
+                    return orig_forward(
+                        self, hidden_states, position_embeddings, attention_mask,
+                        past_key_values, **kwargs,
+                    )
                 value_states = (
                     self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                 )
-            if past_key_values is not None:
-                k_roped, _ = apply_rotary_pos_emb(
-                    key_states, key_states, cos, sin
+                query_roped, key_roped = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin
                 )
-                past_key_values.update(k_roped, value_states, self.layer_idx)
+                attn_output = nvfp4_flash_attn_func(
+                    query_roped,
+                    key_roped,
+                    value_states,
+                    self.scaling,
+                    causal=(kind == "causal"),
+                    num_key_value_groups=query_states.shape[1] // key_states.shape[1],
+                    stochastic_rounding=getattr(
+                        self, "_nvfp4_stochastic_rounding", True
+                    ),
+                    backward_p_dv_stochastic_rounding=(
+                        getattr(self, "_nvfp4_stochastic_rounding", True)
+                        and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
+                    ),
+                    backward_dot_dv_stochastic_rounding=(
+                        getattr(self, "_nvfp4_stochastic_rounding", True)
+                        and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
+                    ),
+                    backward_ds_dq_stochastic_rounding=(
+                        getattr(self, "_nvfp4_stochastic_rounding", True)
+                        and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
+                    ),
+                ).transpose(1, 2)
+            else:
+                # Write roped K/V to the cache so subsequent decode steps see prefill
+                # context, then run NVFP4 on the same roped K/V.
+                fuse_v = (
+                    getattr(self, "_nvfp4_fuse_vproj", _FUSE_VPROJ)
+                    and past_key_values is None
+                    and _can_fuse_vproj(self)
+                )
+                value_states = None
+                if not fuse_v:
+                    value_states = (
+                        self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    )
+                if past_key_values is not None:
+                    k_roped, _ = apply_rotary_pos_emb(
+                        key_states, key_states, cos, sin
+                    )
+                    past_key_values.update(k_roped, value_states, self.layer_idx)
 
-            attn_output = _nvfp4_attention(
-                self, query_states, key_states, value_states, cos, sin,
-                self.scaling, causal=(kind == "causal"),
-                hidden_states=hidden_states if fuse_v else None,
-            )
+                attn_output = _nvfp4_attention(
+                    self, query_states, key_states, value_states, cos, sin,
+                    self.scaling, causal=(kind == "causal"),
+                    hidden_states=hidden_states if fuse_v else None,
+                )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = attn_output * torch.sigmoid(gate)
             return self.o_proj(attn_output), None
@@ -221,7 +291,12 @@ def make_nvfp4_forward(orig_forward):
 
 
 def patch_qwen3_5_nvfp4_attention(
-    model: nn.Module, fuse_vproj: bool = _FUSE_VPROJ
+    model: nn.Module,
+    fuse_vproj: bool = _FUSE_VPROJ,
+    train_backward: bool = False,
+    backward_rtn_grad_packs: bool = False,
+    compile_custom_op: bool = False,
+    stochastic_rounding: bool = True,
 ) -> int:
     """Patch every Qwen3.5 FULL-attention layer's forward to use NVFP4 attention.
 
@@ -230,7 +305,8 @@ def patch_qwen3_5_nvfp4_attention(
 
     ``fuse_vproj``: run v_proj as a native-NVFP4 GEMM with a fused key-axis pack
     epilogue (no bf16 V / transpose / standalone quant). Faster V producer at a
-    small parity cost (v_proj goes FP4); only active on the cache-free prefill path.
+    small parity cost (v_proj goes FP4); only active on the no-grad cache-free
+    prefill path and only for plain ``nn.Linear`` v_proj modules.
     """
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
@@ -240,6 +316,10 @@ def patch_qwen3_5_nvfp4_attention(
         if isinstance(module, Qwen3_5Attention):
             if getattr(module, "_nvfp4_patched", False):
                 module._nvfp4_fuse_vproj = fuse_vproj
+                module._nvfp4_train_backward = train_backward
+                module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
+                module._nvfp4_compile_custom_op = compile_custom_op
+                module._nvfp4_stochastic_rounding = stochastic_rounding
                 continue
             orig = type(module).forward
             if seen_forward is None:
@@ -247,9 +327,16 @@ def patch_qwen3_5_nvfp4_attention(
             module.forward = seen_forward.__get__(module, type(module))
             module._nvfp4_patched = True
             module._nvfp4_fuse_vproj = fuse_vproj
+            module._nvfp4_train_backward = train_backward
+            module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
+            module._nvfp4_compile_custom_op = compile_custom_op
+            module._nvfp4_stochastic_rounding = stochastic_rounding
             patched += 1
     LOG.info(
-        "nvfp4 attention: patched %d Qwen3.5 full-attention layers (fuse_vproj=%s)",
-        patched, fuse_vproj,
+        "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
+        "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
+        "compile_custom_op=%s)",
+        patched, fuse_vproj, train_backward, backward_rtn_grad_packs,
+        compile_custom_op,
     )
     return patched

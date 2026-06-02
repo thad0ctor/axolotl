@@ -208,6 +208,19 @@ class AxolotlInputConfig(
 
     model_config = {"populate_by_name": True}
 
+    axolotl_cli_mode: Literal["train", "inference", "other"] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Internal CLI mode used for mode-specific validation."
+        },
+    )
+    model_config_type: str | None = Field(
+        default=None,
+        exclude=True,
+        json_schema_extra={
+            "description": "Internal model type resolved from the HF config."
+        },
+    )
     strict: bool | None = Field(
         default=False,
         json_schema_extra={"description": "Allow overwrite yml config using from cli"},
@@ -847,7 +860,7 @@ class AxolotlInputConfig(
         },
     )
 
-    sage_attention: SageAttentionConfig | None = Field(
+    sage_fp4_attention: SageAttentionConfig | None = Field(
         default=None,
         json_schema_extra={
             "description": "Settings for `attn_implementation: sage_fp4` (SageAttention-3 "
@@ -1435,6 +1448,20 @@ class AxolotlInputConfig(
         if not isinstance(data, dict):
             return data
 
+        sage_attention = data.get("sage_attention")
+        if isinstance(sage_attention, dict):
+            if data.get("sage_fp4_attention") is not None:
+                raise ValueError(
+                    "`sage_attention` config block has been renamed to "
+                    "`sage_fp4_attention`; set only one of them."
+                )
+            data["sage_fp4_attention"] = sage_attention
+            data.pop("sage_attention", None)
+            LOG.warning(
+                "`sage_attention: {...}` is deprecated. Use "
+                "`sage_fp4_attention: {...}` for attn_implementation: sage_fp4."
+            )
+
         attn_impl = data.get("attn_implementation")
         set_flags = [f for f in LEGACY_ATTN_FLAG_TO_IMPL if data.get(f)]
 
@@ -1532,6 +1559,15 @@ class AxolotlInputConfig(
     @model_validator(mode="after")
     def check_sage_fp4_inference_only(self):
         if self.attn_implementation == "sage_fp4":
+            if self.axolotl_cli_mode == "train":
+                raise ValueError(
+                    "attn_implementation: sage_fp4 (SageAttention-3 FP4) is "
+                    "inference-only and cannot be used by axolotl train. Use "
+                    "fp4_attention_qat for fake-quant attention training, or use "
+                    "nvfp4_training.qwen3_5_native_attention with "
+                    "qwen3_5_native_attention_backward for the experimental "
+                    "Qwen3.5 native FP4 training path."
+                )
             LOG.warning(
                 "attn_implementation: sage_fp4 (SageAttention-3 FP4) is INFERENCE only "
                 "— the FP4 kernel has no backward and will raise during a training "
@@ -1623,6 +1659,61 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             raise ValueError(
                 f"nvfp4_training supports full fine-tune or adapter in (lora, qlora), "
                 f"got adapter={self.adapter!r}."
+            )
+
+        if (
+            self.nvfp4_training.qwen3_5_native_attention_backward
+            and not self.nvfp4_training.qwen3_5_native_attention
+        ):
+            raise ValueError(
+                "nvfp4_training.qwen3_5_native_attention_backward requires "
+                "qwen3_5_native_attention: true."
+            )
+        if (
+            self.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs
+            and not self.nvfp4_training.qwen3_5_native_attention_backward
+        ):
+            raise ValueError(
+                "nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs "
+                "requires qwen3_5_native_attention_backward: true."
+            )
+        if (
+            self.nvfp4_training.qwen3_5_fuse_vproj
+            and not self.nvfp4_training.qwen3_5_native_attention
+        ):
+            raise ValueError(
+                "nvfp4_training.qwen3_5_fuse_vproj requires "
+                "qwen3_5_native_attention: true."
+            )
+        if (
+            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op
+            and not self.nvfp4_training.qwen3_5_native_attention
+        ):
+            raise ValueError(
+                "nvfp4_training.qwen3_5_native_attention_compile_custom_op "
+                "requires qwen3_5_native_attention: true."
+            )
+        qwen3_5_native_flags = (
+            self.nvfp4_training.qwen3_5_native_attention,
+            self.nvfp4_training.qwen3_5_native_attention_backward,
+            self.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs,
+            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op,
+            self.nvfp4_training.qwen3_5_fuse_vproj,
+            self.nvfp4_training.qwen3_5_native_linear_attn,
+            self.nvfp4_training.qwen3_5_native_mlp,
+        )
+        model_config_type = getattr(self, "model_config_type", None)
+        if (
+            model_config_type is not None
+            and any(qwen3_5_native_flags)
+            and model_config_type not in (
+                "qwen3_5",
+                "qwen3_5_moe",
+            )
+        ):
+            raise ValueError(
+                "nvfp4_training Qwen3.5 native switches require "
+                "model_config_type: qwen3_5 or qwen3_5_moe."
             )
 
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
