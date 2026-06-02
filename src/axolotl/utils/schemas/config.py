@@ -214,6 +214,13 @@ class AxolotlInputConfig(
             "description": "Internal CLI mode used for mode-specific validation."
         },
     )
+    model_config_type: str | None = Field(
+        default=None,
+        exclude=True,
+        json_schema_extra={
+            "description": "Internal model type resolved from the HF config."
+        },
+    )
     strict: bool | None = Field(
         default=False,
         json_schema_extra={"description": "Allow overwrite yml config using from cli"},
@@ -1678,9 +1685,13 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             self.nvfp4_training.qwen3_5_native_mlp,
         )
         model_config_type = getattr(self, "model_config_type", None)
-        if any(qwen3_5_native_flags) and model_config_type not in (
-            "qwen3_5",
-            "qwen3_5_moe",
+        if (
+            model_config_type is not None
+            and any(qwen3_5_native_flags)
+            and model_config_type not in (
+                "qwen3_5",
+                "qwen3_5_moe",
+            )
         ):
             raise ValueError(
                 "nvfp4_training Qwen3.5 native switches require "
