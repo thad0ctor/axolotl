@@ -482,6 +482,38 @@ def _flash_bwd_packprep_kernel(
         q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
         mask=mmask[:, None], other=0.0,
     ).to(tl.float32)
+
+    DP2: tl.constexpr = D // 2
+    DP16: tl.constexpr = D // 16
+    MP2: tl.constexpr = BLOCK_M // 2
+    MP16: tl.constexpr = BLOCK_M // 16
+    offs_dp = tl.arange(0, DP2)
+    offs_dsc = tl.arange(0, DP16)
+    offs_mp = pid_m * MP2 + tl.arange(0, MP2)
+    offs_msc = pid_m * MP16 + tl.arange(0, MP16)
+
+    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
+    qtnv, qtsc = _pack_nvfp4_along_k(tl.trans(q), 4 * Sq, seed, D, BLOCK_M, False)
+
+    tl.store(
+        qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+        qnv, mask=mmask[:, None],
+    )
+    tl.store(
+        qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+        qsc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
+    )
+    sq2 = Sq_pad // 2
+    sq16 = Sq_pad // 16
+    tl.store(
+        qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
+        qtnv,
+    )
+    tl.store(
+        qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
+        qtsc.to(tl.uint8, bitcast=True),
+    )
+
     do = tl.load(
         do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
         mask=mmask[:, None], other=0.0,
@@ -494,37 +526,12 @@ def _flash_bwd_packprep_kernel(
         delta = tl.sum(do * o, axis=1)
         tl.store(delta_ptr + pid_zh * Sq + offs_m, delta, mask=mmask)
 
-    # Distinct philox stream per (m-block, operand) so the SR noise on dO is
-    # decorrelated across query blocks. Without the pid_m term every m-block would
-    # draw the same dither pattern (a hidden bias in the gradient estimate).
     mblk = pid_m * (BLOCK_M * D)
-    # along D (rows = m tile)
-    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
     donv, dosc = _pack_nvfp4_along_k(do, 2 * Sq + mblk, seed, BLOCK_M, D, SR)
-    # along M (rows = D): transpose the tile in SRAM, pack the BLOCK_M axis
-    qT = tl.trans(q)
-    doT = tl.trans(do)
-    qtnv, qtsc = _pack_nvfp4_along_k(qT, 4 * Sq, seed, D, BLOCK_M, False)
-    dotnv, dotsc = _pack_nvfp4_along_k(doT, Sq + mblk, seed, D, BLOCK_M, SR)
-
-    DP2: tl.constexpr = D // 2
-    DP16: tl.constexpr = D // 16
-    MP2: tl.constexpr = BLOCK_M // 2
-    MP16: tl.constexpr = BLOCK_M // 16
-    offs_dp = tl.arange(0, DP2)
-    offs_dsc = tl.arange(0, DP16)
-    offs_mp = pid_m * MP2 + tl.arange(0, MP2)
-    offs_msc = pid_m * MP16 + tl.arange(0, MP16)
-
-    # store along-D packs: [zh, Sq, D//2] + [zh, Sq, D//16]
-    tl.store(
-        qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
-        qnv, mask=mmask[:, None],
+    dotnv, dotsc = _pack_nvfp4_along_k(
+        tl.trans(do), Sq + mblk, seed, D, BLOCK_M, SR
     )
-    tl.store(
-        qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
-        qsc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
-    )
+
     tl.store(
         donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
         donv, mask=mmask[:, None],
@@ -532,17 +539,6 @@ def _flash_bwd_packprep_kernel(
     tl.store(
         dosc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
         dosc.to(tl.uint8, bitcast=True), mask=mmask[:, None],
-    )
-    # store along-M packs: [zh, D, Sq_pad//2] + [zh, D, Sq_pad//16]
-    sq2 = Sq_pad // 2
-    sq16 = Sq_pad // 16
-    tl.store(
-        qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
-        qtnv,
-    )
-    tl.store(
-        qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + offs_msc[None, :],
-        qtsc.to(tl.uint8, bitcast=True),
     )
     tl.store(
         dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + offs_mp[None, :],
@@ -579,13 +575,13 @@ def _flash_bwd_kprep_kernel(
         k_ptr + pid_zhk * (Skv * sk_n) + offs_n[:, None] * sk_n + offs_d[None, :],
         mask=nmask[:, None], other=0.0,
     ).to(tl.float32)
+    knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
+    kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
     v = tl.load(
         v_ptr + pid_zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
         mask=nmask[:, None], other=0.0,
     ).to(tl.float32)
-    knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
     vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
-    kTnv, kTsc = _pack_nvfp4_along_k(tl.trans(k), 0, seed, D, BLOCK_N, False)
 
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
@@ -715,26 +711,6 @@ def _flash_bwd_dkdv_kernel(
         ).to(tl.float8e4nv, bitcast=True)
         mp = (start_m // 2) + offs_mp0
         msc = (start_m // 16) + offs_msc0
-        qtnv = tl.load(
-            qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
-        )
-        qtsc = tl.load(
-            qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
-        ).to(tl.float8e4nv, bitcast=True)
-        donv = tl.load(
-            donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
-            mask=mmask[:, None], other=0,
-        )
-        dosc = tl.load(
-            dosc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
-            mask=mmask[:, None], other=0,
-        ).to(tl.float8e4nv, bitcast=True)
-        dotnv = tl.load(
-            dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
-        )
-        dotsc = tl.load(
-            dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
-        ).to(tl.float8e4nv, bitcast=True)
         lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
         delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
 
@@ -752,16 +728,36 @@ def _flash_bwd_dkdv_kernel(
 
         # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M] (SR), dO^T precomputed.
         pT_q, pT_s = _pack_nvfp4_along_k(pT, start_m, seed, BLOCK_N, BLOCK_M, SR)
+        dotnv = tl.load(
+            dotnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
+        )
+        dotsc = tl.load(
+            dotsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
         dv = tl.dot_scaled(pT_q, pT_s, "e2m1", dotnv.T, dotsc, "e2m1", acc=dv)
 
         # dPt[n,m] = sum_d V[n,d] dO[m,d]  (contract D). dO precomputed (SR).
+        donv = tl.load(
+            donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+            mask=mmask[:, None], other=0,
+        )
+        dosc = tl.load(
+            dosc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+            mask=mmask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
         dpT = tl.dot_scaled(vnv, vsc, "e2m1", donv.T, dosc, "e2m1")
 
         dsT = pT * (dpT - delta[None, :]) * scaling
-        dsT = tl.where(sT == _NEG_INF, 0.0, dsT)
+        dsT = tl.where(pT == 0.0, 0.0, dsT)
 
         # dK += dSt @ Q^T.T  (contract M). dSt [BLOCK_N, BLOCK_M] (SR), Q^T precomputed (RTN).
         dsT_q, dsT_s = _pack_nvfp4_along_k(dsT, start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR)
+        qtnv = tl.load(
+            qtnv_ptr + pid_zh * (D * sq2) + offs_d[:, None] * sq2 + mp[None, :],
+        )
+        qtsc = tl.load(
+            qtsc_ptr + pid_zh * (D * sq16) + offs_d[:, None] * sq16 + msc[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
         dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qtnv.T, qtsc, "e2m1", acc=dk)
 
     tl.store(
@@ -781,12 +777,12 @@ def _flash_bwd_dkdv_kernel(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _flash_bwd_dq_kernel(
-    q_ptr, do_ptr, bias_ptr,
+    qnv_ptr, qsc_ptr, donv_ptr, dosc_ptr, bias_ptr,
     knv_ptr, ksc_ptr, vnv_ptr, vsc_ptr, ktnv_ptr, ktsc_ptr,
     lse_ptr, delta_ptr, dq_ptr,
     scaling, seed, Sq, Skv, Skv_pad,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
-    sq_n, sdo_n, sb_z, sdq_n,
+    sb_z, sdq_n,
     HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
@@ -800,19 +796,6 @@ def _flash_bwd_dq_kernel(
     offs_d = tl.arange(0, D)
     mmask = offs_m < Sq
 
-    q = tl.load(
-        q_ptr + pid_zh * (Sq * sq_n) + offs_m[:, None] * sq_n + offs_d[None, :],
-        mask=mmask[:, None], other=0.0,
-    ).to(tl.float32)
-    do = tl.load(
-        do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
-        mask=mmask[:, None], other=0.0,
-    ).to(tl.float32)
-    lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
-    delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
-    qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
-    do_q, do_s = _pack_nvfp4_along_k(do, pid_m * BLOCK_M, seed, BLOCK_M, D, SR)
-
     DP2: tl.constexpr = D // 2
     DP16: tl.constexpr = D // 16
     NP2: tl.constexpr = BLOCK_N // 2
@@ -824,6 +807,25 @@ def _flash_bwd_dq_kernel(
     sk2 = Skv_pad // 2
     sk16 = Skv_pad // 16
 
+    qnv = tl.load(
+        qnv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+        mask=mmask[:, None], other=0,
+    )
+    qsc = tl.load(
+        qsc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+        mask=mmask[:, None], other=0,
+    ).to(tl.float8e4nv, bitcast=True)
+    do_q = tl.load(
+        donv_ptr + pid_zh * (Sq * DP2) + offs_m[:, None] * DP2 + offs_dp[None, :],
+        mask=mmask[:, None], other=0,
+    )
+    do_s = tl.load(
+        dosc_ptr + pid_zh * (Sq * DP16) + offs_m[:, None] * DP16 + offs_dsc[None, :],
+        mask=mmask[:, None], other=0,
+    ).to(tl.float8e4nv, bitcast=True)
+    lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+    delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
+
     dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
     if CAUSAL:
         hi = tl.minimum(Skv, (pid_m * BLOCK_M + BLOCK_M) + (Skv - Sq))
@@ -833,7 +835,7 @@ def _flash_bwd_dq_kernel(
     for start_n in range(0, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         nmask = offs_n < Skv
-        # precomputed K/V packs (K-side pack-prep): knv/vnv along D, K^T along N
+        # precomputed K-side packs: load each layout close to the GEMM that uses it.
         knv = tl.load(
             knv_ptr + zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
             mask=nmask[:, None], other=0,
@@ -841,22 +843,6 @@ def _flash_bwd_dq_kernel(
         ksc = tl.load(
             ksc_ptr + zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
             mask=nmask[:, None], other=0,
-        ).to(tl.float8e4nv, bitcast=True)
-        vnv = tl.load(
-            vnv_ptr + zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
-            mask=nmask[:, None], other=0,
-        )
-        vsc = tl.load(
-            vsc_ptr + zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
-            mask=nmask[:, None], other=0,
-        ).to(tl.float8e4nv, bitcast=True)
-        np_ = (start_n // 2) + offs_np0
-        nsc = (start_n // 16) + offs_nsc0
-        kTnv = tl.load(
-            ktnv_ptr + zhk * (D * sk2) + offs_d[:, None] * sk2 + np_[None, :],
-        )
-        kTsc = tl.load(
-            ktsc_ptr + zhk * (D * sk16) + offs_d[:, None] * sk16 + nsc[None, :],
         ).to(tl.float8e4nv, bitcast=True)
 
         s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
@@ -870,18 +856,91 @@ def _flash_bwd_dq_kernel(
         p = tl.exp(s - lse[:, None])
         p = tl.where(s == _NEG_INF, 0.0, p)
 
+        vnv = tl.load(
+            vnv_ptr + zhk * (Skv * DP2) + offs_n[:, None] * DP2 + offs_dp[None, :],
+            mask=nmask[:, None], other=0,
+        )
+        vsc = tl.load(
+            vsc_ptr + zhk * (Skv * DP16) + offs_n[:, None] * DP16 + offs_dsc[None, :],
+            mask=nmask[:, None], other=0,
+        ).to(tl.float8e4nv, bitcast=True)
         dp = tl.dot_scaled(do_q, do_s, "e2m1", vnv.T, vsc, "e2m1")
         ds = p * (dp - delta[:, None]) * scaling
-        ds = tl.where(s == _NEG_INF, 0.0, ds)
+        ds = tl.where(p == 0.0, 0.0, ds)
 
         # dQ += dS @ K  (contract N). dS [BLOCK_M, BLOCK_N] (SR), K^T precomputed.
         ds_q, ds_s = _pack_nvfp4_along_k(ds, start_n + pid_m * Skv, seed, BLOCK_M, BLOCK_N, SR)
+        np_ = (start_n // 2) + offs_np0
+        nsc = (start_n // 16) + offs_nsc0
+        kTnv = tl.load(
+            ktnv_ptr + zhk * (D * sk2) + offs_d[:, None] * sk2 + np_[None, :],
+        )
+        kTsc = tl.load(
+            ktsc_ptr + zhk * (D * sk16) + offs_d[:, None] * sk16 + nsc[None, :],
+        ).to(tl.float8e4nv, bitcast=True)
         dq = tl.dot_scaled(ds_q, ds_s, "e2m1", kTnv.T, kTsc, "e2m1", acc=dq)
 
     tl.store(
         dq_ptr + pid_zh * (Sq * sdq_n) + offs_m[:, None] * sdq_n + offs_d[None, :],
         dq.to(dq_ptr.dtype.element_ty), mask=mmask[:, None],
     )
+
+
+@triton.jit
+def _gqa_reduce_cast_dkdv_kernel(
+    dk_ptr, dv_ptr, dk_out_ptr, dv_out_ptr,
+    Skv, D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr, NG: tl.constexpr,
+    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid_s = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    pid_zhk = tl.program_id(2)
+    z = pid_zhk // HK
+    hk = pid_zhk % HK
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    smask = offs_s < Skv
+
+    dk_acc = tl.zeros((BLOCK_S, BLOCK_D), dtype=tl.float32)
+    dv_acc = tl.zeros((BLOCK_S, BLOCK_D), dtype=tl.float32)
+    for g in range(0, NG):
+        h = hk * NG + g
+        in_base = (z * H + h) * (Skv * D)
+        ptrs = in_base + offs_s[:, None] * D + offs_d[None, :]
+        mask = smask[:, None]
+        dk_acc += tl.load(dk_ptr + ptrs, mask=mask, other=0.0)
+        dv_acc += tl.load(dv_ptr + ptrs, mask=mask, other=0.0)
+
+    out_base = pid_zhk * (Skv * D)
+    out_ptrs = out_base + offs_s[:, None] * D + offs_d[None, :]
+    tl.store(dk_out_ptr + out_ptrs, dk_acc, mask=smask[:, None])
+    tl.store(dv_out_ptr + out_ptrs, dv_acc, mask=smask[:, None])
+
+
+def _gqa_reduce_cast_dkdv(
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    z: int,
+    h: int,
+    hk: int,
+    s_kv: int,
+    d: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ng = h // hk
+    dk_out = torch.empty((z, hk, s_kv, d), device=dk.device, dtype=dtype)
+    dv_out = torch.empty((z, hk, s_kv, d), device=dv.device, dtype=dtype)
+    block_s = 8 if s_kv <= 2048 else 16
+    block_d = 128 if s_kv >= 4096 else 64
+    _gqa_reduce_cast_dkdv_kernel[
+        (triton.cdiv(s_kv, block_s), triton.cdiv(d, block_d), z * hk)
+    ](
+        dk, dv, dk_out, dv_out,
+        s_kv, D=d, H=h, HK=hk, NG=ng,
+        BLOCK_S=block_s, BLOCK_D=block_d,
+        num_warps=4, num_stages=2,
+    )
+    return dk_out, dv_out
 
 
 def _run_flash_packed(
@@ -1112,13 +1171,13 @@ def _run_bwd(
     dkdv_block_n = 32 if d <= 256 else 32
     dkdv_warps = 8
     dkdv_stages = 3
-    # dq loops over key blocks (already cheap); keep the conservative key tile. Two
-    # pipeline stages overlap the per-block K/V loads + dS SR-pack with the FP4 GEMMs
-    # (the loop holds only narrow tiles, so the extra stage's SRAM fits) — ~15% faster
-    # than the single-stage launch; deeper pipelines give nothing more here.
+    # dq loops over key blocks (already cheap). q/do are prepacked in HBM, which
+    # trims the loop footprint; two stages win at short seq, while long seq can use
+    # the extra overlap from a third stage.
+    dq_block_m = block_m
     dq_block_n = 64 if d >= 256 else min(block_n, 128)
     dq_warps = max(num_warps, 8)
-    dq_stages = 2
+    dq_stages = 3 if s_q >= 4096 else 2
 
     bdummy = bias if bias is not None else q
     sb_z = bias.stride(0) if bias is not None else 0
@@ -1202,16 +1261,15 @@ def _run_bwd(
         BLOCK_M=block_m, BLOCK_N=dkdv_block_n,
         num_warps=dkdv_warps, num_stages=dkdv_stages,
     )
-    _flash_bwd_dq_kernel[(triton.cdiv(s_q, block_m), z * h)](
-        q, do, bdummy,
+    _flash_bwd_dq_kernel[(triton.cdiv(s_q, dq_block_m), z * h)](
+        qnv_p, qsc_p.view(torch.uint8), donv_p, dosc_p.view(torch.uint8), bdummy,
         knv_p, ksc_pv, vnv_p, vsc_pv, ktnv_p, ktsc_pv,
         lse, delta, dq,
         scaling, seed, s_q, s_kv, s_kv_pad,
         D=d, H=h, HK=hk,
-        sq_n=q.stride(1), sdo_n=do.stride(1),
         sb_z=sb_z, sdq_n=dq.stride(1),
         HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
-        BLOCK_M=block_m, BLOCK_N=dq_block_n,
+        BLOCK_M=dq_block_m, BLOCK_N=dq_block_n,
         num_warps=dq_warps, num_stages=dq_stages,
     )
     return dq, dk, dv
@@ -1265,8 +1323,7 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype)
         ng = h // hk
         if ng > 1:
-            dk = dk.reshape(z, hk, ng, s_kv, d).sum(2).to(grad_out.dtype)
-            dv = dv.reshape(z, hk, ng, s_kv, d).sum(2).to(grad_out.dtype)
+            dk, dv = _gqa_reduce_cast_dkdv(dk, dv, z, h, hk, s_kv, d, grad_out.dtype)
         else:
             dk = dk.reshape(z, hk, s_kv, d).to(grad_out.dtype)
             dv = dv.reshape(z, hk, s_kv, d).to(grad_out.dtype)
