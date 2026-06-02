@@ -243,15 +243,6 @@ class NVFP4TrainingConfig(BaseModel):
             "default."
         },
     )
-    qwen3_5_native_attention_layer_autograd: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Qwen3.5 native attention training only. Route supported "
-            "plain-linear full-attention layers through an experimental wider "
-            "custom-autograd boundary. This is a scaffold for future backward "
-            "fusion and is OFF by default."
-        },
-    )
     qwen3_5_fuse_vproj: bool = Field(
         default=False,
         json_schema_extra={

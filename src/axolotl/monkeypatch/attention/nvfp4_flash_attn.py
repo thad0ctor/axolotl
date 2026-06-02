@@ -53,14 +53,7 @@ _BLOCK_N = 128
 # +0.1-0.2x end-to-end (v_proj counted). Real-model logit cos stays >=0.998. OFF by
 # default; flip via patch_qwen3_5_nvfp4_attention(model, fuse_vproj=True).
 _FUSE_VPROJ = False
-_LAYER_AUTOGRAD_ENV = "AXOLOTL_NVFP4_QWEN35_LAYER_AUTOGRAD"
 _CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
-
-
-def _layer_autograd_enabled(module: nn.Module) -> bool:
-    if getattr(module, "_nvfp4_layer_autograd", False):
-        return True
-    return os.environ.get(_LAYER_AUTOGRAD_ENV, "").lower() in {"1", "true", "yes"}
 
 
 def _custom_op_enabled(module: nn.Module) -> bool:
@@ -205,29 +198,6 @@ def make_nvfp4_forward(orig_forward):
         if not has_cache_context:
             kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
 
-        if (
-            grad_enabled
-            and kind is not None
-            and past_key_values is None
-            and getattr(self, "_nvfp4_train_backward", False)
-            and _layer_autograd_enabled(self)
-        ):
-            from axolotl.monkeypatch.attention.nvfp4_qwen35_layer_autograd import (
-                qwen35_nvfp4_layer_attention,
-                supports_qwen35_layer_autograd,
-            )
-
-            if supports_qwen35_layer_autograd(self):
-                return (
-                    qwen35_nvfp4_layer_attention(
-                        self,
-                        hidden_states,
-                        position_embeddings,
-                        causal=(kind == "causal"),
-                    ),
-                    None,
-                )
-
         query_states, gate = torch.chunk(
             self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
             2, dim=-1,
@@ -337,7 +307,6 @@ def patch_qwen3_5_nvfp4_attention(
     backward_dkdv_scratch_bf16: bool = False,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
-    layer_autograd: bool = False,
 ) -> int:
     """Patch every Qwen3.5 FULL-attention layer's forward to use NVFP4 attention.
 
@@ -365,7 +334,6 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_backward_dkdv_scratch_bf16 = backward_dkdv_scratch_bf16
                 module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
-                module._nvfp4_layer_autograd = layer_autograd
                 continue
             orig = type(module).forward
             if seen_forward is None:
@@ -381,16 +349,15 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_backward_dkdv_scratch_bf16 = backward_dkdv_scratch_bf16
             module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
-            module._nvfp4_layer_autograd = layer_autograd
             patched += 1
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, save_backward_packs=%s, "
         "backward_dv_p_rtn=%s, backward_dv_dot_rtn=%s, "
         "backward_dq_ds_rtn=%s, backward_dkdv_scratch_bf16=%s, "
-        "compile_custom_op=%s, layer_autograd=%s)",
+        "compile_custom_op=%s)",
         patched, fuse_vproj, train_backward, save_backward_packs,
         backward_dv_p_rtn, backward_dv_dot_rtn, backward_dq_ds_rtn,
-        backward_dkdv_scratch_bf16, compile_custom_op, layer_autograd,
+        backward_dkdv_scratch_bf16, compile_custom_op,
     )
     return patched

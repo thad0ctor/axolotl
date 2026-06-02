@@ -512,9 +512,6 @@ class PatchManager:
                 compile_custom_op=getattr(
                     nvfp4, "qwen3_5_native_attention_compile_custom_op", False
                 ),
-                layer_autograd=getattr(
-                    nvfp4, "qwen3_5_native_attention_layer_autograd", False
-                ),
                 stochastic_rounding=nvfp4.stochastic_rounding,
             )
 
