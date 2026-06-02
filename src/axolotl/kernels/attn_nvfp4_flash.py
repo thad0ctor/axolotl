@@ -276,6 +276,92 @@ def _next_mult(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
+def _run_flash_packed(
+    qnv, qsc, knv, ksc, vnv, vsc,
+    z, h, hk, s_q, s_kv, d,
+    scaling, causal, bias, out,
+    block_m, block_n, num_warps, num_stages,
+):
+    """Launch the flash kernel on already-packed (tl.dot_scaled layout) Q/K/V.
+
+    qnv/knv: ``[Z*H or Z*Hk, S, D//2]`` uint8;  qsc/ksc: ``[., S, D//16]`` e4m3.
+    vnv: ``[Z*Hk, D, Skv_pad//2]`` uint8;  vsc: ``[Z*Hk, D, Skv_pad//16]`` e4m3
+    (V^T, quantized along the key axis; key axis padded to a multiple of block_n).
+    """
+    qnv_v = qnv.view(torch.uint8)
+    knv_v = knv.view(torch.uint8)
+    vnv_v = vnv.view(torch.uint8)
+    qsc_v = qsc.view(torch.uint8)
+    ksc_v = ksc.view(torch.uint8)
+    vsc_v = vsc.view(torch.uint8)
+
+    grid = (triton.cdiv(s_q, block_m), z * h)
+    _flash_fwd_kernel[grid](
+        qnv_v, qsc_v, knv_v, ksc_v, vnv_v, vsc_v,
+        bias if bias is not None else qnv_v,
+        out,
+        scaling,
+        s_q, s_kv,
+        D=d,
+        H=h, HK=hk,
+        sq_qn=qnv_v.stride(1), sq_sn=qsc_v.stride(1),
+        sk_kn=knv_v.stride(1), sk_sn=ksc_v.stride(1),
+        sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
+        sb_z=bias.stride(0) if bias is not None else 0,
+        so_n=out.stride(1),
+        HAS_BIAS=bias is not None,
+        CAUSAL=causal,
+        BLOCK_M=block_m, BLOCK_N=block_n,
+        DP2=d // 2, DP16=d // 16,
+        NP2=block_n // 2, NP16=block_n // 16,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
+def nvfp4_flash_attention_packed(
+    qnv: torch.Tensor,
+    qsc: torch.Tensor,
+    knv: torch.Tensor,
+    ksc: torch.Tensor,
+    vnv: torch.Tensor,
+    vsc: torch.Tensor,
+    z: int,
+    h: int,
+    hk: int,
+    s_q: int,
+    s_kv: int,
+    d: int,
+    scaling: float,
+    out_dtype: torch.dtype,
+    causal: bool = False,
+    key_pad_bias: torch.Tensor | None = None,
+    block_m: int = 64,
+    block_n: int = 128,
+    num_warps: int = 8,
+    num_stages: int = 3,
+) -> torch.Tensor:
+    """Flash forward on Q/K/V ALREADY in the NVFP4 tl.dot_scaled layout.
+
+    Skips the internal pre-quant entirely — operands are expected to arrive packed
+    from the fused producers (RoPE for Q/K, v_proj epilogue / key-axis quant for V).
+    V's key axis must be padded to a multiple of ``block_n`` (padded keys contribute
+    nothing: masked to -inf and eps-scaled zero columns).
+
+    Returns ``[Z, H, S_q, D]`` in ``out_dtype``.
+    """
+    bias = None
+    if key_pad_bias is not None:
+        bias = key_pad_bias.to(torch.float32).contiguous()
+    out = torch.empty(z * h, s_q, d, device=qnv.device, dtype=out_dtype)
+    _run_flash_packed(
+        qnv, qsc, knv, ksc, vnv, vsc,
+        z, h, hk, s_q, s_kv, d,
+        scaling, causal, bias, out,
+        block_m, block_n, num_warps, num_stages,
+    )
+    return out.reshape(z, h, s_q, d)
+
+
 def nvfp4_flash_attention(
     query: torch.Tensor,
     key: torch.Tensor,
