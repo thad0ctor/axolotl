@@ -136,6 +136,16 @@ class NVFP4TrainingConfig(BaseModel):
             "on mismatch)."
         },
     )
+    fuse_qk_norm_rope: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Experimental, Qwen only. Monkeypatch qwen3/qwen3_5/"
+            "qwen3_5_moe attention to fuse head-dim q_norm/k_norm with RoPE using "
+            "the Gemma4 fused RMSNorm+RoPE Triton kernel. This removes the separate "
+            "q/k RMSNorm and rotate_half/apply_rope materializations but leaves the "
+            "attention matmul itself unchanged. OFF by default."
+        },
+    )
     skip_first_n_blocks: int = Field(
         default=0,
         ge=0,
