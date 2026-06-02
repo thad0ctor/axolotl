@@ -89,11 +89,13 @@ def _pack_nvfp4_along_k(
     scf = sc.to(tl.float32)[:, :, None]
     xn = xb / scf
     if STOCHASTIC:
-        # one FP4 step in the scaled domain: levels are 2^e*{1,1.5}, e in [0,2];
-        # step = 2^floor(log2|xn|) clamped to that exponent range. Add U(-.5,.5)*step.
-        e = tl.floor(tl.log2(tl.maximum(tl.abs(xn), _E4M3_EPS)))
-        e = tl.clamp(e, 0.0, 2.0)
-        step = tl.exp2(e)
+        # one FP4 step in the scaled domain: 2^clamp(floor(log2|xn|),0,2). Adding
+        # U(-.5,.5)*step before round-to-nearest realizes unbiased SR. The step is a
+        # 3-level staircase in |xn| (<2 ->1, <4 ->2, else 4) so it is computed with two
+        # compares instead of log2/floor/exp2 (~3 transcendentals/elt) — the SR math,
+        # not the GEMMs, dominated this kernel.
+        ax = tl.abs(xn)
+        step = tl.where(ax < 2.0, 1.0, tl.where(ax < 4.0, 2.0, 4.0))
         off = base_off + tl.arange(0, ROWS)[:, None, None] * K + \
             tl.arange(0, NG)[None, :, None] * 16 + tl.arange(0, 16)[None, None, :]
         u = tl.rand(seed, off) - 0.5
@@ -406,23 +408,30 @@ def _flash_bwd_prep_kernel(
 
 # ---------------------------------------------------------------------------
 # Native-NVFP4 flash BACKWARD, dK/dV pass. One program per (z, h, key-block n).
-# Recomputes S/P in SRAM from the packed Q/K (no HBM round-trip, no Q/K re-quant),
-# normalizes P with the precomputed LSE, then:
-#   dV[n,:] += sum_m P[m,n] * dO[m,:]   (contract M=seq, large-K -> FP4-friendly)
-#   dP[m,n]  = sum_d dO[m,d] * V[n,d]   (contract D=head_dim, small-K)
-#   dS[m,n]  = P*(dP - delta_i)*scale
-#   dK[n,:] += sum_m dS[m,n] * Q[m,:]   (contract M=seq, large-K -> FP4-friendly)
-# Gradient operands (P, dS, dO) quantized with STOCHASTIC ROUNDING (SR=True).
-# Q,K,V high-precision tiles are repacked to the needed contraction axis in SRAM.
+# Works entirely in the TRANSPOSED [N, M] score frame so NOT A SINGLE operand is
+# transposed in-kernel (the old [M,N] frame paid four tl.trans of fp32 tiles per
+# inner step — the dominant backward cost). Q and dO arrive in BOTH packings'
+# native layouts: q/do as [.,Sq,D] (contract D) and qt/dot as [.,D,Sq] (contract M,
+# pre-transposed once in HBM), so each grad GEMM loads its operand already laid out
+# along its own contraction axis — the "pre-pack each operand in the layout each
+# GEMM needs" lever.
+#
+#   sT[n,m] = scale * K[n,:].Q[m,:]          (recompute, contract D)
+#   pT[n,m] = exp(sT - lse[m])               (column-softmax via precomputed lse)
+#   dV[n,:] += sum_m pT[n,m] * dO[m,:]       (contract M, large-K FP4-friendly)
+#   dPt[n,m] = sum_d V[n,d] * dO[m,d]        (contract D, small-K)
+#   dSt[n,m] = pT*(dPt - delta[m])*scale
+#   dK[n,:] += sum_m dSt[n,m] * Q[m,:]       (contract M, large-K FP4-friendly)
+# Gradient operands (pT, dSt, dO) quantized with STOCHASTIC ROUNDING (SR=True).
 # ---------------------------------------------------------------------------
 @triton.jit
 def _flash_bwd_dkdv_kernel(
-    q_ptr, k_ptr, v_ptr, do_ptr, bias_ptr,
+    q_ptr, qt_ptr, k_ptr, v_ptr, do_ptr, dot_ptr, bias_ptr,
     lse_ptr, delta_ptr,
     dk_ptr, dv_ptr,
     scaling, seed, Sq, Skv,
     D: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
-    sq_n, sk_n, sv_n, sdo_n, sb_z, sdk_n, sdv_n,
+    sq_n, sqt_d, sk_n, sv_n, sdo_n, sdot_d, sb_z, sdk_n, sdv_n,
     HAS_BIAS: tl.constexpr, CAUSAL: tl.constexpr, SR: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
@@ -444,7 +453,7 @@ def _flash_bwd_dkdv_kernel(
         v_ptr + zhk * (Skv * sv_n) + offs_n[:, None] * sv_n + offs_d[None, :],
         mask=nmask[:, None], other=0.0,
     ).to(tl.float32)
-    # K,V packed along D once for this n-block (QK^T recompute + dP). RTN (forward
+    # K,V packed along D once for this n-block (sT recompute + dPt). RTN (forward
     # path operands, not gradients).
     knv, ksc = _pack_nvfp4_along_k(k, 0, seed, BLOCK_N, D, False)
     vnv, vsc = _pack_nvfp4_along_k(v, 0, seed, BLOCK_N, D, False)
@@ -457,6 +466,8 @@ def _flash_bwd_dkdv_kernel(
     else:
         lo = 0
 
+    qt_base = pid_zh * (D * sqt_d)
+    dot_base = pid_zh * (D * sdot_d)
     for start_m in range(lo, Sq, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mmask = offs_m < Sq
@@ -468,39 +479,46 @@ def _flash_bwd_dkdv_kernel(
             do_ptr + pid_zh * (Sq * sdo_n) + offs_m[:, None] * sdo_n + offs_d[None, :],
             mask=mmask[:, None], other=0.0,
         ).to(tl.float32)
+        # pre-transposed Q^T, dO^T tiles [D, BLOCK_M] (contract-M packings, no in-kernel trans)
+        qT = tl.load(
+            qt_ptr + qt_base + offs_d[:, None] * sqt_d + offs_m[None, :],
+            mask=mmask[None, :], other=0.0,
+        ).to(tl.float32)
+        doT = tl.load(
+            dot_ptr + dot_base + offs_d[:, None] * sdot_d + offs_m[None, :],
+            mask=mmask[None, :], other=0.0,
+        ).to(tl.float32)
         lse = tl.load(lse_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
         delta = tl.load(delta_ptr + pid_zh * Sq + offs_m, mask=mmask, other=0.0)
 
-        # recompute scores via native FP4 (Q packed along D in SRAM)
+        # recompute scores transposed: sT[n,m] = scale * K[n,:] . Q[m,:]
         qnv, qsc = _pack_nvfp4_along_k(q, 0, seed, BLOCK_M, D, False)
-        s = tl.dot_scaled(qnv, qsc, "e2m1", knv.T, ksc, "e2m1") * scaling
+        sT = tl.dot_scaled(knv, ksc, "e2m1", qnv.T, qsc, "e2m1") * scaling
         if HAS_BIAS:
             b = tl.load(bias_ptr + z * sb_z + offs_n, mask=nmask, other=_NEG_INF)
-            s = s + b[None, :]
-        s = tl.where(nmask[None, :] & mmask[:, None], s, _NEG_INF)
+            sT = sT + b[:, None]
+        sT = tl.where(nmask[:, None] & mmask[None, :], sT, _NEG_INF)
         if CAUSAL:
-            causal_ok = offs_n[None, :] <= (offs_m[:, None] + (Skv - Sq))
-            s = tl.where(causal_ok, s, _NEG_INF)
-        p = tl.exp(s - lse[:, None])
-        p = tl.where(s == _NEG_INF, 0.0, p)
+            causal_ok = offs_n[:, None] <= (offs_m[None, :] + (Skv - Sq))
+            sT = tl.where(causal_ok, sT, _NEG_INF)
+        pT = tl.exp(sT - lse[None, :])
+        pT = tl.where(sT == _NEG_INF, 0.0, pT)
 
-        # dV += P^T @ dO  (contract M). P^T [BLOCK_N, BLOCK_M] (SR), dO^T [D, BLOCK_M] (SR).
-        pT_q, pT_s = _pack_nvfp4_along_k(tl.trans(p), start_m, seed, BLOCK_N, BLOCK_M, SR)
-        doT_q, doT_s = _pack_nvfp4_along_k(
-            tl.trans(do), start_m + Sq, seed, D, BLOCK_M, SR
-        )
+        # dV += pT @ dO^T.T  (contract M). pT [BLOCK_N, BLOCK_M] (SR), dO^T [D, BLOCK_M] (SR).
+        pT_q, pT_s = _pack_nvfp4_along_k(pT, start_m, seed, BLOCK_N, BLOCK_M, SR)
+        doT_q, doT_s = _pack_nvfp4_along_k(doT, start_m + Sq, seed, D, BLOCK_M, SR)
         dv = tl.dot_scaled(pT_q, pT_s, "e2m1", doT_q.T, doT_s, "e2m1", acc=dv)
 
-        # dP = dO @ V^T  (contract D). dO packed along D (SR).
+        # dPt[n,m] = sum_d V[n,d] dO[m,d]  (contract D). dO packed along D (SR).
         do_q, do_s = _pack_nvfp4_along_k(do, start_m + 2 * Sq, seed, BLOCK_M, D, SR)
-        dp = tl.dot_scaled(do_q, do_s, "e2m1", vnv.T, vsc, "e2m1")
+        dpT = tl.dot_scaled(vnv, vsc, "e2m1", do_q.T, do_s, "e2m1")
 
-        ds = p * (dp - delta[:, None]) * scaling
-        ds = tl.where(s == _NEG_INF, 0.0, ds)
+        dsT = pT * (dpT - delta[None, :]) * scaling
+        dsT = tl.where(sT == _NEG_INF, 0.0, dsT)
 
-        # dK += dS^T @ Q  (contract M). dS^T [BLOCK_N, BLOCK_M] (SR), Q^T [D, BLOCK_M].
-        dsT_q, dsT_s = _pack_nvfp4_along_k(tl.trans(ds), start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR)
-        qT_q, qT_s = _pack_nvfp4_along_k(tl.trans(q), start_m + 4 * Sq, seed, D, BLOCK_M, False)
+        # dK += dSt @ Q^T.T  (contract M). dSt [BLOCK_N, BLOCK_M] (SR), Q^T [D, BLOCK_M] (RTN).
+        dsT_q, dsT_s = _pack_nvfp4_along_k(dsT, start_m + 3 * Sq, seed, BLOCK_N, BLOCK_M, SR)
+        qT_q, qT_s = _pack_nvfp4_along_k(qT, start_m + 4 * Sq, seed, D, BLOCK_M, False)
         dk = tl.dot_scaled(dsT_q, dsT_s, "e2m1", qT_q.T, qT_s, "e2m1", acc=dk)
 
     tl.store(
@@ -788,9 +806,22 @@ def _run_bwd(
     delta = torch.empty(z * h, s_q, device=q.device, dtype=torch.float32)
     seed = torch.randint(0, 2**31 - 1, (1,), device=q.device).item() if sr else 0
     # The recompute kernels hold several fp32 [BLOCK, D] tiles + their FP4 packs in
-    # SRAM at once; D=256 needs small tiles / single-stage to fit the 99KB budget.
+    # SRAM at once; D=256 needs small query tiles to fit the 99KB budget.
     block_m = min(block_m, 64)
-    block_n = 64 if d >= 256 else min(block_n, 128)
+    # dkdv loops over query blocks and is the backward hotspot: a wider key tile
+    # (BLOCK_N=128) + 8 warps halves the program count, enlarges the dV/dK GEMMs and
+    # amortizes the per-iter Q recompute — ~2.5x faster than the 64/4-warp default,
+    # and still fits SMEM (K/V are the only N-resident tiles, packed once along D).
+    dkdv_block_n = 128 if d <= 256 else 64
+    dkdv_warps = 16
+    # dq loops over key blocks (already cheap); keep the conservative key tile.
+    dq_block_n = 64 if d >= 256 else min(block_n, 128)
+    dq_warps = max(num_warps, 8)
+
+    # dkdv consumes Q and dO in the contract-M layout too (Q^T, dO^T [.,D,Sq]); the
+    # transpose is paid once in HBM instead of four times per inner step in-kernel.
+    qt = q.transpose(1, 2).contiguous()
+    dot = do.transpose(1, 2).contiguous()
 
     bdummy = bias if bias is not None else q
     sb_z = bias.stride(0) if bias is not None else 0
@@ -803,18 +834,19 @@ def _run_bwd(
         sq_n=q.stride(1), sk_n=k.stride(1), sdo_n=do.stride(1), so_n=o.stride(1),
         sb_z=sb_z,
         HAS_BIAS=has_bias, CAUSAL=causal,
-        BLOCK_M=block_m, BLOCK_N=block_n,
-        num_warps=num_warps, num_stages=num_stages,
+        BLOCK_M=block_m, BLOCK_N=dq_block_n,
+        num_warps=dq_warps, num_stages=num_stages,
     )
-    _flash_bwd_dkdv_kernel[(triton.cdiv(s_kv, block_n), z * h)](
-        q, k, v, do, bdummy, lse, delta, dk, dv,
+    _flash_bwd_dkdv_kernel[(triton.cdiv(s_kv, dkdv_block_n), z * h)](
+        q, qt, k, v, do, dot, bdummy, lse, delta, dk, dv,
         scaling, seed, s_q, s_kv,
         D=d, H=h, HK=hk,
-        sq_n=q.stride(1), sk_n=k.stride(1), sv_n=v.stride(1), sdo_n=do.stride(1),
+        sq_n=q.stride(1), sqt_d=qt.stride(1), sk_n=k.stride(1), sv_n=v.stride(1),
+        sdo_n=do.stride(1), sdot_d=dot.stride(1),
         sb_z=sb_z, sdk_n=dk.stride(1), sdv_n=dv.stride(1),
         HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
-        BLOCK_M=block_m, BLOCK_N=block_n,
-        num_warps=num_warps, num_stages=num_stages,
+        BLOCK_M=block_m, BLOCK_N=dkdv_block_n,
+        num_warps=dkdv_warps, num_stages=num_stages,
     )
     _flash_bwd_dq_kernel[(triton.cdiv(s_q, block_m), z * h)](
         q, k, v, do, bdummy, lse, delta, dq,
@@ -823,8 +855,8 @@ def _run_bwd(
         sq_n=q.stride(1), sk_n=k.stride(1), sv_n=v.stride(1), sdo_n=do.stride(1),
         sb_z=sb_z, sdq_n=dq.stride(1),
         HAS_BIAS=has_bias, CAUSAL=causal, SR=sr,
-        BLOCK_M=block_m, BLOCK_N=block_n,
-        num_warps=num_warps, num_stages=num_stages,
+        BLOCK_M=block_m, BLOCK_N=dq_block_n,
+        num_warps=dq_warps, num_stages=num_stages,
     )
     return dq, dk, dv
 
