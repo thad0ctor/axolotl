@@ -526,6 +526,11 @@ class TrainerBuilderBase(abc.ABC):
                 os.environ.get("AXOLOTL_DYNAMO_NO_SUPPRESS") != "1"
             )
             torch._dynamo.config.accumulated_cache_size_limit = 256
+            if str(self.cfg.attn_implementation).startswith("flash_attention"):
+                if hasattr(torch._dynamo.config, "capture_scalar_outputs"):
+                    torch._dynamo.config.capture_scalar_outputs = True
+                if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
+                    torch._dynamo.config.allow_unspec_int_on_nn_module = True
             training_args_kwargs["torch_compile"] = self.cfg.torch_compile
             if self.cfg.torch_compile_backend:
                 training_args_kwargs["torch_compile_backend"] = (
