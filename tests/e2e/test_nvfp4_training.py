@@ -446,6 +446,63 @@ class TestNVFP4Training:
         assert loss_rel < 1e-6, loss_rel.item()
         assert grad_rel < 3e-3, grad_rel.item()
 
+    def test_attention_dkdv_bf16_scratch_matches_fp32_scratch(self):
+        """BF16 dK/dV scratch keeps the native-attention gradient close to fp32
+        scratch while leaving forward output unchanged."""
+        from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attn_func
+
+        torch.manual_seed(123)
+        amp = 0.5
+        base = {
+            "q": torch.randn(
+                1, 4, 96, 128, device="cuda", dtype=torch.bfloat16
+            )
+            * amp,
+            "k": torch.randn(
+                1, 2, 96, 128, device="cuda", dtype=torch.bfloat16
+            )
+            * amp,
+            "v": torch.randn(
+                1, 2, 96, 128, device="cuda", dtype=torch.bfloat16
+            )
+            * amp,
+            "upstream": torch.randn(
+                1, 4, 96, 128, device="cuda", dtype=torch.bfloat16
+            )
+            * amp,
+        }
+
+        def run(dkdv_scratch_bf16: bool):
+            q = base["q"].clone().requires_grad_(True)
+            k = base["k"].clone().requires_grad_(True)
+            v = base["v"].clone().requires_grad_(True)
+            out = nvfp4_flash_attn_func(
+                q,
+                k,
+                v,
+                1.0 / (128**0.5),
+                causal=False,
+                num_key_value_groups=2,
+                stochastic_rounding=False,
+                save_backward_packs=True,
+                backward_p_dv_stochastic_rounding=False,
+                backward_dot_dv_stochastic_rounding=False,
+                backward_ds_dq_stochastic_rounding=False,
+                dkdv_scratch_bf16=dkdv_scratch_bf16,
+            )
+            loss = (out.float() * base["upstream"].float()).sum()
+            loss.backward()
+            return out.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
+
+        fp32 = run(False)
+        bf16 = run(True)
+
+        assert torch.equal(fp32[0], bf16[0])
+        for ref, got in zip(fp32[1:], bf16[1:]):
+            assert torch.isfinite(got).all().item()
+            rel = (ref.float() - got.float()).norm() / (ref.float().norm() + 1e-9)
+            assert rel < 1e-2, rel.item()
+
     def test_embedding_quant_forward_and_memory(self):
         """NVFP4Embedding lookup matches bf16 F.embedding within FP4 tolerance and
         the weight memory drops ~3.5x."""

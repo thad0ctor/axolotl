@@ -1686,6 +1686,14 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "requires qwen3_5_native_attention_backward: true."
             )
         if (
+            self.nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16
+            and not self.nvfp4_training.qwen3_5_native_attention_backward
+        ):
+            raise ValueError(
+                "nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16 "
+                "requires qwen3_5_native_attention_backward: true."
+            )
+        if (
             self.nvfp4_training.qwen3_5_fuse_vproj
             and not self.nvfp4_training.qwen3_5_native_attention
         ):
@@ -1716,6 +1724,7 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             self.nvfp4_training.qwen3_5_native_attention_backward,
             self.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs,
             self.nvfp4_training.qwen3_5_native_attention_save_backward_packs,
+            self.nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16,
             self.nvfp4_training.qwen3_5_native_attention_compile_custom_op,
             self.nvfp4_training.qwen3_5_fla_causal_conv_compile_boundary,
             self.nvfp4_training.qwen3_5_fuse_vproj,

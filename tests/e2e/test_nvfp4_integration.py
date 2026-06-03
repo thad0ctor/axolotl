@@ -126,6 +126,7 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
             "qwen3_5_native_attention_backward": True,
             "qwen3_5_native_attention_backward_rtn_grad_packs": True,
             "qwen3_5_native_attention_save_backward_packs": True,
+            "qwen3_5_native_attention_dkdv_scratch_bf16": True,
             "qwen3_5_fla_causal_conv_compile_boundary": True,
             "qwen3_5_fuse_vproj": True,
             "qwen3_5_native_linear_attn": True,
@@ -136,6 +137,7 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
     assert cfg.nvfp4_training.qwen3_5_native_attention_backward is True
     assert cfg.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs is True
     assert cfg.nvfp4_training.qwen3_5_native_attention_save_backward_packs is True
+    assert cfg.nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16 is True
     assert cfg.nvfp4_training.qwen3_5_fla_causal_conv_compile_boundary is True
 
 
@@ -275,6 +277,21 @@ def test_gate_refuses_qwen3_5_saved_packs_without_backward(monkeypatch):
         )
 
 
+def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="qwen3_5_native_attention_backward"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "qwen3_5_native_attention": True,
+                "qwen3_5_native_attention_dkdv_scratch_bf16": True,
+            },
+        )
+
+
 def _tiny_lora_model():
     """A 2-layer toy model wrapped with a PEFT LoRA adapter (CPU-friendly)."""
     import torch
@@ -331,6 +348,7 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
                 "qwen3_5_native_attention": True,
                 "qwen3_5_native_attention_backward": True,
                 "qwen3_5_native_attention_save_backward_packs": True,
+                "qwen3_5_native_attention_dkdv_scratch_bf16": True,
             },
         }
     )
@@ -338,6 +356,7 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
     pm._apply_qwen3_5_native_nvfp4_patches(object())
 
     assert captured["save_backward_packs"] is True
+    assert captured["dkdv_scratch_bf16"] is True
     assert captured["train_backward"] is True
 
 

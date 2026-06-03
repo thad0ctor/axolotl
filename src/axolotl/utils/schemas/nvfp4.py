@@ -239,6 +239,16 @@ class NVFP4TrainingConfig(BaseModel):
             "activation memory to skip backward pack-prep work. OFF by default."
         },
     )
+    qwen3_5_native_attention_dkdv_scratch_bf16: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention training only. Store the "
+            "per-query-head dK/dV scratch buffers in bf16 before GQA reduction "
+            "instead of fp32. This can reduce dK/dV scratch memory traffic, but "
+            "changes an intermediate accumulation cast and stays opt-in. OFF by "
+            "default."
+        },
+    )
     qwen3_5_native_attention_compile_custom_op: bool = Field(
         default=False,
         json_schema_extra={

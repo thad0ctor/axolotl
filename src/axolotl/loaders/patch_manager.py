@@ -520,6 +520,11 @@ class PatchManager:
                     "qwen3_5_native_attention_save_backward_packs",
                     False,
                 ),
+                dkdv_scratch_bf16=getattr(
+                    nvfp4,
+                    "qwen3_5_native_attention_dkdv_scratch_bf16",
+                    False,
+                ),
                 compile_custom_op=getattr(
                     nvfp4, "qwen3_5_native_attention_compile_custom_op", False
                 ),

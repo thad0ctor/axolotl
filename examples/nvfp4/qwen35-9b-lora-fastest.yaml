@@ -7,6 +7,7 @@
 #   this saved-pack path:      1.1525-1.2075 s/step, ~6784-7108 tok/s,
 #                              69.63 GiB active
 #   plus FLA boundary:         1.1708 s/step, ~6997 tok/s, 69.63 GiB active
+#   plus BF16 dK/dV scratch:   1.1485 s/step, ~7132 tok/s, 62.03 GiB active
 #   FP8 lm_head CE b6:         1.7955-1.8257 s/step, ~6729-6845 tok/s,
 #                              80.72 GiB active
 #                              (fits b6, but slower than this b4 max-throughput path)
@@ -14,8 +15,9 @@
 # The speed knob here is qwen3_5_native_attention_save_backward_packs: it saves
 # forward FP4 attention packs and reuses them in backward, trading ~0.4 GiB of
 # activation memory for less backward pack-prep work. The FLA boundary prevents
-# variable packed cu_seqlens from burning compile time in causal_conv1d.
-# Keep both opt-in.
+# variable packed cu_seqlens from burning compile time in causal_conv1d. BF16
+# dK/dV scratch reduces the attention-backward scratch traffic before GQA reduce.
+# Keep these knobs opt-in.
 base_model: Qwen/Qwen3.5-9B
 model_config_type: qwen3_5
 strict: false
@@ -82,6 +84,7 @@ nvfp4_training:
   qwen3_5_native_attention_backward: true
   qwen3_5_native_attention_backward_rtn_grad_packs: true
   qwen3_5_native_attention_save_backward_packs: true
+  qwen3_5_native_attention_dkdv_scratch_bf16: true
   qwen3_5_fla_causal_conv_compile_boundary: true
 
 warmup_steps: 10

@@ -127,11 +127,14 @@ checkpointing path measured so far is:
 - `qwen3_5_native_attention_backward: true`
 - `qwen3_5_native_attention_backward_rtn_grad_packs: true`
 - `qwen3_5_native_attention_save_backward_packs: true`
+- `qwen3_5_native_attention_dkdv_scratch_bf16: true`
 - `qwen3_5_fla_causal_conv_compile_boundary: true`
 
 The saved-pack flag reuses deterministic FP4 attention packs from the forward pass
 inside backward. It increases active memory slightly but removes backward pack-prep
-work. See `examples/nvfp4/qwen35-9b-lora-fastest.yaml`.
+work. The BF16 dK/dV scratch flag halves the per-query-head dK/dV scratch dtype
+before GQA reduction; the final dK/dV tensors remain bf16 either way. See
+`examples/nvfp4/qwen35-9b-lora-fastest.yaml`.
 
 Measured with `scripts/bench_nvfp4.sh` using marginal `train_runtime` delta,
 sequence length 2048, sample packing, no gradient checkpointing:
@@ -141,6 +144,7 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | NVFP4 all-on baseline | 4 | 1.2475 | ~6,567 tok/s | 69.26 GiB |
 | NVFP4 saved attention packs | 4 | 1.2075 | ~6,784 tok/s | 69.63 GiB |
 | NVFP4 saved attention packs (repeat) | 4 | 1.1525 | ~7,108 tok/s | 69.63 GiB |
+| NVFP4 saved packs + BF16 dK/dV scratch | 4 | 1.1485 | ~7,132 tok/s | 62.03 GiB |
 | NVFP4 FP8 lm_head CE | 6 | 1.7955-1.8257 | ~6,729-6,845 tok/s | 80.72 GiB |
 
 Negative checks from the same sweep:
@@ -390,6 +394,7 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `qwen3_5_native_attention_backward` | `bool` | `false` | Qwen3.5 only. Requires `qwen3_5_native_attention`. Use the native NVFP4 autograd attention path while training. |
 | `qwen3_5_native_attention_backward_rtn_grad_packs` | `bool` | `false` | Qwen3.5 native attention training only. Use deterministic round-to-nearest for measured-safe gradient packs while leaving the dK routing-gradient dS pack governed by `stochastic_rounding`. |
 | `qwen3_5_native_attention_save_backward_packs` | `bool` | `false` | Qwen3.5 native attention training only. Save deterministic forward Q/K/V FP4 packs plus transposed backward layouts and reuse them in backward. Trades extra activation memory for higher throughput. |
+| `qwen3_5_native_attention_dkdv_scratch_bf16` | `bool` | `false` | Qwen3.5 native attention training only. Store per-query-head dK/dV scratch in bf16 before GQA reduction instead of fp32. Measured faster on Qwen3.5-9B b4; opt-in because it changes an intermediate gradient cast. |
 | `qwen3_5_fla_causal_conv_compile_boundary` | `bool` | `false` | Qwen3.5 sample-packing only. Runs FLA varlen `causal_conv1d` behind a compile boundary so variable packed `cu_seqlens` lengths do not repeatedly trigger Dynamo/Inductor recompiles. |
 | `qwen3_5_native_mlp` / `qwen3_5_native_linear_attn` / `fp8_lm_head` | `bool` | `false` | Qwen3.5/eval-scoring paths. Current implementations are eval/no-grad only and do not accelerate grad-enabled training. Use `fp8_lm_head_cross_entropy` separately for the opt-in training loss memory path. |
 

@@ -57,8 +57,9 @@ lora_target_modules:
 
 For Blackwell GPUs, `../nvfp4/qwen35-9b-lora-fastest.yaml` is the fastest measured
 Qwen3.5-9B LoRA training example in this tree. It uses FP4 LoRA base GEMMs,
-native FP4 full-attention backward, RTN gradient packs, and saved attention packs.
-The native MLP, linear-attention, and standalone FP8 lm_head paths remain
+native FP4 full-attention backward, RTN gradient packs, saved attention packs,
+and BF16 dK/dV scratch before GQA reduction. The native MLP, linear-attention,
+and standalone FP8 lm_head paths remain
 eval/no-grad only and are not needed for this training-speed config. The opt-in
 FP8 lm_head cross-entropy path can make batch 6 fit without gradient
 checkpointing, but it is currently a memory unlock rather than the fastest
