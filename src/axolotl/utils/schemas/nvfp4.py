@@ -218,6 +218,15 @@ class NVFP4TrainingConfig(BaseModel):
             "validation is still required for production training. OFF by default."
         },
     )
+    qwen3_5_native_attention_save_backward_packs: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 native attention training only. Save the "
+            "forward pass's deterministic Q/K/V NVFP4 packs plus transposed "
+            "backward layouts and reuse them during backward. This spends extra "
+            "activation memory to skip backward pack-prep work. OFF by default."
+        },
+    )
     qwen3_5_native_attention_compile_custom_op: bool = Field(
         default=False,
         json_schema_extra={

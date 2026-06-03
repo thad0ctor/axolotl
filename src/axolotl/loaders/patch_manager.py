@@ -505,6 +505,11 @@ class PatchManager:
                     "qwen3_5_native_attention_backward_rtn_grad_packs",
                     False,
                 ),
+                save_backward_packs=getattr(
+                    nvfp4,
+                    "qwen3_5_native_attention_save_backward_packs",
+                    False,
+                ),
                 compile_custom_op=getattr(
                     nvfp4, "qwen3_5_native_attention_compile_custom_op", False
                 ),

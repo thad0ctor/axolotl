@@ -253,6 +253,9 @@ def make_nvfp4_forward(orig_forward):
                         getattr(self, "_nvfp4_stochastic_rounding", True)
                         and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
                     ),
+                    save_backward_packs=getattr(
+                        self, "_nvfp4_save_backward_packs", False
+                    ),
                 ).transpose(1, 2)
             else:
                 # Write roped K/V to the cache so subsequent decode steps see prefill
@@ -295,6 +298,7 @@ def patch_qwen3_5_nvfp4_attention(
     fuse_vproj: bool = _FUSE_VPROJ,
     train_backward: bool = False,
     backward_rtn_grad_packs: bool = False,
+    save_backward_packs: bool = False,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
 ) -> int:
@@ -318,6 +322,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_fuse_vproj = fuse_vproj
                 module._nvfp4_train_backward = train_backward
                 module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
+                module._nvfp4_save_backward_packs = save_backward_packs
                 module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
                 continue
@@ -329,14 +334,15 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_fuse_vproj = fuse_vproj
             module._nvfp4_train_backward = train_backward
             module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
+            module._nvfp4_save_backward_packs = save_backward_packs
             module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
             patched += 1
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
-        "compile_custom_op=%s)",
+        "save_backward_packs=%s, compile_custom_op=%s)",
         patched, fuse_vproj, train_backward, backward_rtn_grad_packs,
-        compile_custom_op,
+        save_backward_packs, compile_custom_op,
     )
     return patched
