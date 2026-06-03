@@ -127,6 +127,7 @@ checkpointing path measured so far is:
 - `qwen3_5_native_attention_backward: true`
 - `qwen3_5_native_attention_backward_rtn_grad_packs: true`
 - `qwen3_5_native_attention_save_backward_packs: true`
+- `qwen3_5_fla_causal_conv_compile_boundary: true`
 
 The saved-pack flag reuses deterministic FP4 attention packs from the forward pass
 inside backward. It increases active memory slightly but removes backward pack-prep
@@ -140,6 +141,7 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | NVFP4 all-on baseline | 4 | 1.2475 | ~6,567 tok/s | 69.26 GiB |
 | NVFP4 saved attention packs | 4 | 1.2075 | ~6,784 tok/s | 69.63 GiB |
 | NVFP4 saved attention packs (repeat) | 4 | 1.1525 | ~7,108 tok/s | 69.63 GiB |
+| NVFP4 FP8 lm_head CE | 6 | 1.7955-1.8257 | ~6,729-6,845 tok/s | 80.72 GiB |
 
 Negative checks from the same sweep:
 
@@ -147,11 +149,14 @@ Negative checks from the same sweep:
   attention packs: 2.0500 s/step (~5,994 tok/s).
 - Cut Cross Entropy also made batch 6 fit, but was slower than the FP4 fused-CE
   path in the measured b6 run.
+- `fp8_lm_head_cross_entropy` made batch 6 fit and is faster than the old FP4
+  fused-CE path at b6, but it did not beat the b4 saved-pack path on max
+  throughput in validation (b6 1.7955-1.8257 s/step vs b4 1.1793 s/step).
 - bf16 batch 6 at `learning_rate: 2e-4` diverged in the benchmark window (loss up
   to 9.2), so it is not a valid converging full-precision baseline at that LR.
 
-The native Qwen3.5 MLP, linear-attention, and FP8 lm_head patches are currently
-eval/no-grad paths; they do not accelerate this training benchmark.
+The native Qwen3.5 MLP, linear-attention, and standalone FP8 lm_head patches are
+currently eval/no-grad paths; they do not accelerate this training benchmark.
 
 ### Convergence
 
@@ -339,6 +344,20 @@ Two safety guards apply:
 If the `lm_head` dimensions are not FP4-eligible (`%32`), it is left in high
 precision with a warning rather than crashing.
 
+### FP8 lm_head cross-entropy (opt-in)
+
+`fp8_lm_head_cross_entropy: true` patches a frozen, bias-free plain `nn.Linear`
+`lm_head` training forward to stream vocab tiles through FP8 scaled matmul and
+cross-entropy without materializing the full `[batch*seq, vocab]` logits tensor.
+It returns `dL/dhidden` only; the `lm_head` stays frozen and backward accumulates
+against dequantized FP8 weight tiles. It is incompatible with `quantize_lm_head`,
+`fused_fp4_cross_entropy`, and the other CE optimization patches.
+
+This is a memory/batch-size unlock, not the current fastest max-throughput path:
+on Qwen3.5-9B LoRA with sequence length 2048 and no gradient checkpointing it made
+batch 6 fit at 1.7955-1.8257 s/step (~6,729-6,845 tok/s, 80.72 GiB active), while
+the fastest b4 saved-pack path remained ahead on tokens/sec.
+
 ::: {.callout-note}
 At the time of writing, `skip_first_n_blocks` / `skip_last_n_blocks` may be applied
 by the integration layer rather than inside `convert_to_nvfp4_training` directly
@@ -363,6 +382,7 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `exclude_modules` | `list[str]` | `[lm_head, embed_tokens]` | Module name fragments kept in high precision (not swapped). |
 | `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). **Incompatible with tied embeddings and `cut_cross_entropy` (both raise).** `embed_tokens` stays excluded. |
 | `fused_fp4_cross_entropy` | `bool` | `false` | Opt-in. Requires `quantize_lm_head`. Computes CE while tiling over the NVFP4 lm_head so logits are not materialized. This is a memory feature, not a tensor-core FP4 lm_head throughput feature. |
+| `fp8_lm_head_cross_entropy` | `bool` | `false` | Opt-in. Requires a frozen bias-free plain `nn.Linear` lm_head. Streams FP8 lm_head vocab tiles into CE without full logits materialization; returns `dL/dhidden` only. Memory/batch-size feature; not currently the fastest b4 max-throughput path. |
 | `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
 | `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
 | `save_nvfp4` | `bool` | `false` | Opt-in. Store eligible weights NVFP4-packed (qdata + scales) in a `torch.save` sidecar for ~3.5× smaller weight files. See [FP4-packed save](#fp4-packed-save-save_nvfp4) below. **Lossy for FFT resume** (no bf16 master kept); bit-exact for frozen weights. Off by default (bf16 save, unchanged). |
@@ -371,7 +391,7 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `qwen3_5_native_attention_backward_rtn_grad_packs` | `bool` | `false` | Qwen3.5 native attention training only. Use deterministic round-to-nearest for measured-safe gradient packs while leaving the dK routing-gradient dS pack governed by `stochastic_rounding`. |
 | `qwen3_5_native_attention_save_backward_packs` | `bool` | `false` | Qwen3.5 native attention training only. Save deterministic forward Q/K/V FP4 packs plus transposed backward layouts and reuse them in backward. Trades extra activation memory for higher throughput. |
 | `qwen3_5_fla_causal_conv_compile_boundary` | `bool` | `false` | Qwen3.5 sample-packing only. Runs FLA varlen `causal_conv1d` behind a compile boundary so variable packed `cu_seqlens` lengths do not repeatedly trigger Dynamo/Inductor recompiles. |
-| `qwen3_5_native_mlp` / `qwen3_5_native_linear_attn` / `fp8_lm_head` | `bool` | `false` | Qwen3.5/eval-scoring paths. Current implementations are eval/no-grad only and do not accelerate grad-enabled training. |
+| `qwen3_5_native_mlp` / `qwen3_5_native_linear_attn` / `fp8_lm_head` | `bool` | `false` | Qwen3.5/eval-scoring paths. Current implementations are eval/no-grad only and do not accelerate grad-enabled training. Use `fp8_lm_head_cross_entropy` separately for the opt-in training loss memory path. |
 
 ## FP4-packed save (`save_nvfp4`) {#fp4-packed-save-save_nvfp4}
 

@@ -142,6 +142,21 @@ def _packed_cache_key(
     return (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
 
 
+def _get_or_prepack_lm_head_weight_fp8(
+    lm_head: nn.Linear,
+    *,
+    granularity: FP8Granularity,
+) -> FP8LMHeadWeight:
+    key = (_packed_cache_key(lm_head.weight), granularity)
+    cached = getattr(lm_head, "_axolotl_fp8_lm_head_packed", None)
+    if cached is None or cached[0] != key:
+        packed = prepack_lm_head_weight_fp8(lm_head.weight, granularity=granularity)
+        lm_head._axolotl_fp8_lm_head_packed = (key, packed)
+    else:
+        packed = cached[1]
+    return packed
+
+
 def _fp8_forward(self: nn.Linear, hidden: torch.Tensor) -> torch.Tensor:
     orig_forward = self._axolotl_fp8_lm_head_orig_forward
     if torch.is_grad_enabled() or self.training:
@@ -149,17 +164,10 @@ def _fp8_forward(self: nn.Linear, hidden: torch.Tensor) -> torch.Tensor:
     if hidden.device.type != "cuda" or self.weight.device.type != "cuda":
         return orig_forward(hidden)
 
-    key = _packed_cache_key(self.weight)
-    cached = getattr(self, "_axolotl_fp8_lm_head_packed", None)
-    if cached is None or cached[0] != key:
-        packed = prepack_lm_head_weight_fp8(
-            self.weight,
-            granularity=self._axolotl_fp8_lm_head_granularity,
-        )
-        self._axolotl_fp8_lm_head_packed = (key, packed)
-    else:
-        packed = cached[1]
-
+    packed = _get_or_prepack_lm_head_weight_fp8(
+        self,
+        granularity=self._axolotl_fp8_lm_head_granularity,
+    )
     out = fp8_lm_head(
         hidden,
         packed,

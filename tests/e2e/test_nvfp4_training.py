@@ -399,6 +399,53 @@ class TestNVFP4Training:
         # well under that (it only ever holds one [M, V_BLOCK] tile).
         assert fused_peak < 0.25 * mat_peak, (fused_peak, mat_peak)
 
+    def test_fp8_lm_head_cross_entropy_matches_materialized(self):
+        """Streaming FP8 lm_head + CE matches materialized FP8 loss and keeps a
+        correct hidden gradient for the FP8-packed lm_head objective."""
+        from axolotl.kernels.fp8_fused_ce import (
+            fp8_lm_head_cross_entropy,
+            prepack_lm_head_weight_fp8_ce,
+        )
+        from axolotl.kernels.fp8_lm_head import fp8_lm_head
+
+        torch.manual_seed(0)
+        M, H, V = 192, 256, 4096 + 512
+        lm_head = nn.Linear(H, V, bias=False).cuda().bfloat16()
+        lm_head.weight.requires_grad_(False)
+        labels = torch.randint(0, V, (M,), device="cuda")
+        labels[::7] = -100
+        hidden = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
+
+        h_fp8 = hidden.clone().requires_grad_(True)
+        fused = fp8_lm_head_cross_entropy(h_fp8, lm_head, labels, shift=False)
+        fused.backward()
+
+        packed = prepack_lm_head_weight_fp8_ce(lm_head.weight)
+        fp8_logits = fp8_lm_head(
+            hidden, packed.fprop, out_dtype=torch.bfloat16
+        ).float()
+        fp8_ref = torch.nn.functional.cross_entropy(
+            fp8_logits, labels, ignore_index=-100
+        )
+
+        valid = labels != -100
+        probs = torch.softmax(fp8_logits, dim=-1)
+        rows = torch.arange(M, device="cuda")
+        probs[rows[valid], labels[valid]] -= 1.0
+        probs = probs * valid.unsqueeze(1).float() / valid.sum()
+        scale = packed.fprop.scale.float()
+        weight_t = packed.fprop.weight_t.float() * scale
+        grad_ref = (probs @ weight_t.t()).to(torch.bfloat16).float()
+
+        assert torch.isfinite(fused).item()
+        assert torch.isfinite(h_fp8.grad).all().item()
+        loss_rel = (fused - fp8_ref).abs() / (fp8_ref.abs() + 1e-9)
+        grad_rel = (h_fp8.grad.float() - grad_ref).norm() / (
+            grad_ref.norm() + 1e-9
+        )
+        assert loss_rel < 1e-6, loss_rel.item()
+        assert grad_rel < 3e-3, grad_rel.item()
+
     def test_embedding_quant_forward_and_memory(self):
         """NVFP4Embedding lookup matches bf16 F.embedding within FP4 tolerance and
         the weight memory drops ~3.5x."""

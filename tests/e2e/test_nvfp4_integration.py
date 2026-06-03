@@ -65,11 +65,54 @@ def test_schema_accepts_fp8_lm_head_eval_knobs(monkeypatch):
         nvfp4_training={
             "enabled": True,
             "fp8_lm_head": True,
+            "fp8_lm_head_cross_entropy": True,
             "fp8_lm_head_granularity": "rowwise",
         },
     )
     assert cfg.nvfp4_training.fp8_lm_head is True
+    assert cfg.nvfp4_training.fp8_lm_head_cross_entropy is True
     assert cfg.nvfp4_training.fp8_lm_head_granularity == "rowwise"
+
+
+def test_schema_refuses_fp8_lm_head_ce_with_other_ce(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="Only one cross entropy optimization"):
+        AxolotlInputConfig(
+            **BASE,
+            cut_cross_entropy=True,
+            nvfp4_training={
+                "enabled": True,
+                "fp8_lm_head_cross_entropy": True,
+            },
+        )
+
+
+def test_disabled_fp8_lm_head_ce_does_not_conflict(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        chunked_cross_entropy=True,
+        nvfp4_training={
+            "enabled": False,
+            "fp8_lm_head_cross_entropy": True,
+        },
+    )
+    assert cfg.chunked_cross_entropy is True
+    assert cfg.nvfp4_training.enabled is False
+
+
+def test_gate_refuses_fp8_lm_head_ce_with_quantized_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="fp8_lm_head_cross_entropy"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            nvfp4_training={
+                "enabled": True,
+                "quantize_lm_head": True,
+                "fp8_lm_head_cross_entropy": True,
+            },
+        )
 
 
 def test_schema_accepts_qwen3_5_native_switches(monkeypatch):

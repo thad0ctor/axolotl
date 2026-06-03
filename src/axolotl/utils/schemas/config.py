@@ -1701,6 +1701,16 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "nvfp4_training.qwen3_5_native_attention_compile_custom_op "
                 "requires qwen3_5_native_attention: true."
             )
+        if self.nvfp4_training.fp8_lm_head_cross_entropy and (
+            self.nvfp4_training.quantize_lm_head
+            or self.nvfp4_training.fused_fp4_cross_entropy
+        ):
+            raise ValueError(
+                "nvfp4_training.fp8_lm_head_cross_entropy requires the lm_head to "
+                "remain a frozen plain nn.Linear. Disable quantize_lm_head/"
+                "fused_fp4_cross_entropy, or use fused_fp4_cross_entropy for an "
+                "NVFP4-quantized lm_head."
+            )
         qwen3_5_native_flags = (
             self.nvfp4_training.qwen3_5_native_attention,
             self.nvfp4_training.qwen3_5_native_attention_backward,

@@ -114,6 +114,18 @@ class NVFP4TrainingConfig(BaseModel):
             "argmax token. OFF by default."
         },
     )
+    fp8_lm_head_cross_entropy: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Patch a plain frozen bias-free nn.Linear lm_head "
+            "training forward to compute cross-entropy with FP8 scaled-matmul vocab "
+            "tiles, avoiding full [batch*seq, vocab] logits materialization. "
+            "Returns dL/dhidden only (no lm_head weight grad); backward accumulates "
+            "against dequantized FP8 weight tiles. Incompatible with quantize_lm_head, "
+            "fused_fp4_cross_entropy, and other cross-entropy optimization patches. "
+            "OFF by default."
+        },
+    )
     fp8_lm_head_granularity: Literal["tensorwise", "rowwise"] = Field(
         default="rowwise",
         json_schema_extra={

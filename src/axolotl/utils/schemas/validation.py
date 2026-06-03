@@ -1022,6 +1022,15 @@ class OptimizationValidationMixin:
                 "liger_fused_linear_cross_entropy"
             ),
         }
+        nvfp4 = data.get("nvfp4_training") or {}
+        if isinstance(nvfp4, dict):
+            nvfp4_enabled = nvfp4.get("enabled")
+            fp8_lm_head_ce = nvfp4.get("fp8_lm_head_cross_entropy")
+        else:
+            nvfp4_enabled = getattr(nvfp4, "enabled", None)
+            fp8_lm_head_ce = getattr(nvfp4, "fp8_lm_head_cross_entropy", None)
+        if nvfp4_enabled and fp8_lm_head_ce:
+            ce_options["nvfp4_training.fp8_lm_head_cross_entropy"] = True
 
         enabled_options = [k for k, v in ce_options.items() if v]
 
