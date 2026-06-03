@@ -462,6 +462,11 @@ class PatchManager:
 
             convert_norms_to_nvfp4_fused(model)
 
+        if getattr(nvfp4, "fuse_qk_norm_rope", False):
+            from axolotl.monkeypatch.models.qwen_fused_attn import patch_qwen_fused_attn
+
+            patch_qwen_fused_attn(self.cfg.model_config_type)
+
         self._nvfp4_load_packed_sidecar(model)
 
         # Fused FP4 lm_head + cross-entropy: skip materializing the [M, vocab]
