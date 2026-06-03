@@ -141,6 +141,7 @@ sequence length 2048, sample packing, no gradient checkpointing:
 
 | Config | Batch | Marginal s/step | Throughput | Active memory |
 |--------|------:|----------------:|-----------:|--------------:|
+| bf16 full-precision stable baseline (`learning_rate: 2e-5`) | 6 | 2.1550 | ~5,701 tok/s | 89.61 GiB |
 | NVFP4 all-on baseline | 4 | 1.2475 | ~6,567 tok/s | 69.26 GiB |
 | NVFP4 saved attention packs | 4 | 1.2075 | ~6,784 tok/s | 69.63 GiB |
 | NVFP4 saved attention packs (repeat) | 4 | 1.1525 | ~7,108 tok/s | 69.63 GiB |
@@ -162,10 +163,18 @@ Negative checks from the same sweep:
   was slower in the b6 probe (1.8565 s/step).
 - bf16 batch 6 at `learning_rate: 2e-4` diverged in the benchmark window (loss up
   to 9.3), so it is not a valid converging full-precision baseline at that LR.
+  Reducing to `5e-5` avoided the bench divergence threshold but still rose to
+  loss 2.533 / grad norm 1.185e6 over 40 steps. The stable full-precision b6
+  baseline is `learning_rate: 2e-5`: 2.1550 s/step, final loss 1.054, loss max
+  1.231, finite grad norms throughout the 40-step run.
 - fp16 batch 6 with NVFP4 omitted entirely measured 2.6250 s/step and finite loss,
   but logged `grad_norm: nan` from the first step even with `max_grad_norm: 1.0`
-  explicit. Treat it as throughput-only; the clipping setting does not make
-  already non-finite fp16 gradients into a valid convergence baseline.
+  explicit. Diagnostic runs showed the LoRA gradients were already NaN after AMP
+  unscale at global step 0; `GradScaler(init_scale=1.0)` did not fix it, and
+  fp16 b4 without `torch_compile` still produced NaN grad norms for the first
+  several steps before scaler backoff recovered. Treat fp16 Qwen3.5 numbers as
+  throughput-only; clipping cannot repair already non-finite gradients, and this
+  was not caused by the NVFP4 path.
 
 The native Qwen3.5 MLP, linear-attention, and standalone FP8 lm_head patches are
 currently eval/no-grad paths; they do not accelerate this training benchmark.
