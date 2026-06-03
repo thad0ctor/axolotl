@@ -82,6 +82,12 @@ def _fprop_scale_tile(scale: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
     return scale if scale.ndim == 0 else scale[:, lo:hi]
 
 
+def _activation_scale(x: torch.Tensor, granularity: FP8Granularity) -> torch.Tensor:
+    if granularity == "tensorwise":
+        return _scale_from_amax(x.abs().max())
+    return _scale_from_amax(x.abs().amax(dim=1, keepdim=True))
+
+
 class _FP8FusedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, labels, packed, ignore_index, logit_scale, grad_scale):
@@ -90,7 +96,8 @@ class _FP8FusedCrossEntropy(torch.autograd.Function):
         valid = labels != ignore_index
         safe_labels = torch.where(valid, labels, labels.new_zeros(()))
 
-        x_scale = _scale_from_amax(hidden.abs().amax(dim=1, keepdim=True))
+        granularity = packed.fprop.granularity
+        x_scale = _activation_scale(hidden, granularity)
         hidden_fp8 = _quantize_e4m3(hidden, x_scale)
 
         running_max = torch.full(
@@ -169,7 +176,7 @@ class _FP8FusedCrossEntropy(torch.autograd.Function):
             dz[rows, cols] -= in_tile.float()
             dz = dz * coef
 
-            dz_scale = _scale_from_amax(dz.abs().amax(dim=1, keepdim=True))
+            dz_scale = _activation_scale(dz, packed.fprop.granularity)
             dz_fp8 = _quantize_e4m3(dz, dz_scale)
             grad_hidden += _scaled_mm(
                 dz_fp8,

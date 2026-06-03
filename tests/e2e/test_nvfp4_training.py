@@ -403,12 +403,13 @@ class TestNVFP4Training:
         """Streaming FP8 lm_head + CE matches materialized FP8 loss and keeps a
         correct hidden gradient for the FP8-packed lm_head objective."""
         from axolotl.kernels.fp8_fused_ce import (
+            _VOCAB_BLOCK,
+            _activation_scale,
             fp8_lm_head_cross_entropy,
             prepack_lm_head_weight_fp8_ce,
         )
         from axolotl.kernels.fp8_lm_head import (
             _quantize_e4m3,
-            _scale_from_amax,
             _scaled_mm,
             fp8_lm_head,
         )
@@ -421,53 +422,59 @@ class TestNVFP4Training:
         labels[::7] = -100
         hidden = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
 
-        h_fp8 = hidden.clone().requires_grad_(True)
-        fused = fp8_lm_head_cross_entropy(h_fp8, lm_head, labels, shift=False)
-        fused.backward()
+        for granularity in ("rowwise", "tensorwise"):
+            h_fp8 = hidden.clone().requires_grad_(True)
+            fused = fp8_lm_head_cross_entropy(
+                h_fp8, lm_head, labels, shift=False, granularity=granularity
+            )
+            fused.backward()
 
-        packed = prepack_lm_head_weight_fp8_ce(lm_head.weight)
-        fp8_logits = fp8_lm_head(
-            hidden, packed.fprop, out_dtype=torch.bfloat16
-        ).float()
-        fp8_ref = torch.nn.functional.cross_entropy(
-            fp8_logits, labels, ignore_index=-100
-        )
-
-        valid = labels != -100
-        probs = torch.softmax(fp8_logits, dim=-1)
-        rows = torch.arange(M, device="cuda")
-        probs[rows[valid], labels[valid]] -= 1.0
-        probs = probs * valid.unsqueeze(1).float() / valid.sum()
-        scale = packed.fprop.scale.float()
-        weight_t = packed.fprop.weight_t.float() * scale
-        grad_ref = (probs @ weight_t.t()).to(torch.bfloat16).float()
-        grad_tc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
-        for lo in range(0, V, 4096):
-            hi = min(lo + 4096, V)
-            dz = probs[:, lo:hi].contiguous()
-            dz_scale = _scale_from_amax(dz.abs().amax(dim=1, keepdim=True))
-            dz_fp8 = _quantize_e4m3(dz, dz_scale)
-            grad_tc += _scaled_mm(
-                dz_fp8,
-                packed.dgrad_weight[lo:hi, :],
-                scale_a=dz_scale,
-                scale_b=packed.dgrad_scale,
-                out_dtype=torch.bfloat16,
+            packed = prepack_lm_head_weight_fp8_ce(
+                lm_head.weight, granularity=granularity
+            )
+            fp8_logits = fp8_lm_head(
+                hidden, packed.fprop, out_dtype=torch.bfloat16
             ).float()
-        grad_tc = grad_tc.to(torch.bfloat16).float()
+            fp8_ref = torch.nn.functional.cross_entropy(
+                fp8_logits, labels, ignore_index=-100
+            )
 
-        assert torch.isfinite(fused).item()
-        assert torch.isfinite(h_fp8.grad).all().item()
-        loss_rel = (fused - fp8_ref).abs() / (fp8_ref.abs() + 1e-9)
-        grad_tc_rel = (h_fp8.grad.float() - grad_tc).norm() / (
-            grad_tc.norm() + 1e-9
-        )
-        grad_ref_rel = (h_fp8.grad.float() - grad_ref).norm() / (
-            grad_ref.norm() + 1e-9
-        )
-        assert loss_rel < 1e-6, loss_rel.item()
-        assert grad_tc_rel < 1e-4, grad_tc_rel.item()
-        assert grad_ref_rel < 2e-2, grad_ref_rel.item()
+            valid = labels != -100
+            probs = torch.softmax(fp8_logits, dim=-1)
+            rows = torch.arange(M, device="cuda")
+            probs[rows[valid], labels[valid]] -= 1.0
+            probs = probs * valid.unsqueeze(1).float() / valid.sum()
+            scale = packed.fprop.scale.float()
+            weight_t = packed.fprop.weight_t.float() * scale
+            grad_ref = (probs @ weight_t.t()).to(torch.bfloat16).float()
+            grad_tc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+            for lo in range(0, V, _VOCAB_BLOCK):
+                hi = min(lo + _VOCAB_BLOCK, V)
+                dz = probs[:, lo:hi].contiguous()
+                dz_scale = _activation_scale(dz, granularity)
+                dz_fp8 = _quantize_e4m3(dz, dz_scale)
+                grad_tc += _scaled_mm(
+                    dz_fp8,
+                    packed.dgrad_weight[lo:hi, :],
+                    scale_a=dz_scale,
+                    scale_b=packed.dgrad_scale,
+                    out_dtype=torch.bfloat16,
+                ).float()
+            grad_tc = grad_tc.to(torch.bfloat16).float()
+
+            assert torch.isfinite(fused).item()
+            assert torch.isfinite(h_fp8.grad).all().item()
+            loss_rel = (fused - fp8_ref).abs() / (fp8_ref.abs() + 1e-9)
+            grad_tc_rel = (h_fp8.grad.float() - grad_tc).norm() / (
+                grad_tc.norm() + 1e-9
+            )
+            grad_ref_rel = (h_fp8.grad.float() - grad_ref).norm() / (
+                grad_ref.norm() + 1e-9
+            )
+            assert loss_rel < 1e-6, (granularity, loss_rel.item())
+            assert grad_tc_rel < 1e-4, (granularity, grad_tc_rel.item())
+            if granularity == "rowwise":
+                assert grad_ref_rel < 2e-2, grad_ref_rel.item()
 
     def test_attention_dkdv_bf16_scratch_matches_fp32_scratch(self):
         """BF16 dK/dV scratch keeps the native-attention gradient close to fp32

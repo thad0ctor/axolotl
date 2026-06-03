@@ -9,8 +9,7 @@
 #   plus FLA boundary:         1.1708 s/step, ~6997 tok/s, 69.63 GiB active
 #   plus BF16 dK/dV scratch:   1.1415-1.1485 s/step, ~7133-7177 tok/s,
 #                              62.03 GiB active
-#   FP8 lm_head CE b6:         1.7955-1.8257 s/step, ~6729-6845 tok/s,
-#                              80.72 GiB active
+#   FP8 lm_head CE b6:         1.7807 s/step, ~6902 tok/s, 80.32 GiB active
 #                              (fits b6, but slower than this b4 max-throughput path)
 #
 # The speed knob here is qwen3_5_native_attention_save_backward_packs: it saves

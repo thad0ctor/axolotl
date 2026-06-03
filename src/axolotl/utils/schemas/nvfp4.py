@@ -120,8 +120,9 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Patch a plain frozen bias-free nn.Linear lm_head "
             "training forward to compute cross-entropy with FP8 scaled-matmul vocab "
             "tiles, avoiding full [batch*seq, vocab] logits materialization. "
-            "Returns dL/dhidden only (no lm_head weight grad); backward accumulates "
-            "against dequantized FP8 weight tiles. Incompatible with quantize_lm_head, "
+            "Returns dL/dhidden only (no lm_head weight grad); backward uses FP8 "
+            "scaled matmul against a prepacked dgrad weight layout. Incompatible "
+            "with quantize_lm_head, "
             "fused_fp4_cross_entropy, and other cross-entropy optimization patches. "
             "OFF by default."
         },
@@ -131,7 +132,8 @@ class NVFP4TrainingConfig(BaseModel):
         json_schema_extra={
             "description": "Scaling granularity for fp8_lm_head. Rowwise keeps one "
             "scale per vocab row and had the best Qwen3.5 real-hidden-state argmax "
-            "parity in the validation sweep."
+            "parity in the validation sweep; it is also the validated FP8 CE "
+            "training default."
         },
     )
     quantize_embeddings: bool = Field(
