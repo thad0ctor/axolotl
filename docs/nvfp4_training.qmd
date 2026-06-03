@@ -161,7 +161,11 @@ Negative checks from the same sweep:
   tile remains the default. Tensorwise FP8 CE now has correct scale wiring, but it
   was slower in the b6 probe (1.8565 s/step).
 - bf16 batch 6 at `learning_rate: 2e-4` diverged in the benchmark window (loss up
-  to 9.2), so it is not a valid converging full-precision baseline at that LR.
+  to 9.3), so it is not a valid converging full-precision baseline at that LR.
+- fp16 batch 6 with NVFP4 omitted entirely measured 2.6250 s/step and finite loss,
+  but logged `grad_norm: nan` from the first step even with `max_grad_norm: 1.0`
+  explicit. Treat it as throughput-only; the clipping setting does not make
+  already non-finite fp16 gradients into a valid convergence baseline.
 
 The native Qwen3.5 MLP, linear-attention, and standalone FP8 lm_head patches are
 currently eval/no-grad paths; they do not accelerate this training benchmark.
