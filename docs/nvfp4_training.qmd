@@ -144,7 +144,7 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | NVFP4 all-on baseline | 4 | 1.2475 | ~6,567 tok/s | 69.26 GiB |
 | NVFP4 saved attention packs | 4 | 1.2075 | ~6,784 tok/s | 69.63 GiB |
 | NVFP4 saved attention packs (repeat) | 4 | 1.1525 | ~7,108 tok/s | 69.63 GiB |
-| NVFP4 saved packs + BF16 dK/dV scratch | 4 | 1.1485 | ~7,132 tok/s | 62.03 GiB |
+| NVFP4 saved packs + BF16 dK/dV scratch | 4 | 1.1415-1.1485 | ~7,133-7,177 tok/s | 62.03 GiB |
 | NVFP4 FP8 lm_head CE | 6 | 1.7955-1.8257 | ~6,729-6,845 tok/s | 80.72 GiB |
 
 Negative checks from the same sweep:
