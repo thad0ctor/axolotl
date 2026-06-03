@@ -406,7 +406,12 @@ class TestNVFP4Training:
             fp8_lm_head_cross_entropy,
             prepack_lm_head_weight_fp8_ce,
         )
-        from axolotl.kernels.fp8_lm_head import fp8_lm_head
+        from axolotl.kernels.fp8_lm_head import (
+            _quantize_e4m3,
+            _scale_from_amax,
+            _scaled_mm,
+            fp8_lm_head,
+        )
 
         torch.manual_seed(0)
         M, H, V = 192, 256, 4096 + 512
@@ -436,15 +441,33 @@ class TestNVFP4Training:
         scale = packed.fprop.scale.float()
         weight_t = packed.fprop.weight_t.float() * scale
         grad_ref = (probs @ weight_t.t()).to(torch.bfloat16).float()
+        grad_tc = torch.zeros(M, H, device="cuda", dtype=torch.float32)
+        for lo in range(0, V, 4096):
+            hi = min(lo + 4096, V)
+            dz = probs[:, lo:hi].contiguous()
+            dz_scale = _scale_from_amax(dz.abs().amax(dim=1, keepdim=True))
+            dz_fp8 = _quantize_e4m3(dz, dz_scale)
+            grad_tc += _scaled_mm(
+                dz_fp8,
+                packed.dgrad_weight[lo:hi, :],
+                scale_a=dz_scale,
+                scale_b=packed.dgrad_scale,
+                out_dtype=torch.bfloat16,
+            ).float()
+        grad_tc = grad_tc.to(torch.bfloat16).float()
 
         assert torch.isfinite(fused).item()
         assert torch.isfinite(h_fp8.grad).all().item()
         loss_rel = (fused - fp8_ref).abs() / (fp8_ref.abs() + 1e-9)
-        grad_rel = (h_fp8.grad.float() - grad_ref).norm() / (
+        grad_tc_rel = (h_fp8.grad.float() - grad_tc).norm() / (
+            grad_tc.norm() + 1e-9
+        )
+        grad_ref_rel = (h_fp8.grad.float() - grad_ref).norm() / (
             grad_ref.norm() + 1e-9
         )
         assert loss_rel < 1e-6, loss_rel.item()
-        assert grad_rel < 3e-3, grad_rel.item()
+        assert grad_tc_rel < 1e-4, grad_tc_rel.item()
+        assert grad_ref_rel < 2e-2, grad_ref_rel.item()
 
     def test_attention_dkdv_bf16_scratch_matches_fp32_scratch(self):
         """BF16 dK/dV scratch keeps the native-attention gradient close to fp32

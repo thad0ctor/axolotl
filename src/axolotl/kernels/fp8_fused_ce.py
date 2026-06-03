@@ -15,6 +15,7 @@ from axolotl.kernels.fp8_lm_head import (
     _quantize_e4m3,
     _scale_from_amax,
     _scaled_mm,
+    _to_col_major_for_scaled_mm,
     prepack_lm_head_weight_fp8,
 )
 from axolotl.utils.logging import get_logger
@@ -28,6 +29,8 @@ _PATCHED_FORWARDS: set[type] = set()
 @dataclass(frozen=True)
 class FP8FusedCEWeight:
     fprop: FP8LMHeadWeight
+    dgrad_weight: torch.Tensor
+    dgrad_scale: torch.Tensor
 
 
 def prepack_lm_head_weight_fp8_ce(
@@ -42,7 +45,19 @@ def prepack_lm_head_weight_fp8_ce(
         raise ValueError("FP8 fused CE requires vocab and hidden dims divisible by 16")
 
     fprop = prepack_lm_head_weight_fp8(weight, granularity=granularity)
-    return FP8FusedCEWeight(fprop=fprop)
+    weight = weight.detach()
+    if granularity == "tensorwise":
+        dgrad_scale = _scale_from_amax(weight.abs().max())
+    else:
+        dgrad_scale = _scale_from_amax(weight.abs().amax(dim=0, keepdim=True))
+    dgrad_weight = _to_col_major_for_scaled_mm(
+        _quantize_e4m3(weight, dgrad_scale)
+    )
+    return FP8FusedCEWeight(
+        fprop=fprop,
+        dgrad_weight=dgrad_weight,
+        dgrad_scale=dgrad_scale,
+    )
 
 
 def _weight_cache_key(weight: torch.Tensor, granularity: FP8Granularity):
@@ -65,16 +80,6 @@ def _fp8_ce_packed_weight(lm_head: nn.Linear, granularity: FP8Granularity):
 
 def _fprop_scale_tile(scale: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
     return scale if scale.ndim == 0 else scale[:, lo:hi]
-
-
-def _dequant_fprop_weight_t_tile(
-    packed: FP8FusedCEWeight,
-    lo: int,
-    hi: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    scale = _fprop_scale_tile(packed.fprop.scale, lo, hi)
-    return (packed.fprop.weight_t[:, lo:hi].float() * scale.float()).to(dtype)
 
 
 class _FP8FusedCrossEntropy(torch.autograd.Function):
@@ -164,8 +169,15 @@ class _FP8FusedCrossEntropy(torch.autograd.Function):
             dz[rows, cols] -= in_tile.float()
             dz = dz * coef
 
-            w_t_tile = _dequant_fprop_weight_t_tile(packed, lo, hi, torch.float32)
-            grad_hidden += dz.float() @ w_t_tile.t()
+            dz_scale = _scale_from_amax(dz.abs().amax(dim=1, keepdim=True))
+            dz_fp8 = _quantize_e4m3(dz, dz_scale)
+            grad_hidden += _scaled_mm(
+                dz_fp8,
+                packed.dgrad_weight[lo:hi, :],
+                scale_a=dz_scale,
+                scale_b=packed.dgrad_scale,
+                out_dtype=ctx.hidden_dtype,
+            ).float()
 
         return grad_hidden.to(ctx.hidden_dtype), None, None, None, None, None
 
