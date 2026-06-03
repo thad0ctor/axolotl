@@ -14,16 +14,18 @@ What this buys, honestly:
   * MEMORY: the ``[M, V]`` logits (and their fp32 upcast) are never materialized;
     only one ``[M, V_BLOCK]`` tile lives at a time. This is the real win and it
     grows with seq length and vocab.
-  * COMPUTE: the per-tile matmul runs in bf16 (the tile is dequantized before the
-    GEMM, logsumexp accumulates in fp32 for stability), so the lm_head does NOT
-    hit FP4 tensor cores here. The benefit is bandwidth + memory, not FP4 GEMM
-    throughput. A native FP4 logsumexp Triton kernel would be needed for that and
-    is out of scope for this prototype.
+  * COMPUTE: the default path dequantizes each tile before a bf16 GEMM. The
+    experimental ``fp4_matmul=True`` / ``AXOLOTL_NVFP4_FUSED_CE_FP4_MM=1`` path
+    uses FP4 ``torch._scaled_mm`` for the lm_head logits, but still emits one
+    ``[M, V_BLOCK]`` tile and runs CE/logsumexp separately. It is not a native CE
+    epilogue, and backward still uses the dequantized weight tile for dgrad.
 
 lm_head is frozen under LoRA, so only ``dL/dhidden`` is returned (no weight grad).
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 from torch import nn
@@ -32,6 +34,12 @@ from torch import nn
 # keeps it small (16 MiB at M=4096) while giving the bf16 tile-matmul enough work
 # to stay efficient. Tunable; not load-bearing for correctness.
 _VOCAB_BLOCK = 4096
+
+
+def _fp4_scaled_mm_enabled(fp4_matmul: bool | None) -> bool:
+    if fp4_matmul is not None:
+        return fp4_matmul
+    return os.environ.get("AXOLOTL_NVFP4_FUSED_CE_FP4_MM") == "1"
 
 
 def _nvfp4_lm_head_store(module: nn.Module):
@@ -73,6 +81,42 @@ def _nvfp4_lm_head_store(module: nn.Module):
     return store
 
 
+def _nvfp4_lm_head_fp4_store(module: nn.Module):
+    """Return a ``[V, H]`` FP4 store usable by tiled ``torch._scaled_mm``."""
+    from axolotl.utils.nvfp4_training import (
+        NVFP4ComputeBaseLinear,
+        NVFP4FastComputeBaseLinear,
+        NVFP4FastFrozenBaseLinear,
+        NVFP4FrozenBaseLinear,
+        NVFP4TiedLMHead,
+    )
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    if isinstance(module, (NVFP4FrozenBaseLinear, NVFP4TiedLMHead)):
+        return module.w_q
+    if isinstance(module, NVFP4ComputeBaseLinear):
+        return module.w_fprop.t()
+    if isinstance(module, NVFP4FastFrozenBaseLinear):
+        return NVFP4Tensor(
+            module.wq,
+            module.wsc,
+            16,
+            torch.bfloat16,
+            per_tensor_scale=module.w_inv.to(torch.float32),
+            is_swizzled_scales=True,
+        )
+    if isinstance(module, NVFP4FastComputeBaseLinear):
+        return NVFP4Tensor(
+            module.wq_f,
+            module.wsc_f,
+            16,
+            torch.bfloat16,
+            per_tensor_scale=module.w_inv_f.to(torch.float32),
+            is_swizzled_scales=True,
+        )
+    return None
+
+
 def _dequant_vocab_tile(store, lo: int, hi: int, dtype: torch.dtype) -> torch.Tensor:
     """Dequantize vocab rows ``[lo, hi)`` of the packed lm_head to ``[hi-lo, H]``.
 
@@ -94,6 +138,50 @@ def _dequant_vocab_tile(store, lo: int, hi: int, dtype: torch.dtype) -> torch.Te
         None,
     )
     return sub.dequantize(dtype)
+
+
+def _slice_vocab_tile(store, lo: int, hi: int):
+    try:
+        return store[lo:hi]
+    except Exception:
+        return None
+
+
+def _weight_scale_for_scaled_mm(tile) -> torch.Tensor:
+    if tile.is_swizzled_scales:
+        return tile.scale.view(torch.float8_e4m3fn)
+    from torchao.prototype.mx_formats.utils import to_blocked
+
+    rows, hidden = tile.shape
+    return to_blocked(tile.scale.view(rows, hidden // 16)).view(torch.float8_e4m3fn)
+
+
+def _fp4_logits_tile(
+    hidden_q: torch.Tensor,
+    hidden_scale: torch.Tensor,
+    tile,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    logits = torch._scaled_mm(
+        hidden_q,
+        tile.qdata.view(torch.float4_e2m1fn_x2).t(),
+        bias=None,
+        out_dtype=dtype,
+        scale_a=hidden_scale,
+        scale_b=_weight_scale_for_scaled_mm(tile),
+    )
+    if tile.per_tensor_scale is not None:
+        logits = logits * tile.per_tensor_scale.to(dtype)
+    return logits
+
+
+def _quantize_hidden_sl(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    try:
+        from axolotl.utils.nvfp4_training import _mslk_quantize_sl
+
+        return _mslk_quantize_sl(hidden)
+    except Exception:
+        return None
 
 
 class _FusedFP4CrossEntropy(torch.autograd.Function):
@@ -184,6 +272,90 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         return grad_hidden, None, None, None, None, None
 
 
+class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
+    """Tiled CE whose lm_head logits are produced by FP4 ``torch._scaled_mm``."""
+
+    @staticmethod
+    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale):
+        M, _ = hidden.shape
+        V = store.shape[0]
+        device = hidden.device
+        dtype = hidden.dtype
+
+        hidden_q = _quantize_hidden_sl(hidden)
+        if hidden_q is None:
+            raise RuntimeError("MSLK single-level NVFP4 activation quant is unavailable")
+        hidden_qdata, hidden_scale = hidden_q
+
+        valid = labels != ignore_index
+        safe_labels = torch.where(valid, labels, labels.new_zeros(()))
+
+        running_max = torch.full((M,), float("-inf"), device=device, dtype=torch.float32)
+        running_sum = torch.zeros(M, device=device, dtype=torch.float32)
+        label_logit = torch.zeros(M, device=device, dtype=torch.float32)
+
+        for lo in range(0, V, _VOCAB_BLOCK):
+            hi = min(lo + _VOCAB_BLOCK, V)
+            tile = _slice_vocab_tile(store, lo, hi)
+            if tile is None:
+                raise RuntimeError("FP4 lm_head store is not vocab-tile sliceable")
+            logits = _fp4_logits_tile(hidden_qdata, hidden_scale, tile, dtype).float()
+            logits = logits * scale
+
+            tile_max = logits.max(dim=1).values
+            new_max = torch.maximum(running_max, tile_max)
+            running_sum = running_sum * torch.exp(running_max - new_max) + torch.exp(
+                logits - new_max.unsqueeze(1)
+            ).sum(dim=1)
+            running_max = new_max
+
+            in_tile = (safe_labels >= lo) & (safe_labels < hi)
+            cols = (safe_labels - lo).clamp(0, hi - lo - 1)
+            gathered = logits.gather(1, cols.unsqueeze(1)).squeeze(1)
+            label_logit = torch.where(in_tile, gathered, label_logit)
+
+        lse = running_max + torch.log(running_sum)
+        per_token = (lse - label_logit) * valid.float()
+        loss = per_token.sum() * grad_scale
+
+        ctx.save_for_backward(hidden, lse, safe_labels, valid)
+        ctx.store = store
+        ctx.scale = scale
+        ctx.grad_scale = grad_scale
+        ctx.V = V
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        hidden, lse, safe_labels, valid = ctx.saved_tensors
+        store = ctx.store
+        scale = ctx.scale
+        V = ctx.V
+        M, H = hidden.shape
+        dtype = hidden.dtype
+
+        hidden_qdata, hidden_scale = _quantize_hidden_sl(hidden)
+        coef = (grad_loss * ctx.grad_scale * valid.float() * scale).unsqueeze(1)
+        rows = torch.arange(M, device=hidden.device)
+
+        grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
+        for lo in range(0, V, _VOCAB_BLOCK):
+            hi = min(lo + _VOCAB_BLOCK, V)
+            tile = _slice_vocab_tile(store, lo, hi)
+            logits = _fp4_logits_tile(hidden_qdata, hidden_scale, tile, dtype).float()
+            logits = logits * scale
+            sm = torch.exp(logits - lse.unsqueeze(1))
+
+            in_tile = (safe_labels >= lo) & (safe_labels < hi)
+            cols = (safe_labels - lo).clamp(0, hi - lo - 1)
+            sm[rows, cols] -= in_tile.float()
+
+            w_tile = tile.dequantize(dtype)
+            grad_hidden += ((sm * coef).to(dtype)) @ w_tile
+
+        return grad_hidden, None, None, None, None, None
+
+
 def fused_fp4_cross_entropy(
     hidden: torch.Tensor,
     lm_head: nn.Module,
@@ -193,6 +365,7 @@ def fused_fp4_cross_entropy(
     num_items_in_batch=None,
     shift: bool = True,
     logit_scale: float = 1.0,
+    fp4_matmul: bool | None = None,
 ) -> torch.Tensor | None:
     """Fused FP4-lm_head + cross-entropy, or None if the head isn't tile-able.
 
@@ -202,9 +375,6 @@ def fused_fp4_cross_entropy(
     (MSLK-swizzled / hp / bf16) or carries a bias, so the caller falls back to the
     materialized path.
     """
-    store = _nvfp4_lm_head_store(lm_head)
-    if store is None:
-        return None
     if getattr(lm_head, "bias", None) is not None:
         return None  # bias-folding not implemented; rare on lm_head
 
@@ -221,6 +391,22 @@ def fused_fp4_cross_entropy(
         )
     else:
         grad_scale = 1.0 / valid.sum().clamp(min=1).float()
+
+    if _fp4_scaled_mm_enabled(fp4_matmul):
+        fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
+        if fp4_store is not None:
+            try:
+                return _FusedFP4ScaledMMCrossEntropy.apply(
+                    hidden2d, fp4_store, labels1d, ignore_index, logit_scale, grad_scale
+                )
+            except Exception:
+                if fp4_matmul is True:
+                    raise
+                pass
+
+    store = _nvfp4_lm_head_store(lm_head)
+    if store is None:
+        return None
 
     return _FusedFP4CrossEntropy.apply(
         hidden2d, store, labels1d, ignore_index, logit_scale, grad_scale
@@ -245,7 +431,7 @@ LOG = logging.getLogger(__name__)
 _PATCHED_FORWARDS: set = set()
 
 
-def _make_fused_forward(orig_forward):
+def _make_fused_forward(orig_forward, fp4_matmul: bool | None):
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     # Preserve the original forward's signature: the Trainer inspects it via
@@ -255,12 +441,16 @@ def _make_fused_forward(orig_forward):
     def forward(self, *args, **kwargs):
         labels = kwargs.get("labels")
         lm_head = self.get_output_embeddings()
+        has_fp4_ce = _nvfp4_lm_head_store(lm_head) is not None or (
+            _fp4_scaled_mm_enabled(fp4_matmul)
+            and _nvfp4_lm_head_fp4_store(lm_head) is not None
+        )
         # Only intercept the training path with an FP4, tile-able head. Anything
         # else (generation, non-FP4 head, logits_to_keep slicing) -> original.
         if (
             labels is None
             or kwargs.get("logits_to_keep")
-            or _nvfp4_lm_head_store(lm_head) is None
+            or not has_fp4_ce
         ):
             return orig_forward(self, *args, **kwargs)
 
@@ -280,6 +470,7 @@ def _make_fused_forward(orig_forward):
             labels,
             num_items_in_batch=num_items_in_batch,
             shift=True,
+            fp4_matmul=fp4_matmul,
         )
         if loss is None:  # store became non-tileable mid-run -> safe fallback
             kwargs["labels"] = labels
@@ -298,7 +489,10 @@ def _make_fused_forward(orig_forward):
     return forward
 
 
-def patch_model_fused_fp4_ce(model: nn.Module) -> bool:
+def patch_model_fused_fp4_ce(
+    model: nn.Module,
+    fp4_matmul: bool | None = None,
+) -> bool:
     """Patch ``model``'s ForCausalLM forward to use the fused FP4 cross-entropy.
 
     Returns True if a patch was installed (the lm_head is a tile-able FP4 store),
@@ -313,17 +507,27 @@ def patch_model_fused_fp4_ce(model: nn.Module) -> bool:
             causal = model.get_base_model()
         except Exception:
             causal = model
-    if _nvfp4_lm_head_store(causal.get_output_embeddings()) is None:
+    lm_head = causal.get_output_embeddings()
+    has_fp4_ce = _nvfp4_lm_head_store(lm_head) is not None or (
+        _fp4_scaled_mm_enabled(fp4_matmul)
+        and _nvfp4_lm_head_fp4_store(lm_head) is not None
+    )
+    if not has_fp4_ce:
         LOG.warning(
-            "fused_fp4_cross_entropy: lm_head is not a row-sliceable NVFP4 store "
-            "(MSLK-swizzled / hp / bf16 / bias); keeping the materialized CE path."
+            "fused_fp4_cross_entropy: lm_head is not supported by the fused FP4 "
+            "CE paths (row-sliceable store, or FP4 matmul store with "
+            "AXOLOTL_NVFP4_FUSED_CE_FP4_MM=1); keeping the materialized CE path."
         )
         return False
 
     cls = causal.__class__
     if cls in _PATCHED_FORWARDS:
         return True
-    cls.forward = _make_fused_forward(cls.forward)
+    cls.forward = _make_fused_forward(cls.forward, fp4_matmul)
     _PATCHED_FORWARDS.add(cls)
-    LOG.info("fused_fp4_cross_entropy: patched %s.forward (logits not materialized)", cls.__name__)
+    LOG.info(
+        "fused_fp4_cross_entropy: patched %s.forward (logits not materialized%s)",
+        cls.__name__,
+        ", fp4_matmul" if _fp4_scaled_mm_enabled(fp4_matmul) else "",
+    )
     return True

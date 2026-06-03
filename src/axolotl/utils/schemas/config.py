@@ -1799,18 +1799,18 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "load_in_4bit, so it cannot pair with FP4 storage)."
             )
 
-        # The fused linear cross-entropy kernel reads the lm_head weight directly
-        # to fuse the projection with the loss, bypassing the NVFP4 lm_head
-        # forward. Refuse the combination early (the runtime guard in the patch
-        # manager also catches it, but config-time is friendlier).
+        # The standard fused linear cross-entropy kernel reads the lm_head weight
+        # directly, bypassing the NVFP4 lm_head forward. The FP4-aware fused CE
+        # path is the explicit opt-in exception.
         if self.nvfp4_training.quantize_lm_head and getattr(
             self, "cut_cross_entropy", None
-        ):
+        ) and not self.nvfp4_training.fused_fp4_cross_entropy:
             raise ValueError(
                 "nvfp4_training.quantize_lm_head is incompatible with "
                 "cut_cross_entropy: the fused linear cross-entropy kernel consumes "
                 "the lm_head weight directly and bypasses the NVFP4 lm_head forward. "
-                "Disable one (cut_cross_entropy: false or quantize_lm_head: false)."
+                "Disable one, or set nvfp4_training.fused_fp4_cross_entropy: true "
+                "to use the FP4-aware fused CE path."
             )
 
         if self.deepspeed:

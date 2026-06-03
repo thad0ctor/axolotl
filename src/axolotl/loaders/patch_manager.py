@@ -477,7 +477,12 @@ class PatchManager:
         ):
             from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
 
-            patch_model_fused_fp4_ce(model)
+            patch_model_fused_fp4_ce(
+                model,
+                fp4_matmul=True
+                if getattr(nvfp4, "fused_fp4_cross_entropy_fp4_matmul", False)
+                else None,
+            )
 
         if getattr(nvfp4, "fp8_lm_head", False):
             from axolotl.kernels.fp8_lm_head import patch_model_fp8_lm_head
