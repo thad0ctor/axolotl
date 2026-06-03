@@ -237,6 +237,15 @@ class NVFP4TrainingConfig(BaseModel):
             "speed knob; OFF by default."
         },
     )
+    qwen3_5_fla_causal_conv_compile_boundary: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Qwen3.5 sample-packing only. Run FLA varlen "
+            "causal_conv1d behind a torch.compile boundary so packed cu_seqlens "
+            "length changes do not trigger repeated Dynamo recompiles. This may "
+            "trade graph coverage for steadier train steps. OFF by default."
+        },
+    )
     qwen3_5_fuse_vproj: bool = Field(
         default=False,
         json_schema_extra={

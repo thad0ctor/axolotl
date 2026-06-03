@@ -20,6 +20,31 @@ except ImportError:
     except ImportError:
         fla_causal_conv1d = None
 
+_FLA_CAUSAL_CONV_COMPILE_BOUNDARY = False
+
+
+def set_fla_causal_conv_compile_boundary(enabled: bool) -> None:
+    global _FLA_CAUSAL_CONV_COMPILE_BOUNDARY
+    _FLA_CAUSAL_CONV_COMPILE_BOUNDARY = bool(enabled)
+
+
+def _call_fla_causal_conv1d(*, x, weight, bias, activation, cu_seqlens):
+    return fla_causal_conv1d(
+        x=x,
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        cu_seqlens=cu_seqlens,
+    )
+
+
+try:
+    import torch._dynamo as _dynamo
+
+    _call_fla_causal_conv1d_disabled = _dynamo.disable(_call_fla_causal_conv1d)
+except Exception:  # pragma: no cover
+    _call_fla_causal_conv1d_disabled = _call_fla_causal_conv1d
+
 
 def get_cu_seqlens(position_ids):
     """
@@ -167,7 +192,12 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
 
             if fla_causal_conv1d is not None and cu_seqlens is not None:
                 # FLA varlen kernel for packed sequences; input must be contiguous [B, T, D]
-                mixed_qkv, _ = fla_causal_conv1d(
+                conv_fn = (
+                    _call_fla_causal_conv1d_disabled
+                    if _FLA_CAUSAL_CONV_COMPILE_BOUNDARY
+                    else _call_fla_causal_conv1d
+                )
+                mixed_qkv, _ = conv_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias,
@@ -237,7 +267,13 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
     return patched_forward
 
 
-def _apply_packing_patches(model_type: str, cls_prefix: str, forward_factory) -> None:
+def _apply_packing_patches(
+    model_type: str,
+    cls_prefix: str,
+    forward_factory,
+    *,
+    fla_causal_conv_compile_boundary: bool = False,
+) -> None:
     module_name = f"transformers.models.{model_type}.modeling_{model_type}"
 
     try:
@@ -247,23 +283,37 @@ def _apply_packing_patches(model_type: str, cls_prefix: str, forward_factory) ->
         return
 
     _inject_fla_kernels(module)
+    set_fla_causal_conv_compile_boundary(fla_causal_conv_compile_boundary)
     getattr(module, f"{cls_prefix}DecoderLayer").forward = _patched_decoder_forward
     gated_cls = getattr(module, f"{cls_prefix}GatedDeltaNet")
     gated_cls.forward = forward_factory(module.apply_mask_to_padding_states)
 
     LOG.info(
         f"Applied {cls_prefix} packing patch "
-        f"(fla_causal_conv1d={'available' if fla_causal_conv1d else 'unavailable'})"
+        f"(fla_causal_conv1d={'available' if fla_causal_conv1d else 'unavailable'}, "
+        f"compile_boundary={fla_causal_conv_compile_boundary})"
     )
 
 
-def patch_qwen3_5_modeling_packing():
-    _apply_packing_patches("qwen3_5", "Qwen3_5", _make_qwen3_5_gated_delta_forward)
-
-
-def patch_qwen3_5_moe_modeling_packing():
+def patch_qwen3_5_modeling_packing(
+    *, fla_causal_conv_compile_boundary: bool = False
+):
     _apply_packing_patches(
-        "qwen3_5_moe", "Qwen3_5Moe", _make_qwen3_5_gated_delta_forward
+        "qwen3_5",
+        "Qwen3_5",
+        _make_qwen3_5_gated_delta_forward,
+        fla_causal_conv_compile_boundary=fla_causal_conv_compile_boundary,
+    )
+
+
+def patch_qwen3_5_moe_modeling_packing(
+    *, fla_causal_conv_compile_boundary: bool = False
+):
+    _apply_packing_patches(
+        "qwen3_5_moe",
+        "Qwen3_5Moe",
+        _make_qwen3_5_gated_delta_forward,
+        fla_causal_conv_compile_boundary=fla_causal_conv_compile_boundary,
     )
 
 

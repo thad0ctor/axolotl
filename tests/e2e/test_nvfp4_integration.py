@@ -83,6 +83,7 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
             "qwen3_5_native_attention_backward": True,
             "qwen3_5_native_attention_backward_rtn_grad_packs": True,
             "qwen3_5_native_attention_save_backward_packs": True,
+            "qwen3_5_fla_causal_conv_compile_boundary": True,
             "qwen3_5_fuse_vproj": True,
             "qwen3_5_native_linear_attn": True,
             "qwen3_5_native_mlp": True,
@@ -92,6 +93,7 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
     assert cfg.nvfp4_training.qwen3_5_native_attention_backward is True
     assert cfg.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs is True
     assert cfg.nvfp4_training.qwen3_5_native_attention_save_backward_packs is True
+    assert cfg.nvfp4_training.qwen3_5_fla_causal_conv_compile_boundary is True
 
 
 def test_gate_refuses_qwen3_5_switch_on_other_model(monkeypatch):
@@ -294,6 +296,46 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
 
     assert captured["save_backward_packs"] is True
     assert captured["train_backward"] is True
+
+
+def test_qwen3_5_packing_patch_forwards_fla_compile_boundary(monkeypatch):
+    _supported(monkeypatch, True)
+    from axolotl.loaders import patch_manager
+    from axolotl.monkeypatch.models.qwen3_5 import modeling
+
+    captured = []
+
+    def fake_patch(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(patch_manager.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(modeling, "patch_qwen3_5_modeling_packing", fake_patch)
+
+    pm = _patch_manager(
+        {
+            "model_config_type": "qwen3_5",
+            "sample_packing": True,
+            "bf16": True,
+        }
+    )
+
+    pm._apply_model_specific_patches()
+
+    pm = _patch_manager(
+        {
+            "model_config_type": "qwen3_5",
+            "sample_packing": True,
+            "nvfp4_training": {
+                "enabled": True,
+                "qwen3_5_fla_causal_conv_compile_boundary": True,
+            },
+        }
+    )
+
+    pm._apply_model_specific_patches()
+
+    assert captured[0]["fla_causal_conv_compile_boundary"] is False
+    assert captured[1]["fla_causal_conv_compile_boundary"] is True
 
 
 def test_apply_selects_lora_compute_mode(monkeypatch):

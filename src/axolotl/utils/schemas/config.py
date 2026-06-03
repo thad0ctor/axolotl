@@ -1707,6 +1707,7 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             self.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs,
             self.nvfp4_training.qwen3_5_native_attention_save_backward_packs,
             self.nvfp4_training.qwen3_5_native_attention_compile_custom_op,
+            self.nvfp4_training.qwen3_5_fla_causal_conv_compile_boundary,
             self.nvfp4_training.qwen3_5_fuse_vproj,
             self.nvfp4_training.qwen3_5_native_linear_attn,
             self.nvfp4_training.qwen3_5_native_mlp,

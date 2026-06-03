@@ -6,10 +6,13 @@
 #   all-on NVFP4 b4 baseline: 1.2475 s/step, ~6567 tok/s, 69.26 GiB active
 #   this saved-pack path:      1.1525-1.2075 s/step, ~6784-7108 tok/s,
 #                              69.63 GiB active
+#   plus FLA boundary:         1.1708 s/step, ~6997 tok/s, 69.63 GiB active
 #
 # The speed knob here is qwen3_5_native_attention_save_backward_packs: it saves
 # forward FP4 attention packs and reuses them in backward, trading ~0.4 GiB of
-# activation memory for less backward pack-prep work. Keep it opt-in.
+# activation memory for less backward pack-prep work. The FLA boundary prevents
+# variable packed cu_seqlens from burning compile time in causal_conv1d.
+# Keep both opt-in.
 base_model: Qwen/Qwen3.5-9B
 model_config_type: qwen3_5
 strict: false
@@ -76,6 +79,7 @@ nvfp4_training:
   qwen3_5_native_attention_backward: true
   qwen3_5_native_attention_backward_rtn_grad_packs: true
   qwen3_5_native_attention_save_backward_packs: true
+  qwen3_5_fla_causal_conv_compile_boundary: true
 
 warmup_steps: 10
 logging_steps: 1

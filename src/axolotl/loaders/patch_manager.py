@@ -921,14 +921,36 @@ class PatchManager:
                     patch_qwen3_5_modeling_packing,
                 )
 
-                patch_qwen3_5_modeling_packing()
+                nvfp4 = getattr(self.cfg, "nvfp4_training", None)
+                patch_qwen3_5_modeling_packing(
+                    fla_causal_conv_compile_boundary=bool(
+                        nvfp4
+                        and nvfp4.enabled
+                        and getattr(
+                            nvfp4,
+                            "qwen3_5_fla_causal_conv_compile_boundary",
+                            False,
+                        )
+                    )
+                )
 
             if self.cfg.model_config_type == "qwen3_5_moe" and self.cfg.sample_packing:
                 from axolotl.monkeypatch.models.qwen3_5.modeling import (
                     patch_qwen3_5_moe_modeling_packing,
                 )
 
-                patch_qwen3_5_moe_modeling_packing()
+                nvfp4 = getattr(self.cfg, "nvfp4_training", None)
+                patch_qwen3_5_moe_modeling_packing(
+                    fla_causal_conv_compile_boundary=bool(
+                        nvfp4
+                        and nvfp4.enabled
+                        and getattr(
+                            nvfp4,
+                            "qwen3_5_fla_causal_conv_compile_boundary",
+                            False,
+                        )
+                    )
+                )
 
             if (
                 self.cfg.model_config_type in ["qwen3_5", "qwen3_5_moe"]
