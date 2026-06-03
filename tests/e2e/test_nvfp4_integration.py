@@ -292,6 +292,22 @@ def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
         )
 
 
+def test_gate_refuses_qwen3_5_compile_custom_op_with_backward(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="inference-only"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "qwen3_5_native_attention": True,
+                "qwen3_5_native_attention_backward": True,
+                "qwen3_5_native_attention_compile_custom_op": True,
+            },
+        )
+
+
 def _tiny_lora_model():
     """A 2-layer toy model wrapped with a PEFT LoRA adapter (CPU-friendly)."""
     import torch

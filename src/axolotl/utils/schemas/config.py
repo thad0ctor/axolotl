@@ -1709,6 +1709,15 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "nvfp4_training.qwen3_5_native_attention_compile_custom_op "
                 "requires qwen3_5_native_attention: true."
             )
+        if (
+            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op
+            and self.nvfp4_training.qwen3_5_native_attention_backward
+        ):
+            raise ValueError(
+                "nvfp4_training.qwen3_5_native_attention_compile_custom_op is "
+                "inference-only and cannot be combined with "
+                "qwen3_5_native_attention_backward."
+            )
         if self.nvfp4_training.fp8_lm_head_cross_entropy and (
             self.nvfp4_training.quantize_lm_head
             or self.nvfp4_training.fused_fp4_cross_entropy
