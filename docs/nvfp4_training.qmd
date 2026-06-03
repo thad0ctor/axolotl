@@ -116,6 +116,43 @@ Compiled NVFP4 vs compiled bf16, optimizer step included (measured on RTX 5090,
 The isolated-GEMM ceiling is ~2.9–3.6×; about 2× is realized end-to-end at 7–8B.
 **Eager mode is always slower** (0.1–0.25×) — compile is mandatory.
 
+### Fastest measured Qwen3.5-9B LoRA path
+
+For Qwen3.5-9B LoRA SFT on RTX PRO 6000 Blackwell, the fastest no-gradient-
+checkpointing path measured so far is:
+
+- `adapter: lora`
+- `nvfp4_training.base_mode: compute`
+- `qwen3_5_native_attention: true`
+- `qwen3_5_native_attention_backward: true`
+- `qwen3_5_native_attention_backward_rtn_grad_packs: true`
+- `qwen3_5_native_attention_save_backward_packs: true`
+
+The saved-pack flag reuses deterministic FP4 attention packs from the forward pass
+inside backward. It increases active memory slightly but removes backward pack-prep
+work. See `examples/nvfp4/qwen35-9b-lora-fastest.yaml`.
+
+Measured with `scripts/bench_nvfp4.sh` using marginal `train_runtime` delta,
+sequence length 2048, sample packing, no gradient checkpointing:
+
+| Config | Batch | Marginal s/step | Throughput | Active memory |
+|--------|------:|----------------:|-----------:|--------------:|
+| NVFP4 all-on baseline | 4 | 1.2475 | ~6,567 tok/s | 69.26 GiB |
+| NVFP4 saved attention packs | 4 | 1.2075 | ~6,784 tok/s | 69.63 GiB |
+| NVFP4 saved attention packs (repeat) | 4 | 1.1525 | ~7,108 tok/s | 69.63 GiB |
+
+Negative checks from the same sweep:
+
+- `fused_fp4_cross_entropy` made batch 6 fit but remained slower after saved
+  attention packs: 2.0500 s/step (~5,994 tok/s).
+- Cut Cross Entropy also made batch 6 fit, but was slower than the FP4 fused-CE
+  path in the measured b6 run.
+- bf16 batch 6 at `learning_rate: 2e-4` diverged in the benchmark window (loss up
+  to 9.2), so it is not a valid converging full-precision baseline at that LR.
+
+The native Qwen3.5 MLP, linear-attention, and FP8 lm_head patches are currently
+eval/no-grad paths; they do not accelerate this training benchmark.
+
 ### Convergence
 
 In an A/B run (same model/data/seed/optimizer; Qwen2.5-0.5B, 120 steps), NVFP4 full
@@ -322,11 +359,18 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `stochastic_rounding` | `bool` | `true` | Stochastic rounding on gradient operands. |
 | `hadamard` | `bool` | `true` | Random Hadamard transform on wgrad inputs. |
 | `quantize_base` | `bool` | `false` | Adapter modes only. `false` = LoRA + FP4 compute (frozen base high-precision, FP4 GEMMs, throughput only). `true` = NVFP4-QLoRA (frozen base stored packed in FP4, ~3.5× weight memory). Implied by `adapter: qlora`. Conflicts with `load_in_4bit`/`load_in_8bit`. |
+| `base_mode` | `"compute" \| "storage" \| "hp"` | `null` | Adapter modes only. `compute` pre-quantizes the frozen base into FP4 layouts for fastest LoRA base fprop/dgrad; `storage` stores the frozen base packed in FP4 for maximum memory savings; `hp` keeps the base high precision and re-quantizes each step. Overrides `quantize_base` when set. |
 | `exclude_modules` | `list[str]` | `[lm_head, embed_tokens]` | Module name fragments kept in high precision (not swapped). |
 | `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). **Incompatible with tied embeddings and `cut_cross_entropy` (both raise).** `embed_tokens` stays excluded. |
+| `fused_fp4_cross_entropy` | `bool` | `false` | Opt-in. Requires `quantize_lm_head`. Computes CE while tiling over the NVFP4 lm_head so logits are not materialized. This is a memory feature, not a tensor-core FP4 lm_head throughput feature. |
 | `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
 | `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
 | `save_nvfp4` | `bool` | `false` | Opt-in. Store eligible weights NVFP4-packed (qdata + scales) in a `torch.save` sidecar for ~3.5× smaller weight files. See [FP4-packed save](#fp4-packed-save-save_nvfp4) below. **Lossy for FFT resume** (no bf16 master kept); bit-exact for frozen weights. Off by default (bf16 save, unchanged). |
+| `qwen3_5_native_attention` | `bool` | `false` | Qwen3.5 only. Patch full softmax-attention layers to use the native NVFP4 attention path on dense causal/full batches. |
+| `qwen3_5_native_attention_backward` | `bool` | `false` | Qwen3.5 only. Requires `qwen3_5_native_attention`. Use the native NVFP4 autograd attention path while training. |
+| `qwen3_5_native_attention_backward_rtn_grad_packs` | `bool` | `false` | Qwen3.5 native attention training only. Use deterministic round-to-nearest for measured-safe gradient packs while leaving the dK routing-gradient dS pack governed by `stochastic_rounding`. |
+| `qwen3_5_native_attention_save_backward_packs` | `bool` | `false` | Qwen3.5 native attention training only. Save deterministic forward Q/K/V FP4 packs plus transposed backward layouts and reuse them in backward. Trades extra activation memory for higher throughput. |
+| `qwen3_5_native_mlp` / `qwen3_5_native_linear_attn` / `fp8_lm_head` | `bool` | `false` | Qwen3.5/eval-scoring paths. Current implementations are eval/no-grad only and do not accelerate grad-enabled training. |
 
 ## FP4-packed save (`save_nvfp4`) {#fp4-packed-save-save_nvfp4}
 

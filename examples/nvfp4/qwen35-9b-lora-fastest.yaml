@@ -1,0 +1,86 @@
+# Fastest measured native NVFP4 training path for Qwen3.5-9B LoRA on Blackwell.
+#
+# Target shape: text-only SFT, sequence_len 2048, sample packing, no gradient
+# checkpointing. Measured on RTX PRO 6000 Blackwell 96GB with
+# scripts/bench_nvfp4.sh (20 -> 60 marginal train_runtime):
+#   all-on NVFP4 b4 baseline: 1.2475 s/step, ~6567 tok/s, 69.26 GiB active
+#   this saved-pack path:      1.1525-1.2075 s/step, ~6784-7108 tok/s,
+#                              69.63 GiB active
+#
+# The speed knob here is qwen3_5_native_attention_save_backward_packs: it saves
+# forward FP4 attention packs and reuses them in backward, trading ~0.4 GiB of
+# activation memory for less backward pack-prep work. Keep it opt-in.
+base_model: Qwen/Qwen3.5-9B
+model_config_type: qwen3_5
+strict: false
+
+chat_template: qwen3_5
+datasets:
+  - path: yahma/alpaca-cleaned
+    type: alpaca
+val_set_size: 0.0
+dataset_prepared_path: last_run_prepared
+output_dir: ./outputs/qwen35_9b_lora_nvfp4_fastest
+
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+load_in_8bit: false
+load_in_4bit: false
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  - linear_attn.in_proj_qkv
+  - linear_attn.in_proj_z
+  - linear_attn.out_proj
+
+gradient_accumulation_steps: 1
+# This measured b4 path targets 96GB Blackwell. Reduce micro_batch_size on
+# smaller cards or enable gradient_checkpointing if you need memory headroom.
+micro_batch_size: 4
+num_epochs: 1
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2.0e-4
+
+bf16: true
+fp16: false
+tf32: true
+torch_compile: true
+
+gradient_checkpointing: false
+attn_implementation: flash_attention_2
+
+nvfp4_training:
+  enabled: true
+  base_mode: compute
+  stochastic_rounding: true
+  hadamard: true
+  exclude_modules: [lm_head, embed_tokens]
+  skip_first_n_blocks: 0
+  skip_last_n_blocks: 0
+
+  # Qwen3.5 full-attention training path. The saved-pack flag is the measured
+  # throughput win; RTN grad packs keep the safe gradient-side packs deterministic.
+  qwen3_5_native_attention: true
+  qwen3_5_native_attention_backward: true
+  qwen3_5_native_attention_backward_rtn_grad_packs: true
+  qwen3_5_native_attention_save_backward_packs: true
+
+warmup_steps: 10
+logging_steps: 1
+save_strategy: "no"
+saves_per_epoch:
+evals_per_epoch:
+weight_decay: 0.0
+special_tokens:
