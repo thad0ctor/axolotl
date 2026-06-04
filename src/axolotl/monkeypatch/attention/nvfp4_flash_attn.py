@@ -313,7 +313,12 @@ def make_nvfp4_forward(orig_forward):
             and getattr(self, "_nvfp4_fuse_attn_proj", False)
             and getattr(self, "_nvfp4_attn_proj_ok", False)
         )
-        if use_fp4_proj:
+        # q/k feed QK^T->softmax (error amplified through exp); o_proj is a direct
+        # readout. Separable sub-gates let q/k stay bf16 while o_proj goes FP4 (the
+        # near-lossless subset). Both default ON when the main flag is on.
+        use_fp4_qk = use_fp4_proj and getattr(self, "_nvfp4_fp4_qk", True)
+        use_fp4_o = use_fp4_proj and getattr(self, "_nvfp4_fp4_o", True)
+        if use_fp4_qk:
             q_full, k_full = _nvfp4_qk_proj(self, hidden_states)
             query_states, gate = torch.chunk(
                 q_full.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1,
@@ -326,7 +331,7 @@ def make_nvfp4_forward(orig_forward):
         gate = gate.reshape(*input_shape, -1)
 
         query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        if use_fp4_proj:
+        if use_fp4_qk:
             key_states = self.k_norm(k_full.view(hidden_shape)).transpose(1, 2)
         else:
             key_states = self.k_norm(
@@ -439,7 +444,7 @@ def make_nvfp4_forward(orig_forward):
                 )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = attn_output * torch.sigmoid(gate)
-            if use_fp4_proj:
+            if use_fp4_o:
                 return _nvfp4_o_proj(self, attn_output), None
             return self.o_proj(attn_output), None
 
