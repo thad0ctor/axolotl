@@ -160,6 +160,19 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | NVFP4 saved packs + BF16 dK/dV scratch | 4 | 1.1415-1.1485 | ~7,133-7,177 tok/s | 62.03 GiB |
 | NVFP4 saved packs + BF16 dK/dV scratch (beta lock-down repeat) | 4 | 1.2017 | ~6,817 tok/s | 62.03 GiB |
 | NVFP4 FP8 lm_head CE | 6 | 1.7807 | ~6,902 tok/s | 80.32 GiB |
+| Locked profile, 500-step long-tail (RTX PRO 6000 #1, PCIe-first) | 4 | 1.2302 | ~6,659 tok/s | 62.03 GiB |
+| Locked profile + `hadamard: false` (RTX PRO 6000 #1) | 4 | 1.2155 | ~6,739 tok/s | 62.03 GiB |
+
+The marginal s/step varies ~5% **between the two RTX PRO 6000 boards**: the
+PCIe-first board measured 1.2208–1.2302 across 60- and 500-step runs, while the
+1.14–1.15 figures above were recorded on the second board. The 500-step long-tail
+(marginal over 460 steps) matches the 60-step marginal, so `torch.compile` warmup is
+fully amortized by the marginal method and ~1.22–1.23 s/step is the true steady state
+on the first board — the spread is board-to-board, not a short-run or compile-warmup
+artifact. Always compare configs on the same board with `dataset_prepared_path` held
+fixed. Dropping the random Hadamard transform (`hadamard: false`) shaved ~1%
+(1.2295 → 1.2155 s/step) at unchanged loss — see the convergence-recipe note on why
+RHT is near-free to drop for frozen-base LoRA.
 
 Negative checks from the same sweep:
 
@@ -317,7 +330,11 @@ convergence, plus a non-optional two-level scaling:
   dimension of both wgrad operands while the FP4 quantization in between sees
   Gaussian-ized values; on outlier-heavy gradients this cuts wgrad FP4 noise ~63%.
   16×16 is the paper's ablation sweet spot (4×4 worse, 128×128 only marginally
-  better).
+  better). For **LoRA with a frozen FP4 base** (`base_mode: compute`) there is no
+  base weight-gradient, so RHT on the base operands is effectively a no-op: a
+  matched-data A/B on Qwen3.5-9B LoRA (RTX PRO 6000) measured `hadamard: false` at
+  1.2155 s/step vs 1.2295 with it on — ~1% faster at unchanged loss (1.037 vs 1.032).
+  Keep it on for full fine-tunes (real base wgrad); it is near-free to drop for LoRA.
 - **Two-level scaling (always on, not a knob)** — a per-tensor fp32 scale plus the
   per-block e4m3 scale. This is *mandatory*: without the per-tensor level, small
   gradients (~1e-5/element) underflow the per-block e4m3 scale floor (2^-9) and
