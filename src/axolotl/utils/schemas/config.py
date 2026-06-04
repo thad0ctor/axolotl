@@ -1570,9 +1570,9 @@ class AxolotlInputConfig(
                     "attn_implementation: sage_fp4 (SageAttention-3 FP4) is "
                     "inference-only and cannot be used by axolotl train. Use "
                     "fp4_attention_qat for fake-quant attention training, or use "
-                    "nvfp4_training.qwen3_5_native_attention with "
-                    "qwen3_5_native_attention_backward for the experimental "
-                    "Qwen3.5 native FP4 training path."
+                    "nvfp4_training.attention.enabled with "
+                    "attention.backward.enabled for the experimental "
+                    "native FP4 training path."
                 )
             LOG.warning(
                 "attn_implementation: sage_fp4 (SageAttention-3 FP4) is INFERENCE only "
@@ -1667,62 +1667,14 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 f"got adapter={self.adapter!r}."
             )
 
-        if (
-            self.nvfp4_training.qwen3_5_native_attention_backward
-            and not self.nvfp4_training.qwen3_5_native_attention
-        ):
-            raise ValueError(
-                "nvfp4_training.qwen3_5_native_attention_backward requires "
-                "qwen3_5_native_attention: true."
-            )
-        if (
-            self.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs
-            and not self.nvfp4_training.qwen3_5_native_attention_backward
-        ):
-            raise ValueError(
-                "nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs "
-                "requires qwen3_5_native_attention_backward: true."
-            )
-        if (
-            self.nvfp4_training.qwen3_5_native_attention_save_backward_packs
-            and not self.nvfp4_training.qwen3_5_native_attention_backward
-        ):
-            raise ValueError(
-                "nvfp4_training.qwen3_5_native_attention_save_backward_packs "
-                "requires qwen3_5_native_attention_backward: true."
-            )
-        if (
-            self.nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16
-            and not self.nvfp4_training.qwen3_5_native_attention_backward
-        ):
-            raise ValueError(
-                "nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16 "
-                "requires qwen3_5_native_attention_backward: true."
-            )
-        if (
-            self.nvfp4_training.qwen3_5_fuse_vproj
-            and not self.nvfp4_training.qwen3_5_native_attention
-        ):
-            raise ValueError(
-                "nvfp4_training.qwen3_5_fuse_vproj requires "
-                "qwen3_5_native_attention: true."
-            )
-        if (
-            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op
-            and not self.nvfp4_training.qwen3_5_native_attention
-        ):
-            raise ValueError(
-                "nvfp4_training.qwen3_5_native_attention_compile_custom_op "
-                "requires qwen3_5_native_attention: true."
-            )
-        # Tri-state auto-resolve: under torch_compile the bare tl.dot_scaled flash
-        # kernel raises an Inductor CompilationError and (with the default error
-        # suppression) silently falls the attention region back to eager, blocking
-        # fusion of the surrounding elementwise. The opaque custom op compiles
-        # around it with bit-identical grads, so default it on when compile is live.
-        if self.nvfp4_training.qwen3_5_native_attention_compile_custom_op is None:
-            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op = bool(
-                self.nvfp4_training.qwen3_5_native_attention and self.torch_compile
+        # attention.* requires-relationships are enforced inside NVFP4AttentionConfig.
+        # Tri-state auto-resolve (cross-field with torch_compile): under compile the
+        # bare tl.dot_scaled flash kernel raises an Inductor CompilationError and
+        # silently falls the attention region back to eager; the opaque custom op
+        # compiles around it with bit-identical grads, so default it on when live.
+        if self.nvfp4_training.attention.backward.compile_custom_op is None:
+            self.nvfp4_training.attention.backward.compile_custom_op = bool(
+                self.nvfp4_training.attention.enabled and self.torch_compile
             )
         if self.nvfp4_training.fp8_lm_head_cross_entropy and (
             self.nvfp4_training.quantize_lm_head
@@ -1744,17 +1696,19 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "remain a frozen plain nn.Linear. Disable quantize_lm_head/"
                 "fused_fp4_cross_entropy/fp8_lm_head_cross_entropy."
             )
+        _attn = self.nvfp4_training.attention
         qwen3_5_native_flags = (
-            self.nvfp4_training.qwen3_5_native_attention,
-            self.nvfp4_training.qwen3_5_native_attention_backward,
-            self.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs,
-            self.nvfp4_training.qwen3_5_native_attention_save_backward_packs,
-            self.nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16,
-            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op,
-            self.nvfp4_training.qwen3_5_fla_causal_conv_compile_boundary,
-            self.nvfp4_training.qwen3_5_fuse_vproj,
-            self.nvfp4_training.qwen3_5_native_linear_attn,
-            self.nvfp4_training.qwen3_5_native_mlp,
+            _attn.enabled,
+            _attn.backward.enabled,
+            _attn.backward.rtn_grad_packs,
+            _attn.backward.save_packs,
+            _attn.backward.dkdv_scratch_bf16,
+            _attn.backward.compile_custom_op,
+            _attn.fuse_vproj,
+            _attn.fp4_projections,
+            self.nvfp4_training.fla_causal_conv_compile_boundary,
+            self.nvfp4_training.linear_attn,
+            self.nvfp4_training.mlp,
         )
         model_config_type = getattr(self, "model_config_type", None)
         if (

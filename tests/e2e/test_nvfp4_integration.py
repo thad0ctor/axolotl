@@ -155,23 +155,54 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
         model_config_type="qwen3_5",
         nvfp4_training={
             "enabled": True,
-            "qwen3_5_native_attention": True,
-            "qwen3_5_native_attention_backward": True,
-            "qwen3_5_native_attention_backward_rtn_grad_packs": True,
-            "qwen3_5_native_attention_save_backward_packs": True,
-            "qwen3_5_native_attention_dkdv_scratch_bf16": True,
-            "qwen3_5_fla_causal_conv_compile_boundary": True,
-            "qwen3_5_fuse_vproj": True,
-            "qwen3_5_native_linear_attn": True,
-            "qwen3_5_native_mlp": True,
+            "attention": {
+                "enabled": True,
+                "fuse_vproj": True,
+                "fp4_projections": True,
+                "backward": {
+                    "enabled": True,
+                    "rtn_grad_packs": True,
+                    "save_packs": True,
+                    "dkdv_scratch_bf16": True,
+                },
+            },
+            "linear_attn": True,
+            "mlp": True,
+            "fla_causal_conv_compile_boundary": True,
         },
     )
-    assert cfg.nvfp4_training.qwen3_5_native_attention is True
-    assert cfg.nvfp4_training.qwen3_5_native_attention_backward is True
-    assert cfg.nvfp4_training.qwen3_5_native_attention_backward_rtn_grad_packs is True
-    assert cfg.nvfp4_training.qwen3_5_native_attention_save_backward_packs is True
-    assert cfg.nvfp4_training.qwen3_5_native_attention_dkdv_scratch_bf16 is True
-    assert cfg.nvfp4_training.qwen3_5_fla_causal_conv_compile_boundary is True
+    a = cfg.nvfp4_training.attention
+    assert a.enabled is True and a.fuse_vproj is True and a.fp4_projections is True
+    assert a.backward.enabled is True and a.backward.rtn_grad_packs is True
+    assert a.backward.save_packs is True and a.backward.dkdv_scratch_bf16 is True
+    assert cfg.nvfp4_training.linear_attn is True and cfg.nvfp4_training.mlp is True
+    assert cfg.nvfp4_training.fla_causal_conv_compile_boundary is True
+
+
+def test_schema_migrates_legacy_attention_flags(monkeypatch):
+    _supported(monkeypatch, True)
+    import warnings
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cfg = AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "qwen3_5_native_attention": True,
+                "qwen3_5_native_attention_backward": True,
+                "qwen3_5_native_attention_save_backward_packs": True,
+                "qwen3_5_native_mlp": True,
+                "qwen3_5_fla_causal_conv_compile_boundary": True,
+            },
+        )
+    a = cfg.nvfp4_training.attention
+    assert a.enabled is True and a.backward.enabled is True
+    assert a.backward.save_packs is True
+    assert cfg.nvfp4_training.mlp is True
+    assert cfg.nvfp4_training.fla_causal_conv_compile_boundary is True
+    assert any("deprecated" in str(x.message) for x in w)
 
 
 def test_gate_refuses_qwen3_5_switch_on_other_model(monkeypatch):
@@ -183,7 +214,7 @@ def test_gate_refuses_qwen3_5_switch_on_other_model(monkeypatch):
             model_config_type="qwen2",
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention": True,
+                "attention": {"enabled": True},
             },
         )
 
@@ -269,58 +300,55 @@ def test_disabled_nvfp4_skips_gate(monkeypatch):
 
 def test_gate_refuses_qwen3_5_backward_without_attention(monkeypatch):
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match="qwen3_5_native_attention"):
+    with pytest.raises(ValueError, match=r"requires attention\.enabled"):
         AxolotlConfigWCapabilities(
             **BASE,
             **CAPS,
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention_backward": True,
+                "attention": {"backward": {"enabled": True}},
             },
         )
 
 
 def test_gate_refuses_qwen3_5_rtn_without_backward(monkeypatch):
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match="qwen3_5_native_attention_backward"):
+    with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
         AxolotlConfigWCapabilities(
             **BASE,
             **CAPS,
             model_config_type="qwen3_5",
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention": True,
-                "qwen3_5_native_attention_backward_rtn_grad_packs": True,
+                "attention": {"enabled": True, "backward": {"rtn_grad_packs": True}},
             },
         )
 
 
 def test_gate_refuses_qwen3_5_saved_packs_without_backward(monkeypatch):
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match="qwen3_5_native_attention_backward"):
+    with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
         AxolotlConfigWCapabilities(
             **BASE,
             **CAPS,
             model_config_type="qwen3_5",
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention": True,
-                "qwen3_5_native_attention_save_backward_packs": True,
+                "attention": {"enabled": True, "backward": {"save_packs": True}},
             },
         )
 
 
 def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match="qwen3_5_native_attention_backward"):
+    with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
         AxolotlConfigWCapabilities(
             **BASE,
             **CAPS,
             model_config_type="qwen3_5",
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention": True,
-                "qwen3_5_native_attention_dkdv_scratch_bf16": True,
+                "attention": {"enabled": True, "backward": {"dkdv_scratch_bf16": True}},
             },
         )
 
@@ -336,27 +364,29 @@ def test_qwen3_5_compile_custom_op_allowed_with_backward(monkeypatch):
         model_config_type="qwen3_5",
         nvfp4_training={
             "enabled": True,
-            "qwen3_5_native_attention": True,
-            "qwen3_5_native_attention_backward": True,
-            "qwen3_5_native_attention_compile_custom_op": True,
+            "attention": {
+                "enabled": True,
+                "backward": {"enabled": True, "compile_custom_op": True},
+            },
         },
     )
-    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is True
-    assert cfg.nvfp4_training.qwen3_5_native_attention_backward is True
+    assert cfg.nvfp4_training.attention.backward.compile_custom_op is True
+    assert cfg.nvfp4_training.attention.backward.enabled is True
 
 
 def test_qwen3_5_compile_custom_op_requires_native_attention(monkeypatch):
-    # The remaining dependency gate: compile_custom_op needs native_attention on.
+    # The remaining dependency gate: compile_custom_op needs attention.enabled on.
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match="requires qwen3_5_native_attention"):
+    with pytest.raises(
+        ValueError, match=r"compile_custom_op requires attention\.enabled"
+    ):
         AxolotlConfigWCapabilities(
             **BASE,
             **CAPS,
             model_config_type="qwen3_5",
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention": False,
-                "qwen3_5_native_attention_compile_custom_op": True,
+                "attention": {"backward": {"compile_custom_op": True}},
             },
         )
 
@@ -373,11 +403,10 @@ def test_qwen3_5_compile_custom_op_autoenabled_under_torch_compile(monkeypatch):
         torch_compile=True,
         nvfp4_training={
             "enabled": True,
-            "qwen3_5_native_attention": True,
-            "qwen3_5_native_attention_backward": True,
+            "attention": {"enabled": True, "backward": {"enabled": True}},
         },
     )
-    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is True
+    assert cfg.nvfp4_training.attention.backward.compile_custom_op is True
 
 
 def test_qwen3_5_compile_custom_op_default_off_without_torch_compile(monkeypatch):
@@ -388,11 +417,10 @@ def test_qwen3_5_compile_custom_op_default_off_without_torch_compile(monkeypatch
         model_config_type="qwen3_5",
         nvfp4_training={
             "enabled": True,
-            "qwen3_5_native_attention": True,
-            "qwen3_5_native_attention_backward": True,
+            "attention": {"enabled": True, "backward": {"enabled": True}},
         },
     )
-    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is False
+    assert cfg.nvfp4_training.attention.backward.compile_custom_op is False
 
 
 def test_qwen3_5_compile_custom_op_explicit_optout_under_torch_compile(monkeypatch):
@@ -405,12 +433,13 @@ def test_qwen3_5_compile_custom_op_explicit_optout_under_torch_compile(monkeypat
         torch_compile=True,
         nvfp4_training={
             "enabled": True,
-            "qwen3_5_native_attention": True,
-            "qwen3_5_native_attention_backward": True,
-            "qwen3_5_native_attention_compile_custom_op": False,
+            "attention": {
+                "enabled": True,
+                "backward": {"enabled": True, "compile_custom_op": False},
+            },
         },
     )
-    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is False
+    assert cfg.nvfp4_training.attention.backward.compile_custom_op is False
 
 
 def _tiny_lora_model():
@@ -466,10 +495,14 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
             "nvfp4_training": {
                 "enabled": True,
                 "stochastic_rounding": True,
-                "qwen3_5_native_attention": True,
-                "qwen3_5_native_attention_backward": True,
-                "qwen3_5_native_attention_save_backward_packs": True,
-                "qwen3_5_native_attention_dkdv_scratch_bf16": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {
+                        "enabled": True,
+                        "save_packs": True,
+                        "dkdv_scratch_bf16": True,
+                    },
+                },
             },
         }
     )
@@ -510,7 +543,7 @@ def test_qwen3_5_packing_patch_forwards_fla_compile_boundary(monkeypatch):
             "sample_packing": True,
             "nvfp4_training": {
                 "enabled": True,
-                "qwen3_5_fla_causal_conv_compile_boundary": True,
+                "fla_causal_conv_compile_boundary": True,
             },
         }
     )

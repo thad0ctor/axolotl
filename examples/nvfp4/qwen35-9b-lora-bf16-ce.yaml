@@ -39,7 +39,7 @@
 # max_grad_norm: 1.0 explicit, fp16 produced NaN LoRA gradients at the first AMP
 # unscale. bf16 is the natural full-precision Blackwell baseline.
 #
-# The speed knob here is qwen3_5_native_attention_save_backward_packs: it saves
+# The speed knob here is attention.backward.save_packs: it saves
 # forward FP4 attention packs and reuses them in backward, trading ~0.4 GiB of
 # activation memory for less backward pack-prep work. The FLA boundary prevents
 # variable packed cu_seqlens from burning compile time in causal_conv1d. BF16
@@ -118,14 +118,16 @@ nvfp4_training:
   # Chunked bf16 lm_head CE: skip materializing the [tokens, vocab] logits.
   bf16_lm_head_cross_entropy: true
 
-  # Qwen3.5 full-attention training path. The saved-pack flag is the measured
-  # throughput win; RTN grad packs keep the safe gradient-side packs deterministic.
-  qwen3_5_native_attention: true
-  qwen3_5_native_attention_backward: true
-  qwen3_5_native_attention_backward_rtn_grad_packs: true
-  qwen3_5_native_attention_save_backward_packs: true
-  qwen3_5_native_attention_dkdv_scratch_bf16: true
-  qwen3_5_fla_causal_conv_compile_boundary: true
+  # Native full-attention training path. save_packs is the measured throughput
+  # win; rtn_grad_packs keeps the safe gradient-side packs deterministic.
+  attention:
+    enabled: true
+    backward:
+      enabled: true
+      rtn_grad_packs: true
+      save_packs: true
+      dkdv_scratch_bf16: true
+  fla_causal_conv_compile_boundary: true
 
 warmup_steps: 10
 logging_steps: 1

@@ -4,9 +4,120 @@ Real low-precision COMPUTE (FP4 forward/backward GEMMs on Blackwell), distinct
 from the fake-quant QAT/PTQ `quantization:` block.
 """
 
+import warnings
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class NVFP4AttentionBackwardConfig(BaseModel):
+    """Native-NVFP4 attention training (backward) settings (expert recipe)."""
+
+    enabled: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Use the native NVFP4 autograd attention path while "
+            "training. Validated for convergence but can be slower than bf16 at "
+            "short sequence lengths, so it stays explicitly opt-in."
+        },
+    )
+    rtn_grad_packs: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Deterministic round-to-nearest for the measured-safe "
+            "gradient packs (softmax P / transposed dO for dV, dS for dQ), leaving "
+            "the dK and dPt packs governed by stochastic_rounding. Faster in "
+            "microbenchmarks; convergence validation still required."
+        },
+    )
+    save_packs: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Save the forward pass's deterministic Q/K/V NVFP4 packs "
+            "(+ transposed backward layouts) and reuse them in backward — trades "
+            "activation memory for less backward pack-prep work."
+        },
+    )
+    dkdv_scratch_bf16: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Store the per-query-head dK/dV scratch buffers in bf16 "
+            "before GQA reduction instead of fp32 (less scratch traffic; bit-exact "
+            "vs the fp32-then-cast path)."
+        },
+    )
+    compile_custom_op: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Route the native NVFP4 flash attention through an opaque "
+            "torch custom op (torch.compile escape hatch). Tri-state: None "
+            "auto-enables it whenever torch_compile is on; True/False force it."
+        },
+    )
+
+
+class NVFP4AttentionConfig(BaseModel):
+    """Native-NVFP4 full-attention path (model-agnostic; applied where the "
+    architecture supports it). Replaces the flat ``qwen3_5_native_attention*`` flags."""
+
+    enabled: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Patch full softmax-attention layers to the native NVFP4 "
+            "attention path on dense causal/full batches. Falls back to the model's "
+            "configured attention for unsupported masks/cache states."
+        },
+    )
+    fuse_vproj: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Run v_proj as a native NVFP4 GEMM with key-axis pack "
+            "epilogue on inference/cache-free prefill (~1.4-1.5x V producer; v_proj "
+            "goes FP4). Default (null): ON for inference, OFF for training."
+        },
+    )
+    fp4_projections: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Run q/k/o_proj as native NVFP4 GEMMs (q/k share one "
+            "activation pack) on inference prefill. Parity-affecting (not bit-exact); "
+            "speed-neutral on hybrid models, a per-layer win on dense models. OFF by "
+            "default; plain-nn.Linear only."
+        },
+    )
+    backward: NVFP4AttentionBackwardConfig = Field(
+        default_factory=NVFP4AttentionBackwardConfig,
+        json_schema_extra={"description": "Native-NVFP4 attention training settings."},
+    )
+
+    @model_validator(mode="after")
+    def _check_requires(self):
+        if not self.enabled:
+            if self.backward.enabled:
+                raise ValueError(
+                    "nvfp4_training.attention.backward.enabled requires "
+                    "attention.enabled: true."
+                )
+            if self.fuse_vproj:
+                raise ValueError(
+                    "nvfp4_training.attention.fuse_vproj requires attention.enabled: true."
+                )
+            if self.compile_custom_op_set():
+                raise ValueError(
+                    "nvfp4_training.attention.backward.compile_custom_op requires "
+                    "attention.enabled: true."
+                )
+        if not self.backward.enabled:
+            for sub in ("rtn_grad_packs", "save_packs", "dkdv_scratch_bf16"):
+                if getattr(self.backward, sub):
+                    raise ValueError(
+                        f"nvfp4_training.attention.backward.{sub} requires "
+                        "attention.backward.enabled: true."
+                    )
+        return self
+
+    def compile_custom_op_set(self) -> bool:
+        return bool(self.backward.compile_custom_op)
 
 
 class NVFP4TrainingConfig(BaseModel):
@@ -245,103 +356,84 @@ class NVFP4TrainingConfig(BaseModel):
             "resume. OFF by default (bf16 save, unchanged)."
         },
     )
-    qwen3_5_native_attention: bool = Field(
+    attention: NVFP4AttentionConfig = Field(
+        default_factory=NVFP4AttentionConfig,
+        json_schema_extra={
+            "description": "Native-NVFP4 full-attention path settings (model-agnostic; "
+            "applied where the architecture supports it). Replaces the deprecated flat "
+            "qwen3_5_native_attention* flags."
+        },
+    )
+    linear_attn: bool = Field(
         default=False,
         json_schema_extra={
-            "description": "Qwen3.5 only. Patch full softmax-attention layers to use "
-            "the native NVFP4 attention path on dense causal/full batches. Forward "
-            "falls back to the model's configured attention for unsupported masks or "
-            "cache states. OFF by default."
+            "description": "Patch linear-attention (e.g. GatedDeltaNet) large "
+            "projection GEMMs to native NVFP4 in no-grad forward/eval. Training "
+            "forwards fall back to the original implementation."
         },
     )
-    qwen3_5_native_attention_backward: bool = Field(
+    mlp: bool = Field(
         default=False,
         json_schema_extra={
-            "description": "Qwen3.5 only; requires qwen3_5_native_attention. Use the "
-            "native NVFP4 autograd attention path while training. This is validated "
-            "for convergence but can be slower than bf16 at short sequence lengths, "
-            "so it stays explicitly opt-in."
+            "description": "Patch dense SwiGLU MLP GEMMs to native NVFP4 in no-grad "
+            "forward/eval. Training forwards fall back to the original implementation."
         },
     )
-    qwen3_5_native_attention_backward_rtn_grad_packs: bool = Field(
+    fla_causal_conv_compile_boundary: bool = Field(
         default=False,
         json_schema_extra={
-            "description": "Qwen3.5 native attention training only. Use "
-            "deterministic round-to-nearest for the measured-safe gradient packs "
-            "(softmax P and transposed dO for dV, and dS for dQ) while leaving the "
-            "dK routing-gradient dS pack AND the dPt dO pack governed by "
-            "stochastic_rounding. This "
-            "collapsed mode was faster in backward microbenchmarks; convergence "
-            "validation is still required for production training. OFF by default."
+            "description": "Sample-packing only. Run FLA varlen causal_conv1d behind a "
+            "torch.compile boundary so packed cu_seqlens length changes do not trigger "
+            "repeated Dynamo recompiles. Trades graph coverage for steadier steps."
         },
     )
-    qwen3_5_native_attention_save_backward_packs: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Qwen3.5 native attention training only. Save the "
-            "forward pass's deterministic Q/K/V NVFP4 packs plus transposed "
-            "backward layouts and reuse them during backward. This spends extra "
-            "activation memory to skip backward pack-prep work. OFF by default."
-        },
-    )
-    qwen3_5_native_attention_dkdv_scratch_bf16: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Qwen3.5 native attention training only. Store the "
-            "per-query-head dK/dV scratch buffers in bf16 before GQA reduction "
-            "instead of fp32. This can reduce dK/dV scratch memory traffic, but "
-            "changes an intermediate accumulation cast and stays opt-in. OFF by "
-            "default."
-        },
-    )
-    qwen3_5_native_attention_compile_custom_op: bool | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": "Route the native NVFP4 flash-attention call through an "
-            "opaque torch custom op as a torch.compile compatibility escape hatch "
-            "when the internal Triton tl.dot_scaled kernel cannot be captured. On "
-            "the no-grad path this wraps the packed forward op; with "
-            "qwen3_5_native_attention_backward it wraps a DIFFERENTIABLE custom op "
-            "(forward + registered native-NVFP4 backward) so Inductor compiles "
-            "around the whole attention instead of falling the backward subgraph "
-            "back to eager. Tri-state: None auto-enables it whenever torch_compile "
-            "is on (the bare tl.dot_scaled path raises an Inductor CompilationError "
-            "there and silently falls the region back to eager); True/False force it."
-        },
-    )
-    qwen3_5_fla_causal_conv_compile_boundary: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Qwen3.5 sample-packing only. Run FLA varlen "
-            "causal_conv1d behind a torch.compile boundary so packed cu_seqlens "
-            "length changes do not trigger repeated Dynamo recompiles. This may "
-            "trade graph coverage for steadier train steps. OFF by default."
-        },
-    )
-    qwen3_5_fuse_vproj: bool | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": "Qwen3.5 native attention only. Run v_proj as a native "
-            "NVFP4 GEMM with key-axis pack epilogue on inference/cache-free prefill "
-            "(~1.4-1.5x V producer; v_proj goes FP4, so attn-op cos ~0.967 but "
-            "real-model logit cos stays >=0.998 / top-1 preserved). Default (null): "
-            "ON for inference, OFF for training (the grad path ignores this flag). "
-            "Skipped automatically for adapter-wrapped v_proj modules."
-        },
-    )
-    qwen3_5_native_linear_attn: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Qwen3.5 only. Patch GatedDeltaNet's large projection GEMMs "
-            "to native NVFP4 in no-grad forward/eval. Training forwards fall back to "
-            "the original implementation."
-        },
-    )
-    qwen3_5_native_mlp: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Qwen3.5 only. Patch dense SwiGLU MLP GEMMs to native NVFP4 "
-            "in no-grad forward/eval. Training forwards fall back to the original "
-            "implementation."
-        },
-    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_attention_flags(cls, data):
+        """Map deprecated flat ``qwen3_5_*`` attention flags onto the nested schema."""
+        if not isinstance(data, dict):
+            return data
+        attn_map = {
+            "qwen3_5_native_attention": ("enabled",),
+            "qwen3_5_fuse_vproj": ("fuse_vproj",),
+            "qwen3_5_native_attention_backward": ("backward", "enabled"),
+            "qwen3_5_native_attention_backward_rtn_grad_packs": ("backward", "rtn_grad_packs"),
+            "qwen3_5_native_attention_save_backward_packs": ("backward", "save_packs"),
+            "qwen3_5_native_attention_dkdv_scratch_bf16": ("backward", "dkdv_scratch_bf16"),
+            "qwen3_5_native_attention_compile_custom_op": ("backward", "compile_custom_op"),
+        }
+        top_map = {
+            "qwen3_5_native_linear_attn": "linear_attn",
+            "qwen3_5_native_mlp": "mlp",
+            "qwen3_5_fla_causal_conv_compile_boundary": "fla_causal_conv_compile_boundary",
+        }
+        used: list[str] = []
+        attn = dict(data.get("attention") or {})
+        bwd = dict(attn.get("backward") or {})
+        for old, path in attn_map.items():
+            if old not in data:
+                continue
+            used.append(old)
+            val = data.pop(old)
+            if len(path) == 1:
+                attn.setdefault(path[0], val)  # explicit nested value wins
+            else:
+                bwd.setdefault(path[1], val)
+        if bwd:
+            attn["backward"] = bwd
+        if attn:
+            data["attention"] = attn
+        for old, new in top_map.items():
+            if old in data:
+                used.append(old)
+                data.setdefault(new, data.pop(old))
+        if used:
+            warnings.warn(
+                "nvfp4_training: flat attention flags "
+                f"{sorted(used)} are deprecated; use the nested "
+                "nvfp4_training.attention.* schema instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return data

@@ -279,8 +279,7 @@ class PatchManager:
                     "be used by axolotl train. For Qwen3.5 native FP4 attention "
                     "training, keep a training-capable attention backend such as "
                     "flash_attention_2 and enable nvfp4_training with "
-                    "qwen3_5_native_attention plus "
-                    "qwen3_5_native_attention_backward."
+                    "attention.enabled plus attention.backward.enabled."
                 )
 
             patch_sage_fp4_attn()
@@ -516,7 +515,8 @@ class PatchManager:
         if self.cfg.model_config_type not in ("qwen3_5", "qwen3_5_moe"):
             return
 
-        if getattr(nvfp4, "qwen3_5_native_attention", False):
+        attn = nvfp4.attention
+        if attn.enabled:
             from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
                 patch_qwen3_5_nvfp4_attention,
             )
@@ -524,42 +524,25 @@ class PatchManager:
             patch_qwen3_5_nvfp4_attention(
                 model,
                 fuse_vproj=(
-                    self.inference
-                    if getattr(nvfp4, "qwen3_5_fuse_vproj", None) is None
-                    else nvfp4.qwen3_5_fuse_vproj
+                    self.inference if attn.fuse_vproj is None else attn.fuse_vproj
                 ),
-                train_backward=getattr(
-                    nvfp4, "qwen3_5_native_attention_backward", False
-                ),
-                backward_rtn_grad_packs=getattr(
-                    nvfp4,
-                    "qwen3_5_native_attention_backward_rtn_grad_packs",
-                    False,
-                ),
-                save_backward_packs=getattr(
-                    nvfp4,
-                    "qwen3_5_native_attention_save_backward_packs",
-                    False,
-                ),
-                dkdv_scratch_bf16=getattr(
-                    nvfp4,
-                    "qwen3_5_native_attention_dkdv_scratch_bf16",
-                    False,
-                ),
-                compile_custom_op=bool(
-                    getattr(nvfp4, "qwen3_5_native_attention_compile_custom_op", False)
-                ),
+                fuse_attn_proj=attn.fp4_projections,
+                train_backward=attn.backward.enabled,
+                backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
+                save_backward_packs=attn.backward.save_packs,
+                dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
+                compile_custom_op=bool(attn.backward.compile_custom_op),
                 stochastic_rounding=nvfp4.stochastic_rounding,
             )
 
-        if getattr(nvfp4, "qwen3_5_native_linear_attn", False):
+        if nvfp4.linear_attn:
             from axolotl.monkeypatch.attention.nvfp4_linear_attn import (
                 patch_qwen3_5_nvfp4_linear_attn,
             )
 
             patch_qwen3_5_nvfp4_linear_attn(model)
 
-        if getattr(nvfp4, "qwen3_5_native_mlp", False):
+        if nvfp4.mlp:
             from axolotl.monkeypatch.attention.nvfp4_mlp import (
                 patch_qwen3_5_nvfp4_mlp,
             )
@@ -962,11 +945,7 @@ class PatchManager:
                     fla_causal_conv_compile_boundary=bool(
                         nvfp4
                         and nvfp4.enabled
-                        and getattr(
-                            nvfp4,
-                            "qwen3_5_fla_causal_conv_compile_boundary",
-                            False,
-                        )
+                        and nvfp4.fla_causal_conv_compile_boundary
                     )
                 )
 
@@ -980,11 +959,7 @@ class PatchManager:
                     fla_causal_conv_compile_boundary=bool(
                         nvfp4
                         and nvfp4.enabled
-                        and getattr(
-                            nvfp4,
-                            "qwen3_5_fla_causal_conv_compile_boundary",
-                            False,
-                        )
+                        and nvfp4.fla_causal_conv_compile_boundary
                     )
                 )
 
