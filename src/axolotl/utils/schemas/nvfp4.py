@@ -277,11 +277,14 @@ class NVFP4TrainingConfig(BaseModel):
     qwen3_5_native_attention_compile_custom_op: bool = Field(
         default=False,
         json_schema_extra={
-            "description": "Qwen3.5 native attention inference only. Route the "
-            "packed NVFP4 flash-attention call through an opaque torch custom op "
-            "as a torch.compile compatibility escape hatch when the internal "
-            "Triton tl.dot_scaled kernel cannot be captured. This is not a proven "
-            "speed knob; OFF by default."
+            "description": "Route the native NVFP4 flash-attention call through an "
+            "opaque torch custom op as a torch.compile compatibility escape hatch "
+            "when the internal Triton tl.dot_scaled kernel cannot be captured. On "
+            "the no-grad path this wraps the packed forward op; with "
+            "qwen3_5_native_attention_backward it wraps a DIFFERENTIABLE custom op "
+            "(forward + registered native-NVFP4 backward) so Inductor compiles "
+            "around the whole attention instead of falling the backward subgraph "
+            "back to eager. Not a proven speed knob; OFF by default."
         },
     )
     qwen3_5_fla_causal_conv_compile_boundary: bool = Field(

@@ -225,41 +225,70 @@ def make_nvfp4_forward(orig_forward):
                         self, hidden_states, position_embeddings, attention_mask,
                         past_key_values, **kwargs,
                     )
+                # Break the Inductor graph on BOTH sides of the FP4 attention block.
+                # Fused with the FP4 plugin's quantized q/k/v/o_proj autograd, the
+                # surrounding compiled backward miscompiles (param grads spike ~1e5
+                # -> NaN). The op stays opaque (no InductorError, no bwd eager
+                # fallback); the breaks just give it the eager boundary the
+                # eager-fallback baseline already gets. Rest of the model still compiles.
+                if _custom_op_enabled(self):
+                    torch._dynamo.graph_break()
                 value_states = (
                     self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                 )
                 query_roped, key_roped = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin
                 )
-                attn_output = nvfp4_flash_attn_func(
-                    query_roped,
-                    key_roped,
-                    value_states,
-                    self.scaling,
-                    causal=(kind == "causal"),
-                    num_key_value_groups=query_states.shape[1] // key_states.shape[1],
-                    stochastic_rounding=getattr(
-                        self, "_nvfp4_stochastic_rounding", True
-                    ),
-                    backward_p_dv_stochastic_rounding=(
-                        getattr(self, "_nvfp4_stochastic_rounding", True)
-                        and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
-                    ),
-                    backward_dot_dv_stochastic_rounding=(
-                        getattr(self, "_nvfp4_stochastic_rounding", True)
-                        and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
-                    ),
-                    backward_ds_dq_stochastic_rounding=(
-                        getattr(self, "_nvfp4_stochastic_rounding", True)
-                        and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
-                    ),
-                    save_backward_packs=getattr(
-                        self, "_nvfp4_save_backward_packs", False
-                    ),
-                    dkdv_scratch_bf16=getattr(
-                        self, "_nvfp4_dkdv_scratch_bf16", False
-                    ),
-                ).transpose(1, 2)
+                sr = getattr(self, "_nvfp4_stochastic_rounding", True)
+                grad_sr = sr and not getattr(
+                    self, "_nvfp4_backward_rtn_grad_packs", False
+                )
+                ng = query_states.shape[1] // key_states.shape[1]
+                if _custom_op_enabled(self):
+                    # Differentiable opaque custom op: Inductor compiles AROUND the
+                    # whole native-NVFP4 attention (fwd + registered native-NVFP4
+                    # bwd) instead of tracing tl.dot_scaled and silently falling the
+                    # bwd subgraph back to eager. Same grads as nvfp4_flash_attn_func.
+                    from axolotl.kernels.attn_nvfp4_custom_op import (
+                        nvfp4_flash_attn_train_custom_op,
+                    )
+
+                    attn_output = nvfp4_flash_attn_train_custom_op(
+                        query_roped,
+                        key_roped,
+                        value_states,
+                        self.scaling,
+                        causal=(kind == "causal"),
+                        num_key_value_groups=ng,
+                        stochastic_rounding=sr,
+                        backward_p_dv_stochastic_rounding=grad_sr,
+                        backward_dot_dv_stochastic_rounding=grad_sr,
+                        backward_ds_dq_stochastic_rounding=grad_sr,
+                        dkdv_scratch_bf16=getattr(
+                            self, "_nvfp4_dkdv_scratch_bf16", False
+                        ),
+                    ).transpose(1, 2)
+                    # trailing half of the isolating break (see the leading one above)
+                    torch._dynamo.graph_break()
+                else:
+                    attn_output = nvfp4_flash_attn_func(
+                        query_roped,
+                        key_roped,
+                        value_states,
+                        self.scaling,
+                        causal=(kind == "causal"),
+                        num_key_value_groups=ng,
+                        stochastic_rounding=sr,
+                        backward_p_dv_stochastic_rounding=grad_sr,
+                        backward_dot_dv_stochastic_rounding=grad_sr,
+                        backward_ds_dq_stochastic_rounding=grad_sr,
+                        save_backward_packs=getattr(
+                            self, "_nvfp4_save_backward_packs", False
+                        ),
+                        dkdv_scratch_bf16=getattr(
+                            self, "_nvfp4_dkdv_scratch_bf16", False
+                        ),
+                    ).transpose(1, 2)
             else:
                 # Write roped K/V to the cache so subsequent decode steps see prefill
                 # context, then run NVFP4 on the same roped K/V.
