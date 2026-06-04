@@ -64,7 +64,9 @@ class _BF16FusedCrossEntropy(torch.autograd.Function):
         valid = labels != ignore_index
         safe_labels = torch.where(valid, labels, labels.new_zeros(()))
 
-        running_max = torch.full((M,), float("-inf"), device=device, dtype=torch.float32)
+        running_max = torch.full(
+            (M,), float("-inf"), device=device, dtype=torch.float32
+        )
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
 

@@ -1,3 +1,4 @@
+# mypy: disable-error-code="assignment, misc"
 """NVFP4-GEMM training: real FP4 forward + backward GEMMs on Blackwell.
 
 This is a throughput feature, not a memory feature: master weights and
@@ -24,8 +25,8 @@ import logging
 from dataclasses import dataclass
 
 import torch
-from torch import nn
 import triton
+from torch import nn
 from triton import language as tl
 
 LOG = logging.getLogger(__name__)
@@ -482,7 +483,9 @@ class NVFP4FrozenBaseFunction(torch.autograd.Function):
             # GEMM (the stored layout is quantized along K for the forward).
             w_hp = w_q.dequantize(torch.bfloat16)
             grad_x = _fp4_mm(
-                g_p, w_hp, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding),
+                g_p,
+                w_hp,
+                QuantPolicy(stochastic=ctx.recipe.stochastic_rounding),
                 QuantPolicy(),
             )[:m]
             grad_x = grad_x.reshape(ctx.x_shape)
@@ -521,7 +524,11 @@ def _fsdp_nvfp4_class():
             ctx, per_tensor_scale = metadata
             if out is not None:
                 return
-            inner = {"qdata": qdata, "scale": scale, "per_tensor_scale": per_tensor_scale}
+            inner = {
+                "qdata": qdata,
+                "scale": scale,
+                "per_tensor_scale": per_tensor_scale,
+            }
             rebuilt = type(self).__tensor_unflatten__(inner, ctx, None, None)
             return rebuilt, (qdata, scale)
 
@@ -776,9 +783,9 @@ class NVFP4ComputeBaseFunction(torch.autograd.Function):
             g_p, m = _pad_to_block(g, 0)
             # dgrad: gx[M,K] = g[M,N] @ W[N,K]; W pre-quantized along N (contraction)
             g_q = _quantize(g_p, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding))
-            grad_x = _addmm_nvfp4_dispatch(
-                g_q, ctx.w_dgrad, torch.ops.aten.mm.default
-            )[:m]
+            grad_x = _addmm_nvfp4_dispatch(g_q, ctx.w_dgrad, torch.ops.aten.mm.default)[
+                :m
+            ]
             grad_x = grad_x.reshape(ctx.x_shape)
         return grad_x, None, None, None
 
@@ -803,9 +810,7 @@ class NVFP4ComputeBaseLinear(nn.Module):
         self.out_features = w_fprop.shape[1]
 
     def forward(self, x):
-        out = NVFP4ComputeBaseFunction.apply(
-            x, self.w_fprop, self.w_dgrad, self.recipe
-        )
+        out = NVFP4ComputeBaseFunction.apply(x, self.w_fprop, self.w_dgrad, self.recipe)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -932,13 +937,29 @@ def _recipe_load_lane(
     else:
         mask = None
         other = None
-    return tl.load(x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=other).to(tl.float32)
+    return tl.load(
+        x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=other
+    ).to(tl.float32)
 
 
 @triton.jit
 def _recipe_hadamard16(
-    x0, x1, x2, x3, x4, x5, x6, x7,
-    x8, x9, x10, x11, x12, x13, x14, x15,
+    x0,
+    x1,
+    x2,
+    x3,
+    x4,
+    x5,
+    x6,
+    x7,
+    x8,
+    x9,
+    x10,
+    x11,
+    x12,
+    x13,
+    x14,
+    x15,
 ):
     a0 = x0 + x1
     a1 = x0 - x1
@@ -1030,8 +1051,22 @@ def _recipe_hadamard16(
 
 @triton.jit
 def _recipe_lane_amax(
-    y0, y1, y2, y3, y4, y5, y6, y7,
-    y8, y9, y10, y11, y12, y13, y14, y15,
+    y0,
+    y1,
+    y2,
+    y3,
+    y4,
+    y5,
+    y6,
+    y7,
+    y8,
+    y9,
+    y10,
+    y11,
+    y12,
+    y13,
+    y14,
+    y15,
 ):
     a = tl.maximum(tl.abs(y0), tl.abs(y1))
     a = tl.maximum(a, tl.abs(y2))
@@ -1070,26 +1105,60 @@ def _recipe_rht_amax_kernel(
     if USE_INT64_INDEXING:
         offs_m = offs_m.to(tl.int64)
 
-    x0 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 0, USE_MASK)
-    x1 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 1, USE_MASK)
-    x2 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 2, USE_MASK)
-    x3 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 3, USE_MASK)
-    x4 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 4, USE_MASK)
-    x5 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 5, USE_MASK)
-    x6 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 6, USE_MASK)
-    x7 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 7, USE_MASK)
-    x8 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 8, USE_MASK)
-    x9 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 9, USE_MASK)
-    x10 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 10, USE_MASK)
-    x11 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 11, USE_MASK)
-    x12 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 12, USE_MASK)
-    x13 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 13, USE_MASK)
-    x14 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 14, USE_MASK)
-    x15 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 15, USE_MASK)
+    x0 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 0, USE_MASK
+    )
+    x1 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 1, USE_MASK
+    )
+    x2 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 2, USE_MASK
+    )
+    x3 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 3, USE_MASK
+    )
+    x4 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 4, USE_MASK
+    )
+    x5 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 5, USE_MASK
+    )
+    x6 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 6, USE_MASK
+    )
+    x7 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 7, USE_MASK
+    )
+    x8 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 8, USE_MASK
+    )
+    x9 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 9, USE_MASK
+    )
+    x10 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 10, USE_MASK
+    )
+    x11 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 11, USE_MASK
+    )
+    x12 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 12, USE_MASK
+    )
+    x13 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 13, USE_MASK
+    )
+    x14 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 14, USE_MASK
+    )
+    x15 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 15, USE_MASK
+    )
 
     if HADAMARD:
-        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15 = _recipe_hadamard16(
-            x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15
+        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15 = (
+            _recipe_hadamard16(
+                x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15
+            )
         )
     else:
         y0, y1, y2, y3, y4, y5, y6, y7 = x0, x1, x2, x3, x4, x5, x6, x7
@@ -1102,7 +1171,9 @@ def _recipe_rht_amax_kernel(
 
 
 @triton.jit
-def _recipe_norm_lane(y, scales, global_scale, seed, base_off, lane_off, STOCHASTIC: tl.constexpr):
+def _recipe_norm_lane(
+    y, scales, global_scale, seed, base_off, lane_off, STOCHASTIC: tl.constexpr
+):
     yn = y * (global_scale / scales.to(tl.float32))
     if STOCHASTIC:
         ax = tl.abs(yn)
@@ -1151,26 +1222,60 @@ def _recipe_quantize_kernel(
     if USE_INT64_INDEXING:
         offs_m = offs_m.to(tl.int64)
 
-    x0 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 0, USE_MASK)
-    x1 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 1, USE_MASK)
-    x2 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 2, USE_MASK)
-    x3 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 3, USE_MASK)
-    x4 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 4, USE_MASK)
-    x5 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 5, USE_MASK)
-    x6 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 6, USE_MASK)
-    x7 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 7, USE_MASK)
-    x8 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 8, USE_MASK)
-    x9 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 9, USE_MASK)
-    x10 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 10, USE_MASK)
-    x11 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 11, USE_MASK)
-    x12 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 12, USE_MASK)
-    x13 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 13, USE_MASK)
-    x14 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 14, USE_MASK)
-    x15 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 15, USE_MASK)
+    x0 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 0, USE_MASK
+    )
+    x1 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 1, USE_MASK
+    )
+    x2 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 2, USE_MASK
+    )
+    x3 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 3, USE_MASK
+    )
+    x4 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 4, USE_MASK
+    )
+    x5 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 5, USE_MASK
+    )
+    x6 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 6, USE_MASK
+    )
+    x7 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 7, USE_MASK
+    )
+    x8 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 8, USE_MASK
+    )
+    x9 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 9, USE_MASK
+    )
+    x10 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 10, USE_MASK
+    )
+    x11 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 11, USE_MASK
+    )
+    x12 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 12, USE_MASK
+    )
+    x13 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 13, USE_MASK
+    )
+    x14 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 14, USE_MASK
+    )
+    x15 = _recipe_load_lane(
+        x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 15, USE_MASK
+    )
 
     if HADAMARD:
-        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15 = _recipe_hadamard16(
-            x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15
+        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15 = (
+            _recipe_hadamard16(
+                x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15
+            )
         )
     else:
         y0, y1, y2, y3, y4, y5, y6, y7 = x0, x1, x2, x3, x4, x5, x6, x7
@@ -1189,28 +1294,62 @@ def _recipe_quantize_kernel(
         scales = tl.where(scale_mask, scales, 0.0)
 
     offs_m_in_layout = (pid_m * M_PER_BLOCK % 128) + tl.arange(0, M_PER_BLOCK)[:, None]
-    layout_off = ((pid_m * M_PER_BLOCK) // 128) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
+    layout_off = (
+        (pid_m * M_PER_BLOCK) // 128
+    ) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
     scale_offs = layout_off + _recipe_scale_swizzle(offs_m_in_layout)
     tl.store(s_ptr + scale_offs, scales)
 
     row_base = offs_m * N
     col_base = pid_n * 64 + group * 16
-    n0 = _recipe_norm_lane(y0, scales, global_scale, seed, row_base + col_base, 0, STOCHASTIC)
-    n1 = _recipe_norm_lane(y1, scales, global_scale, seed, row_base + col_base, 1, STOCHASTIC)
-    n2 = _recipe_norm_lane(y2, scales, global_scale, seed, row_base + col_base, 2, STOCHASTIC)
-    n3 = _recipe_norm_lane(y3, scales, global_scale, seed, row_base + col_base, 3, STOCHASTIC)
-    n4 = _recipe_norm_lane(y4, scales, global_scale, seed, row_base + col_base, 4, STOCHASTIC)
-    n5 = _recipe_norm_lane(y5, scales, global_scale, seed, row_base + col_base, 5, STOCHASTIC)
-    n6 = _recipe_norm_lane(y6, scales, global_scale, seed, row_base + col_base, 6, STOCHASTIC)
-    n7 = _recipe_norm_lane(y7, scales, global_scale, seed, row_base + col_base, 7, STOCHASTIC)
-    n8 = _recipe_norm_lane(y8, scales, global_scale, seed, row_base + col_base, 8, STOCHASTIC)
-    n9 = _recipe_norm_lane(y9, scales, global_scale, seed, row_base + col_base, 9, STOCHASTIC)
-    n10 = _recipe_norm_lane(y10, scales, global_scale, seed, row_base + col_base, 10, STOCHASTIC)
-    n11 = _recipe_norm_lane(y11, scales, global_scale, seed, row_base + col_base, 11, STOCHASTIC)
-    n12 = _recipe_norm_lane(y12, scales, global_scale, seed, row_base + col_base, 12, STOCHASTIC)
-    n13 = _recipe_norm_lane(y13, scales, global_scale, seed, row_base + col_base, 13, STOCHASTIC)
-    n14 = _recipe_norm_lane(y14, scales, global_scale, seed, row_base + col_base, 14, STOCHASTIC)
-    n15 = _recipe_norm_lane(y15, scales, global_scale, seed, row_base + col_base, 15, STOCHASTIC)
+    n0 = _recipe_norm_lane(
+        y0, scales, global_scale, seed, row_base + col_base, 0, STOCHASTIC
+    )
+    n1 = _recipe_norm_lane(
+        y1, scales, global_scale, seed, row_base + col_base, 1, STOCHASTIC
+    )
+    n2 = _recipe_norm_lane(
+        y2, scales, global_scale, seed, row_base + col_base, 2, STOCHASTIC
+    )
+    n3 = _recipe_norm_lane(
+        y3, scales, global_scale, seed, row_base + col_base, 3, STOCHASTIC
+    )
+    n4 = _recipe_norm_lane(
+        y4, scales, global_scale, seed, row_base + col_base, 4, STOCHASTIC
+    )
+    n5 = _recipe_norm_lane(
+        y5, scales, global_scale, seed, row_base + col_base, 5, STOCHASTIC
+    )
+    n6 = _recipe_norm_lane(
+        y6, scales, global_scale, seed, row_base + col_base, 6, STOCHASTIC
+    )
+    n7 = _recipe_norm_lane(
+        y7, scales, global_scale, seed, row_base + col_base, 7, STOCHASTIC
+    )
+    n8 = _recipe_norm_lane(
+        y8, scales, global_scale, seed, row_base + col_base, 8, STOCHASTIC
+    )
+    n9 = _recipe_norm_lane(
+        y9, scales, global_scale, seed, row_base + col_base, 9, STOCHASTIC
+    )
+    n10 = _recipe_norm_lane(
+        y10, scales, global_scale, seed, row_base + col_base, 10, STOCHASTIC
+    )
+    n11 = _recipe_norm_lane(
+        y11, scales, global_scale, seed, row_base + col_base, 11, STOCHASTIC
+    )
+    n12 = _recipe_norm_lane(
+        y12, scales, global_scale, seed, row_base + col_base, 12, STOCHASTIC
+    )
+    n13 = _recipe_norm_lane(
+        y13, scales, global_scale, seed, row_base + col_base, 13, STOCHASTIC
+    )
+    n14 = _recipe_norm_lane(
+        y14, scales, global_scale, seed, row_base + col_base, 14, STOCHASTIC
+    )
+    n15 = _recipe_norm_lane(
+        y15, scales, global_scale, seed, row_base + col_base, 15, STOCHASTIC
+    )
 
     q0 = _recipe_fp32_to_fp4_packed((n0, n1))
     q1 = _recipe_fp32_to_fp4_packed((n2, n3))
@@ -1632,9 +1771,9 @@ class NVFP4FastFrozenBaseFunction(torch.autograd.Function):
                 gp, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding)
             )
             wdq, wdsc, wd_inv = _mslk_quantize(w_hp.t().contiguous())  # B = W.t()
-            grad_x = _mslk_scaled_mm(
-                gq, gsc, g_inv, wdq, wdsc, wd_inv, grad_out.dtype
-            )[:m]
+            grad_x = _mslk_scaled_mm(gq, gsc, g_inv, wdq, wdsc, wd_inv, grad_out.dtype)[
+                :m
+            ]
             grad_x = grad_x.reshape(ctx.x_shape)
         return grad_x, None, None, None, None, None, None
 
@@ -1753,7 +1892,11 @@ def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
     elif isinstance(base, NVFP4FastFrozenBaseLinear):
         # single FP4 layout: dequantize the stored weight for the dgrad GEMM.
         w_hp = _mslk_dequant(
-            base.wq, base.wsc, base.w_inv, (base.out_features, base.in_features), g.dtype
+            base.wq,
+            base.wsc,
+            base.w_inv,
+            (base.out_features, base.in_features),
+            g.dtype,
         )
         out = _fp4_mm(gp, w_hp, sr, QuantPolicy())
     elif isinstance(base, NVFP4FrozenBaseLinear):
@@ -1768,8 +1911,7 @@ def _is_swappable(module: nn.Linear) -> bool:
     # the _scaled_mm packed-contraction rule (logical %32, not just block %16) —
     # an out_features of 16 packs to 8 and trips "trailing dim divisible by 16".
     return (
-        module.in_features % _GEMM_ALIGN == 0
-        and module.out_features % _GEMM_ALIGN == 0
+        module.in_features % _GEMM_ALIGN == 0 and module.out_features % _GEMM_ALIGN == 0
     )
 
 
@@ -2117,9 +2259,7 @@ def swap_tied_embedding_and_lm_head_to_nvfp4(
     tied_head = NVFP4TiedLMHead(new_embed, lm_head_bias, recipe)
     _set_submodule(model, lm_head_name, tied_head)
     _dynamo_disable_forward(tied_head)
-    LOG.info(
-        "NVFP4 training: tied embedding/lm_head quantized once (shared FP4 store)"
-    )
+    LOG.info("NVFP4 training: tied embedding/lm_head quantized once (shared FP4 store)")
     return True
 
 
@@ -2220,8 +2360,7 @@ def convert_vision_tower_to_nvfp4(
         _stream_quantize_swap(vt, name, module, build)
         swapped += 1
     LOG.info(
-        "nvfp4_training.quantize_vision_tower: swapped %d linears under %s "
-        "(mode=%s)",
+        "nvfp4_training.quantize_vision_tower: swapped %d linears under %s (mode=%s)",
         swapped,
         vt_name,
         base_mode,
@@ -2323,7 +2462,6 @@ def convert_lora_base_to_te_nvfp4(
     constraint. Weights are copied in; dims must be divisible by 16.
     """
     import transformer_engine.pytorch as te
-
     from peft.tuners.lora import Linear as LoraLinear
 
     recipe = recipe or NVFP4Recipe()
@@ -2394,9 +2532,7 @@ def convert_lora_base_to_nvfp4(
     # plus one transient layer. Weights already on the GPU are quantized in place.
     # A materialized named_modules() list would pin every base_layer and defeat
     # the per-layer free, so keep only the lora.Linear references.
-    target = (
-        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    )
+    target = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     lora_modules = [
         (n, m) for n, m in model.named_modules() if isinstance(m, LoraLinear)
     ]
@@ -2570,7 +2706,7 @@ def load_nvfp4_packed(model: nn.Module, model_dir) -> int:
     path = os.path.join(str(model_dir), NVFP4_PACKED_SIDECAR)
     if not os.path.isfile(path):
         return 0
-    packed = torch.load(path, weights_only=False, map_location="cpu")
+    packed = torch.load(path, weights_only=False, map_location="cpu")  # nosec B614
     by_module: dict[str, dict] = {}
     for key, tensor in packed.items():
         mod_name, buf_name = key.rsplit(".", 1)
@@ -2604,7 +2740,5 @@ def load_nvfp4_packed(model: nn.Module, model_dir) -> int:
             else:
                 module.register_buffer(bname, tensor)
             restored += 1
-    LOG.info(
-        "NVFP4 save_nvfp4: restored %d packed tensor(s) from %s", restored, path
-    )
+    LOG.info("NVFP4 save_nvfp4: restored %d packed tensor(s) from %s", restored, path)
     return restored

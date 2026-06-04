@@ -398,10 +398,19 @@ class NVFP4TrainingConfig(BaseModel):
             "qwen3_5_native_attention": ("enabled",),
             "qwen3_5_fuse_vproj": ("fuse_vproj",),
             "qwen3_5_native_attention_backward": ("backward", "enabled"),
-            "qwen3_5_native_attention_backward_rtn_grad_packs": ("backward", "rtn_grad_packs"),
+            "qwen3_5_native_attention_backward_rtn_grad_packs": (
+                "backward",
+                "rtn_grad_packs",
+            ),
             "qwen3_5_native_attention_save_backward_packs": ("backward", "save_packs"),
-            "qwen3_5_native_attention_dkdv_scratch_bf16": ("backward", "dkdv_scratch_bf16"),
-            "qwen3_5_native_attention_compile_custom_op": ("backward", "compile_custom_op"),
+            "qwen3_5_native_attention_dkdv_scratch_bf16": (
+                "backward",
+                "dkdv_scratch_bf16",
+            ),
+            "qwen3_5_native_attention_compile_custom_op": (
+                "backward",
+                "compile_custom_op",
+            ),
         }
         top_map = {
             "qwen3_5_native_linear_attn": "linear_attn",

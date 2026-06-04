@@ -1,3 +1,4 @@
+# mypy: disable-error-code="arg-type"
 """Fused RMSNorm -> NVFP4 quantization for consumer Blackwell (sm_120).
 
 MSLK ships a fused rms+quant kernel (`triton_scale_nvfp4_quant_rms`) but it uses a
@@ -268,10 +269,11 @@ class NVFP4FusedRMSNorm(nn.Module):
         w = norm.weight
         with torch.no_grad():
             x = torch.randn(8, w.shape[-1], device=w.device, dtype=w.dtype)
-            normed = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+            normed = x.float() * torch.rsqrt(
+                x.float().pow(2).mean(-1, keepdim=True) + eps
+            )
             y = norm(x).float()
             e_plain = (y - normed * w.float()).abs().mean()
             e_zc = (y - normed * (1.0 + w.float())).abs().mean()
             zero_centered = bool(e_zc < e_plain)
         return cls(w, eps, zero_centered)
-

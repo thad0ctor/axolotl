@@ -57,9 +57,9 @@ _CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
 
 
 def _custom_op_enabled(module: nn.Module) -> bool:
-    requested = getattr(
-        module, "_nvfp4_compile_custom_op", False
-    ) or os.environ.get(_CUSTOM_OP_ENV, "").lower() in {"1", "true", "yes"}
+    requested = getattr(module, "_nvfp4_compile_custom_op", False) or os.environ.get(
+        _CUSTOM_OP_ENV, ""
+    ).lower() in {"1", "true", "yes"}
     return bool(requested) and torch.compiler.is_compiling()
 
 
@@ -73,9 +73,7 @@ def _causal_tril(q_len: int, kv_len: int, device: torch.device) -> torch.Tensor:
     key = (q_len, kv_len, device)
     t = _TRIL_CACHE.get(key)
     if t is None:
-        t = torch.tril(
-            torch.ones(q_len, kv_len, dtype=torch.bool, device=device)
-        )
+        t = torch.tril(torch.ones(q_len, kv_len, dtype=torch.bool, device=device))
         _TRIL_CACHE[key] = t
     return t
 
@@ -150,10 +148,10 @@ def _can_fuse_vproj(module: nn.Module) -> bool:
 
 def _nvfp4_attention(
     module: nn.Module,
-    query_states: torch.Tensor,   # [Z, H, S, D]  post q_norm, PRE-RoPE
-    key_states: torch.Tensor,     # [Z, Hk, S, D] post k_norm, PRE-RoPE
-    value_states: torch.Tensor,   # [Z, Hk, Skv, D]
-    cos: torch.Tensor,            # [Z, S, rotary_dim]
+    query_states: torch.Tensor,  # [Z, H, S, D]  post q_norm, PRE-RoPE
+    key_states: torch.Tensor,  # [Z, Hk, S, D] post k_norm, PRE-RoPE
+    value_states: torch.Tensor,  # [Z, Hk, Skv, D]
+    cos: torch.Tensor,  # [Z, S, rotary_dim]
     sin: torch.Tensor,
     scaling: float,
     causal: bool,
@@ -183,8 +181,18 @@ def _nvfp4_attention(
         # The compile custom op keeps the [Z, H, S, D] schema (its registered op /
         # fake are layout-fixed), so the transpose stays on the compiled path.
         out = nvfp4_flash_attention_packed_custom_op(
-            qnv, qsc, knv, ksc, vnv, vsc,
-            z=z, h=h, hk=hk, s_q=s_q, s_kv=s_kv, d=d,
+            qnv,
+            qsc,
+            knv,
+            ksc,
+            vnv,
+            vsc,
+            z=z,
+            h=h,
+            hk=hk,
+            s_q=s_q,
+            s_kv=s_kv,
+            d=d,
             scaling=scaling,
             out_dtype=query_states.dtype,
             causal=causal,
@@ -195,8 +203,18 @@ def _nvfp4_attention(
     # Eager path: the kernel writes the [Z, S, H, D] HF attn_output layout directly,
     # so the per-layer transpose(1,2)+contiguous copy at the caller is eliminated.
     return nvfp4_flash_attention_packed(
-        qnv, qsc, knv, ksc, vnv, vsc,
-        z=z, h=h, hk=hk, s_q=s_q, s_kv=s_kv, d=d,
+        qnv,
+        qsc,
+        knv,
+        ksc,
+        vnv,
+        vsc,
+        z=z,
+        h=h,
+        hk=hk,
+        s_q=s_q,
+        s_kv=s_kv,
+        d=d,
         scaling=scaling,
         out_dtype=query_states.dtype,
         causal=causal,
@@ -276,6 +294,7 @@ def make_nvfp4_forward(orig_forward):
     ``train_backward`` was enabled at patch time, grad-enabled dense prefill uses
     the differentiable native-NVFP4 attention function.
     """
+
     def forward(
         self,
         hidden_states,
@@ -287,8 +306,12 @@ def make_nvfp4_forward(orig_forward):
         grad_enabled = torch.is_grad_enabled()
         if kwargs.get("output_attentions"):
             return orig_forward(
-                self, hidden_states, position_embeddings, attention_mask,
-                past_key_values, **kwargs,
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
             )
 
         input_shape = hidden_states.shape[:-1]
@@ -321,12 +344,15 @@ def make_nvfp4_forward(orig_forward):
         if use_fp4_qk:
             q_full, k_full = _nvfp4_qk_proj(self, hidden_states)
             query_states, gate = torch.chunk(
-                q_full.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1,
+                q_full.view(*input_shape, -1, self.head_dim * 2),
+                2,
+                dim=-1,
             )
         else:
             query_states, gate = torch.chunk(
                 self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
-                2, dim=-1,
+                2,
+                dim=-1,
             )
         gate = gate.reshape(*input_shape, -1)
 
@@ -351,8 +377,12 @@ def make_nvfp4_forward(orig_forward):
                     or past_key_values is not None
                 ):
                     return orig_forward(
-                        self, hidden_states, position_embeddings, attention_mask,
-                        past_key_values, **kwargs,
+                        self,
+                        hidden_states,
+                        position_embeddings,
+                        attention_mask,
+                        past_key_values,
+                        **kwargs,
                     )
                 # Break the Inductor graph on BOTH sides of the FP4 attention block.
                 # Fused with the FP4 plugin's quantized q/k/v/o_proj autograd, the
@@ -432,14 +462,18 @@ def make_nvfp4_forward(orig_forward):
                         self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                     )
                 if past_key_values is not None:
-                    k_roped, _ = apply_rotary_pos_emb(
-                        key_states, key_states, cos, sin
-                    )
+                    k_roped, _ = apply_rotary_pos_emb(key_states, key_states, cos, sin)
                     past_key_values.update(k_roped, value_states, self.layer_idx)
 
                 attn_output = _nvfp4_attention(
-                    self, query_states, key_states, value_states, cos, sin,
-                    self.scaling, causal=(kind == "causal"),
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    cos,
+                    sin,
+                    self.scaling,
+                    causal=(kind == "causal"),
                     hidden_states=hidden_states if fuse_v else None,
                 )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -449,8 +483,12 @@ def make_nvfp4_forward(orig_forward):
             return self.o_proj(attn_output), None
 
         return orig_forward(
-            self, hidden_states, position_embeddings, attention_mask,
-            past_key_values, **kwargs,
+            self,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values,
+            **kwargs,
         )
 
     return forward
@@ -517,7 +555,12 @@ def patch_qwen3_5_nvfp4_attention(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
         "save_backward_packs=%s, dkdv_scratch_bf16=%s, compile_custom_op=%s)",
-        patched, fuse_vproj, train_backward, backward_rtn_grad_packs,
-        save_backward_packs, dkdv_scratch_bf16, compile_custom_op,
+        patched,
+        fuse_vproj,
+        train_backward,
+        backward_rtn_grad_packs,
+        save_backward_packs,
+        dkdv_scratch_bf16,
+        compile_custom_op,
     )
     return patched

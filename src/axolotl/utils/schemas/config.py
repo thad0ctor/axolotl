@@ -59,9 +59,9 @@ from axolotl.utils.schemas.model import (
 )
 from axolotl.utils.schemas.multimodal import MultiModalConfig
 from axolotl.utils.schemas.nvfp4 import NVFP4TrainingConfig
-from axolotl.utils.schemas.sage import SageAttentionConfig
 from axolotl.utils.schemas.peft import LoraConfig, ReLoRAConfig
 from axolotl.utils.schemas.quantization import PTQConfig, QATConfig
+from axolotl.utils.schemas.sage import SageAttentionConfig
 from axolotl.utils.schemas.training import HyperparametersConfig, JaggedLRConfig
 from axolotl.utils.schemas.trl import TRLConfig
 from axolotl.utils.schemas.validation import ValidationMixin
@@ -1714,7 +1714,8 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
         if (
             model_config_type is not None
             and any(qwen3_5_native_flags)
-            and model_config_type not in (
+            and model_config_type
+            not in (
                 "qwen3_5",
                 "qwen3_5_moe",
             )
@@ -1772,9 +1773,11 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
         # The standard fused linear cross-entropy kernel reads the lm_head weight
         # directly, bypassing the NVFP4 lm_head forward. The FP4-aware fused CE
         # path is the explicit opt-in exception.
-        if self.nvfp4_training.quantize_lm_head and getattr(
-            self, "cut_cross_entropy", None
-        ) and not self.nvfp4_training.fused_fp4_cross_entropy:
+        if (
+            self.nvfp4_training.quantize_lm_head
+            and getattr(self, "cut_cross_entropy", None)
+            and not self.nvfp4_training.fused_fp4_cross_entropy
+        ):
             raise ValueError(
                 "nvfp4_training.quantize_lm_head is incompatible with "
                 "cut_cross_entropy: the fused linear cross-entropy kernel consumes "

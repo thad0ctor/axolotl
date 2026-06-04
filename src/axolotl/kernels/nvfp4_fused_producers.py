@@ -27,7 +27,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
 from mslk.quantize.triton.fp4_quantize import convert_fp32_to_fp4_packed
 
 _E4M3_EPS = tl.constexpr(1.5258789e-05)
@@ -43,19 +42,32 @@ _F4_MAX = tl.constexpr(6.0)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _rope_quant_kernel(
-    x_ptr,            # [Z*H, S, D]  high-precision (normed) Q or K
-    cos_ptr, sin_ptr, # [Z, S, ROT]  (ROT = rotary_dim)
-    q_ptr, s_ptr,     # [Z*H, S, D//2] uint8, [Z*H, S, D//16] e4m3
-    Z, H, S,
-    s_xz, s_xh, s_xr,  # x: per-z, per-h, per-row(seq) strides; col(D) stride = 1
-    s_cz, s_cr,       # cos/sin: per-z stride, per-row stride; col stride = 1
-    s_qn, s_qr,       # q packed: per-(z*h) stride, per-row stride
-    s_sn, s_sr,       # scale: per-(z*h) stride, per-row stride
-    D: tl.constexpr, ROT: tl.constexpr, HALF: tl.constexpr,
+    x_ptr,  # [Z*H, S, D]  high-precision (normed) Q or K
+    cos_ptr,
+    sin_ptr,  # [Z, S, ROT]  (ROT = rotary_dim)
+    q_ptr,
+    s_ptr,  # [Z*H, S, D//2] uint8, [Z*H, S, D//16] e4m3
+    Z,
+    H,
+    S,
+    s_xz,
+    s_xh,
+    s_xr,  # x: per-z, per-h, per-row(seq) strides; col(D) stride = 1
+    s_cz,
+    s_cr,  # cos/sin: per-z stride, per-row stride; col stride = 1
+    s_qn,
+    s_qr,  # q packed: per-(z*h) stride, per-row stride
+    s_sn,
+    s_sr,  # scale: per-(z*h) stride, per-row stride
+    D: tl.constexpr,
+    ROT: tl.constexpr,
+    HALF: tl.constexpr,
     BLOCK_R: tl.constexpr,
-    DP2: tl.constexpr, DP16: tl.constexpr, NG: tl.constexpr,
+    DP2: tl.constexpr,
+    DP16: tl.constexpr,
+    NG: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)   # z*h
+    pid_n = tl.program_id(0)  # z*h
     pid_r = tl.program_id(1)
     z = pid_n // H
     h = pid_n % H
@@ -67,7 +79,8 @@ def _rope_quant_kernel(
     xbase = z * s_xz + h * s_xh
     x = tl.load(
         x_ptr + xbase + offs_r[:, None] * s_xr + offs_d[None, :],
-        mask=rmask[:, None], other=0.0,
+        mask=rmask[:, None],
+        other=0.0,
     ).to(tl.float32)
 
     # partial RoPE on the first ROT dims; tail [ROT, D) passes through unrotated.
@@ -77,7 +90,8 @@ def _rope_quant_kernel(
     partner = tl.where(is_low, offs_d + HALF, offs_d - HALF)
     xp = tl.load(
         x_ptr + xbase + offs_r[:, None] * s_xr + partner[None, :],
-        mask=rmask[:, None] & (partner[None, :] < ROT), other=0.0,
+        mask=rmask[:, None] & (partner[None, :] < ROT),
+        other=0.0,
     ).to(tl.float32)
     rot = tl.where(is_low, -xp, xp)
 
@@ -86,11 +100,13 @@ def _rope_quant_kernel(
     cd = tl.where(is_rot, offs_d, 0)
     cos = tl.load(
         cos_ptr + cbase + offs_r[:, None] * s_cr + cd[None, :],
-        mask=rmask[:, None], other=0.0,
+        mask=rmask[:, None],
+        other=0.0,
     ).to(tl.float32)
     sin = tl.load(
         sin_ptr + cbase + offs_r[:, None] * s_cr + cd[None, :],
-        mask=rmask[:, None], other=0.0,
+        mask=rmask[:, None],
+        other=0.0,
     ).to(tl.float32)
 
     x_rot = tl.where(is_rot[None, :], x * cos + rot * sin, x)
@@ -106,12 +122,14 @@ def _rope_quant_kernel(
     offs_qk = tl.arange(0, DP2)
     tl.store(
         q_ptr + pid_n * s_qn + offs_r[:, None] * s_qr + offs_qk[None, :],
-        qpk, mask=rmask[:, None],
+        qpk,
+        mask=rmask[:, None],
     )
     offs_sk = tl.arange(0, DP16)
     tl.store(
         s_ptr + pid_n * s_sn + offs_r[:, None] * s_sr + offs_sk[None, :],
-        sc.to(tl.uint8, bitcast=True), mask=rmask[:, None],
+        sc.to(tl.uint8, bitcast=True),
+        mask=rmask[:, None],
     )
 
 
@@ -146,15 +164,30 @@ def fused_rope_quant_qk(
     BLOCK_R = 64
     grid = (z * h, triton.cdiv(s, BLOCK_R))
     _rope_quant_kernel[grid](
-        x, cos, sin, q, sc,
-        z, h, s,
-        x.stride(0), x.stride(1), x.stride(2),
-        cos.stride(0), cos.stride(1),
-        q.stride(0), q.stride(1),
-        sc.stride(0), sc.stride(1),
-        D=d, ROT=rot, HALF=rot // 2,
+        x,
+        cos,
+        sin,
+        q,
+        sc,
+        z,
+        h,
+        s,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        cos.stride(0),
+        cos.stride(1),
+        q.stride(0),
+        q.stride(1),
+        sc.stride(0),
+        sc.stride(1),
+        D=d,
+        ROT=rot,
+        HALF=rot // 2,
         BLOCK_R=BLOCK_R,
-        DP2=d // 2, DP16=d // 16, NG=d // 16,
+        DP2=d // 2,
+        DP16=d // 16,
+        NG=d // 16,
     )
     return q, sc.view(torch.float8_e4m3fn)
 
@@ -193,18 +226,30 @@ def quant_v_keyaxis(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _vproj_pack_keyaxis_kernel(
-    xnv_ptr, xsc_ptr,          # [Z, S, K//2] uint8, [Z, S, K//16] e4m3  (activation)
-    wnv_ptr, wsc_ptr,          # [HK*D, K//2] uint8, [HK*D, K//16] e4m3  (Wv, [HK*D,K])
-    vnv_ptr, vsc_ptr,          # [Z*HK, D, S_pad//2] uint8, [Z*HK, D, S_pad//16] e4m3
-    S, S_pad, K,
-    sx_z, sx_s,                # x packed: per-z, per-row(seq) strides
-    ssc_z, ssc_s,              # x scale: per-z, per-row strides
-    sw_n,                      # weight packed row stride (= K//2); scale row = K//16
-    sv_d, svsc_d,              # vnv/vsc per-row(D) strides (= S_pad//2, S_pad//16)
-    HK: tl.constexpr, D: tl.constexpr,
-    BLOCK_S: tl.constexpr, BLOCK_K: tl.constexpr,
-    KP2: tl.constexpr, KP16: tl.constexpr,
-    SP2: tl.constexpr, SP16: tl.constexpr,   # BLOCK_S//2, BLOCK_S//16
+    xnv_ptr,
+    xsc_ptr,  # [Z, S, K//2] uint8, [Z, S, K//16] e4m3  (activation)
+    wnv_ptr,
+    wsc_ptr,  # [HK*D, K//2] uint8, [HK*D, K//16] e4m3  (Wv, [HK*D,K])
+    vnv_ptr,
+    vsc_ptr,  # [Z*HK, D, S_pad//2] uint8, [Z*HK, D, S_pad//16] e4m3
+    S,
+    S_pad,
+    K,
+    sx_z,
+    sx_s,  # x packed: per-z, per-row(seq) strides
+    ssc_z,
+    ssc_s,  # x scale: per-z, per-row strides
+    sw_n,  # weight packed row stride (= K//2); scale row = K//16
+    sv_d,
+    svsc_d,  # vnv/vsc per-row(D) strides (= S_pad//2, S_pad//16)
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    KP2: tl.constexpr,
+    KP16: tl.constexpr,
+    SP2: tl.constexpr,
+    SP16: tl.constexpr,  # BLOCK_S//2, BLOCK_S//16
 ):
     pid_z = tl.program_id(0)
     pid_hk = tl.program_id(1)
@@ -213,7 +258,7 @@ def _vproj_pack_keyaxis_kernel(
 
     offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     smask = offs_s < S
-    offs_d = tl.arange(0, D)              # this head's D output cols = W rows [hk*D, (hk+1)*D)
+    offs_d = tl.arange(0, D)  # this head's D output cols = W rows [hk*D, (hk+1)*D)
     wrow = pid_hk * D + offs_d
 
     acc = tl.zeros((BLOCK_S, D), dtype=tl.float32)
@@ -222,11 +267,13 @@ def _vproj_pack_keyaxis_kernel(
         offk16 = k0 // 16 + tl.arange(0, KP16)
         a = tl.load(
             xnv_ptr + pid_z * sx_z + offs_s[:, None] * sx_s + offk2[None, :],
-            mask=smask[:, None], other=0,
+            mask=smask[:, None],
+            other=0,
         )
         asc = tl.load(
             xsc_ptr + pid_z * ssc_z + offs_s[:, None] * ssc_s + offk16[None, :],
-            mask=smask[:, None], other=0,
+            mask=smask[:, None],
+            other=0,
         ).to(tl.float8e4nv, bitcast=True)
         w = tl.load(wnv_ptr + wrow[:, None] * sw_n + offk2[None, :])
         wsc = tl.load(
@@ -239,7 +286,7 @@ def _vproj_pack_keyaxis_kernel(
 
     # pack along the SEQ axis (group-16): transpose the [BLOCK_S, D] tile to [D, BLOCK_S]
     # so groups of 16 run down the seq axis, matching the V^T key-axis layout.
-    accT = tl.trans(acc)                     # [D, BLOCK_S]
+    accT = tl.trans(acc)  # [D, BLOCK_S]
     NG: tl.constexpr = BLOCK_S // 16
     xb = accT.reshape(D, NG, 16)
     amax = tl.max(tl.abs(xb), axis=2)
@@ -275,9 +322,9 @@ def prepack_vproj_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 
 
 def fused_vproj_quant_v_keyaxis(
-    hidden_states: torch.Tensor,   # [Z, S, hidden]
-    wnv: torch.Tensor,             # [HK*D, hidden//2] uint8  (prepacked v_proj weight)
-    wsc: torch.Tensor,             # [HK*D, hidden//16] e4m3
+    hidden_states: torch.Tensor,  # [Z, S, hidden]
+    wnv: torch.Tensor,  # [HK*D, hidden//2] uint8  (prepacked v_proj weight)
+    wsc: torch.Tensor,  # [HK*D, hidden//16] e4m3
     hk: int,
     d: int,
     block_n: int = 128,
@@ -310,18 +357,31 @@ def fused_vproj_quant_v_keyaxis(
 
     grid = (z, hk, triton.cdiv(s, block_s))
     _vproj_pack_keyaxis_kernel[grid](
-        xnv.view(torch.uint8), xsc,
-        wnv.view(torch.uint8), wsc.view(torch.uint8),
-        vnv, vsc,
-        s, s_pad, k,
-        xnv.stride(0), xnv.stride(1),
-        xsc.stride(0), xsc.stride(1),
+        xnv.view(torch.uint8),
+        xsc,
+        wnv.view(torch.uint8),
+        wsc.view(torch.uint8),
+        vnv,
+        vsc,
+        s,
+        s_pad,
+        k,
+        xnv.stride(0),
+        xnv.stride(1),
+        xsc.stride(0),
+        xsc.stride(1),
         wnv.stride(0),
-        vnv.stride(1), vsc.stride(1),
-        HK=hk, D=d,
-        BLOCK_S=block_s, BLOCK_K=block_k,
-        KP2=block_k // 2, KP16=block_k // 16,
-        SP2=block_s // 2, SP16=block_s // 16,
-        num_warps=num_warps, num_stages=num_stages,
+        vnv.stride(1),
+        vsc.stride(1),
+        HK=hk,
+        D=d,
+        BLOCK_S=block_s,
+        BLOCK_K=block_k,
+        KP2=block_k // 2,
+        KP16=block_k // 16,
+        SP2=block_s // 2,
+        SP16=block_s // 16,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return vnv, vsc.view(torch.float8_e4m3fn), s_pad

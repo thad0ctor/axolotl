@@ -606,11 +606,34 @@ def test_batched_qkv_matches_per_module(inplace):
         kA, kB = _lora_pair(ko, in_f, rank)
         vA, vB = _lora_pair(vo, in_f, rank)
         q, k, v = LoRA_QKV.apply(
-            X, None,
-            weights[0], None, None, qA, qB, 2.0, None, None,
-            weights[1], None, None, kA, kB, 2.0, None, None,
-            weights[2], None, None, vA, vB, 2.0, None, None,
-            inplace, batched,
+            X,
+            None,
+            weights[0],
+            None,
+            None,
+            qA,
+            qB,
+            2.0,
+            None,
+            None,
+            weights[1],
+            None,
+            None,
+            kA,
+            kB,
+            2.0,
+            None,
+            None,
+            weights[2],
+            None,
+            None,
+            vA,
+            vB,
+            2.0,
+            None,
+            None,
+            inplace,
+            batched,
         )
         loss = (q.float() ** 2).sum() + (k.float() ** 2).sum() + (v.float() ** 2).sum()
         loss.backward()
@@ -625,7 +648,7 @@ def test_batched_qkv_matches_per_module(inplace):
     assert torch.isfinite(o2).all() and torch.isfinite(x2).all()
     assert torch.equal(o1, o2)
     assert torch.equal(x1, x2)
-    for a, b in zip(g1, g2):
+    for a, b in zip(g1, g2, strict=False):
         assert torch.equal(a, b)
 
 
@@ -646,12 +669,36 @@ def test_batched_mlp_matches_per_module(inplace):
         uA, uB = _lora_pair(inter, in_f, rank)
         dA, dB = _lora_pair(in_f, inter, rank)
         out = LoRA_MLP.apply(
-            X, None,
-            gW, None, None, gA, gB, 2.0, None, None,
-            uW, None, None, uA, uB, 2.0, None, None,
-            dW, None, None, dA, dB, 2.0, None, None,
-            swiglu_forward, swiglu_backward,
-            inplace, batched,
+            X,
+            None,
+            gW,
+            None,
+            None,
+            gA,
+            gB,
+            2.0,
+            None,
+            None,
+            uW,
+            None,
+            None,
+            uA,
+            uB,
+            2.0,
+            None,
+            None,
+            dW,
+            None,
+            None,
+            dA,
+            dB,
+            2.0,
+            None,
+            None,
+            swiglu_forward,
+            swiglu_backward,
+            inplace,
+            batched,
         )
         (out.float() ** 2).sum().backward()
         return (
@@ -665,5 +712,5 @@ def test_batched_mlp_matches_per_module(inplace):
     assert torch.isfinite(o2).all() and torch.isfinite(x2).all()
     assert torch.equal(o1, o2)
     assert torch.equal(x1, x2)
-    for a, b in zip(g1, g2):
+    for a, b in zip(g1, g2, strict=False):
         assert torch.equal(a, b)

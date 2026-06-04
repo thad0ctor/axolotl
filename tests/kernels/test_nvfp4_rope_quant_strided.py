@@ -2,6 +2,7 @@
 view and produce BIT-IDENTICAL packs to the contiguous path — the invariant behind
 dropping the per-layer .contiguous() copy (prefill grab #2). The production caller
 passes q_norm(...).transpose(1,2), exactly this layout."""
+
 import pytest
 import torch
 
@@ -12,7 +13,9 @@ if cuda:
     from axolotl.kernels.nvfp4_fused_producers import fused_rope_quant_qk
 
 
-@pytest.mark.parametrize("Z,H,S,D", [(1, 16, 300, 256), (1, 8, 256, 128), (2, 4, 128, 256)])
+@pytest.mark.parametrize(
+    "Z,H,S,D", [(1, 16, 300, 256), (1, 8, 256, 128), (2, 4, 128, 256)]
+)
 def test_strided_matches_contiguous(Z, H, S, D):
     torch.manual_seed(0)
     rot = D
@@ -22,7 +25,7 @@ def test_strided_matches_contiguous(Z, H, S, D):
     cos = torch.randn(Z, S, rot, device="cuda", dtype=torch.bfloat16)
     sin = torch.randn(Z, S, rot, device="cuda", dtype=torch.bfloat16)
 
-    q_s, sc_s = fused_rope_quant_qk(x_t, cos, sin)               # strided (no copy)
+    q_s, sc_s = fused_rope_quant_qk(x_t, cos, sin)  # strided (no copy)
     q_c, sc_c = fused_rope_quant_qk(x_t.contiguous(), cos, sin)  # contiguous reference
 
     assert torch.equal(q_s, q_c), "packed FP4 differs between strided and contiguous"
@@ -36,10 +39,14 @@ def test_noncontiguous_d_falls_back():
     torch.manual_seed(0)
     Z, H, S, D = 1, 4, 64, 128
     # make D non-unit-stride by transposing S<->D, then take a view where D is dim 3
-    x = torch.randn(Z, H, D, S, device="cuda", dtype=torch.bfloat16).transpose(2, 3)  # [Z,H,S,D], D stride = S
+    x = torch.randn(Z, H, D, S, device="cuda", dtype=torch.bfloat16).transpose(
+        2, 3
+    )  # [Z,H,S,D], D stride = S
     assert x.stride(3) != 1
     cos = torch.randn(Z, S, D, device="cuda", dtype=torch.bfloat16)
     sin = torch.randn(Z, S, D, device="cuda", dtype=torch.bfloat16)
     q_fb, sc_fb = fused_rope_quant_qk(x, cos, sin)
     q_ref, sc_ref = fused_rope_quant_qk(x.contiguous(), cos, sin)
-    assert torch.equal(q_fb, q_ref) and torch.equal(sc_fb.view(torch.uint8), sc_ref.view(torch.uint8))
+    assert torch.equal(q_fb, q_ref) and torch.equal(
+        sc_fb.view(torch.uint8), sc_ref.view(torch.uint8)
+    )

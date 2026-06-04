@@ -1,7 +1,5 @@
 """Schema, gate, and (GPU-gated) end-to-end tests for nvfp4_training."""
 
-import os
-
 import pytest
 
 import axolotl.utils.nvfp4_training as nvfp4_mod
@@ -22,7 +20,12 @@ BASE = {
 # Capability gates live on AxolotlConfigWCapabilities; supply the two capability
 # blocks so the gate validator runs without touching real hardware.
 CAPS = {
-    "capabilities": {"bf16": True, "fp8": True, "n_gpu": 1, "compute_capability": "sm_120"},
+    "capabilities": {
+        "bf16": True,
+        "fp8": True,
+        "n_gpu": 1,
+        "compute_capability": "sm_120",
+    },
     "env_capabilities": {"torch_version": "2.8.0"},
 }
 
@@ -51,7 +54,9 @@ def test_schema_accepts_valid_nvfp4_config(monkeypatch):
 def test_schema_backend_defaults_native_and_accepts_te(monkeypatch):
     _supported(monkeypatch, True)
     assert (
-        AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True}).nvfp4_training.backend
+        AxolotlInputConfig(
+            **BASE, nvfp4_training={"enabled": True}
+        ).nvfp4_training.backend
         == "native"
     )
     cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True, "backend": "te"})
@@ -222,9 +227,7 @@ def test_gate_refuses_qwen3_5_switch_on_other_model(monkeypatch):
 def test_gate_refuses_unsupported_hardware(monkeypatch):
     _supported(monkeypatch, False, "no Blackwell here")
     with pytest.raises(ValueError, match="no Blackwell here"):
-        AxolotlConfigWCapabilities(
-            **BASE, **CAPS, nvfp4_training={"enabled": True}
-        )
+        AxolotlConfigWCapabilities(**BASE, **CAPS, nvfp4_training={"enabled": True})
 
 
 def test_gate_allows_lora(monkeypatch):
@@ -292,9 +295,7 @@ def test_gate_refuses_fp16(monkeypatch):
 
 def test_disabled_nvfp4_skips_gate(monkeypatch):
     _supported(monkeypatch, False, "should not be raised")
-    cfg = AxolotlConfigWCapabilities(
-        **BASE, **CAPS, nvfp4_training={"enabled": False}
-    )
+    cfg = AxolotlConfigWCapabilities(**BASE, **CAPS, nvfp4_training={"enabled": False})
     assert cfg.nvfp4_training.enabled is False
 
 
@@ -444,7 +445,6 @@ def test_qwen3_5_compile_custom_op_explicit_optout_under_torch_compile(monkeypat
 
 def _tiny_lora_model():
     """A 2-layer toy model wrapped with a PEFT LoRA adapter (CPU-friendly)."""
-    import torch
     from peft import LoraConfig, get_peft_model
     from torch import nn
 
@@ -486,9 +486,7 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
         captured.update(kwargs)
         return 1
 
-    monkeypatch.setattr(
-        nvfp4_flash_attn, "patch_qwen3_5_nvfp4_attention", fake_patch
-    )
+    monkeypatch.setattr(nvfp4_flash_attn, "patch_qwen3_5_nvfp4_attention", fake_patch)
     pm = _patch_manager(
         {
             "model_config_type": "qwen3_5",
@@ -563,26 +561,21 @@ def test_apply_selects_lora_compute_mode(monkeypatch):
     from axolotl.utils.nvfp4_training import (
         NVFP4ComputeBaseLinear,
         NVFP4FastComputeBaseLinear,
-        NVFP4FrozenBaseLinear,
         NVFP4FastFrozenBaseLinear,
+        NVFP4FrozenBaseLinear,
     )
 
     model = _tiny_lora_model()
-    pm = _patch_manager(
-        {"adapter": "lora", "nvfp4_training": {"enabled": True}}
-    )
+    pm = _patch_manager({"adapter": "lora", "nvfp4_training": {"enabled": True}})
     pm._apply_nvfp4_training(model)
 
-    bases = [
-        m.base_layer for m in model.modules() if isinstance(m, LoraLinear)
-    ]
+    bases = [m.base_layer for m in model.modules() if isinstance(m, LoraLinear)]
     assert bases and all(
         isinstance(b, (NVFP4ComputeBaseLinear, NVFP4FastComputeBaseLinear))
         for b in bases
     )
     assert not any(
-        isinstance(b, (NVFP4FrozenBaseLinear, NVFP4FastFrozenBaseLinear))
-        for b in bases
+        isinstance(b, (NVFP4FrozenBaseLinear, NVFP4FastFrozenBaseLinear)) for b in bases
     )
 
 
@@ -606,7 +599,6 @@ def test_apply_selects_hp_mode_when_requested(monkeypatch):
 def test_apply_selects_fft_mode_when_no_adapter(monkeypatch):
     """No adapter -> raw nn.Linear swapped to NVFP4Linear (full fine-tune)."""
     _supported(monkeypatch, True)
-    import torch
     from torch import nn
 
     from axolotl.utils.nvfp4_training import NVFP4Linear
@@ -685,9 +677,9 @@ def test_e2e_lora_swap_and_train_step(quantize_base):
     from transformers import AutoModelForCausalLM
 
     from axolotl.utils.nvfp4_training import (
-        NVFP4FrozenBaseLinear,
-        NVFP4FastFrozenBaseLinear,
         NVFP4FastComputeBaseLinear,
+        NVFP4FastFrozenBaseLinear,
+        NVFP4FrozenBaseLinear,
         NVFP4Linear,
         NVFP4Recipe,
         convert_lora_base_to_nvfp4,

@@ -378,7 +378,8 @@ class PatchManager:
             # FP4-storage path, so a requested storage/compute base_mode would
             # silently give no memory saving. Steer the user to backend: native.
             if adapter in ("lora", "qlora") and (
-                nvfp4.quantize_base or getattr(nvfp4, "base_mode", None) in ("storage", "compute")
+                nvfp4.quantize_base
+                or getattr(nvfp4, "base_mode", None) in ("storage", "compute")
             ):
                 LOG.warning(
                     "nvfp4_training.backend: te ignores base_mode/quantize_base "
@@ -767,9 +768,9 @@ class PatchManager:
             # lm_head store; force the torchao storage class for it. Otherwise use
             # the requested base mode (compute/storage/hp).
             if bool(getattr(nvfp4, "fused_fp4_cross_entropy", False)):
-                from axolotl.utils.nvfp4_training import swap_frozen_lm_head_tileable
-
                 import torch.nn as _nn
+
+                from axolotl.utils.nvfp4_training import swap_frozen_lm_head_tileable
 
                 out_emb = model.get_output_embeddings()
                 if isinstance(out_emb, _nn.Linear):

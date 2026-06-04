@@ -1,3 +1,4 @@
+# mypy: disable-error-code="union-attr"
 """
 Module for definition of Low-Rank Adaptation (LoRA) Triton kernels.
 
@@ -64,7 +65,11 @@ def get_lora_parameters(
 
     if is_nvfp4_base(base_layer):
         b = base_layer.bias
-        if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+        if (
+            not hasattr(proj, "disable_adapters")
+            or proj.disable_adapters
+            or proj.merged
+        ):
             return None, b, base_layer, None, None, None, None, None, None
         quant_state = base_layer
         W = None
@@ -72,7 +77,11 @@ def get_lora_parameters(
         W = base_layer.weight
         b = base_layer.bias
 
-        if not hasattr(proj, "disable_adapters") or proj.disable_adapters or proj.merged:
+        if (
+            not hasattr(proj, "disable_adapters")
+            or proj.disable_adapters
+            or proj.merged
+        ):
             quant_state = getattr(W, "quant_state", None)
             if quant_state is None and W.dtype == torch.float8_e4m3fn:
                 quant_state = getattr(base_layer, "weight_scale_inv", None)
@@ -296,8 +305,10 @@ def matmul_lora(
     if is_nvfp4:
         # FP4 base GEMM against the NVFP4 module (W is None); the `out=` buffer
         # cannot be reused since the FP4 GEMM allocates its own output.
-        out = nvfp4_base_dgrad(X, W_quant) if nvfp4_dgrad else nvfp4_base_fprop(
-            X, W_quant
+        out = (
+            nvfp4_base_dgrad(X, W_quant)
+            if nvfp4_dgrad
+            else nvfp4_base_fprop(X, W_quant)
         )
     else:
         W = dequantize(W.t(), W_quant)
