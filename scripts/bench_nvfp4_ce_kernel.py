@@ -1,3 +1,4 @@
+# mypy: disable-error-code="operator"
 #!/usr/bin/env python
 """Microbenchmark NVFP4 lm_head + CE variants.
 
@@ -110,7 +111,9 @@ def main() -> None:
         print(f"liger=unavailable ({type(liger_exc).__name__}: {liger_exc})")
 
     def materialized_loss(x):
-        return F.cross_entropy((x @ dense_weight.t()).float(), labels, ignore_index=-100)
+        return F.cross_entropy(
+            (x @ dense_weight.t()).float(), labels, ignore_index=-100
+        )
 
     def old_loss(x):
         return fused_fp4_cross_entropy(x, head, labels, shift=False, fp4_matmul=False)
@@ -139,6 +142,7 @@ def main() -> None:
 
     def wrap_loss(loss_fn):
         if not args.backward:
+
             def run():
                 with torch.no_grad():
                     loss_fn(hidden)
@@ -155,28 +159,37 @@ def main() -> None:
         return run
 
     timings: list[tuple[str, float | None]] = []
-    timings.append((
-        "materialized_bf16_ce",
-        _time_cuda(wrap_loss(materialized_loss), args.warmup, args.iters),
-    ))
+    timings.append(
+        (
+            "materialized_bf16_ce",
+            _time_cuda(wrap_loss(materialized_loss), args.warmup, args.iters),
+        )
+    )
     if liger is not None:
+
         def liger_loss(x):
             return liger(dense_weight, x, labels)
 
-        timings.append((
-            "liger_fused_linear_ce",
-            _time_cuda(wrap_loss(liger_loss), args.warmup, args.iters),
-        ))
+        timings.append(
+            (
+                "liger_fused_linear_ce",
+                _time_cuda(wrap_loss(liger_loss), args.warmup, args.iters),
+            )
+        )
     old_probe = old_loss(hidden)
     if old_probe is not None:
-        timings.append((
-            "existing_nvfp4_fused_ce",
-            _time_cuda(wrap_loss(old_loss), args.warmup, args.iters),
-        ))
-    timings.append((
-        "fp4_scaled_mm_ce",
-        _time_cuda(wrap_loss(new_loss), args.warmup, args.iters),
-    ))
+        timings.append(
+            (
+                "existing_nvfp4_fused_ce",
+                _time_cuda(wrap_loss(old_loss), args.warmup, args.iters),
+            )
+        )
+    timings.append(
+        (
+            "fp4_scaled_mm_ce",
+            _time_cuda(wrap_loss(new_loss), args.warmup, args.iters),
+        )
+    )
 
     for name, ms in timings:
         tok_s = args.tokens / (ms / 1000.0)

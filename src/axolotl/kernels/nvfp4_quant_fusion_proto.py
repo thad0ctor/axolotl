@@ -28,7 +28,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
 from mslk.quantize.triton.fp4_quantize import (
     convert_fp32_to_fp4_packed,
     nvfp4_scale_swizzle,
@@ -140,8 +139,9 @@ def _rope_quant_kernel(
     x_rot = x * cos + rot * sin
 
     x_blocks = x_rot.reshape(M_PER_BLOCK, 4, 16)
-    _quant_emit(x_blocks, q_ptr, s_ptr, gscale, pid_m, pid_n, M, N,
-                M_PER_BLOCK, NUM_N_BLOCKS)
+    _quant_emit(
+        x_blocks, q_ptr, s_ptr, gscale, pid_m, pid_n, M, N, M_PER_BLOCK, NUM_N_BLOCKS
+    )
 
 
 def fused_rope_quant(x2d, cos2d, sin2d, two_level: bool = False):
@@ -171,11 +171,23 @@ def fused_rope_quant(x2d, cos2d, sin2d, two_level: bool = False):
     M_PER_BLOCK = min(triton.next_power_of_2(M), 128)
     grid = (triton.cdiv(N, 64), triton.cdiv(M, M_PER_BLOCK))
     _rope_quant_kernel[grid](
-        x2d, cos2d, sin2d, q, s, float(gscale), M, N, N // 2,
-        M_PER_BLOCK=M_PER_BLOCK, NUM_N_BLOCKS=triton.cdiv(N, 64),
+        x2d,
+        cos2d,
+        sin2d,
+        q,
+        s,
+        float(gscale),
+        M,
+        N,
+        N // 2,
+        M_PER_BLOCK=M_PER_BLOCK,
+        NUM_N_BLOCKS=triton.cdiv(N, 64),
     )
-    return (q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn),
-            (1.0 / gscale).to(x2d.dtype))
+    return (
+        q.view(torch.float4_e2m1fn_x2),
+        s.view(torch.float8_e4m3fn),
+        (1.0 / gscale).to(x2d.dtype),
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -232,10 +244,9 @@ def _softmax_quant_kernel(
     sb = tl.arange(0, N_BLOCKS)  # group-block index along N
     pid_n = sb // 4
     in4 = sb % 4
-    layout_off = (
-        (padded_r // 128) * (tl.cdiv(N, 64)) * NUM_ELEM_PER_LAYOUT
-        + pid_n * NUM_ELEM_PER_LAYOUT
-    )
+    layout_off = (padded_r // 128) * (
+        tl.cdiv(N, 64)
+    ) * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
     offs_m_in_layout = (padded_r % 128).to(tl.int32)
     # swizzle for a single row m: sub_layout_off + (m//32)*4 + in4
     m = offs_m_in_layout
@@ -257,8 +268,14 @@ def fused_softmax_quant(scores: torch.Tensor, out_dtype=torch.bfloat16):
     BLOCK_N = triton.next_power_of_2(N)
     grid = (M,)
     _softmax_quant_kernel[grid](
-        scores, q, s, gscale, M, N,
-        BLOCK_N=BLOCK_N, N_BLOCKS=N // 16,
+        scores,
+        q,
+        s,
+        gscale,
+        M,
+        N,
+        BLOCK_N=BLOCK_N,
+        N_BLOCKS=N // 16,
     )
     inv_gs = torch.tensor(1.0 / gscale, device=scores.device, dtype=out_dtype)
     return q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn), inv_gs
@@ -269,8 +286,14 @@ def fused_softmax_quant(scores: torch.Tensor, out_dtype=torch.bfloat16):
 # ----------------------------------------------------------------------------
 @triton.jit
 def _identity_quant_kernel(
-    x_ptr, q_ptr, s_ptr, gscale, M, N,
-    M_PER_BLOCK: tl.constexpr, NUM_N_BLOCKS: tl.constexpr,
+    x_ptr,
+    q_ptr,
+    s_ptr,
+    gscale,
+    M,
+    N,
+    M_PER_BLOCK: tl.constexpr,
+    NUM_N_BLOCKS: tl.constexpr,
 ):
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(0)
@@ -279,8 +302,9 @@ def _identity_quant_kernel(
     mask = (offs_m < M) & (offs_n < N)
     x = tl.load(x_ptr + offs_m * N + offs_n, mask=mask, other=0.0).to(tl.float32)
     x_blocks = x.reshape(M_PER_BLOCK, 4, 16)
-    _quant_emit(x_blocks, q_ptr, s_ptr, gscale, pid_m, pid_n, M, N,
-                M_PER_BLOCK, NUM_N_BLOCKS)
+    _quant_emit(
+        x_blocks, q_ptr, s_ptr, gscale, pid_m, pid_n, M, N, M_PER_BLOCK, NUM_N_BLOCKS
+    )
 
 
 def fused_vproj_quant(v2d: torch.Tensor, two_level: bool = False):
@@ -303,8 +327,17 @@ def fused_vproj_quant(v2d: torch.Tensor, two_level: bool = False):
     M_PER_BLOCK = min(triton.next_power_of_2(M), 128)
     grid = (triton.cdiv(N, 64), triton.cdiv(M, M_PER_BLOCK))
     _identity_quant_kernel[grid](
-        v2d, q, s, float(gscale), M, N,
-        M_PER_BLOCK=M_PER_BLOCK, NUM_N_BLOCKS=triton.cdiv(N, 64),
+        v2d,
+        q,
+        s,
+        float(gscale),
+        M,
+        N,
+        M_PER_BLOCK=M_PER_BLOCK,
+        NUM_N_BLOCKS=triton.cdiv(N, 64),
     )
-    return (q.view(torch.float4_e2m1fn_x2), s.view(torch.float8_e4m3fn),
-            (1.0 / gscale).to(v2d.dtype))
+    return (
+        q.view(torch.float4_e2m1fn_x2),
+        s.view(torch.float8_e4m3fn),
+        (1.0 / gscale).to(v2d.dtype),
+    )

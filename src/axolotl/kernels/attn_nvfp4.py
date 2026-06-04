@@ -54,11 +54,7 @@ def _repeat_kv(t: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return t
     z, hk, s, d = t.shape
-    return (
-        t[:, :, None, :, :]
-        .expand(z, hk, n_rep, s, d)
-        .reshape(z, hk * n_rep, s, d)
-    )
+    return t[:, :, None, :, :].expand(z, hk, n_rep, s, d).reshape(z, hk * n_rep, s, d)
 
 
 def nvfp4_attention(

@@ -30,7 +30,9 @@ def _code_to_dtype(code: int) -> torch.dtype:
     try:
         return _CODE_TO_DTYPE[int(code)]
     except KeyError as exc:
-        raise TypeError(f"unsupported NVFP4 attention output dtype code: {code}") from exc
+        raise TypeError(
+            f"unsupported NVFP4 attention output dtype code: {code}"
+        ) from exc
 
 
 @torch.library.custom_op("axolotl_nvfp4::flash_attention_packed", mutates_args=())
@@ -315,9 +317,19 @@ def _flash_attention_train_bwd_op(
         do,
         out.reshape(z * h, s_q, d).contiguous(),
         bias,
-        z, h, hk, s_q, s_kv, d,
-        scaling, causal, sr,
-        block_m, block_n, num_warps, num_stages,
+        z,
+        h,
+        hk,
+        s_q,
+        s_kv,
+        d,
+        scaling,
+        causal,
+        sr,
+        block_m,
+        block_n,
+        num_warps,
+        num_stages,
         lse=None,
         sr_p_dv=backward_p_dv_sr,
         sr_dot_dv=backward_dot_dv_sr,
@@ -389,9 +401,22 @@ def _flash_attention_train_backward(ctx, grad_out):
     )
     # one grad slot per forward input (16 inputs)
     return (
-        dq, dk, dv,
-        None, None, None, None, None, None, None, None,
-        None, None, None, None, None,
+        dq,
+        dk,
+        dv,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 
@@ -434,9 +459,21 @@ def nvfp4_flash_attn_train_custom_op(
         else key_pad_bias
     )
     sr = stochastic_rounding
-    p_dv = sr if backward_p_dv_stochastic_rounding is None else backward_p_dv_stochastic_rounding
-    dot_dv = sr if backward_dot_dv_stochastic_rounding is None else backward_dot_dv_stochastic_rounding
-    ds_dq = sr if backward_ds_dq_stochastic_rounding is None else backward_ds_dq_stochastic_rounding
+    p_dv = (
+        sr
+        if backward_p_dv_stochastic_rounding is None
+        else backward_p_dv_stochastic_rounding
+    )
+    dot_dv = (
+        sr
+        if backward_dot_dv_stochastic_rounding is None
+        else backward_dot_dv_stochastic_rounding
+    )
+    ds_dq = (
+        sr
+        if backward_ds_dq_stochastic_rounding is None
+        else backward_ds_dq_stochastic_rounding
+    )
     return torch.ops.axolotl_nvfp4.flash_attention_train(
         query,
         key,

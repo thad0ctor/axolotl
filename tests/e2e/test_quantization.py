@@ -374,8 +374,8 @@ class TestQuantization:
         Uses dims divisible by 16 (the NVFP4 forward GEMM requires it); this is
         why the full-model swap test above never runs forward through lm_head.
         """
-        from torchao.quantization import quantize_
         from torchao.prototype.qat import NVFP4FakeQuantizedLinear
+        from torchao.quantization import quantize_
 
         from axolotl.utils.quantization import _make_qat_config
 

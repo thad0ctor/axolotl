@@ -1,3 +1,4 @@
+# mypy: disable-error-code="attr-defined"
 """FP4-attention quantization-aware training (Attn-QAT, arXiv 2603.00040).
 
 QAT for FP4 attention: during SFT the attention operands (Q, K, V and the
@@ -184,8 +185,13 @@ def nvfp4_qat_attention_forward(
             )
             nvfp4_qat_attention_forward._fused_logged = True
         out = _fused_nvfp4_qat_attention(
-            query, key, value, scaling, causal,
-            module.num_key_value_groups, key_pad_bias,
+            query,
+            key,
+            value,
+            scaling,
+            causal,
+            module.num_key_value_groups,
+            key_pad_bias,
         )
         return out.transpose(1, 2).contiguous(), None
 
@@ -204,9 +210,9 @@ def nvfp4_qat_attention_forward(
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[..., : k_fq.shape[-2]]
 
-    attn_weights = nn.functional.softmax(
-        attn_weights, dim=-1, dtype=torch.float32
-    ).to(query.dtype)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
     attn_weights = nn.functional.dropout(
         attn_weights, p=dropout, training=module.training
     )

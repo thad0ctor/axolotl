@@ -64,9 +64,7 @@ def _flash_available() -> bool:
     return importlib.util.find_spec("flash_attn") is not None
 
 
-def _fallback_kind(
-    attention_mask: torch.Tensor | None, q_len: int, kv_len: int
-) -> str:
+def _fallback_kind(attention_mask: torch.Tensor | None, q_len: int, kv_len: int) -> str:
     """Classify the fallback for inputs the FP4 kernel can't serve.
 
     ``"causal"`` / ``"full"`` are flash-attention-eligible (dense, no per-key

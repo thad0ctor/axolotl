@@ -295,9 +295,7 @@ def _apply_packing_patches(
     )
 
 
-def patch_qwen3_5_modeling_packing(
-    *, fla_causal_conv_compile_boundary: bool = False
-):
+def patch_qwen3_5_modeling_packing(*, fla_causal_conv_compile_boundary: bool = False):
     _apply_packing_patches(
         "qwen3_5",
         "Qwen3_5",

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import triton
 from torch import nn
 
 from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
@@ -44,8 +45,6 @@ from axolotl.kernels.nvfp4_linear import (
     prepack_weight_nvfp4,
 )
 from axolotl.utils.logging import get_logger
-
-import triton
 
 LOG = get_logger(__name__)
 
@@ -113,14 +112,24 @@ def _gemm_from_packed_act(anv, asc, wnv, wsc, m, n_out, k, out_dtype):
     block_m, block_n, block_k = 128, 128, 256
     grid = (triton.cdiv(m, block_m), triton.cdiv(n_out, block_n))
     _nvfp4_gemm_kernel[grid](
-        anv.view(torch.uint8), asc.view(torch.uint8),
-        wnv.view(torch.uint8), wsc.view(torch.uint8),
+        anv.view(torch.uint8),
+        asc.view(torch.uint8),
+        wnv.view(torch.uint8),
+        wsc.view(torch.uint8),
         out,
-        m, n_out, k,
-        anv.stride(0), wnv.stride(0), out.stride(0),
-        asc.stride(0), wsc.stride(0),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-        num_warps=8, num_stages=3,
+        m,
+        n_out,
+        k,
+        anv.stride(0),
+        wnv.stride(0),
+        out.stride(0),
+        asc.stride(0),
+        wsc.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=8,
+        num_stages=3,
     )
     return out
 
@@ -150,7 +159,9 @@ def make_nvfp4_gdn_forward(orig_forward):
             torch.is_grad_enabled()
             or use_cache
             or kwargs
-            or not _position_ids_are_dense_unpacked(position_ids, hidden_states.shape[1])
+            or not _position_ids_are_dense_unpacked(
+                position_ids, hidden_states.shape[1]
+            )
         ):
             return _call_orig_forward(
                 orig_forward,
@@ -226,8 +237,11 @@ def make_nvfp4_gdn_forward(orig_forward):
             key = key.repeat_interleave(rep, dim=2)
 
         core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-            query, key, value,
-            g=g, beta=beta,
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
             initial_state=None,
             output_final_state=cache_params is not None,
             use_qk_l2norm_in_kernel=True,
@@ -242,9 +256,7 @@ def make_nvfp4_gdn_forward(orig_forward):
 
         # out_proj: separate activation (post delta-rule), its own NVFP4 path.
         out_wnv, out_wsc = _get_packed_weight(self, "_out_packed", self.out_proj)
-        output = nvfp4_linear(
-            core_attn_out, out_wnv, out_wsc, self.hidden_size
-        )
+        output = nvfp4_linear(core_attn_out, out_wnv, out_wsc, self.hidden_size)
         return output
 
     return forward

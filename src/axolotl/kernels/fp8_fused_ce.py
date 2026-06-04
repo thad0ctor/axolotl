@@ -50,9 +50,7 @@ def prepack_lm_head_weight_fp8_ce(
         dgrad_scale = _scale_from_amax(weight.abs().max())
     else:
         dgrad_scale = _scale_from_amax(weight.abs().amax(dim=0, keepdim=True))
-    dgrad_weight = _to_col_major_for_scaled_mm(
-        _quantize_e4m3(weight, dgrad_scale)
-    )
+    dgrad_weight = _to_col_major_for_scaled_mm(_quantize_e4m3(weight, dgrad_scale))
     return FP8FusedCEWeight(
         fprop=fprop,
         dgrad_weight=dgrad_weight,
@@ -148,14 +146,9 @@ class _FP8FusedCrossEntropy(torch.autograd.Function):
         H = packed.fprop.in_features
         M = hidden_fp8.shape[0]
         rows = torch.arange(M, device=hidden_fp8.device)
-        grad_hidden = torch.zeros(
-            M, H, device=hidden_fp8.device, dtype=torch.float32
-        )
+        grad_hidden = torch.zeros(M, H, device=hidden_fp8.device, dtype=torch.float32)
         coef = (
-            grad_loss.float()
-            * ctx.grad_scale
-            * valid.float()
-            * ctx.logit_scale
+            grad_loss.float() * ctx.grad_scale * valid.float() * ctx.logit_scale
         ).unsqueeze(1)
 
         for lo in range(0, V, _VOCAB_BLOCK):
@@ -266,9 +259,7 @@ def _make_fused_forward(orig_forward):
             labels,
             num_items_in_batch=num_items_in_batch,
             shift=True,
-            granularity=getattr(
-                self, "_axolotl_fp8_lm_head_ce_granularity", "rowwise"
-            ),
+            granularity=getattr(self, "_axolotl_fp8_lm_head_ce_granularity", "rowwise"),
         )
         if loss is None:
             kwargs["labels"] = labels
@@ -312,9 +303,7 @@ def patch_model_fp8_lm_head_cross_entropy(
         )
         return False
     if lm_head.bias is not None or lm_head.weight.requires_grad:
-        LOG.warning(
-            "fp8_lm_head_cross_entropy: requires a frozen bias-free lm_head"
-        )
+        LOG.warning("fp8_lm_head_cross_entropy: requires a frozen bias-free lm_head")
         return False
     if lm_head.weight.shape[0] % 16 or lm_head.weight.shape[1] % 16:
         LOG.warning("fp8_lm_head_cross_entropy: lm_head dims are not FP8-eligible")

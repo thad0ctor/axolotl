@@ -27,11 +27,15 @@ def parse_args():
     )
     compile_group = parser.add_mutually_exclusive_group()
     compile_group.add_argument("--compile", dest="compile_model", action="store_true")
-    compile_group.add_argument("--no-compile", dest="compile_model", action="store_false")
+    compile_group.add_argument(
+        "--no-compile", dest="compile_model", action="store_false"
+    )
     parser.set_defaults(compile_model=None)
     parser.add_argument("--fullgraph", action="store_true")
     parser.add_argument("--probe-only", action="store_true")
-    parser.add_argument("--no-probe-on-fail", dest="probe_on_fail", action="store_false")
+    parser.add_argument(
+        "--no-probe-on-fail", dest="probe_on_fail", action="store_false"
+    )
     parser.set_defaults(probe_on_fail=True)
     return parser.parse_args()
 

@@ -62,7 +62,7 @@ class TestNVFP4Training:
 
     def test_gemm_wiring_matches_dequant_matmul(self):
         """The FP4 GEMM must equal dequant(a) @ dequant(b)."""
-        from axolotl.utils.nvfp4_training import _fp4_mm, QuantPolicy, _quantize
+        from axolotl.utils.nvfp4_training import QuantPolicy, _fp4_mm, _quantize
 
         torch.manual_seed(0)
         a = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
@@ -247,7 +247,7 @@ class TestNVFP4Training:
                 super().__init__()
                 self.lm_head = nn.Linear(2048, 4096, bias=False)
 
-        for mode, cls in (
+        for mode, _cls in (
             ("compute", NVFP4ComputeBaseLinear),
             ("storage", NVFP4FrozenBaseLinear),
         ):
@@ -336,7 +336,7 @@ class TestNVFP4Training:
                     n = xf * torch.rsqrt(
                         xf.pow(2).mean(-1, keepdim=True) + s.variance_epsilon
                     )
-                    g = (1.0 + s.weight.float()) if zero_centered else s.weight.float()
+                    g = (1.0 + s.weight.float()) if zero_centered else s.weight.float()  # noqa: B023
                     return (n * g).to(x.dtype)
 
             norm = Norm().cuda()
@@ -624,21 +624,10 @@ class TestNVFP4Training:
         torch.manual_seed(123)
         amp = 0.5
         base = {
-            "q": torch.randn(
-                1, 4, 96, 128, device="cuda", dtype=torch.bfloat16
-            )
-            * amp,
-            "k": torch.randn(
-                1, 2, 96, 128, device="cuda", dtype=torch.bfloat16
-            )
-            * amp,
-            "v": torch.randn(
-                1, 2, 96, 128, device="cuda", dtype=torch.bfloat16
-            )
-            * amp,
-            "upstream": torch.randn(
-                1, 4, 96, 128, device="cuda", dtype=torch.bfloat16
-            )
+            "q": torch.randn(1, 4, 96, 128, device="cuda", dtype=torch.bfloat16) * amp,
+            "k": torch.randn(1, 2, 96, 128, device="cuda", dtype=torch.bfloat16) * amp,
+            "v": torch.randn(1, 2, 96, 128, device="cuda", dtype=torch.bfloat16) * amp,
+            "upstream": torch.randn(1, 4, 96, 128, device="cuda", dtype=torch.bfloat16)
             * amp,
         }
 
@@ -668,7 +657,7 @@ class TestNVFP4Training:
         bf16 = run(True)
 
         assert torch.equal(fp32[0], bf16[0])
-        for ref, got in zip(fp32[1:], bf16[1:]):
+        for ref, got in zip(fp32[1:], bf16[1:], strict=False):
             assert torch.isfinite(got).all().item()
             rel = (ref.float() - got.float()).norm() / (ref.float().norm() + 1e-9)
             assert rel < 1e-2, rel.item()
@@ -830,9 +819,9 @@ class TestNVFP4Training:
         assert isinstance(m.lm_head, nn.Linear)
 
     def test_compile_no_graph_breaks(self):
-        from axolotl.utils.nvfp4_training import NVFP4Linear, NVFP4Recipe
-
         import torch._dynamo as dyn
+
+        from axolotl.utils.nvfp4_training import NVFP4Linear, NVFP4Recipe
 
         torch.manual_seed(0)
         linear = nn.Linear(512, 256).cuda().bfloat16()
@@ -1006,8 +995,8 @@ class TestNVFP4Adapters:
             NVFP4ComputeBaseLinear,
             NVFP4Linear,
             NVFP4Recipe,
-            is_nvfp4_base,
             convert_lora_base_to_nvfp4,
+            is_nvfp4_base,
         )
 
         # bit-identical to the per-step path (same quantization, just cached)
@@ -1078,9 +1067,7 @@ class TestNVFP4Adapters:
         fq = _to_fsdp_nvfp4(wq)
         assert hasattr(fq, "fsdp_pre_all_gather")
         assert hasattr(fq, "fsdp_post_all_gather")
-        assert torch.equal(
-            fq.dequantize(torch.bfloat16), wq.dequantize(torch.bfloat16)
-        )
+        assert torch.equal(fq.dequantize(torch.bfloat16), wq.dequantize(torch.bfloat16))
 
         # simulate the gather: split qdata/scale by row, concat, reconstruct
         (qd, sc), (ctx, pts) = fq.fsdp_pre_all_gather(mesh=None)

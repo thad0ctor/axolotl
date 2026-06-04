@@ -29,13 +29,22 @@ from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
 
 @triton.jit
 def _nvfp4_gemm_kernel(
-    anv_ptr, asc_ptr,          # [M, K//2] uint8, [M, K//16] e4m3 (activation)
-    wnv_ptr, wsc_ptr,          # [N, K//2] uint8, [N, K//16] e4m3 (weight, W[N,K])
-    out_ptr,                   # [M, N] out_dtype
-    M, N, K,
-    s_am, s_wn, s_om,          # row strides (col stride = 1)
-    s_asc, s_wsc,              # scale row strides
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    anv_ptr,
+    asc_ptr,  # [M, K//2] uint8, [M, K//16] e4m3 (activation)
+    wnv_ptr,
+    wsc_ptr,  # [N, K//2] uint8, [N, K//16] e4m3 (weight, W[N,K])
+    out_ptr,  # [M, N] out_dtype
+    M,
+    N,
+    K,
+    s_am,
+    s_wn,
+    s_om,  # row strides (col stride = 1)
+    s_asc,
+    s_wsc,  # scale row strides
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -52,19 +61,23 @@ def _nvfp4_gemm_kernel(
         offk16 = k0 // 16 + tl.arange(0, KP16)
         a = tl.load(
             anv_ptr + offs_m[:, None] * s_am + offk2[None, :],
-            mask=mmask[:, None], other=0,
+            mask=mmask[:, None],
+            other=0,
         )
         asc = tl.load(
             asc_ptr + offs_m[:, None] * s_asc + offk16[None, :],
-            mask=mmask[:, None], other=0,
+            mask=mmask[:, None],
+            other=0,
         ).to(tl.float8e4nv, bitcast=True)
         w = tl.load(
             wnv_ptr + offs_n[:, None] * s_wn + offk2[None, :],
-            mask=nmask[:, None], other=0,
+            mask=nmask[:, None],
+            other=0,
         )
         wsc = tl.load(
             wsc_ptr + offs_n[:, None] * s_wsc + offk16[None, :],
-            mask=nmask[:, None], other=0,
+            mask=nmask[:, None],
+            other=0,
         ).to(tl.float8e4nv, bitcast=True)
         acc = tl.dot_scaled(a, asc, "e2m1", w.T, wsc, "e2m1", acc=acc)
 
@@ -118,13 +131,23 @@ def nvfp4_linear(
     out = torch.empty(m, n_out, device=x.device, dtype=out_dtype)
     grid = (triton.cdiv(m, block_m), triton.cdiv(n_out, block_n))
     _nvfp4_gemm_kernel[grid](
-        anv.view(torch.uint8), asc.view(torch.uint8),
-        wnv.view(torch.uint8), wsc.view(torch.uint8),
+        anv.view(torch.uint8),
+        asc.view(torch.uint8),
+        wnv.view(torch.uint8),
+        wsc.view(torch.uint8),
         out,
-        m, n_out, k,
-        anv.stride(0), wnv.stride(0), out.stride(0),
-        asc.stride(0), wsc.stride(0),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-        num_warps=num_warps, num_stages=num_stages,
+        m,
+        n_out,
+        k,
+        anv.stride(0),
+        wnv.stride(0),
+        out.stride(0),
+        asc.stride(0),
+        wsc.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out.reshape(*lead, n_out)

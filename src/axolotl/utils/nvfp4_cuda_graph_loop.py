@@ -96,7 +96,9 @@ def validate_loop_cfg(cfg):
 
 
 def maybe_compile_model(model: torch.nn.Module, cfg, options: GraphLoopOptions):
-    compile_model = cfg.torch_compile if options.compile_model is None else options.compile_model
+    compile_model = (
+        cfg.torch_compile if options.compile_model is None else options.compile_model
+    )
     if not compile_model:
         return model, "compile=off"
 
@@ -188,7 +190,9 @@ def build_dataloader(cfg, train_dataset, tokenizer) -> DataLoader:
     )
 
 
-def build_optimizer(model: torch.nn.Module, cfg, capturable: bool) -> torch.optim.Optimizer:
+def build_optimizer(
+    model: torch.nn.Module, cfg, capturable: bool
+) -> torch.optim.Optimizer:
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
         raise ValueError("model has no trainable parameters")
@@ -213,10 +217,14 @@ def _model_device(model: torch.nn.Module) -> torch.device:
 
 
 def _tensor_batch(batch: dict[str, Any]) -> dict[str, torch.Tensor]:
-    return {key: value for key, value in batch.items() if isinstance(value, torch.Tensor)}
+    return {
+        key: value for key, value in batch.items() if isinstance(value, torch.Tensor)
+    }
 
 
-def _trim_batch_for_model(batch: dict[str, torch.Tensor], cfg) -> dict[str, torch.Tensor]:
+def _trim_batch_for_model(
+    batch: dict[str, torch.Tensor], cfg
+) -> dict[str, torch.Tensor]:
     out = dict(batch)
     out.pop("length", None)
     if (
@@ -444,7 +452,9 @@ def run_loop(cfg, options: GraphLoopOptions) -> GraphLoopResult:
         "No LR scheduler is applied in this prototype.",
     ]
     if cfg.sample_packing:
-        notes.append("DataLoader uses Axolotl MultipackBatchSampler and packed collator.")
+        notes.append(
+            "DataLoader uses Axolotl MultipackBatchSampler and packed collator."
+        )
     if options.reuse_static_batch:
         notes.append("Reuses one static batch; this is capture feasibility only.")
 
@@ -528,7 +538,9 @@ def run_loop(cfg, options: GraphLoopOptions) -> GraphLoopResult:
                     notes=notes,
                     probes=probes,
                 )
-            notes.append("Graph capture failed; auto mode fell back to eager static loop.")
+            notes.append(
+                "Graph capture failed; auto mode fell back to eager static loop."
+            )
             optimizer = build_optimizer(model, cfg, capturable=False)
     else:
         probes = []
@@ -594,8 +606,7 @@ def format_result(result: GraphLoopResult) -> str:
     ]
     if result.median_ms is not None:
         lines.append(
-            f"cuda_ms_per_step median={result.median_ms:.3f} "
-            f"mean={result.mean_ms:.3f}"
+            f"cuda_ms_per_step median={result.median_ms:.3f} mean={result.mean_ms:.3f}"
         )
         lines.append(f"input_tokens_per_second median={result.tokens_per_second:.1f}")
     if result.loss_first is not None:

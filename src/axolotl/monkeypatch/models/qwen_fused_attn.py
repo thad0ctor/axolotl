@@ -11,7 +11,9 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 
-def _attention_interface(functions, implementation: str, fallback: Callable) -> Callable:
+def _attention_interface(
+    functions, implementation: str, fallback: Callable
+) -> Callable:
     if hasattr(functions, "get_interface"):
         return functions.get_interface(implementation, fallback)
     if implementation == "eager":

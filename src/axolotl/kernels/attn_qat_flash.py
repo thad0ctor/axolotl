@@ -1,3 +1,4 @@
+# ruff: noqa: E741
 """Fused FlashAttention-style NVFP4 fake-quant attention (Attn-QAT, arXiv 2603.00040).
 
 Long-context follow-up to the eager v1 in ``axolotl.utils.attn_qat``: instead of
@@ -56,7 +57,6 @@ _E4M3_MAX = 448.0
 
 
 if HAS_TRITON:
-
     _BLK = tl.constexpr(16)
     _F4MAX = tl.constexpr(6.0)
     _EPS = tl.constexpr(0.015625)
@@ -73,13 +73,27 @@ if HAS_TRITON:
         s = tl.where(x >= 0, 1.0, -1.0)
         a = tl.abs(x)
         # nearest grid point by midpoint thresholds
-        r = tl.where(a < 0.25, 0.0,
-            tl.where(a < 0.75, 0.5,
-            tl.where(a < 1.25, 1.0,
-            tl.where(a < 1.75, 1.5,
-            tl.where(a < 2.5, 2.0,
-            tl.where(a < 3.5, 3.0,
-            tl.where(a < 5.0, 4.0, 6.0)))))))
+        r = tl.where(
+            a < 0.25,
+            0.0,
+            tl.where(
+                a < 0.75,
+                0.5,
+                tl.where(
+                    a < 1.25,
+                    1.0,
+                    tl.where(
+                        a < 1.75,
+                        1.5,
+                        tl.where(
+                            a < 2.5,
+                            2.0,
+                            tl.where(a < 3.5, 3.0, tl.where(a < 5.0, 4.0, 6.0)),
+                        ),
+                    ),
+                ),
+            ),
+        )
         # ties-to-even at the midpoints
         r = tl.where(a == 0.25, 0.0, r)
         r = tl.where(a == 0.75, 1.0, r)
@@ -134,14 +148,35 @@ if HAS_TRITON:
 
     @triton.jit
     def _attn_qat_fwd(
-        Q, K, V, sm_scale, B,
-        O, Op, M,  # noqa: E741
-        stride_qz, stride_qh, stride_qm, stride_qk,
-        stride_kz, stride_kh, stride_kn, stride_kk,
-        stride_vz, stride_vh, stride_vn, stride_vk,
-        stride_oz, stride_oh, stride_om, stride_ok,
+        Q,
+        K,
+        V,
+        sm_scale,
+        B,
+        O,
+        Op,
+        M,  # noqa: E741
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
         stride_bz,
-        Z, H, N_CTX, N_KV,
+        Z,
+        H,
+        N_CTX,
+        N_KV,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -246,16 +281,42 @@ if HAS_TRITON:
 
     @triton.jit
     def _attn_qat_bwd(
-        Q, K, V, sm_scale, B,
-        DO, Op, M,
-        DQ, DK, DV,
-        stride_qz, stride_qh, stride_qm, stride_qk,
-        stride_kz, stride_kh, stride_kn, stride_kk,
-        stride_vz, stride_vh, stride_vn, stride_vk,
-        stride_oz, stride_oh, stride_om, stride_ok,
-        stride_dkz, stride_dkh, stride_dkn, stride_dkk,
+        Q,
+        K,
+        V,
+        sm_scale,
+        B,
+        DO,
+        Op,
+        M,
+        DQ,
+        DK,
+        DV,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        stride_dkz,
+        stride_dkh,
+        stride_dkn,
+        stride_dkk,
         stride_bz,
-        Z, H, N_CTX, N_KV,
+        Z,
+        H,
+        N_CTX,
+        N_KV,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -308,8 +369,12 @@ if HAS_TRITON:
             m_mask = offs_m < N_CTX
 
             q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
-            do_ptrs = do_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
-            op_ptrs = op_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+            do_ptrs = (
+                do_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+            )
+            op_ptrs = (
+                op_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+            )
             q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
             do = tl.load(do_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
             op = tl.load(op_ptrs, mask=m_mask[:, None], other=0.0).to(tl.float32)
@@ -337,7 +402,9 @@ if HAS_TRITON:
             ds = tl.where(n_mask[None, :], ds, 0.0)
             dk += tl.dot(tl.trans(ds).to(qf.dtype), qf)
             dq = tl.dot(ds.to(kf.dtype), kf)
-            dq_ptrs = dq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+            dq_ptrs = (
+                dq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+            )
             tl.atomic_add(dq_ptrs, dq, mask=m_mask[:, None])
 
         dk_ptrs = dk_base + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkk
@@ -375,16 +442,43 @@ class _AttnQatFlash(torch.autograd.Function):
         m = torch.empty((Z * H, N_CTX), device=q.device, dtype=torch.float32)
         grid = (triton.cdiv(N_CTX, BLOCK_M), Z * H)
         _attn_qat_fwd[grid](
-            q, k, v, sm_scale, b, o, op, m,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            q,
+            k,
+            v,
+            sm_scale,
+            b,
+            o,
+            op,
+            m,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            o.stride(3),
             stride_bz,
-            Z, H, N_CTX, N_KV,
-            HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            CAUSAL=causal, HAS_BIAS=has_bias, GQA_GROUP=gqa_group,
-            num_warps=4, num_stages=1,
+            Z,
+            H,
+            N_CTX,
+            N_KV,
+            HEAD_DIM=D,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            CAUSAL=causal,
+            HAS_BIAS=has_bias,
+            GQA_GROUP=gqa_group,
+            num_warps=4,
+            num_stages=1,
         )
         ctx.save_for_backward(q, k, v, op, m, bias)
         ctx.sm_scale = sm_scale
@@ -410,17 +504,50 @@ class _AttnQatFlash(torch.autograd.Function):
         dv = torch.empty_like(q)
         grid = (triton.cdiv(N_KV, BLOCK_N), Z * H)
         _attn_qat_bwd[grid](
-            q, k, v, ctx.sm_scale, b, do, op, m, dq, dk, dv,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            q,
+            k,
+            v,
+            ctx.sm_scale,
+            b,
+            do,
+            op,
+            m,
+            dq,
+            dk,
+            dv,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            do.stride(0),
+            do.stride(1),
+            do.stride(2),
+            do.stride(3),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            dk.stride(3),
             stride_bz,
-            Z, H, N_CTX, N_KV,
-            HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            CAUSAL=ctx.causal, HAS_BIAS=has_bias, GQA_GROUP=ctx.gqa_group,
-            num_warps=4, num_stages=1,
+            Z,
+            H,
+            N_CTX,
+            N_KV,
+            HEAD_DIM=D,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            CAUSAL=ctx.causal,
+            HAS_BIAS=has_bias,
+            GQA_GROUP=ctx.gqa_group,
+            num_warps=4,
+            num_stages=1,
         )
         dq = dq.to(q.dtype)
         if ctx.gqa_group > 1:

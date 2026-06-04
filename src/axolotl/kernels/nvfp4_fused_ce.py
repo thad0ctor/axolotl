@@ -83,6 +83,8 @@ def _nvfp4_lm_head_store(module: nn.Module):
 
 def _nvfp4_lm_head_fp4_store(module: nn.Module):
     """Return a ``[V, H]`` FP4 store usable by tiled ``torch._scaled_mm``."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
     from axolotl.utils.nvfp4_training import (
         NVFP4ComputeBaseLinear,
         NVFP4FastComputeBaseLinear,
@@ -90,7 +92,6 @@ def _nvfp4_lm_head_fp4_store(module: nn.Module):
         NVFP4FrozenBaseLinear,
         NVFP4TiedLMHead,
     )
-    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 
     if isinstance(module, (NVFP4FrozenBaseLinear, NVFP4TiedLMHead)):
         return module.w_q
@@ -175,7 +176,9 @@ def _fp4_logits_tile(
     return logits
 
 
-def _quantize_hidden_sl(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+def _quantize_hidden_sl(
+    hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     try:
         from axolotl.utils.nvfp4_training import _mslk_quantize_sl
 
@@ -208,7 +211,9 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         valid = labels != ignore_index
         safe_labels = torch.where(valid, labels, labels.new_zeros(()))
 
-        running_max = torch.full((M,), float("-inf"), device=device, dtype=torch.float32)
+        running_max = torch.full(
+            (M,), float("-inf"), device=device, dtype=torch.float32
+        )
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
 
@@ -252,7 +257,9 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         dtype = hidden.dtype
 
         # d(loss)/d(logit_v) = grad_loss * grad_scale * mask * (softmax_v - onehot_v) * scale
-        coef = (grad_loss * ctx.grad_scale * valid.float() * scale).unsqueeze(1)  # [M,1]
+        coef = (grad_loss * ctx.grad_scale * valid.float() * scale).unsqueeze(
+            1
+        )  # [M,1]
         rows = torch.arange(M, device=hidden.device)
 
         grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
@@ -284,13 +291,17 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
 
         hidden_q = _quantize_hidden_sl(hidden)
         if hidden_q is None:
-            raise RuntimeError("MSLK single-level NVFP4 activation quant is unavailable")
+            raise RuntimeError(
+                "MSLK single-level NVFP4 activation quant is unavailable"
+            )
         hidden_qdata, hidden_scale = hidden_q
 
         valid = labels != ignore_index
         safe_labels = torch.where(valid, labels, labels.new_zeros(()))
 
-        running_max = torch.full((M,), float("-inf"), device=device, dtype=torch.float32)
+        running_max = torch.full(
+            (M,), float("-inf"), device=device, dtype=torch.float32
+        )
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
 
@@ -386,9 +397,7 @@ def fused_fp4_cross_entropy(
     valid = labels1d != ignore_index
     if num_items_in_batch is not None:
         denom = num_items_in_batch
-        grad_scale = (
-            1.0 / denom if torch.is_tensor(denom) else 1.0 / float(denom)
-        )
+        grad_scale = 1.0 / denom if torch.is_tensor(denom) else 1.0 / float(denom)
     else:
         grad_scale = 1.0 / valid.sum().clamp(min=1).float()
 
@@ -447,11 +456,7 @@ def _make_fused_forward(orig_forward, fp4_matmul: bool | None):
         )
         # Only intercept the training path with an FP4, tile-able head. Anything
         # else (generation, non-FP4 head, logits_to_keep slicing) -> original.
-        if (
-            labels is None
-            or kwargs.get("logits_to_keep")
-            or not has_fp4_ce
-        ):
+        if labels is None or kwargs.get("logits_to_keep") or not has_fp4_ce:
             return orig_forward(self, *args, **kwargs)
 
         # Run the base model to get hidden states (mirror the HF forward prologue).
