@@ -13,8 +13,17 @@
 #                              62.03 GiB active
 #   beta lock-down repeat:     1.2017 s/step, ~6817 tok/s,
 #                              62.03 GiB active
-#   FP8 lm_head CE b6:         1.7807 s/step, ~6902 tok/s, 80.32 GiB active
-#                              (fits b6, but slower than this b4 max-throughput path)
+#   clean GPU3 repeat:         1.0635 s/step, ~7701 tok/s,
+#                              69.63 GiB active
+#   b5 no CE repeat:           1.5195 s/step, ~6740 tok/s,
+#                              74.43 GiB active
+#   b6 no CE repeat:           1.8473 s/step, ~6652 tok/s,
+#                              86.83 GiB active
+#   FP8 lm_head CE b6:         1.7700-1.7807 s/step, ~6902-6943 tok/s,
+#                              80.32 GiB active (slower; one validation run
+#                              loss-collapsed with non-finite grad norms)
+#   FP8 lm_head CE b5 repeat:  1.5312 s/step, ~6688 tok/s, 69.60 GiB active
+#                              (memory win, not a throughput win)
 #
 # Do not use fp16 as the convergence baseline here: with NVFP4 omitted and
 # max_grad_norm: 1.0 explicit, fp16 produced NaN LoRA gradients at the first AMP
@@ -25,9 +34,12 @@
 # activation memory for less backward pack-prep work. The FLA boundary prevents
 # variable packed cu_seqlens from burning compile time in causal_conv1d. BF16
 # dK/dV scratch reduces the attention-backward scratch traffic before GQA reduce.
-# The no-grad/eval-only Qwen3.5 native MLP, native linear-attn, fused v_proj, and
-# standalone fp8_lm_head switches are intentionally omitted: a same-prepared-data
-# ablation measured 1.2017 s/step without them vs 1.2335 s/step with them.
+# The no-grad/eval-only Qwen3.5 native MLP, native linear-attn, fused v_proj,
+# standalone fp8_lm_head, FP8 lm_head CE, CCE, and Liger fused-linear CE
+# switches are intentionally omitted. Same-prepared-data ablations measured:
+# 1.2017 s/step without legacy switches vs 1.2335 s/step with them; FP8 CE b5
+# 1.5312 s/step; CCE/Liger CE loss-collapse with non-finite grad norms in this
+# NVFP4 training setup.
 #
 # For benchmark comparisons, copy this config to /tmp, set base_model to the
 # local model path, and keep dataset_prepared_path fixed across compared runs.

@@ -13,7 +13,8 @@
 #   3. A co-running job (another bench, a llama.cpp server) steals SMs/bandwidth and
 #      silently inflates timings. We REFUSE to measure unless the target GPU is
 #      exclusively idle (<2.5 GiB used) before each run, and abort if it isn't.
-# Also: a fast-but-diverging run is worse than useless -> we flag DIVERGED (loss>5).
+# Also: a fast-but-diverging run is worse than useless -> we flag DIVERGED
+# for non-finite loss/grad_norm or loss > 5.
 #
 # Usage:
 #   scripts/bench_nvfp4.sh [--gpu N] [--steps N2] [--short N1] [--venv PATH] cfg.yaml ...
@@ -64,7 +65,7 @@ runwall(){ # $1=cfg $2=steps -> echoes train_runtime (or empty on fail); writes 
   # a FULL EPOCH and the marginal math is wrong. Force it.
   grep -q "^max_steps:" "$LOGDIR/run.yaml" || echo "max_steps: $steps" >> "$LOGDIR/run.yaml"
   "$AX" train "$LOGDIR/run.yaml" --launcher python > "$log" 2>&1 || true
-  grep -oE "train_runtime': '([0-9.]+)'" "$log" | grep -oE "[0-9.]+" | tail -1
+  grep -oE "train_runtime': '([0-9.]+)'" "$log" | grep -oE "[0-9.]+" | tail -1 || true
 }
 
 printf '\n%-26s %12s %10s %10s %9s\n' CONFIG "s/step(marg)" "warmup s" "loss" "act GiB"
@@ -80,19 +81,34 @@ for cfg in "${CFGS[@]}"; do
   w1=$(runwall "$cfg" "$N1" "$LOGDIR/$name.short.log")
   require_idle "$name:long"
   w2=$(runwall "$cfg" "$N2" "$LOGDIR/$name.long.log")
-  "$PY" - "$name" "$LOGDIR/$name.long.log" "${w1:-0}" "${w2:-0}" "$N1" "$N2" <<'PY'
-import re, sys
+"$PY" - "$name" "$LOGDIR/$name.long.log" "${w1:-0}" "${w2:-0}" "$N1" "$N2" <<'PY'
+import math, re, sys
 name, log, w1, w2, n1, n2 = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
 s = open(log).read()
-losses = [float(x) for x in re.findall(r"'loss': '([0-9.eE+-]+)'", s)]
+
+def floats_for(field):
+    vals = []
+    for raw in re.findall(rf"'{field}': '([^']+)'", s):
+        try:
+            vals.append(float(raw))
+        except ValueError:
+            pass
+    return vals
+
+losses = floats_for("loss")
+grad_norms = floats_for("grad_norm")
 act = [float(x) for x in re.findall(r"max_active \(GiB\)': '([0-9.]+)'", s)]
 failed = ("OutOfMemoryError" in s or "Traceback (most recent call last)" in s) and "'train_loss'" not in s
-diverged = any((l != l) or l > 5.0 for l in losses) if losses else False
+bad_loss = any((not math.isfinite(l)) or l > 5.0 for l in losses) if losses else False
+bad_grad = any(not math.isfinite(g) for g in grad_norms) if grad_norms else False
+diverged = bad_loss or bad_grad
 if failed or w1 == 0 or w2 == 0:
     err = next((ln.strip() for ln in s.splitlines() if "OutOfMemory" in ln), "run failed")
     print(f"{name:<26} {'FAILED':>12}  {err[:50]}")
 elif diverged:
-    print(f"{name:<26} {'DIVERGED':>12}  (loss up to {max(losses):.1f})")
+    loss_msg = f"loss up to {max(losses):.1f}" if losses else "no loss"
+    grad_msg = "non-finite grad_norm" if bad_grad else "finite grad_norm"
+    print(f"{name:<26} {'DIVERGED':>12}  ({loss_msg}; {grad_msg})")
 else:
     marg = (w2 - w1) / (n2 - n1)
     warm = w1 - n1 * marg

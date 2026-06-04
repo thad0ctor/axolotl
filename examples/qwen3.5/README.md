@@ -63,7 +63,9 @@ linear-attention, and standalone FP8 lm_head paths remain eval/no-grad only and
 are intentionally left out of this training-speed config. The opt-in
 FP8 lm_head cross-entropy path can make batch 6 fit without gradient
 checkpointing, but it is currently a memory unlock rather than the fastest
-tokens/sec setting.
+tokens/sec setting. Cut Cross Entropy and Liger fused-linear CE are not valid
+for this NVFP4 training profile today; they loss-collapse with non-finite grad
+norms in validation.
 
 ### Routed Experts (MoE)
 

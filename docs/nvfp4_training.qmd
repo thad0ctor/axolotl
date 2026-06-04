@@ -159,7 +159,11 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | NVFP4 saved attention packs (repeat) | 4 | 1.1525 | ~7,108 tok/s | 69.63 GiB |
 | NVFP4 saved packs + BF16 dK/dV scratch | 4 | 1.1415-1.1485 | ~7,133-7,177 tok/s | 62.03 GiB |
 | NVFP4 saved packs + BF16 dK/dV scratch (beta lock-down repeat) | 4 | 1.2017 | ~6,817 tok/s | 62.03 GiB |
-| NVFP4 FP8 lm_head CE | 6 | 1.7807 | ~6,902 tok/s | 80.32 GiB |
+| NVFP4 locked b4, clean repeat on PCI-order GPU 3 | 4 | 1.0635 | ~7,701 tok/s | 69.63 GiB |
+| NVFP4 locked b5, no CE | 5 | 1.5195 | ~6,740 tok/s | 74.43 GiB |
+| NVFP4 locked b6, no CE | 6 | 1.8473 | ~6,652 tok/s | 86.83 GiB |
+| NVFP4 FP8 lm_head CE, clean b5 repeat | 5 | 1.5312 | ~6,688 tok/s | 69.60 GiB |
+| NVFP4 FP8 lm_head CE, clean b6 short repeat | 6 | 1.7700 | ~6,943 tok/s | 80.32 GiB |
 | Locked profile, 500-step long-tail (RTX PRO 6000 #1, PCIe-first) | 4 | 1.2302 | ~6,659 tok/s | 62.03 GiB |
 | Locked profile + `hadamard: false` (RTX PRO 6000 #1) | 4 | 1.2155 | ~6,739 tok/s | 62.03 GiB |
 
@@ -178,11 +182,13 @@ Negative checks from the same sweep:
 
 - `fused_fp4_cross_entropy` made batch 6 fit but remained slower after saved
   attention packs: 2.0500 s/step (~5,994 tok/s).
-- Cut Cross Entropy also made batch 6 fit, but was slower than the FP4 fused-CE
-  path in the measured b6 run.
-- `fp8_lm_head_cross_entropy` made batch 6 fit and is faster than the old FP4
-  fused-CE path at b6, but it did not beat the b4 saved-pack path on max
-  throughput in validation (b6 1.7807 s/step vs b4 1.1415-1.1485 s/step).
+- Cut Cross Entropy and Liger fused-linear CE are not valid with this NVFP4
+  training setup today: b5 warmups loss-collapsed to zero after the first step
+  and logged non-finite grad norms.
+- `fp8_lm_head_cross_entropy` can reduce memory and run b5/b6, but it did not
+  beat the b4 saved-pack path on max throughput in clean validation. It is also
+  not fully deterministic yet: one b6 run loss-collapsed with `grad_norm: nan`,
+  while a later short b6 repeat stayed finite at 1.7700 s/step.
 - FP8 CE `VOCAB_BLOCK=8192` looked faster in a 40-step filter but did not validate
   in the 60-step marginal run (1.7912 s/step, 81.29 GiB), so the 4096-rowwise
   tile remains the default. Tensorwise FP8 CE now has correct scale wiring, but it
@@ -407,8 +413,11 @@ patches.
 
 This is a memory/batch-size unlock, not the current fastest max-throughput path:
 on Qwen3.5-9B LoRA with sequence length 2048 and no gradient checkpointing it made
-batch 6 fit at 1.7807 s/step (~6,902 tok/s, 80.32 GiB active), while the fastest
-b4 saved-pack path remained ahead on tokens/sec.
+batch 5 run at 1.5312 s/step (~6,688 tok/s, 69.60 GiB active) and batch 6 run at
+1.7700 s/step (~6,943 tok/s, 80.32 GiB active), while the fastest b4 saved-pack
+path remained ahead on tokens/sec. Treat batch-6 FP8 CE as experimental: one
+validation run loss-collapsed after the first step with non-finite grad norms,
+while a later short repeat stayed finite.
 
 ::: {.callout-note}
 At the time of writing, `skip_first_n_blocks` / `skip_last_n_blocks` may be applied
