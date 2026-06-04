@@ -56,6 +56,16 @@ time rather than failing mid-run.
   `NVFP4BlockScaling`. Hand-tuned CUTLASS kernels — faster GEMMs — but an
   optional, heavier dependency, and **full-fine-tune only**.
 
+::: {.callout-note}
+The native NVFP4 **attention** kernel (`nvfp4_training.attention`) lives in a
+standalone SageAttention fork and is imported as `sageattention.nvfp4`. It is
+pure Triton — install it without building SageAttention's CUDA kernels:
+
+```bash
+SAGEATTN_SKIP_CUDA_BUILD=1 pip install -e /path/to/SageAttention-NVFP4
+```
+:::
+
 To use the TE backend, install the extra:
 
 ```bash

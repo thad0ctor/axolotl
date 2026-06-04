@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from mslk.quantize.triton.fp4_quantize import convert_fp32_to_fp4_packed
+from sageattention.nvfp4 import convert_fp32_to_fp4_packed
 
 _E4M3_EPS = tl.constexpr(1.5258789e-05)
 _F8E4M3_MAX = tl.constexpr(448.0)

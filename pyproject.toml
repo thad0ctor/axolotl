@@ -143,6 +143,12 @@ transformer-engine = [
     "transformer_engine[pytorch]>=2.8.0",
     "nvidia-cublas>=13.3.0.5",
 ]
+# Native NVFP4 attention backend. The flash-attention kernel lives in a standalone
+# SageAttention fork; install it Triton-only (editable/local) — see
+# docs/nvfp4_training.qmd.
+nvfp4-attn = [
+    "sageattention",
+]
 opentelemetry = [
     "opentelemetry-api",
     "opentelemetry-sdk",
