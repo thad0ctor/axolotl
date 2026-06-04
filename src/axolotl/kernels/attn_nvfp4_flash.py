@@ -1345,8 +1345,12 @@ def _run_bwd(
     reuse_k_pack = knv_saved is not None and ksc_saved is not None
     reuse_v_pack = vnv_saved is not None and vsc_saved is not None
     reuse_kt_pack = ktnv_saved is not None and ktsc_saved is not None
-    dq = torch.empty(z * h, s_q, d, device=q.device, dtype=torch.float32)
     dkdv_scratch_dtype = torch.bfloat16 if dkdv_scratch_bf16 else torch.float32
+    # dq accumulates in fp32 registers and only downcasts at the final store, so a
+    # bf16 scratch buffer is bit-identical to fp32-then-.to(bf16) here — a pure
+    # memory save (the largest bwd scratch plane). Must stay fp32 if the fused
+    # atomic-add dq path is ever enabled (atomics need fp32).
+    dq = torch.empty(z * h, s_q, d, device=q.device, dtype=dkdv_scratch_dtype)
     dk = torch.empty(z * h, s_kv, d, device=q.device, dtype=dkdv_scratch_dtype)
     dv = torch.empty(z * h, s_kv, d, device=q.device, dtype=dkdv_scratch_dtype)
     if not have_lse:
