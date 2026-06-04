@@ -63,18 +63,26 @@ def _custom_op_enabled(module: nn.Module) -> bool:
     return bool(requested) and torch.compiler.is_compiling()
 
 
-def _mask_is_dense_causal_or_full(
-    attention_mask: torch.Tensor | None, q_len: int, kv_len: int
-) -> str | None:
-    """Return 'causal' / 'full' if the mask is a dense causal/full mask, else None.
+_DENSE_KIND_ATTR = "_nvfp4_dense_kind"
+_TRIL_CACHE: dict[tuple, torch.Tensor] = {}
 
-    None -> there is per-key padding (or a mask shape we can't densely represent),
-    so the caller must fall back to the original forward.
-    """
-    if attention_mask is None:
-        return "causal" if q_len == kv_len else "full"
-    if attention_mask.dim() != 4:
-        return None
+
+def _causal_tril(q_len: int, kv_len: int, device: torch.device) -> torch.Tensor:
+    """Lower-triangular keep mask, cached by (shape, device) to avoid rebuilding the
+    O(S^2) tensor on every classification."""
+    key = (q_len, kv_len, device)
+    t = _TRIL_CACHE.get(key)
+    if t is None:
+        t = torch.tril(
+            torch.ones(q_len, kv_len, dtype=torch.bool, device=device)
+        )
+        _TRIL_CACHE[key] = t
+    return t
+
+
+def _classify_dense_mask(
+    attention_mask: torch.Tensor, q_len: int, kv_len: int
+) -> str | None:
     m = attention_mask[..., :kv_len]
     if m.shape[-1] != kv_len:
         return None
@@ -88,12 +96,38 @@ def _mask_is_dense_causal_or_full(
     if bool(keep.all()):
         return "full"
     if q_len == kv_len:
-        causal = torch.tril(
-            torch.ones(q_len, kv_len, dtype=torch.bool, device=keep.device)
-        )[None]
-        if bool((keep == causal).all()):
+        if bool((keep == _causal_tril(q_len, kv_len, keep.device)[None]).all()):
             return "causal"
     return None
+
+
+def _mask_is_dense_causal_or_full(
+    attention_mask: torch.Tensor | None, q_len: int, kv_len: int
+) -> str | None:
+    """Return 'causal' / 'full' if the mask is a dense causal/full mask, else None.
+
+    None -> there is per-key padding (or a mask shape we can't densely represent),
+    so the caller must fall back to the original forward.
+
+    The dense 4D classification needs ``bool(...)`` reductions (each a device->host
+    sync) plus an O(Z*S^2) full-mask compare. The mask tensor is shared across all
+    decoder layers in a forward, so the result is cached on it (keyed by shape and
+    ``_version``) — computed once per model-forward, not once per attention layer.
+    """
+    if attention_mask is None:
+        return "causal" if q_len == kv_len else "full"
+    if attention_mask.dim() != 4:
+        return None
+    ckey = (q_len, kv_len, attention_mask._version)
+    cached = getattr(attention_mask, _DENSE_KIND_ATTR, None)
+    if cached is not None and cached[0] == ckey:
+        return cached[1]
+    kind = _classify_dense_mask(attention_mask, q_len, kv_len)
+    try:
+        setattr(attention_mask, _DENSE_KIND_ATTR, (ckey, kind))
+    except (AttributeError, RuntimeError):
+        pass  # some tensor subclasses disallow setattr; correctness is unaffected
+    return kind
 
 
 def _get_vproj_packed(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
