@@ -11,6 +11,8 @@
 #   plus FLA boundary:         1.1708 s/step, ~6997 tok/s, 69.63 GiB active
 #   plus BF16 dK/dV scratch:   1.1415-1.1485 s/step, ~7133-7177 tok/s,
 #                              62.03 GiB active
+#   beta lock-down repeat:     1.2017 s/step, ~6817 tok/s,
+#                              62.03 GiB active
 #   FP8 lm_head CE b6:         1.7807 s/step, ~6902 tok/s, 80.32 GiB active
 #                              (fits b6, but slower than this b4 max-throughput path)
 #
@@ -23,7 +25,12 @@
 # activation memory for less backward pack-prep work. The FLA boundary prevents
 # variable packed cu_seqlens from burning compile time in causal_conv1d. BF16
 # dK/dV scratch reduces the attention-backward scratch traffic before GQA reduce.
-# Keep these knobs opt-in.
+# The no-grad/eval-only Qwen3.5 native MLP, native linear-attn, fused v_proj, and
+# standalone fp8_lm_head switches are intentionally omitted: a same-prepared-data
+# ablation measured 1.2017 s/step without them vs 1.2335 s/step with them.
+#
+# For benchmark comparisons, copy this config to /tmp, set base_model to the
+# local model path, and keep dataset_prepared_path fixed across compared runs.
 base_model: Qwen/Qwen3.5-9B
 model_config_type: qwen3_5
 strict: false
@@ -33,8 +40,8 @@ datasets:
   - path: yahma/alpaca-cleaned
     type: alpaca
 val_set_size: 0.0
-dataset_prepared_path: last_run_prepared
-output_dir: ./outputs/qwen35_9b_lora_nvfp4_fastest
+dataset_prepared_path: /tmp/axolotl_nvfp4_qwen35_fastest_prepared
+output_dir: /tmp/axolotl_nvfp4_qwen35_fastest_out
 
 sequence_len: 2048
 sample_packing: true
@@ -66,6 +73,7 @@ num_epochs: 1
 optimizer: adamw_torch_fused
 lr_scheduler: cosine
 learning_rate: 2.0e-4
+max_grad_norm: 1.0
 
 bf16: true
 fp16: false
@@ -83,6 +91,7 @@ nvfp4_training:
   exclude_modules: [lm_head, embed_tokens]
   skip_first_n_blocks: 0
   skip_last_n_blocks: 0
+  fuse_rmsnorm: false
 
   # Qwen3.5 full-attention training path. The saved-pack flag is the measured
   # throughput win; RTN grad packs keep the safe gradient-side packs deterministic.
