@@ -269,7 +269,8 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "Qwen3.5 native attention training only. Use "
             "deterministic round-to-nearest for the measured-safe gradient packs "
             "(softmax P and transposed dO for dV, and dS for dQ) while leaving the "
-            "dK routing-gradient dS pack governed by stochastic_rounding. This "
+            "dK routing-gradient dS pack AND the dPt dO pack governed by "
+            "stochastic_rounding. This "
             "collapsed mode was faster in backward microbenchmarks; convergence "
             "validation is still required for production training. OFF by default."
         },
