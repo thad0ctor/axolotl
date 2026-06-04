@@ -104,6 +104,25 @@ class NVFP4TrainingConfig(BaseModel):
             "OFF by default."
         },
     )
+    bf16_lm_head_cross_entropy: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Patch a plain frozen bias-free nn.Linear lm_head "
+            "training forward to compute cross-entropy by tiling over the vocab in "
+            "bf16, avoiding full [batch*seq, vocab] logits materialization (~1 GiB "
+            "at vocab 152k / seq 8k) and the matching logits-gradient GEMM. The "
+            "per-tile lm_head matmul runs in plain bf16 (bit-for-bit the same "
+            "arithmetic as the materialized hidden @ W.t()); logsumexp/softmax and "
+            "the dL/dhidden accumulation are kept in fp32. This is the exact tiled "
+            "CE gradient (no low-probability vocab filtering), so it is "
+            "convergence-safe under NVFP4 stochastic-rounding grads where the fused "
+            "cut_cross_entropy / Liger paths collapsed. Returns dL/dhidden only (no "
+            "lm_head weight grad). Incompatible with quantize_lm_head, "
+            "fused_fp4_cross_entropy, and the FP8 cross-entropy patch. This is a "
+            "MEMORY/backward-traffic win, not an FP4 tensor-core throughput win. "
+            "OFF by default."
+        },
+    )
     fp8_lm_head: bool = Field(
         default=False,
         json_schema_extra={

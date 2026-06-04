@@ -502,6 +502,13 @@ class PatchManager:
                 granularity=getattr(nvfp4, "fp8_lm_head_granularity", "rowwise"),
             )
 
+        if getattr(nvfp4, "bf16_lm_head_cross_entropy", False):
+            from axolotl.kernels.bf16_fused_ce import (
+                patch_model_bf16_lm_head_cross_entropy,
+            )
+
+            patch_model_bf16_lm_head_cross_entropy(model)
+
     def _apply_qwen3_5_native_nvfp4_patches(self, model: PreTrainedModel):
         nvfp4 = self.cfg.nvfp4_training
         if not (nvfp4 and nvfp4.enabled):

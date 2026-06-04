@@ -115,6 +115,39 @@ def test_gate_refuses_fp8_lm_head_ce_with_quantized_lm_head(monkeypatch):
         )
 
 
+def test_schema_accepts_bf16_lm_head_ce(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        nvfp4_training={"enabled": True, "bf16_lm_head_cross_entropy": True},
+    )
+    assert cfg.nvfp4_training.bf16_lm_head_cross_entropy is True
+
+
+def test_schema_refuses_bf16_lm_head_ce_with_other_ce(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="Only one cross entropy optimization"):
+        AxolotlInputConfig(
+            **BASE,
+            cut_cross_entropy=True,
+            nvfp4_training={"enabled": True, "bf16_lm_head_cross_entropy": True},
+        )
+
+
+def test_gate_refuses_bf16_lm_head_ce_with_quantized_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="bf16_lm_head_cross_entropy"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            nvfp4_training={
+                "enabled": True,
+                "quantize_lm_head": True,
+                "bf16_lm_head_cross_entropy": True,
+            },
+        )
+
+
 def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
     _supported(monkeypatch, True)
     cfg = AxolotlInputConfig(
