@@ -292,17 +292,37 @@ def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
         )
 
 
-def test_gate_refuses_qwen3_5_compile_custom_op_with_backward(monkeypatch):
+def test_qwen3_5_compile_custom_op_allowed_with_backward(monkeypatch):
+    # The compile custom op is now a differentiable, training-compatible op
+    # (register_autograd), so it is ALLOWED together with native_attention_backward
+    # (the prior inference-only rejection gate was removed).
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match="inference-only"):
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        model_config_type="qwen3_5",
+        nvfp4_training={
+            "enabled": True,
+            "qwen3_5_native_attention": True,
+            "qwen3_5_native_attention_backward": True,
+            "qwen3_5_native_attention_compile_custom_op": True,
+        },
+    )
+    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is True
+    assert cfg.nvfp4_training.qwen3_5_native_attention_backward is True
+
+
+def test_qwen3_5_compile_custom_op_requires_native_attention(monkeypatch):
+    # The remaining dependency gate: compile_custom_op needs native_attention on.
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="requires qwen3_5_native_attention"):
         AxolotlConfigWCapabilities(
             **BASE,
             **CAPS,
             model_config_type="qwen3_5",
             nvfp4_training={
                 "enabled": True,
-                "qwen3_5_native_attention": True,
-                "qwen3_5_native_attention_backward": True,
+                "qwen3_5_native_attention": False,
                 "qwen3_5_native_attention_compile_custom_op": True,
             },
         )
