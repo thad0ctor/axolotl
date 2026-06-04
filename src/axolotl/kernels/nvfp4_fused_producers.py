@@ -47,7 +47,7 @@ def _rope_quant_kernel(
     cos_ptr, sin_ptr, # [Z, S, ROT]  (ROT = rotary_dim)
     q_ptr, s_ptr,     # [Z*H, S, D//2] uint8, [Z*H, S, D//16] e4m3
     Z, H, S,
-    s_xn, s_xr,       # x: per-(z*h) stride, per-row(seq) stride; col stride = 1
+    s_xz, s_xh, s_xr,  # x: per-z, per-h, per-row(seq) strides; col(D) stride = 1
     s_cz, s_cr,       # cos/sin: per-z stride, per-row stride; col stride = 1
     s_qn, s_qr,       # q packed: per-(z*h) stride, per-row stride
     s_sn, s_sr,       # scale: per-(z*h) stride, per-row stride
@@ -58,12 +58,13 @@ def _rope_quant_kernel(
     pid_n = tl.program_id(0)   # z*h
     pid_r = tl.program_id(1)
     z = pid_n // H
+    h = pid_n % H
 
     offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
     rmask = offs_r < S
     offs_d = tl.arange(0, D)
 
-    xbase = pid_n * s_xn
+    xbase = z * s_xz + h * s_xh
     x = tl.load(
         x_ptr + xbase + offs_r[:, None] * s_xr + offs_d[None, :],
         mask=rmask[:, None], other=0.0,
@@ -130,20 +131,24 @@ def fused_rope_quant_qk(
     z, h, s, d = x.shape
     rot = cos.shape[-1]
     assert d % 16 == 0 and rot % 2 == 0 and rot <= d
-    x = x.contiguous()
+    # Read x in whatever layout it arrives (typically a [Z,S,H,D].transpose(1,2)
+    # view → non-contiguous, but D stays contiguous), so we DON'T pay a full bf16
+    # copy here. The kernel only needs the head_dim (D) unit-stride; if some caller
+    # passes a non-D-contiguous x, fall back to a copy (correctness over speed).
+    if x.stride(3) != 1:
+        x = x.contiguous()
     cos = cos.contiguous()
     sin = sin.contiguous()
 
-    xn = x.reshape(z * h, s, d)
     q = x.new_empty(z * h, s, d // 2, dtype=torch.uint8)
     sc = x.new_empty(z * h, s, d // 16, dtype=torch.uint8)
 
     BLOCK_R = 64
     grid = (z * h, triton.cdiv(s, BLOCK_R))
     _rope_quant_kernel[grid](
-        xn, cos, sin, q, sc,
+        x, cos, sin, q, sc,
         z, h, s,
-        xn.stride(0), xn.stride(1),
+        x.stride(0), x.stride(1), x.stride(2),
         cos.stride(0), cos.stride(1),
         q.stride(0), q.stride(1),
         sc.stride(0), sc.stride(1),
