@@ -25,6 +25,8 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import triton
+from triton import language as tl
 
 LOG = logging.getLogger(__name__)
 
@@ -221,6 +223,22 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
     )
 
     t = t.contiguous()
+    if (
+        (policy.hadamard or policy.stochastic)
+        and t.is_cuda
+        and t.dim() == 2
+        and t.shape[-1] % _BLOCK_SIZE == 0
+        and _recipe_fusion_available(t)
+    ):
+        q, s, inv_gs = _mslk_quantize_recipe(t, policy)
+        return NVFP4Tensor(
+            q,
+            s,
+            _BLOCK_SIZE,
+            t.dtype,
+            per_tensor_scale=inv_gs.to(torch.float32),
+            is_swizzled_scales=True,
+        )
     if policy.hadamard:
         t = _apply_rht(t).contiguous()
     per_tensor_scale = per_tensor_amax_to_scale(torch.max(torch.abs(t)))
@@ -828,6 +846,18 @@ def _mslk_available() -> bool:
     return _MSLK_AVAILABLE
 
 
+def _recipe_fusion_available(t: torch.Tensor) -> bool:
+    if (
+        not t.is_cuda
+        or t.dim() != 2
+        or t.shape[-1] % _BLOCK_SIZE != 0
+        or not _mslk_available()
+    ):
+        return False
+    cap = torch.cuda.get_device_capability(t.device)
+    return cap[0] == 10
+
+
 def _swizzled_scale_shape(m: int, k: int) -> tuple[int, int]:
     """Shape of MSLK's swizzled e4m3 block-scale tensor for a [m, k] input.
 
@@ -839,6 +869,458 @@ def _swizzled_scale_shape(m: int, k: int) -> tuple[int, int]:
     n_blocks = k // _BLOCK_SIZE
     rounded_k = (n_blocks + 3) // 4 * 4
     return rounded_m, rounded_k
+
+
+@triton.jit
+def _recipe_scale_swizzle(offs_m):
+    sub_layout_idx = offs_m % 32
+    sub_layout_off = sub_layout_idx * 16
+    sub_layout_row = offs_m // 32
+    elems = tl.arange(0, 4)[None, :]
+    return sub_layout_off + sub_layout_row * 4 + elems
+
+
+@triton.jit
+def _recipe_fp32_to_fp4_packed(x_pairs):
+    x_fp4x2 = tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b8 byte0, byte1, byte2, byte3;
+        cvt.rn.satfinite.e2m1x2.f32 byte0, $5, $1;
+        cvt.rn.satfinite.e2m1x2.f32 byte1, $6, $2;
+        cvt.rn.satfinite.e2m1x2.f32 byte2, $7, $3;
+        cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $4;
+        mov.b32 $0, {byte0, byte1, byte2, byte3};
+        }
+        """,
+        constraints=("=r,r,r,r,r,r,r,r,r"),
+        args=x_pairs,
+        dtype=tl.uint8,
+        is_pure=True,
+        pack=4,
+    )
+    return x_fp4x2
+
+
+@triton.jit
+def _recipe_load_lane(
+    x_ptr,
+    offs_m,
+    group,
+    pid_n,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    lane: tl.constexpr,
+    USE_MASK: tl.constexpr,
+):
+    offs_n = pid_n * 64 + group * 16 + lane
+    if USE_MASK:
+        mask = (offs_m < M) & (offs_n < N)
+        other = 0.0
+    else:
+        mask = None
+        other = None
+    return tl.load(x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=other).to(tl.float32)
+
+
+@triton.jit
+def _recipe_hadamard16(
+    x0, x1, x2, x3, x4, x5, x6, x7,
+    x8, x9, x10, x11, x12, x13, x14, x15,
+):
+    a0 = x0 + x1
+    a1 = x0 - x1
+    a2 = x2 + x3
+    a3 = x2 - x3
+    a4 = x4 + x5
+    a5 = x4 - x5
+    a6 = x6 + x7
+    a7 = x6 - x7
+    a8 = x8 + x9
+    a9 = x8 - x9
+    a10 = x10 + x11
+    a11 = x10 - x11
+    a12 = x12 + x13
+    a13 = x12 - x13
+    a14 = x14 + x15
+    a15 = x14 - x15
+
+    b0 = a0 + a2
+    b1 = a1 + a3
+    b2 = a0 - a2
+    b3 = a1 - a3
+    b4 = a4 + a6
+    b5 = a5 + a7
+    b6 = a4 - a6
+    b7 = a5 - a7
+    b8 = a8 + a10
+    b9 = a9 + a11
+    b10 = a8 - a10
+    b11 = a9 - a11
+    b12 = a12 + a14
+    b13 = a13 + a15
+    b14 = a12 - a14
+    b15 = a13 - a15
+
+    c0 = b0 + b4
+    c1 = b1 + b5
+    c2 = b2 + b6
+    c3 = b3 + b7
+    c4 = b0 - b4
+    c5 = b1 - b5
+    c6 = b2 - b6
+    c7 = b3 - b7
+    c8 = b8 + b12
+    c9 = b9 + b13
+    c10 = b10 + b14
+    c11 = b11 + b15
+    c12 = b8 - b12
+    c13 = b9 - b13
+    c14 = b10 - b14
+    c15 = b11 - b15
+
+    s = 0.25
+    y0 = -(c0 + c8) * s
+    y1 = (c1 + c9) * s
+    y2 = (c2 + c10) * s
+    y3 = -(c3 + c11) * s
+    y4 = (c4 + c12) * s
+    y5 = (c5 + c13) * s
+    y6 = (c6 + c14) * s
+    y7 = (c7 + c15) * s
+    y8 = (c0 - c8) * s
+    y9 = (c1 - c9) * s
+    y10 = (c2 - c10) * s
+    y11 = -(c3 - c11) * s
+    y12 = -(c4 - c12) * s
+    y13 = (c5 - c13) * s
+    y14 = -(c6 - c14) * s
+    y15 = -(c7 - c15) * s
+    return (
+        y0.to(tl.bfloat16).to(tl.float32),
+        y1.to(tl.bfloat16).to(tl.float32),
+        y2.to(tl.bfloat16).to(tl.float32),
+        y3.to(tl.bfloat16).to(tl.float32),
+        y4.to(tl.bfloat16).to(tl.float32),
+        y5.to(tl.bfloat16).to(tl.float32),
+        y6.to(tl.bfloat16).to(tl.float32),
+        y7.to(tl.bfloat16).to(tl.float32),
+        y8.to(tl.bfloat16).to(tl.float32),
+        y9.to(tl.bfloat16).to(tl.float32),
+        y10.to(tl.bfloat16).to(tl.float32),
+        y11.to(tl.bfloat16).to(tl.float32),
+        y12.to(tl.bfloat16).to(tl.float32),
+        y13.to(tl.bfloat16).to(tl.float32),
+        y14.to(tl.bfloat16).to(tl.float32),
+        y15.to(tl.bfloat16).to(tl.float32),
+    )
+
+
+@triton.jit
+def _recipe_lane_amax(
+    y0, y1, y2, y3, y4, y5, y6, y7,
+    y8, y9, y10, y11, y12, y13, y14, y15,
+):
+    a = tl.maximum(tl.abs(y0), tl.abs(y1))
+    a = tl.maximum(a, tl.abs(y2))
+    a = tl.maximum(a, tl.abs(y3))
+    a = tl.maximum(a, tl.abs(y4))
+    a = tl.maximum(a, tl.abs(y5))
+    a = tl.maximum(a, tl.abs(y6))
+    a = tl.maximum(a, tl.abs(y7))
+    a = tl.maximum(a, tl.abs(y8))
+    a = tl.maximum(a, tl.abs(y9))
+    a = tl.maximum(a, tl.abs(y10))
+    a = tl.maximum(a, tl.abs(y11))
+    a = tl.maximum(a, tl.abs(y12))
+    a = tl.maximum(a, tl.abs(y13))
+    a = tl.maximum(a, tl.abs(y14))
+    return tl.maximum(a, tl.abs(y15))
+
+
+@triton.jit
+def _recipe_rht_amax_kernel(
+    x_ptr,
+    partial_ptr,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    M_PER_BLOCK: tl.constexpr,
+    USE_MASK: tl.constexpr,
+    HADAMARD: tl.constexpr,
+    USE_INT64_INDEXING: tl.constexpr,
+):
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(0)
+    offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
+    group = tl.arange(0, 4)[None, :]
+    if USE_INT64_INDEXING:
+        offs_m = offs_m.to(tl.int64)
+
+    x0 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 0, USE_MASK)
+    x1 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 1, USE_MASK)
+    x2 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 2, USE_MASK)
+    x3 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 3, USE_MASK)
+    x4 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 4, USE_MASK)
+    x5 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 5, USE_MASK)
+    x6 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 6, USE_MASK)
+    x7 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 7, USE_MASK)
+    x8 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 8, USE_MASK)
+    x9 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 9, USE_MASK)
+    x10 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 10, USE_MASK)
+    x11 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 11, USE_MASK)
+    x12 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 12, USE_MASK)
+    x13 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 13, USE_MASK)
+    x14 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 14, USE_MASK)
+    x15 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 15, USE_MASK)
+
+    if HADAMARD:
+        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15 = _recipe_hadamard16(
+            x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15
+        )
+    else:
+        y0, y1, y2, y3, y4, y5, y6, y7 = x0, x1, x2, x3, x4, x5, x6, x7
+        y8, y9, y10, y11, y12, y13, y14, y15 = x8, x9, x10, x11, x12, x13, x14, x15
+
+    a = _recipe_lane_amax(
+        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15
+    )
+    tl.store(partial_ptr + pid_m * tl.num_programs(0) + pid_n, tl.max(a))
+
+
+@triton.jit
+def _recipe_norm_lane(y, scales, global_scale, seed, base_off, lane_off, STOCHASTIC: tl.constexpr):
+    yn = y * (global_scale / scales.to(tl.float32))
+    if STOCHASTIC:
+        ax = tl.abs(yn)
+        step = tl.where(ax < 2.0, 1.0, tl.where(ax < 4.0, 2.0, 4.0))
+        yn = yn + (tl.rand(seed, base_off + lane_off) - 0.5) * step
+    return tl.clamp(yn, -6.0, 6.0)
+
+
+@triton.jit
+def _recipe_quantize_kernel(
+    x_ptr,
+    global_scale_ptr,
+    q_ptr,
+    s_ptr,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    seed,
+    M_PER_BLOCK: tl.constexpr,
+    USE_MASK: tl.constexpr,
+    HADAMARD: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
+    USE_INT64_INDEXING: tl.constexpr,
+):
+    E4M3_EPS = 1.5258789e-05
+    FP8_E4M3_MAX = 448.0
+    FP4_E2M1_MAX = 6.0
+    NUM_ELEM_PER_LAYOUT: tl.constexpr = 128 * 4
+    NUM_N_BLOCKS = tl.cdiv(N, 64)
+
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(0)
+
+    if M_PER_BLOCK != 128 and pid_m * M_PER_BLOCK >= M:
+        layout_off = pid_n * NUM_ELEM_PER_LAYOUT
+        offs_m_zero = tl.arange(0, 128)[:, None]
+        scale_offs = layout_off + _recipe_scale_swizzle(offs_m_zero)
+        zero_scales = tl.full([128, 4], 0, dtype=tl.float8e4nv)
+        oob_mask = (offs_m_zero >= M) & tl.full((4,), True, dtype=tl.int1)[None, :]
+        tl.store(s_ptr + scale_offs, zero_scales, mask=oob_mask)
+        return
+
+    offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
+    group = tl.arange(0, 4)[None, :]
+    if USE_INT64_INDEXING:
+        offs_m = offs_m.to(tl.int64)
+
+    x0 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 0, USE_MASK)
+    x1 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 1, USE_MASK)
+    x2 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 2, USE_MASK)
+    x3 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 3, USE_MASK)
+    x4 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 4, USE_MASK)
+    x5 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 5, USE_MASK)
+    x6 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 6, USE_MASK)
+    x7 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 7, USE_MASK)
+    x8 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 8, USE_MASK)
+    x9 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 9, USE_MASK)
+    x10 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 10, USE_MASK)
+    x11 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 11, USE_MASK)
+    x12 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 12, USE_MASK)
+    x13 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 13, USE_MASK)
+    x14 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 14, USE_MASK)
+    x15 = _recipe_load_lane(x_ptr, offs_m, group, pid_n, stride_xm, stride_xn, M, N, 15, USE_MASK)
+
+    if HADAMARD:
+        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15 = _recipe_hadamard16(
+            x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15
+        )
+    else:
+        y0, y1, y2, y3, y4, y5, y6, y7 = x0, x1, x2, x3, x4, x5, x6, x7
+        y8, y9, y10, y11, y12, y13, y14, y15 = x8, x9, x10, x11, x12, x13, x14, x15
+
+    block_amax = _recipe_lane_amax(
+        y0, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14, y15
+    )
+    global_scale = tl.load(global_scale_ptr)
+    scales = tl.clamp(block_amax / FP4_E2M1_MAX * global_scale, E4M3_EPS, FP8_E4M3_MAX)
+    scales = scales.to(tl.float8e4nv)
+
+    if USE_MASK:
+        scale_offs_n = pid_n * 4 + group
+        scale_mask = (offs_m < M) & (scale_offs_n < (N // 16))
+        scales = tl.where(scale_mask, scales, 0.0)
+
+    offs_m_in_layout = (pid_m * M_PER_BLOCK % 128) + tl.arange(0, M_PER_BLOCK)[:, None]
+    layout_off = ((pid_m * M_PER_BLOCK) // 128) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
+    scale_offs = layout_off + _recipe_scale_swizzle(offs_m_in_layout)
+    tl.store(s_ptr + scale_offs, scales)
+
+    row_base = offs_m * N
+    col_base = pid_n * 64 + group * 16
+    n0 = _recipe_norm_lane(y0, scales, global_scale, seed, row_base + col_base, 0, STOCHASTIC)
+    n1 = _recipe_norm_lane(y1, scales, global_scale, seed, row_base + col_base, 1, STOCHASTIC)
+    n2 = _recipe_norm_lane(y2, scales, global_scale, seed, row_base + col_base, 2, STOCHASTIC)
+    n3 = _recipe_norm_lane(y3, scales, global_scale, seed, row_base + col_base, 3, STOCHASTIC)
+    n4 = _recipe_norm_lane(y4, scales, global_scale, seed, row_base + col_base, 4, STOCHASTIC)
+    n5 = _recipe_norm_lane(y5, scales, global_scale, seed, row_base + col_base, 5, STOCHASTIC)
+    n6 = _recipe_norm_lane(y6, scales, global_scale, seed, row_base + col_base, 6, STOCHASTIC)
+    n7 = _recipe_norm_lane(y7, scales, global_scale, seed, row_base + col_base, 7, STOCHASTIC)
+    n8 = _recipe_norm_lane(y8, scales, global_scale, seed, row_base + col_base, 8, STOCHASTIC)
+    n9 = _recipe_norm_lane(y9, scales, global_scale, seed, row_base + col_base, 9, STOCHASTIC)
+    n10 = _recipe_norm_lane(y10, scales, global_scale, seed, row_base + col_base, 10, STOCHASTIC)
+    n11 = _recipe_norm_lane(y11, scales, global_scale, seed, row_base + col_base, 11, STOCHASTIC)
+    n12 = _recipe_norm_lane(y12, scales, global_scale, seed, row_base + col_base, 12, STOCHASTIC)
+    n13 = _recipe_norm_lane(y13, scales, global_scale, seed, row_base + col_base, 13, STOCHASTIC)
+    n14 = _recipe_norm_lane(y14, scales, global_scale, seed, row_base + col_base, 14, STOCHASTIC)
+    n15 = _recipe_norm_lane(y15, scales, global_scale, seed, row_base + col_base, 15, STOCHASTIC)
+
+    q0 = _recipe_fp32_to_fp4_packed((n0, n1))
+    q1 = _recipe_fp32_to_fp4_packed((n2, n3))
+    q2 = _recipe_fp32_to_fp4_packed((n4, n5))
+    q3 = _recipe_fp32_to_fp4_packed((n6, n7))
+    q4 = _recipe_fp32_to_fp4_packed((n8, n9))
+    q5 = _recipe_fp32_to_fp4_packed((n10, n11))
+    q6 = _recipe_fp32_to_fp4_packed((n12, n13))
+    q7 = _recipe_fp32_to_fp4_packed((n14, n15))
+
+    q_col = pid_n * 32 + group * 8
+    q_mask_base = offs_m < M
+    if USE_INT64_INDEXING:
+        q_col = q_col.to(tl.int64)
+    if USE_MASK:
+        mask0 = q_mask_base & ((q_col + 0) < (N // 2))
+        mask1 = q_mask_base & ((q_col + 1) < (N // 2))
+        mask2 = q_mask_base & ((q_col + 2) < (N // 2))
+        mask3 = q_mask_base & ((q_col + 3) < (N // 2))
+        mask4 = q_mask_base & ((q_col + 4) < (N // 2))
+        mask5 = q_mask_base & ((q_col + 5) < (N // 2))
+        mask6 = q_mask_base & ((q_col + 6) < (N // 2))
+        mask7 = q_mask_base & ((q_col + 7) < (N // 2))
+    else:
+        mask0 = None
+        mask1 = None
+        mask2 = None
+        mask3 = None
+        mask4 = None
+        mask5 = None
+        mask6 = None
+        mask7 = None
+    q_base = offs_m * (N // 2) + q_col
+    tl.store(q_ptr + q_base + 0, q0, mask=mask0)
+    tl.store(q_ptr + q_base + 1, q1, mask=mask1)
+    tl.store(q_ptr + q_base + 2, q2, mask=mask2)
+    tl.store(q_ptr + q_base + 3, q3, mask=mask3)
+    tl.store(q_ptr + q_base + 4, q4, mask=mask4)
+    tl.store(q_ptr + q_base + 5, q5, mask=mask5)
+    tl.store(q_ptr + q_base + 6, q6, mask=mask6)
+    tl.store(q_ptr + q_base + 7, q7, mask=mask7)
+
+
+def _recipe_m_per_block(m: int) -> int:
+    return min(triton.next_power_of_2(m), 128)
+
+
+def _recipe_rht_amax(t: torch.Tensor, hadamard: bool) -> torch.Tensor:
+    if not hadamard:
+        return torch.amax(torch.abs(t)).to(torch.float32)
+    m, n = t.shape
+    m_per_block = _recipe_m_per_block(m)
+    grid = (triton.cdiv(n, 64), triton.cdiv(m, m_per_block))
+    partial = torch.empty((grid[1], grid[0]), device=t.device, dtype=torch.float32)
+    _recipe_rht_amax_kernel[grid](
+        t,
+        partial,
+        t.stride(0),
+        t.stride(1),
+        m,
+        n,
+        M_PER_BLOCK=m_per_block,
+        USE_MASK=m % m_per_block != 0 or n % 64 != 0,
+        HADAMARD=hadamard,
+        USE_INT64_INDEXING=m * n > 2**31 - 1,
+    )
+    return torch.amax(partial).to(torch.float32)
+
+
+@torch.library.custom_op("axolotl_nvfp4::quantize_two_level_recipe", mutates_args=())
+def _mslk_quantize_recipe_op(
+    t: torch.Tensor,
+    hadamard: bool,
+    stochastic: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    t = t.contiguous()
+    m, n = t.shape
+    amax = _recipe_rht_amax(t, bool(hadamard))
+    global_scale = _NVFP4_GLOBAL_AMAX / torch.clamp(amax, min=1e-12)
+    q = t.new_empty(m, n // 2, dtype=torch.uint8)
+    rm, rk = _swizzled_scale_shape(m, n)
+    s = t.new_empty(rm, rk, dtype=torch.float8_e4m3fn)
+    seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item() if stochastic else 0
+    m_per_block = _recipe_m_per_block(m)
+    grid = (triton.cdiv(n, 64), triton.cdiv(m, m_per_block))
+    if m_per_block != 128:
+        grid = (grid[0], grid[1] + 1)
+    _recipe_quantize_kernel[grid](
+        t,
+        global_scale,
+        q,
+        s,
+        t.stride(0),
+        t.stride(1),
+        m,
+        n,
+        seed,
+        M_PER_BLOCK=m_per_block,
+        USE_MASK=m % m_per_block != 0 or n % 64 != 0,
+        HADAMARD=hadamard,
+        STOCHASTIC=stochastic,
+        USE_INT64_INDEXING=m * n > 2**31 - 1,
+    )
+    return (
+        q.view(torch.float4_e2m1fn_x2),
+        s.view(torch.float8_e4m3fn),
+        (1.0 / global_scale).to(t.dtype),
+    )
+
+
+@_mslk_quantize_recipe_op.register_fake
+def _(t, hadamard: bool, stochastic: bool):
+    del hadamard, stochastic
+    m, k = t.shape
+    rm, rk = _swizzled_scale_shape(m, k)
+    return (
+        t.new_empty(m, k // 2, dtype=torch.float4_e2m1fn_x2),
+        t.new_empty(rm, rk, dtype=torch.float8_e4m3fn),
+        t.new_empty((), dtype=t.dtype),
+    )
 
 
 # MSLK's Triton quant kernels registered as opaque custom ops. Inductor's
@@ -909,6 +1391,12 @@ def _mslk_quantize(t: torch.Tensor):
     opaque-in-graph under torch.compile (see ``_mslk_quantize_op``).
     """
     return _mslk_quantize_op(t)
+
+
+def _mslk_quantize_recipe(t: torch.Tensor, policy: QuantPolicy):
+    if not (policy.hadamard or policy.stochastic) or not _recipe_fusion_available(t):
+        return _mslk_quantize(t)
+    return _mslk_quantize_recipe_op(t, bool(policy.hadamard), bool(policy.stochastic))
 
 
 def _mslk_dequant(qdata, scale, inv_gs, shape, dtype=torch.bfloat16) -> torch.Tensor:
@@ -1004,13 +1492,16 @@ class NVFP4FastComputeBaseFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, wq_f, wsc_f, w_inv_f, wq_d, wsc_d, w_inv_d, out_features):
+    def forward(
+        ctx, x, wq_f, wsc_f, w_inv_f, wq_d, wsc_d, w_inv_d, out_features, recipe
+    ):
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
         # fprop: single-level activation (no per-step amax) @ two-level weight.
         xq, xsc = _prequant_sl(x, x2d)
         out = _mslk_fprop_mm(xq, xsc, wq_f, wsc_f, w_inv_f, x.dtype)
         ctx.dgrad = (wq_d, wsc_d, w_inv_d)
+        ctx.recipe = recipe
         ctx.x_shape = orig_shape
         ctx.out_features = out_features
         return out.reshape(*orig_shape[:-1], out_features)
@@ -1021,21 +1512,23 @@ class NVFP4FastComputeBaseFunction(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             wq_d, wsc_d, w_inv_d = ctx.dgrad
             g = grad_out.reshape(-1, ctx.out_features)
-            gq, gsc, g_inv = _mslk_quantize(g)
+            gq, gsc, g_inv = _mslk_quantize_recipe(
+                g, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding)
+            )
             grad_x = _mslk_scaled_mm(
                 gq, gsc, g_inv, wq_d, wsc_d, w_inv_d, grad_out.dtype
             )
             grad_x = grad_x.reshape(ctx.x_shape)
-        return grad_x, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None
 
 
 class NVFP4FastComputeBaseLinear(nn.Module):
     """Frozen LoRA base with MSLK-fused FP4 compute on fprop + dgrad.
 
     Drop-in for :class:`NVFP4ComputeBaseLinear` (same memory: two FP4 weight
-    layouts + scales) chosen when MSLK is available. ``recipe`` SR/RHT are not
-    applied here (MSLK's plain quant is round-to-nearest); on sm_120 the recipe
-    is disabled anyway, and the win is throughput.
+    layouts + scales) chosen when MSLK is available. Gradient-side SR is applied
+    by the recipe-aware quantizer; RHT is irrelevant because the base is frozen
+    and has no wgrad.
     """
 
     def __init__(self, w_f, w_d, bias, out_features, recipe: NVFP4Recipe):
@@ -1064,6 +1557,7 @@ class NVFP4FastComputeBaseLinear(nn.Module):
             self.wsc_d,
             self.w_inv_d,
             self.out_features,
+            self.recipe,
         )
         return out if self.bias is None else out + self.bias
 
@@ -1100,12 +1594,13 @@ class NVFP4FastFrozenBaseFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, wq, wsc, w_inv, out_features, in_features):
+    def forward(ctx, x, wq, wsc, w_inv, out_features, in_features, recipe):
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
         xq, xsc, x_inv = _mslk_quantize(x2d)
         out = _mslk_scaled_mm(xq, xsc, x_inv, wq, wsc, w_inv, x.dtype)
         ctx.wstore = (wq, wsc, w_inv)
+        ctx.recipe = recipe
         ctx.x_shape = orig_shape
         ctx.out_features = out_features
         ctx.in_features = in_features
@@ -1123,13 +1618,15 @@ class NVFP4FastFrozenBaseFunction(torch.autograd.Function):
                 wq, wsc, w_inv, (ctx.out_features, ctx.in_features), grad_out.dtype
             )
             gp, m = _pad_to_block(g, 0)
-            gq, gsc, g_inv = _mslk_quantize(gp)
+            gq, gsc, g_inv = _mslk_quantize_recipe(
+                gp, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding)
+            )
             wdq, wdsc, wd_inv = _mslk_quantize(w_hp.t().contiguous())  # B = W.t()
             grad_x = _mslk_scaled_mm(
                 gq, gsc, g_inv, wdq, wdsc, wd_inv, grad_out.dtype
             )[:m]
             grad_x = grad_x.reshape(ctx.x_shape)
-        return grad_x, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None
 
 
 class NVFP4FastFrozenBaseLinear(nn.Module):
@@ -1138,8 +1635,8 @@ class NVFP4FastFrozenBaseLinear(nn.Module):
 
     Drop-in for :class:`NVFP4FrozenBaseLinear`, chosen when MSLK is available. Same
     single-layout FP4 storage; dgrad dequantizes the weight (no second layout).
-    ``recipe`` SR/RHT are not applied (MSLK's quant is round-to-nearest), matching
-    :class:`NVFP4FastComputeBaseLinear`.
+    Gradient-side SR is applied by the recipe-aware quantizer; RHT is irrelevant
+    because the base is frozen and has no wgrad.
     """
 
     def __init__(self, w_store, bias, out_features, in_features, recipe: NVFP4Recipe):
@@ -1155,7 +1652,13 @@ class NVFP4FastFrozenBaseLinear(nn.Module):
 
     def forward(self, x):
         out = NVFP4FastFrozenBaseFunction.apply(
-            x, self.wq, self.wsc, self.w_inv, self.out_features, self.in_features
+            x,
+            self.wq,
+            self.wsc,
+            self.w_inv,
+            self.out_features,
+            self.in_features,
+            self.recipe,
         )
         return out if self.bias is None else out + self.bias
 
@@ -1229,7 +1732,7 @@ def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
     gp, m = _pad_to_block(g, 0)
     sr = QuantPolicy(stochastic=base.recipe.stochastic_rounding)
     if isinstance(base, NVFP4FastComputeBaseLinear):
-        gq, gsc, g_inv = _mslk_quantize(gp)
+        gq, gsc, g_inv = _mslk_quantize_recipe(gp, sr)
         out = _mslk_scaled_mm(
             gq, gsc, g_inv, base.wq_d, base.wsc_d, base.w_inv_d, g.dtype
         )
@@ -1904,13 +2407,6 @@ def convert_lora_base_to_nvfp4(
             streamed = True
         if compute_base:
             fast = _mslk_available()
-            if fast and (recipe.stochastic_rounding or recipe.hadamard):
-                LOG.warning_once(
-                    "NVFP4 MSLK-fast compute base uses round-to-nearest; the "
-                    "stochastic_rounding/hadamard convergence recipe is NOT applied "
-                    "(harmless on sm_120 where the recipe is off anyway, but on "
-                    "sm_100 this drops the recipe — use base_mode without mslk for it)."
-                )
             cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
             module.base_layer = cls.from_linear(base, recipe)
         elif quantized_storage:
