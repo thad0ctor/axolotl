@@ -129,18 +129,26 @@ def fused_rmsnorm_nvfp4(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    rms: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """RMSNorm(x) * weight, returning (normalized bf16, packed fp4, swizzled scales).
 
     Single-level (activation) NVFP4: global_scale is implicitly 1.0. The fp4/scale
     outputs feed ``torch._scaled_mm`` directly (TN layout, contraction %32).
+
+    ``rms`` (the per-row ``rsqrt(mean(x^2)+eps)``) may be passed in when the caller
+    already computed it (e.g. the autograd Function saves it for backward), to avoid
+    a redundant full-row reduction over x.
     """
     orig_dims, K = x.shape[:-1], x.shape[-1]
     x2 = x.reshape(-1, K)
     M, N = x2.shape
     assert N % 16 == 0, "K must be divisible by 16 for NVFP4 quantization"
 
-    rms = torch.rsqrt(x2.float().pow(2).mean(-1, keepdim=True) + eps).reshape(M)
+    if rms is None:
+        rms = torch.rsqrt(x2.float().pow(2).mean(-1, keepdim=True) + eps).reshape(M)
+    else:
+        rms = rms.reshape(M)
 
     num_scales = N // 16
     n_row_blocks = triton.cdiv(M, 128)
@@ -191,9 +199,9 @@ class _FusedRMSNormNVFP4Function(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, eps):
-        y, xq, xsc = fused_rmsnorm_nvfp4(x, weight, eps)
         x2 = x.reshape(-1, x.shape[-1])
         r = torch.rsqrt(x2.float().pow(2).mean(-1, keepdim=True) + eps)
+        y, xq, xsc = fused_rmsnorm_nvfp4(x, weight, eps, rms=r.reshape(-1))
         ctx.save_for_backward(x2, weight, r)
         ctx.eps = eps
         # Stash the fused quant keyed by the output the consuming linear sees.
