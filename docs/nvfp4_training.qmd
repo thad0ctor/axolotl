@@ -167,6 +167,25 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | Locked profile, 500-step long-tail (RTX PRO 6000 #1, PCIe-first) | 4 | 1.2302 | ~6,659 tok/s | 62.03 GiB |
 | Locked profile + `hadamard: false` (RTX PRO 6000 #1) | 4 | 1.2155 | ~6,739 tok/s | 62.03 GiB |
 | Locked profile + once-per-forward mask classify (RTX PRO 6000 #1) | 4 | 1.1863 | ~6,906 tok/s | 62.03 GiB |
+| Agent-fix re-bench: locked baseline (RTX PRO 6000 #1, 3-run median) | 4 | 1.1897 | ~6,886 tok/s | 69.63 GiB |
+| + attention compile custom op auto-enabled | 4 | 1.1678 | ~7,015 tok/s | 60.64 GiB |
+| + abs→`vector_norm` amax fuse + batched LoRA A-GEMMs (full stack) | 4 | 1.1310 | ~7,244 tok/s | 60.64 GiB |
+
+A 2026-06 sweep profiled the whole step and found full attention is only ~7% of
+GPU time (so a faster FP4 attention backward is not the lever), while ~26% is
+unfused NVFP4 quant/elementwise and ~11% is the bf16 lm_head. The dominant cause
+was a **silent eager fallback**: the attention forward's P@V `tl.dot_scaled` raises
+an `InductorError` inside Inductor autotune, and with `suppress_errors` on (the
+training default) the whole attention-containing subgraph ran eager, blocking
+fusion of the surrounding elementwise. Auto-enabling the differentiable attention
+custom op when `torch_compile` is on (see `qwen3_5_native_attention_compile_custom_op`
+below) makes Inductor compile *around* the opaque op, restoring fusion. Stacked with
+the bit-exact amax fuse (`amax(abs(t))` → `vector_norm(t, inf)`, dropping the
+full-tensor abs pass) and batched shared-input LoRA A-GEMMs (`lora_batch_kernel`),
+the interleaved A/B above measured **1.131 vs 1.190 s/step (~4.8% faster) and
+−9 GiB** at identical loss. All three changes are bit-exact or opt-in; the first
+also drops active memory because the custom-op backward does not retain forward
+packs (`qwen3_5_native_attention_save_backward_packs` has no effect under it).
 
 The marginal s/step varies ~5% **between the two RTX PRO 6000 boards**: the
 PCIe-first board measured 1.2208–1.2302 across 60- and 500-step runs, while the
@@ -189,7 +208,11 @@ Negative checks from the same sweep:
   attention packs: 2.0500 s/step (~5,994 tok/s).
 - Cut Cross Entropy and Liger fused-linear CE are not valid with this NVFP4
   training setup today: b5 warmups loss-collapsed to zero after the first step
-  and logged non-finite grad norms.
+  and logged non-finite grad norms. The opt-in `bf16_lm_head_cross_entropy` path
+  (below) avoids that collapse — it never filters gradient mass and keeps the
+  logsumexp and `grad_hidden` accumulation in fp32 — but it is a memory win, not a
+  throughput win (1.2178 s/step, 56.48 GiB at b4; the tile GEMMs are bf16 with the
+  same FLOPs as the materialized lm_head, so it trades ~2.5% speed for ~13 GiB).
 - `fp8_lm_head_cross_entropy` can reduce memory and run b5/b6, but it did not
   beat the b4 saved-pack path on max throughput in clean validation. It is also
   not fully deterministic yet: one b6 run loss-collapsed with `grad_norm: nan`,
@@ -424,6 +447,27 @@ path remained ahead on tokens/sec. Treat batch-6 FP8 CE as experimental: one
 validation run loss-collapsed after the first step with non-finite grad norms,
 while a later short repeat stayed finite.
 
+### Chunked bf16 lm_head cross-entropy (opt-in)
+
+`bf16_lm_head_cross_entropy: true` is a **memory** option for a frozen, bias-free
+plain `nn.Linear` `lm_head`. It computes the loss and `dL/dhidden` by streaming the
+vocabulary in tiles (`_VOCAB_BLOCK = 4096`) with online softmax, so the
+`[tokens, vocab]` logits tensor and its gradient are never materialized. Unlike the
+fused CCE/Liger kernels — which loss-collapse in this NVFP4 setup — it does **no**
+gradient filtering, keeps the logsumexp and `grad_hidden` accumulation in fp32, and
+downcasts to bf16 once at the end, matching `F.cross_entropy` to ~1e-7 (loss) /
+~3.5e-3 (grad, pure bf16-GEMM noise) at the Qwen3.5 vocab scale.
+
+It is a memory/batch-size unlock, **not** a throughput win: the tile GEMMs are bf16
+with the same FLOPs as the materialized lm_head (which is already frozen, so there is
+no weight gradient to save), so it trades speed for memory. On Qwen3.5-9B LoRA
+(seq 2048, b4, RTX PRO 6000) it measured **1.2178 s/step at 56.48 GiB active** versus
+the locked saved-pack path's ~1.19 s/step at 69.63 GiB — ~2.5% slower for ~13 GiB
+headroom. Use it when memory-bound (to fit a larger batch); otherwise leave it off.
+It engages only for a frozen bias-free `nn.Linear` lm_head in training (it falls back
+to materialized CE otherwise) and is mutually exclusive with `quantize_lm_head`,
+`fused_fp4_cross_entropy`, and `fp8_lm_head_cross_entropy`.
+
 ::: {.callout-note}
 At the time of writing, `skip_first_n_blocks` / `skip_last_n_blocks` may be applied
 by the integration layer rather than inside `convert_to_nvfp4_training` directly
@@ -457,7 +501,8 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `qwen3_5_native_attention_backward_rtn_grad_packs` | `bool` | `false` | Qwen3.5 native attention training only. Use deterministic round-to-nearest for measured-safe gradient packs while leaving the dK routing-gradient dS pack governed by `stochastic_rounding`. |
 | `qwen3_5_native_attention_save_backward_packs` | `bool` | `false` | Qwen3.5 native attention training only. Save deterministic forward Q/K/V FP4 packs plus transposed backward layouts and reuse them in backward. Trades extra activation memory for higher throughput. |
 | `qwen3_5_native_attention_dkdv_scratch_bf16` | `bool` | `false` | Qwen3.5 native attention training only. Store per-query-head dK/dV scratch in bf16 before GQA reduction instead of fp32. Measured faster on Qwen3.5-9B b4; opt-in because it changes an intermediate gradient cast. |
-| `qwen3_5_native_attention_compile_custom_op` | `bool` | `false` | Qwen3.5 native attention inference only. Opaque custom-op escape hatch for strict compile coverage around Triton `tl.dot_scaled`; rejected when native attention backward is enabled. |
+| `qwen3_5_native_attention_compile_custom_op` | `bool \| null` | `null` (auto) | Qwen3.5 native attention. Wraps the attention path in an opaque differentiable custom op so Inductor compiles *around* the Triton `tl.dot_scaled` (which otherwise raises an `InductorError` and silently drops the block to eager). `null` auto-enables it when `torch_compile` is on and native attention is enabled (the measured fastest path); `true`/`false` force it. Bit-exact; under it `save_backward_packs` has no effect (backward recomputes packs across the boundary) and active memory drops. |
+| `bf16_lm_head_cross_entropy` | `bool` | `false` | Opt-in **memory** path. Requires a frozen bias-free plain `nn.Linear` lm_head. Chunked online-softmax CE over bf16 vocab tiles — no `[tokens, vocab]` logits materialization, fp32 logsumexp/`grad_hidden`, no gradient filtering (avoids the CCE/Liger collapse). Trades ~2.5% throughput for ~13 GiB. Mutually exclusive with `quantize_lm_head` / `fused_fp4_cross_entropy` / `fp8_lm_head_cross_entropy`. |
 | `qwen3_5_fla_causal_conv_compile_boundary` | `bool` | `false` | Qwen3.5 sample-packing only. Runs FLA varlen `causal_conv1d` behind a compile boundary so variable packed `cu_seqlens` lengths do not repeatedly trigger Dynamo/Inductor recompiles. |
 | `qwen3_5_fuse_vproj` / `qwen3_5_native_mlp` / `qwen3_5_native_linear_attn` / `fp8_lm_head` | `bool` | `false` | Qwen3.5/eval-scoring paths. Current implementations are eval/no-grad only and do not accelerate grad-enabled training. Use `fp8_lm_head_cross_entropy` separately for the opt-in training loss memory path. |
 
