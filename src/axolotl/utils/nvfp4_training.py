@@ -209,6 +209,16 @@ def _to_nvfp4_chunked(t, per_tensor_scale, act_quant_kwargs):
     return NVFP4Tensor.__tensor_unflatten__(inner, ctx, None, None)
 
 
+def _abs_amax(t: torch.Tensor) -> torch.Tensor:
+    """Global max(|t|) as fp32 in ONE fused reduction (no materialized ``|t|``).
+
+    Bit-identical to ``torch.amax(torch.abs(t))`` but the inf-norm reduction folds
+    the abs into the reduce kernel, dropping the separate ``AbsFunctor`` elementwise
+    pass that dominated the NVFP4 quant prologue.
+    """
+    return torch.linalg.vector_norm(t, ord=float("inf")).to(torch.float32)
+
+
 def _quantize(t: torch.Tensor, policy: QuantPolicy):
     """Quantize a high-precision tensor to an NVFP4Tensor (along its last dim).
 
@@ -241,7 +251,7 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
         )
     if policy.hadamard:
         t = _apply_rht(t).contiguous()
-    per_tensor_scale = per_tensor_amax_to_scale(torch.max(torch.abs(t)))
+    per_tensor_scale = per_tensor_amax_to_scale(_abs_amax(t))
     if policy.stochastic:
         t = _sr_dither(t, per_tensor_scale).contiguous()
     # RHT/SR rewrite the whole tensor up front (no per-block-row independence), so
@@ -574,7 +584,7 @@ class NVFP4FrozenBaseLinear(nn.Module):
         )
 
         w = linear.weight.detach()
-        pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
+        pts = per_tensor_amax_to_scale(_abs_amax(w))
         w_q = _to_nvfp4_chunked(
             w.contiguous(),
             pts,
@@ -599,7 +609,7 @@ def _embedding_to_nvfp4(weight: torch.Tensor):
     )
 
     w = weight.detach().contiguous()
-    pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
+    pts = per_tensor_amax_to_scale(_abs_amax(w))
     return _to_nvfp4_chunked(
         w, pts, QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE)
     )
@@ -1250,7 +1260,7 @@ def _recipe_m_per_block(m: int) -> int:
 
 def _recipe_rht_amax(t: torch.Tensor, hadamard: bool) -> torch.Tensor:
     if not hadamard:
-        return torch.amax(torch.abs(t)).to(torch.float32)
+        return _abs_amax(t)
     m, n = t.shape
     m_per_block = _recipe_m_per_block(m)
     grid = (triton.cdiv(n, 64), triton.cdiv(m, m_per_block))
@@ -1342,7 +1352,7 @@ def _mslk_quantize_op(
     from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
 
     t = t.contiguous()
-    amax = torch.amax(torch.abs(t)).to(torch.float32)
+    amax = _abs_amax(t)
     global_scale = _NVFP4_GLOBAL_AMAX / torch.clamp(amax, min=1e-12)
     q, s = triton_quantize_nvfp4(t, global_scale)
     return (
@@ -2509,7 +2519,7 @@ def collect_nvfp4_packed_state(model: nn.Module) -> tuple[dict, set[str]]:
         if isinstance(module, NVFP4Linear):
             # FFT: pack the bf16 master to FP4 (lossy for resume).
             w = module.weight.detach()
-            pts = per_tensor_amax_to_scale(torch.max(torch.abs(w)))
+            pts = per_tensor_amax_to_scale(_abs_amax(w))
             w_q = _to_nvfp4_chunked(
                 w.contiguous(), pts, QuantizeTensorToNVFP4Kwargs(block_size=_BLOCK_SIZE)
             )
