@@ -9,9 +9,9 @@ fork (a SageAttention fork). This module preserves the historical
 from __future__ import annotations
 
 from sageattention.nvfp4 import (  # noqa: F401
-    _NVFP4FlashAttn,
     _gqa_reduce_cast_dkdv,
     _next_mult,
+    _NVFP4FlashAttn,
     _quant_nvfp4,
     _quant_nvfp4_dual,
     _resolve_fwd_tiles,
