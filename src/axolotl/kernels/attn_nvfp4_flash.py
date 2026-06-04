@@ -1530,10 +1530,21 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         bias = None
         if key_pad_bias is not None:
             bias = key_pad_bias.to(torch.float32).contiguous()
+        # On the saved-packs backward, HP q/k/v are never dereferenced (have_lse
+        # skips prep; full pack reuse skips kprep and sets packprep STORE_Q/QT
+        # False), so don't pay three full bf16 [.,S,D] copies — save placeholders.
+        if save_backward_packs:
+            empty = torch.empty(0, device=query.device, dtype=query.dtype)
+            q_save = k_save = v_save = empty
+        else:
+            q_save = query.reshape(z * h, s_q, d).contiguous()
+            k_save = key.reshape(z * hk, s_kv, d).contiguous()
+            v_save = value.reshape(z * hk, s_kv, d).contiguous()
+        ctx.save_backward_packs = save_backward_packs
         ctx.save_for_backward(
-            query.reshape(z * h, s_q, d).contiguous(),
-            key.reshape(z * hk, s_kv, d).contiguous(),
-            value.reshape(z * hk, s_kv, d).contiguous(),
+            q_save,
+            k_save,
+            v_save,
             out.reshape(z * h, s_q, d),
             bias if bias is not None else torch.empty(0, device=query.device),
             lse,
@@ -1572,6 +1583,12 @@ class _NVFP4FlashAttn(torch.autograd.Function):
         z, h, hk, s_q, s_kv, d = ctx.dims
         block_m, block_n, num_warps, num_stages = ctx.tiles
         bias = bias if ctx.has_bias else None
+        if getattr(ctx, "save_backward_packs", False):
+            # q/k/v were not saved (placeholders); the packs are the real operands.
+            # _run_bwd never reads HP q/k/v here, but needs a tensor with q's
+            # [z*h,s_q,d] shape/device/stride for scratch allocs and the unused
+            # bias-dummy pointer — o satisfies that.
+            q = k = v = o
         do = grad_out.reshape(z * h, s_q, d).contiguous()
         dq, dk, dv = _run_bwd(
             q, k, v, do, o, bias,
