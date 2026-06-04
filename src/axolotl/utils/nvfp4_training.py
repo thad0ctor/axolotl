@@ -268,25 +268,38 @@ def _pad_to_block(t: torch.Tensor, dim: int) -> tuple[torch.Tensor, int]:
 class NVFP4LinearFunction(torch.autograd.Function):
     """Linear with FP4 GEMMs in forward (fprop) and backward (dgrad + wgrad).
 
-    Master weight stays high-precision (the saved ``weight``); only GEMM
-    operands are quantized. Per the NVFP4 recipe, gradient operands get
+    Master weight stays high-precision (the differentiable ``weight``); only GEMM
+    operands are quantized. The weight changes only once per optimizer step, so
+    its two FP4 b-operand layouts (``w_fprop``, ``w_dgrad``) are pre-quantized by
+    the caller (:class:`NVFP4Linear`) and passed as non-differentiable side
+    inputs — wgrad still flows to the master ``weight`` (the RTN-quantized
+    layouts carry no gradient). Per the NVFP4 recipe, gradient operands get
     stochastic rounding and wgrad inputs get RHT (via ``QuantPolicy``).
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, recipe):
-        # x:[*, K]  weight:[N, K]  out:[*, N]
+    def forward(ctx, x, weight, w_fprop, w_dgrad, bias, recipe):
+        from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
+        # x:[*, K]  weight:[N, K]  w_fprop: pre-quantized W.T b-operand [K,N].
+        # w_fprop/w_dgrad are None under torch.compile (the version cache is a
+        # data-dependent Python branch that can't be traced) — then quantize the
+        # weight inline exactly as the pre-cache path did, bit-identical.
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
         x2d_p, m = _pad_to_block(x2d, 0)
 
-        w_pol = QuantPolicy()
-        a_pol = QuantPolicy()
-        out = _fp4_mm(x2d_p, weight.t(), a_pol, w_pol)[:m]  # [M,K]@[K,N]->[M,N]
+        # fprop: x[M,K] @ W.T[K,N]. w_fprop == _quantize(W, QuantPolicy()).t(),
+        # bit-identical to _fp4_mm(x, weight.t(), ..)'s internal weight quant.
+        if w_fprop is None:
+            w_fprop = _quantize(weight.contiguous(), QuantPolicy()).t()
+        a_q = _quantize(x2d_p, QuantPolicy())
+        out = _addmm_nvfp4_dispatch(a_q, w_fprop, torch.ops.aten.mm.default)[:m]
         if bias is not None:
             out = out + bias
 
         ctx.save_for_backward(x2d, weight)
+        ctx.w_dgrad = w_dgrad
         ctx.recipe = recipe
         ctx.has_bias = bias is not None
         ctx.x_shape = orig_shape
@@ -294,7 +307,10 @@ class NVFP4LinearFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
         x2d, weight = ctx.saved_tensors  # x2d:[M,K] weight:[N,K]
+        w_dgrad = ctx.w_dgrad
         recipe = ctx.recipe
         g = grad_out.reshape(-1, weight.shape[0])  # [M, N]
 
@@ -307,21 +323,29 @@ class NVFP4LinearFunction(torch.autograd.Function):
         )
 
         if ctx.needs_input_grad[0]:
-            # dgrad: grad_x[M,K] = g[M,N] @ weight[N,K]   (contraction N)
+            # dgrad: grad_x[M,K] = g[M,N] @ weight[N,K]   (contraction N).
+            # w_dgrad == _quantize(W.t().contiguous(), QuantPolicy()).t(),
+            # bit-identical to _fp4_mm(g, weight, ..)'s internal weight quant.
             g_p, m = _pad_to_block(g, 0)
-            grad_x = _fp4_mm(g_p, weight, g_pol, QuantPolicy())[:m]
+            if w_dgrad is None:
+                w_dgrad = _quantize(weight.t().contiguous(), QuantPolicy()).t()
+            g_q = _quantize(g_p, g_pol)
+            grad_x = _addmm_nvfp4_dispatch(g_q, w_dgrad, torch.ops.aten.mm.default)[:m]
             grad_x = grad_x.reshape(ctx.x_shape)
 
         if ctx.needs_input_grad[1]:
-            # wgrad: grad_w[N,K] = g.t()[N,M] @ x[M,K]    (contraction M, RHT)
+            # wgrad: grad_w[N,K] = g.t()[N,M] @ x[M,K]    (contraction M, RHT).
+            # Unchanged — uses only g and the saved x, never the weight value, so
+            # the master-weight gradient is bit-identical to the requant path.
             gt, _ = _pad_to_block(g.t().contiguous(), 1)  # [N, M_pad]
             xp, _ = _pad_to_block(x2d, 0)  # [M_pad, K]
             grad_w = _fp4_mm(gt, xp, rht_pol, rht_pol)
 
-        if ctx.has_bias and ctx.needs_input_grad[2]:
+        # input order: (x, weight, w_fprop, w_dgrad, bias, recipe) -> bias is [4]
+        if ctx.has_bias and ctx.needs_input_grad[4]:
             grad_bias = g.sum(dim=0)
 
-        return grad_x, grad_w, grad_bias, None
+        return grad_x, grad_w, None, None, grad_bias, None
 
 
 @dataclass
@@ -348,9 +372,43 @@ class NVFP4Linear(nn.Module):
         self.recipe = recipe
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
+        # Per-step cache of the two FP4 b-operand layouts, invalidated when the
+        # optimizer mutates the master weight (bumps weight._version). The weight
+        # quant is deterministic RTN, so caching is bit-exact, not approximate.
+        self._wq_version = None
+        self._wq_fprop = None
+        self._wq_dgrad = None
+
+    def _quantized_weights(self):
+        """(w_fprop, w_dgrad) for the current weight, recomputed only on update.
+
+        Mirrors NVFP4ComputeBaseLinear.from_linear's two layouts but from the
+        live master weight, refreshed when weight._version changes (one optimizer
+        step). detach() so no autograd tracks through the cached FP4 operands —
+        the differentiable path to the master weight is the wgrad in backward.
+        """
+        version = self.weight._version
+        if self._wq_version != version:
+            w = self.weight.detach()
+            # fprop b-operand represents W.T ([K,N]): quantize W then transpose.
+            self._wq_fprop = _quantize(w, QuantPolicy()).t()
+            # dgrad b-operand represents W ([N,K]) blocked along N: quantize W.T.
+            self._wq_dgrad = _quantize(w.t().contiguous(), QuantPolicy()).t()
+            self._wq_version = version
+        return self._wq_fprop, self._wq_dgrad
 
     def forward(self, x):
-        return NVFP4LinearFunction.apply(x, self.weight, self.bias, self.recipe)
+        # Under torch.compile the cache lookup (a data-dependent branch on
+        # weight._version) can't be traced; pass None so the autograd Function
+        # quantizes the weight inline, which compiles with zero graph breaks and
+        # is what the graph already fuses.
+        if torch.compiler.is_compiling():
+            w_fprop = w_dgrad = None
+        else:
+            w_fprop, w_dgrad = self._quantized_weights()
+        return NVFP4LinearFunction.apply(
+            x, self.weight, w_fprop, w_dgrad, self.bias, self.recipe
+        )
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, recipe: NVFP4Recipe) -> "NVFP4Linear":

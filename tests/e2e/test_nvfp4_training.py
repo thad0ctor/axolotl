@@ -74,6 +74,146 @@ class TestNVFP4Training:
         rel = ((got - ref).norm() / ref.norm()).item()
         assert rel < 2e-2, f"GEMM wiring rel-err {rel}"
 
+    @pytest.mark.parametrize("stochastic", [False, True])
+    @pytest.mark.parametrize("hadamard", [False, True])
+    def test_cached_weight_is_bit_exact(self, stochastic, hadamard):
+        """The per-step weight-quant cache must be bit-identical to re-quantizing.
+
+        Weight quant is deterministic RTN, so the cached b-operands reproduce the
+        old per-call quant exactly — out, grad_x, and grad_w must match with zero
+        difference. A fixed seed around fwd/bwd aligns any SR draws (which are on
+        the activation/gradient operands, not the cached weight)."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Linear,
+            NVFP4Recipe,
+            QuantPolicy,
+            _fp4_mm,
+            _pad_to_block,
+        )
+
+        class OldFn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, weight, bias, recipe):
+                orig_shape = x.shape
+                x2d = x.reshape(-1, orig_shape[-1])
+                x2d_p, m = _pad_to_block(x2d, 0)
+                out = _fp4_mm(x2d_p, weight.t(), QuantPolicy(), QuantPolicy())[:m]
+                if bias is not None:
+                    out = out + bias
+                ctx.save_for_backward(x2d, weight)
+                ctx.recipe = recipe
+                ctx.has_bias = bias is not None
+                ctx.x_shape = orig_shape
+                return out.reshape(*orig_shape[:-1], weight.shape[0])
+
+            @staticmethod
+            def backward(ctx, grad_out):
+                x2d, weight = ctx.saved_tensors
+                recipe = ctx.recipe
+                g = grad_out.reshape(-1, weight.shape[0])
+                grad_x = grad_w = grad_bias = None
+                g_pol = QuantPolicy(stochastic=recipe.stochastic_rounding)
+                rht_pol = QuantPolicy(
+                    stochastic=recipe.stochastic_rounding, hadamard=recipe.hadamard
+                )
+                if ctx.needs_input_grad[0]:
+                    g_p, m = _pad_to_block(g, 0)
+                    grad_x = _fp4_mm(g_p, weight, g_pol, QuantPolicy())[:m]
+                    grad_x = grad_x.reshape(ctx.x_shape)
+                if ctx.needs_input_grad[1]:
+                    gt, _ = _pad_to_block(g.t().contiguous(), 1)
+                    xp, _ = _pad_to_block(x2d, 0)
+                    grad_w = _fp4_mm(gt, xp, rht_pol, rht_pol)
+                if ctx.has_bias and ctx.needs_input_grad[2]:
+                    grad_bias = g.sum(dim=0)
+                return grad_x, grad_w, grad_bias, None
+
+        recipe = NVFP4Recipe(stochastic_rounding=stochastic, hadamard=hadamard)
+        torch.manual_seed(0)
+        N, K, M = 1024, 1024, 512
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        x_data = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        gout = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+        new_mod = NVFP4Linear(nn.Parameter(w.clone()), nn.Parameter(b.clone()), recipe)
+        xn = x_data.clone().requires_grad_(True)
+        torch.manual_seed(1234)
+        out_new = new_mod(xn)
+        torch.manual_seed(1234)
+        out_new.backward(gout.clone())
+
+        w_old, b_old = nn.Parameter(w.clone()), nn.Parameter(b.clone())
+        xo = x_data.clone().requires_grad_(True)
+        torch.manual_seed(1234)
+        out_old = OldFn.apply(xo, w_old, b_old, recipe)
+        torch.manual_seed(1234)
+        out_old.backward(gout.clone())
+
+        assert torch.equal(out_new, out_old)
+        assert torch.equal(xn.grad, xo.grad)
+        assert torch.equal(new_mod.weight.grad, w_old.grad)
+        assert torch.equal(new_mod.bias.grad, b_old.grad)
+
+    def test_weight_quant_cached_per_version(self):
+        """Weight is quantized twice (fprop+dgrad layout) per optimizer step, not
+        per micro-step: across N passes with no update the count stays at 2, and an
+        in-place weight update (bumping ``_version``) re-quantizes once."""
+        import axolotl.utils.nvfp4_training as nvmod
+        from axolotl.utils.nvfp4_training import NVFP4Linear, NVFP4Recipe
+
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        torch.manual_seed(0)
+        w = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
+        mod = NVFP4Linear(nn.Parameter(w.clone()), None, recipe)
+
+        calls = {"n": 0}
+        real = nvmod._quantize
+
+        def counting(t, policy):
+            calls["n"] += 1
+            return real(t, policy)
+
+        # Per fwd+bwd the non-weight quant calls: fprop activation (1), dgrad
+        # gradient (1), wgrad inputs gt+xp via _fp4_mm (2) = 4.
+        non_weight = 4
+        n_passes = 4
+        nvmod._quantize = counting
+        try:
+            base = calls["n"]
+            for _ in range(n_passes):
+                x = torch.randn(
+                    128, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                mod(x).sum().backward()
+            weight_quant = (calls["n"] - base) - non_weight * n_passes
+            assert weight_quant == 2, weight_quant  # cached across all passes
+
+            before = calls["n"]
+            with torch.no_grad():
+                mod.weight.add_(0.01)  # _version bump
+            x = torch.randn(
+                128, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            mod(x).sum().backward()
+            weight_quant_after = (calls["n"] - before) - non_weight
+            assert weight_quant_after == 2, weight_quant_after  # re-quant once
+        finally:
+            nvmod._quantize = real
+
+        # Fresh forward after an update must use the NEW weight, not a stale cache.
+        torch.manual_seed(0)
+        w2 = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+        m2 = NVFP4Linear(nn.Parameter(w2.clone()), None, recipe)
+        xt = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+        out_a = m2(xt).detach().clone()
+        with torch.no_grad():
+            m2.weight.mul_(2.0)
+        out_b = m2(xt).detach().clone()
+        ref = NVFP4Linear(nn.Parameter((w2 * 2.0).clone()), None, recipe)
+        assert not torch.equal(out_a, out_b)
+        assert torch.equal(out_b, ref(xt))
+
     def test_convert_excludes_sensitive_and_odd_dims(self):
         """Swap eligible linears; keep lm_head/embeddings high-precision."""
         from transformers import AutoModelForCausalLM
