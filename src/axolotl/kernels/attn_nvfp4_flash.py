@@ -207,6 +207,121 @@ def _quant_nvfp4(
 
 
 # ---------------------------------------------------------------------------
+# Fused dual-layout NVFP4 pack. One pass over a [B, S, D] source emits BOTH the
+# along-D pack (layout A: group-16 along D, [B, S, D//2] + scale [B, S, D//16])
+# and the along-S pack (layout B / transpose: group-16 along S, padded to S_pad,
+# [B, D, S_pad//2] + scale [B, D, S_pad//16]). The source [BLOCK_S, D] tile is read
+# ONCE into SRAM and both group-reductions are taken from it, halving Q/K/V read
+# traffic vs the two separate _quant_nvfp4 launches.
+#
+# Each layout is bit-identical to the corresponding standalone _quant_nvfp4 call:
+# groups of 16 never straddle a tile boundary (16 | BLOCK_S, D loaded whole), so
+# every per-group amax/scale/division/pack matches element-for-element.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quant_nvfp4_dual_kernel(
+    x_ptr,
+    qa_ptr, sa_ptr,            # layout A (along D): [B, S, D//2], [B, S, D//16]
+    qb_ptr, sb_ptr,            # layout B (along S): [B, D, S_pad//2], [B, D, S_pad//16]
+    S, D, S_PAD,
+    s_xb, s_xs, s_xd,          # source strides
+    s_qab, s_qar,              # layout A: batch stride, per-row (S) stride (= D//2)
+    s_sab, s_sar,              # layout A scale: batch stride, per-row stride (= D//16)
+    s_qbb, s_qbr,              # layout B: batch stride, per-row (D) stride (= S_pad//2)
+    s_sbb, s_sbr,              # layout B scale: batch stride, per-row stride (= S_pad//16)
+    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_d = tl.arange(0, BLOCK_D)
+    smask = offs_s < S
+    # one read of the source tile; padded S rows -> 0.0 (amax 0 -> eps scale -> zero pack)
+    x = tl.load(
+        x_ptr + pid_b * s_xb + offs_s[:, None] * s_xs + offs_d[None, :] * s_xd,
+        mask=smask[:, None], other=0.0,
+    ).to(tl.float32)
+
+    # layout A: group-16 along D, one pack per S-row
+    NGA: tl.constexpr = BLOCK_D // 16
+    xa = x.reshape(BLOCK_S, NGA, 16)
+    amax_a = tl.max(tl.abs(xa), axis=2)
+    sca = tl.clamp(amax_a / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    xna = xa / sca.to(tl.float32)[:, :, None]
+    pairs_a = xna.reshape(BLOCK_S * (BLOCK_D // 2), 2).split()
+    qa = convert_fp32_to_fp4_packed(pairs_a).reshape(BLOCK_S, BLOCK_D // 2)
+    offs_ad = tl.arange(0, BLOCK_D // 2)
+    tl.store(
+        qa_ptr + pid_b * s_qab + offs_s[:, None] * s_qar + offs_ad[None, :],
+        qa, mask=smask[:, None],
+    )
+    offs_asg = tl.arange(0, NGA)
+    tl.store(
+        sa_ptr + pid_b * s_sab + offs_s[:, None] * s_sar + offs_asg[None, :],
+        sca.to(tl.uint8, bitcast=True), mask=smask[:, None],
+    )
+
+    # layout B: group-16 along S, one pack per D-row (transpose the resident tile)
+    NGB: tl.constexpr = BLOCK_S // 16
+    xt = tl.trans(x)  # [BLOCK_D, BLOCK_S]
+    xtb = xt.reshape(BLOCK_D, NGB, 16)
+    amax_b = tl.max(tl.abs(xtb), axis=2)
+    scb = tl.clamp(amax_b / _F4_MAX, _E4M3_EPS, _F8E4M3_MAX).to(tl.float8e4nv)
+    xnb = xtb / scb.to(tl.float32)[:, :, None]
+    pairs_b = xnb.reshape(BLOCK_D * (BLOCK_S // 2), 2).split()
+    qb = convert_fp32_to_fp4_packed(pairs_b).reshape(BLOCK_D, BLOCK_S // 2)
+    offs_bs = pid_s * (BLOCK_S // 2) + tl.arange(0, BLOCK_S // 2)
+    tl.store(
+        qb_ptr + pid_b * s_qbb + offs_d[:, None] * s_qbr + offs_bs[None, :],
+        qb, mask=offs_bs[None, :] < (S_PAD // 2),
+    )
+    offs_bsg = pid_s * NGB + tl.arange(0, NGB)
+    tl.store(
+        sb_ptr + pid_b * s_sbb + offs_d[:, None] * s_sbr + offs_bsg[None, :],
+        scb.to(tl.uint8, bitcast=True), mask=offs_bsg[None, :] < (S_PAD // 16),
+    )
+
+
+def _quant_nvfp4_dual(
+    x: torch.Tensor, s_pad: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused pack of ``x`` ``[B, S, D]`` into both NVFP4 layouts in one read.
+
+    Returns ``(qa, sa, qb, sb)``:
+      * ``qa`` ``[B, S, D//2]`` uint8 / ``sa`` ``[B, S, D//16]`` e4m3 — along-D pack,
+        bit-identical to ``_quant_nvfp4(x)``.
+      * ``qb`` ``[B, D, s_pad//2]`` uint8 / ``sb`` ``[B, D, s_pad//16]`` e4m3 —
+        along-S pack padded to ``s_pad``, bit-identical to
+        ``_quant_nvfp4(x, transpose=True, k_pad=s_pad)``.
+    """
+    B, S, D = x.shape
+    assert D % 16 == 0 and D in (128, 256)
+    assert s_pad % 16 == 0 and s_pad >= S
+    x = x.contiguous()
+    # BLOCK_S aligned to 16 so along-S groups never straddle a tile; the grid spans
+    # the PADDED S so the last (padding) tile zero-fills layout B's tail groups.
+    BLOCK_S = 64
+    assert s_pad % BLOCK_S == 0 or s_pad <= BLOCK_S, "s_pad must tile by BLOCK_S"
+    qa = x.new_empty(B, S, D // 2, dtype=torch.uint8)
+    sa = x.new_zeros(B, S, D // 16, dtype=torch.uint8)
+    qb = x.new_empty(B, D, s_pad // 2, dtype=torch.uint8)
+    sb = x.new_zeros(B, D, s_pad // 16, dtype=torch.uint8)
+    grid = (B, triton.cdiv(s_pad, BLOCK_S))
+    _quant_nvfp4_dual_kernel[grid](
+        x,
+        qa, sa, qb, sb,
+        S, D, s_pad,
+        x.stride(0), x.stride(1), x.stride(2),
+        qa.stride(0), qa.stride(1),
+        sa.stride(0), sa.stride(1),
+        qb.stride(0), qb.stride(1),
+        sb.stride(0), sb.stride(1),
+        BLOCK_S=BLOCK_S, BLOCK_D=D,
+    )
+    return qa, sa.view(torch.float8_e4m3fn), qb, sb.view(torch.float8_e4m3fn)
+
+
+# ---------------------------------------------------------------------------
 # Fused flash forward. Grid: (num_q_blocks, Z*H). Each program owns one Q-block
 # of one (z, head); it indexes the matching KV head for GQA.
 # ---------------------------------------------------------------------------
@@ -1104,19 +1219,23 @@ def nvfp4_flash_attention(
     # V is quantized via strided reads (no physical transpose) and its key axis is
     # padded to a multiple of block_n: padded keys are masked to -inf (P weight 0)
     # and the eps-scaled zero V columns contribute nothing, so the result is exact.
-    qnv, qsc = _quant_nvfp4(q2)
-    knv, ksc = _quant_nvfp4(k2)
     s_kv_pad = _next_mult(s_kv, block_n)
-    vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
     packs = None
     if return_packs:
+        # Fuse each operand's two pack layouts into ONE read of the source. Q/K emit
+        # {along-D (fwd), along-M (bwd)}; V emits {along-D (bwd), along-key^T (fwd)} —
+        # V's forward V^T is layout B (along the key axis, padded to s_kv_pad).
         bwd_block_m = min(block_m, 64)
         s_q_bwd_pad = _next_mult(s_q, max(bwd_block_m, 32))
         s_kv_bwd_pad = _next_mult(s_kv, 64)
-        qtnv, qtsc = _quant_nvfp4(q2, transpose=True, k_pad=s_q_bwd_pad)
-        vdnv, vdsc = _quant_nvfp4(v2)
-        ktnv, ktsc = _quant_nvfp4(k2, transpose=True, k_pad=s_kv_bwd_pad)
+        qnv, qsc, qtnv, qtsc = _quant_nvfp4_dual(q2, s_q_bwd_pad)
+        knv, ksc, ktnv, ktsc = _quant_nvfp4_dual(k2, s_kv_bwd_pad)
+        vdnv, vdsc, vnv, vsc = _quant_nvfp4_dual(v2, s_kv_pad)
         packs = (qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc)
+    else:
+        qnv, qsc = _quant_nvfp4(q2)
+        knv, ksc = _quant_nvfp4(k2)
+        vnv, vsc = _quant_nvfp4(v2, transpose=True, k_pad=s_kv_pad)
 
     bias = None
     if key_pad_bias is not None:
