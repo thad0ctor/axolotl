@@ -205,6 +205,69 @@ def _nvfp4_attention(
     )  # [Z, S, H, D]
 
 
+# ---------------------------------------------------------------------------
+# Shared-activation-pack FP4 for the full-attention block's hidden-consuming
+# projections. q_proj (gated, -> 2*head_dim) and k_proj BOTH read hidden_states
+# and contract the same K=hidden, so hidden is NVFP4-packed ONCE and reused for
+# both FP4 GEMMs (the cross-op lever already used by the MLP gate/up and the GDN
+# in_proj). o_proj (post-attention activation) gets its own FP4 GEMM. All
+# parity-affecting (q/k/o go FP4) -> opt-in, default OFF, plain-nn.Linear only.
+# ---------------------------------------------------------------------------
+def _attn_proj_ok(module: nn.Module) -> bool:
+    from axolotl.monkeypatch.attention.nvfp4_linear_attn import _is_plain_linear
+
+    if not (
+        _is_plain_linear(module.q_proj)
+        and _is_plain_linear(module.k_proj)
+        and _is_plain_linear(module.o_proj)
+    ):
+        return False
+    return (
+        module.q_proj.in_features % 16 == 0
+        and module.k_proj.in_features % 16 == 0
+        and module.o_proj.in_features % 16 == 0
+    )
+
+
+def _nvfp4_qk_proj(module, hidden_states):
+    """FP4 q_proj + k_proj sharing ONE NVFP4 pack of hidden_states."""
+    from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
+    from axolotl.monkeypatch.attention.nvfp4_linear_attn import (
+        _gemm_from_packed_act,
+        _get_packed_weight,
+    )
+
+    dtype = hidden_states.dtype
+    k = hidden_states.shape[-1]
+    lead = hidden_states.shape[:-1]
+    x2d = hidden_states.reshape(-1, k)
+    m = x2d.shape[0]
+    anv, asc = _quant_nvfp4(x2d.unsqueeze(0))
+    anv, asc = anv[0], asc[0]
+    q_wnv, q_wsc = _get_packed_weight(module, "_qproj_packed", module.q_proj)
+    k_wnv, k_wsc = _get_packed_weight(module, "_kproj_packed", module.k_proj)
+    q_outf, k_outf = module.q_proj.out_features, module.k_proj.out_features
+    q = _gemm_from_packed_act(anv, asc, q_wnv, q_wsc, m, q_outf, k, dtype)
+    kk = _gemm_from_packed_act(anv, asc, k_wnv, k_wsc, m, k_outf, k, dtype)
+    if module.q_proj.bias is not None:
+        q = q + module.q_proj.bias
+    if module.k_proj.bias is not None:
+        kk = kk + module.k_proj.bias
+    return q.reshape(*lead, q_outf), kk.reshape(*lead, k_outf)
+
+
+def _nvfp4_o_proj(module, attn_output):
+    """FP4 o_proj (+bias)."""
+    from axolotl.kernels.nvfp4_linear import nvfp4_linear
+    from axolotl.monkeypatch.attention.nvfp4_linear_attn import _get_packed_weight
+
+    o_wnv, o_wsc = _get_packed_weight(module, "_oproj_packed", module.o_proj)
+    out = nvfp4_linear(attn_output, o_wnv, o_wsc, module.o_proj.out_features)
+    if module.o_proj.bias is not None:
+        out = out + module.o_proj.bias
+    return out
+
+
 def make_nvfp4_forward(orig_forward):
     """Build a patched ``Qwen3_5Attention.forward`` that uses NVFP4 attention.
 
@@ -243,16 +306,32 @@ def make_nvfp4_forward(orig_forward):
         if not has_cache_context:
             kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
-            2, dim=-1,
+        # Shared-pack FP4 q/k_proj: no-grad prefill, opt-in, plain-Linear only.
+        use_fp4_proj = (
+            not grad_enabled
+            and kind is not None
+            and getattr(self, "_nvfp4_fuse_attn_proj", False)
+            and getattr(self, "_nvfp4_attn_proj_ok", False)
         )
+        if use_fp4_proj:
+            q_full, k_full = _nvfp4_qk_proj(self, hidden_states)
+            query_states, gate = torch.chunk(
+                q_full.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1,
+            )
+        else:
+            query_states, gate = torch.chunk(
+                self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
+                2, dim=-1,
+            )
         gate = gate.reshape(*input_shape, -1)
 
         query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(
-            self.k_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
+        if use_fp4_proj:
+            key_states = self.k_norm(k_full.view(hidden_shape)).transpose(1, 2)
+        else:
+            key_states = self.k_norm(
+                self.k_proj(hidden_states).view(hidden_shape)
+            ).transpose(1, 2)
 
         cos, sin = position_embeddings
 
@@ -360,6 +439,8 @@ def make_nvfp4_forward(orig_forward):
                 )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = attn_output * torch.sigmoid(gate)
+            if use_fp4_proj:
+                return _nvfp4_o_proj(self, attn_output), None
             return self.o_proj(attn_output), None
 
         return orig_forward(
@@ -373,6 +454,7 @@ def make_nvfp4_forward(orig_forward):
 def patch_qwen3_5_nvfp4_attention(
     model: nn.Module,
     fuse_vproj: bool = _FUSE_VPROJ,
+    fuse_attn_proj: bool = False,
     train_backward: bool = False,
     backward_rtn_grad_packs: bool = False,
     save_backward_packs: bool = False,
@@ -404,6 +486,10 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
                 module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
+                module._nvfp4_fuse_attn_proj = fuse_attn_proj
+                module._nvfp4_attn_proj_ok = (
+                    _attn_proj_ok(module) if fuse_attn_proj else False
+                )
                 continue
             orig = type(module).forward
             if seen_forward is None:
@@ -417,6 +503,10 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
             module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
+            module._nvfp4_fuse_attn_proj = fuse_attn_proj
+            module._nvfp4_attn_proj_ok = (
+                _attn_proj_ok(module) if fuse_attn_proj else False
+            )
             patched += 1
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
