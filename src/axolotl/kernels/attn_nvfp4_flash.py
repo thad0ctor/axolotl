@@ -331,7 +331,7 @@ def _flash_fwd_kernel(
     knv_ptr, ksc_ptr,          # [Z*Hk, Skv, D//2], [Z*Hk, Skv, D//16]
     vnv_ptr, vsc_ptr,          # [Z*Hk, D, Skv//2], [Z*Hk, D, Skv//16]  (V^T, quant on key)
     bias_ptr,                  # [Z, Skv] fp32 additive key-pad bias, or 0
-    out_ptr,                   # [Z*H, Sq, D]  out_dtype
+    out_ptr,                   # [Z*H, Sq, D] (default) or [Z, Sq, H, D] (OUT_ZSHD)
     lse_ptr,                   # [Z*H, Sq] fp32 logsumexp, written iff STORE_LSE
     scaling,
     Sq, Skv,
@@ -341,10 +341,12 @@ def _flash_fwd_kernel(
     sk_kn, sk_sn,
     sv_kn, sv_sn,
     sb_z,
-    so_n,
+    so_n,                      # out row (Sq-axis) stride: D ([Z*H,Sq,D]) or H*D ([Z,Sq,H,D])
+    so_z, so_h,                # out z / head strides, used only when OUT_ZSHD
     HAS_BIAS: tl.constexpr,
     CAUSAL: tl.constexpr,
     STORE_LSE: tl.constexpr,
+    OUT_ZSHD: tl.constexpr,    # store the [Z, Sq, H, D] layout directly (no transpose+copy)
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     DP2: tl.constexpr, DP16: tl.constexpr,   # D//2, D//16
     NP2: tl.constexpr, NP16: tl.constexpr,   # BLOCK_N//2, BLOCK_N//16
@@ -444,7 +446,13 @@ def _flash_fwd_kernel(
         m_i = m_new
 
     acc = acc / l_i[:, None]
-    obase = pid_zh * (Sq * so_n)
+    if OUT_ZSHD:
+        # [Z, Sq, H, D]: this program owns out[z, q_block, h, :]. Same acc tile, just
+        # different store strides — the transpose+contiguous copy the caller used to
+        # pay per layer is folded into the epilogue at zero extra compute.
+        obase = z * so_z + h * so_h
+    else:
+        obase = pid_zh * (Sq * so_n)
     tl.store(
         out_ptr + obase + offs_m[:, None] * so_n + offs_d[None, :],
         acc.to(out_ptr.dtype.element_ty), mask=mmask[:, None],
@@ -1083,12 +1091,17 @@ def _run_flash_packed(
     z, h, hk, s_q, s_kv, d,
     scaling, causal, bias, out,
     block_m, block_n, num_warps, num_stages,
+    out_zshd=False,
 ):
     """Launch the flash kernel on already-packed (tl.dot_scaled layout) Q/K/V.
 
     qnv/knv: ``[Z*H or Z*Hk, S, D//2]`` uint8;  qsc/ksc: ``[., S, D//16]`` e4m3.
     vnv: ``[Z*Hk, D, Skv_pad//2]`` uint8;  vsc: ``[Z*Hk, D, Skv_pad//16]`` e4m3
     (V^T, quantized along the key axis; key axis padded to a multiple of block_n).
+
+    ``out_zshd``: ``out`` is laid out ``[Z, Sq, H, D]`` and the kernel stores that
+    layout directly (the Sq-axis row stride is ``out.stride(1)`` either way; the z/head
+    strides come from the 4-D tensor). Default ``out`` is ``[Z*H, Sq, D]``.
     """
     qnv_v = qnv.view(torch.uint8)
     knv_v = knv.view(torch.uint8)
@@ -1112,9 +1125,12 @@ def _run_flash_packed(
         sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
         sb_z=bias.stride(0) if bias is not None else 0,
         so_n=out.stride(1),
+        so_z=out.stride(0) if out_zshd else 0,
+        so_h=out.stride(2) if out_zshd else 0,
         HAS_BIAS=bias is not None,
         CAUSAL=causal,
         STORE_LSE=False,
+        OUT_ZSHD=out_zshd,
         BLOCK_M=block_m, BLOCK_N=block_n,
         DP2=d // 2, DP16=d // 16,
         NP2=block_n // 2, NP16=block_n // 16,
@@ -1143,6 +1159,7 @@ def nvfp4_flash_attention_packed(
     block_n: int = 128,
     num_warps: int = 8,
     num_stages: int = 3,
+    out_layout: str = "zhsd",
 ) -> torch.Tensor:
     """Flash forward on Q/K/V ALREADY in the NVFP4 tl.dot_scaled layout.
 
@@ -1151,7 +1168,11 @@ def nvfp4_flash_attention_packed(
     V's key axis must be padded to a multiple of ``block_n`` (padded keys contribute
     nothing: masked to -inf and eps-scaled zero columns).
 
-    Returns ``[Z, H, S_q, D]`` in ``out_dtype``.
+    ``out_layout``:
+      * ``"zhsd"`` (default): returns ``[Z, H, Sq, D]``.
+      * ``"zshd"``: returns ``[Z, Sq, H, D]`` (the HF attn_output layout) written by
+        the kernel directly, so the caller needs neither ``transpose(1,2)`` nor a
+        ``contiguous()`` copy. Bit-identical to ``"zhsd"`` then ``.transpose(1,2)``.
     """
     bias = None
     if key_pad_bias is not None:
@@ -1159,13 +1180,20 @@ def nvfp4_flash_attention_packed(
     block_m, block_n, num_warps, num_stages = _resolve_fwd_tiles(
         d, block_m, block_n, num_warps, num_stages
     )
-    out = torch.empty(z * h, s_q, d, device=qnv.device, dtype=out_dtype)
+    out_zshd = out_layout == "zshd"
+    if out_zshd:
+        out = torch.empty(z, s_q, h, d, device=qnv.device, dtype=out_dtype)
+    else:
+        out = torch.empty(z * h, s_q, d, device=qnv.device, dtype=out_dtype)
     _run_flash_packed(
         qnv, qsc, knv, ksc, vnv, vsc,
         z, h, hk, s_q, s_kv, d,
         scaling, causal, bias, out,
         block_m, block_n, num_warps, num_stages,
+        out_zshd=out_zshd,
     )
+    if out_zshd:
+        return out
     return out.reshape(z, h, s_q, d)
 
 
@@ -1271,9 +1299,11 @@ def nvfp4_flash_attention(
             sv_kn=vnv_v.stride(1), sv_sn=vsc_v.stride(1),
             sb_z=bias.stride(0) if bias is not None else 0,
             so_n=out.stride(1),
+            so_z=0, so_h=0,
             HAS_BIAS=bias is not None,
             CAUSAL=causal,
             STORE_LSE=return_lse,
+            OUT_ZSHD=False,
             BLOCK_M=block_m, BLOCK_N=block_n,
             DP2=d // 2, DP16=d // 16,
             NP2=block_n // 2, NP16=block_n // 16,

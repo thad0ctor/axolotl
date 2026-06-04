@@ -175,23 +175,34 @@ def _nvfp4_attention(
     else:
         vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
 
-    flash_attention_packed = nvfp4_flash_attention_packed
     if _custom_op_enabled(module):
         from axolotl.kernels.attn_nvfp4_custom_op import (
             nvfp4_flash_attention_packed_custom_op,
         )
 
-        flash_attention_packed = nvfp4_flash_attention_packed_custom_op
+        # The compile custom op keeps the [Z, H, S, D] schema (its registered op /
+        # fake are layout-fixed), so the transpose stays on the compiled path.
+        out = nvfp4_flash_attention_packed_custom_op(
+            qnv, qsc, knv, ksc, vnv, vsc,
+            z=z, h=h, hk=hk, s_q=s_q, s_kv=s_kv, d=d,
+            scaling=scaling,
+            out_dtype=query_states.dtype,
+            causal=causal,
+            block_n=_BLOCK_N,
+        )  # [Z, H, S, D]
+        return out.transpose(1, 2)  # [Z, S, H, D]
 
-    out = flash_attention_packed(
+    # Eager path: the kernel writes the [Z, S, H, D] HF attn_output layout directly,
+    # so the per-layer transpose(1,2)+contiguous copy at the caller is eliminated.
+    return nvfp4_flash_attention_packed(
         qnv, qsc, knv, ksc, vnv, vsc,
         z=z, h=h, hk=hk, s_q=s_q, s_kv=s_kv, d=d,
         scaling=scaling,
         out_dtype=query_states.dtype,
         causal=causal,
         block_n=_BLOCK_N,
-    )  # [Z, H, S, D]
-    return out.transpose(1, 2)  # [Z, S, H, D]
+        out_layout="zshd",
+    )  # [Z, S, H, D]
 
 
 def make_nvfp4_forward(orig_forward):
