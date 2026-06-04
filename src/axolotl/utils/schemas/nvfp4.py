@@ -296,11 +296,14 @@ class NVFP4TrainingConfig(BaseModel):
             "trade graph coverage for steadier train steps. OFF by default."
         },
     )
-    qwen3_5_fuse_vproj: bool = Field(
-        default=False,
+    qwen3_5_fuse_vproj: bool | None = Field(
+        default=None,
         json_schema_extra={
             "description": "Qwen3.5 native attention only. Run v_proj as a native "
-            "NVFP4 GEMM with key-axis pack epilogue on inference/cache-free prefill. "
+            "NVFP4 GEMM with key-axis pack epilogue on inference/cache-free prefill "
+            "(~1.4-1.5x V producer; v_proj goes FP4, so attn-op cos ~0.967 but "
+            "real-model logit cos stays >=0.998 / top-1 preserved). Default (null): "
+            "ON for inference, OFF for training (the grad path ignores this flag). "
             "Skipped automatically for adapter-wrapped v_proj modules."
         },
     )

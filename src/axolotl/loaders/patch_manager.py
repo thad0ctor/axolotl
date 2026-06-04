@@ -516,7 +516,11 @@ class PatchManager:
 
             patch_qwen3_5_nvfp4_attention(
                 model,
-                fuse_vproj=getattr(nvfp4, "qwen3_5_fuse_vproj", False),
+                fuse_vproj=(
+                    self.inference
+                    if getattr(nvfp4, "qwen3_5_fuse_vproj", None) is None
+                    else nvfp4.qwen3_5_fuse_vproj
+                ),
                 train_backward=getattr(
                     nvfp4, "qwen3_5_native_attention_backward", False
                 ),
