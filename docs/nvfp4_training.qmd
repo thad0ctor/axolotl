@@ -166,6 +166,7 @@ sequence length 2048, sample packing, no gradient checkpointing:
 | NVFP4 FP8 lm_head CE, clean b6 short repeat | 6 | 1.7700 | ~6,943 tok/s | 80.32 GiB |
 | Locked profile, 500-step long-tail (RTX PRO 6000 #1, PCIe-first) | 4 | 1.2302 | ~6,659 tok/s | 62.03 GiB |
 | Locked profile + `hadamard: false` (RTX PRO 6000 #1) | 4 | 1.2155 | ~6,739 tok/s | 62.03 GiB |
+| Locked profile + once-per-forward mask classify (RTX PRO 6000 #1) | 4 | 1.1863 | ~6,906 tok/s | 62.03 GiB |
 
 The marginal s/step varies ~5% **between the two RTX PRO 6000 boards**: the
 PCIe-first board measured 1.2208–1.2302 across 60- and 500-step runs, while the
@@ -176,7 +177,11 @@ on the first board — the spread is board-to-board, not a short-run or compile-
 artifact. Always compare configs on the same board with `dataset_prepared_path` held
 fixed. Dropping the random Hadamard transform (`hadamard: false`) shaved ~1%
 (1.2295 → 1.2155 s/step) at unchanged loss — see the convergence-recipe note on why
-RHT is near-free to drop for frozen-base LoRA.
+RHT is near-free to drop for frozen-base LoRA. Classifying the dense causal/full
+attention mask **once per model-forward** (it is shared across decoder layers) instead
+of once per attention layer removes the per-layer `bool(...)` device→host syncs and the
+O(Z·S²) `tril`/compare; a same-session A/B on board #1 measured 1.1863 vs 1.1983 s/step
+(~1% faster) at unchanged loss.
 
 Negative checks from the same sweep:
 
