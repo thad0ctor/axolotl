@@ -938,6 +938,12 @@ class AxolotlInputConfig(
             "description": "Apply custom LoRA autograd function for embedding layers. See: https://docs.axolotl.ai/docs/lora_optims.html"
         },
     )
+    lora_batch_kernel: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Batch the per-projection LoRA adapter GEMMs that share an input (q/k/v and gate/up) into a single concatenated matmul to cut tiny-kernel launch overhead. Opt-in; only affects the lora_qkv_kernel/lora_mlp_kernel fast path (no DoRA/dropout/lora_bias)."
+        },
+    )
 
     chunked_cross_entropy: bool | None = Field(
         default=None,
