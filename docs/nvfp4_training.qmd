@@ -44,6 +44,44 @@ Software requirements:
 If any requirement is missing, Axolotl raises a validation error at config-check
 time rather than failing mid-run.
 
+## Installation
+
+Beyond a vanilla Axolotl install, the native NVFP4 path needs four extras that
+the standard wheels do not pull in:
+
+1. **A CUDA 13.0 PyTorch** (`>= 2.11`) whose bundled Triton exposes
+   `tl.dot_scaled` with native NVFP4 (e2m1 data + e4m3 group-16 scales) — the FP4
+   tensor-core path the kernels emit. Install from the cu130 (or nightly cu130)
+   index, not the default stable wheels.
+2. **`transformers >= 4.57`** for Qwen3.5 (`qwen3_5`) support.
+3. **`mslk`** — [github.com/pytorch/MSLK](https://github.com/pytorch/MSLK),
+   Meta/PyTorch's FP4 quant Triton kernels (`triton_quantize_nvfp4` etc.) used by
+   the NVFP4 linear/MLP path. Published on the PyTorch wheel index:
+   `uv pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu130`.
+4. **The SageAttention-NVFP4 fork** (`sageattention.nvfp4`) — the native-NVFP4
+   flash-attention kernel (forward + FP4 backward). It has **no PyPI package**;
+   clone the fork and install it editable. It is pure Triton, so skip the
+   SageAttention CUDA build: `SAGEATTN_SKIP_CUDA_BUILD=1 uv pip install -e <fork>`.
+
+`scripts/install_nvfp4.sh` wires all four up (uv by default, matching Axolotl's
+workflow):
+
+```bash
+# into the active venv:
+bash scripts/install_nvfp4.sh
+
+# or provision an isolated env first, and also (re)install the cu130 torch:
+bash scripts/install_nvfp4.sh --create-venv .venv-nvfp4 --with-torch
+
+# plain pip instead of uv:
+bash scripts/install_nvfp4.sh --tool pip
+```
+
+It clones the fork (default `thad0ctor/SageAttention` @ `nvfp4-attention`;
+override with `--sage-repo/--sage-ref`), installs mslk from the PyTorch index
+(or `--build-mslk` from source), installs the `nvfp4-attn` extra, and validates
+that `tl.dot_scaled`, `mslk`, and `sageattention.nvfp4` all import.
+
 ### Backends
 
 `nvfp4_training.backend` selects the FP4 compute implementation:
