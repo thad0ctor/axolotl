@@ -274,8 +274,8 @@ class NVFP4TrainingConfig(BaseModel):
             "default."
         },
     )
-    qwen3_5_native_attention_compile_custom_op: bool = Field(
-        default=False,
+    qwen3_5_native_attention_compile_custom_op: bool | None = Field(
+        default=None,
         json_schema_extra={
             "description": "Route the native NVFP4 flash-attention call through an "
             "opaque torch custom op as a torch.compile compatibility escape hatch "
@@ -284,7 +284,9 @@ class NVFP4TrainingConfig(BaseModel):
             "qwen3_5_native_attention_backward it wraps a DIFFERENTIABLE custom op "
             "(forward + registered native-NVFP4 backward) so Inductor compiles "
             "around the whole attention instead of falling the backward subgraph "
-            "back to eager. Not a proven speed knob; OFF by default."
+            "back to eager. Tri-state: None auto-enables it whenever torch_compile "
+            "is on (the bare tl.dot_scaled path raises an Inductor CompilationError "
+            "there and silently falls the region back to eager); True/False force it."
         },
     )
     qwen3_5_fla_causal_conv_compile_boundary: bool = Field(

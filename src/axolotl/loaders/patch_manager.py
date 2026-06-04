@@ -539,8 +539,8 @@ class PatchManager:
                     "qwen3_5_native_attention_dkdv_scratch_bf16",
                     False,
                 ),
-                compile_custom_op=getattr(
-                    nvfp4, "qwen3_5_native_attention_compile_custom_op", False
+                compile_custom_op=bool(
+                    getattr(nvfp4, "qwen3_5_native_attention_compile_custom_op", False)
                 ),
                 stochastic_rounding=nvfp4.stochastic_rounding,
             )

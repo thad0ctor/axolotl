@@ -1709,6 +1709,15 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "nvfp4_training.qwen3_5_native_attention_compile_custom_op "
                 "requires qwen3_5_native_attention: true."
             )
+        # Tri-state auto-resolve: under torch_compile the bare tl.dot_scaled flash
+        # kernel raises an Inductor CompilationError and (with the default error
+        # suppression) silently falls the attention region back to eager, blocking
+        # fusion of the surrounding elementwise. The opaque custom op compiles
+        # around it with bit-identical grads, so default it on when compile is live.
+        if self.nvfp4_training.qwen3_5_native_attention_compile_custom_op is None:
+            self.nvfp4_training.qwen3_5_native_attention_compile_custom_op = bool(
+                self.nvfp4_training.qwen3_5_native_attention and self.torch_compile
+            )
         if self.nvfp4_training.fp8_lm_head_cross_entropy and (
             self.nvfp4_training.quantize_lm_head
             or self.nvfp4_training.fused_fp4_cross_entropy

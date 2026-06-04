@@ -328,6 +328,58 @@ def test_qwen3_5_compile_custom_op_requires_native_attention(monkeypatch):
         )
 
 
+def test_qwen3_5_compile_custom_op_autoenabled_under_torch_compile(monkeypatch):
+    # Tri-state default (None): under torch_compile the bare tl.dot_scaled flash
+    # kernel raises an Inductor CompilationError and silently falls back to eager,
+    # so the opaque custom op is auto-enabled.
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        model_config_type="qwen3_5",
+        torch_compile=True,
+        nvfp4_training={
+            "enabled": True,
+            "qwen3_5_native_attention": True,
+            "qwen3_5_native_attention_backward": True,
+        },
+    )
+    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is True
+
+
+def test_qwen3_5_compile_custom_op_default_off_without_torch_compile(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        model_config_type="qwen3_5",
+        nvfp4_training={
+            "enabled": True,
+            "qwen3_5_native_attention": True,
+            "qwen3_5_native_attention_backward": True,
+        },
+    )
+    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is False
+
+
+def test_qwen3_5_compile_custom_op_explicit_optout_under_torch_compile(monkeypatch):
+    # An explicit False must survive auto-resolution (opt-out wins).
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        model_config_type="qwen3_5",
+        torch_compile=True,
+        nvfp4_training={
+            "enabled": True,
+            "qwen3_5_native_attention": True,
+            "qwen3_5_native_attention_backward": True,
+            "qwen3_5_native_attention_compile_custom_op": False,
+        },
+    )
+    assert cfg.nvfp4_training.qwen3_5_native_attention_compile_custom_op is False
+
+
 def _tiny_lora_model():
     """A 2-layer toy model wrapped with a PEFT LoRA adapter (CPU-friendly)."""
     import torch
