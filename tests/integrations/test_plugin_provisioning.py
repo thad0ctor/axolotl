@@ -1,5 +1,6 @@
 """Tests for external plugin source provisioning."""
 
+import shutil
 import subprocess  # nosec
 import sys
 
@@ -15,8 +16,11 @@ from axolotl.utils.schemas.config import PluginSpec
 
 
 def _git(args, cwd):
+    git_bin = shutil.which("git")
+    if not git_bin:
+        pytest.skip("git executable not found in PATH")
     subprocess.run(  # nosec
-        ["git", *args],
+        [git_bin, *args],
         cwd=str(cwd),
         check=True,
         stdout=subprocess.PIPE,
