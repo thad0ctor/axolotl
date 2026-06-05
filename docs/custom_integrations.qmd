@@ -119,3 +119,55 @@ It is not necessary to place your integration in the `integrations` folder. It c
 See this repo for an example: [https://github.com/axolotl-ai-cloud/diff-transformer](https://github.com/axolotl-ai-cloud/diff-transformer)
 
 :::
+
+## External plugin sources
+
+To use a third-party plugin without modifying your Axolotl checkout or manually
+installing it, a `plugins:` entry may be a mapping that points at an external
+**git repository or local directory**. Axolotl clones (or resolves) the source into
+a cache directory, adds it to `sys.path`, and then loads the class — your Axolotl
+install is never touched.
+
+```yaml
+plugins:
+  # Existing form — a dotted class path — is unchanged.
+  - axolotl.integrations.liger.LigerPlugin
+
+  # External git source.
+  - cls: my_plugin.MyPlugin                       # dotted path to the plugin class
+    source: https://github.com/org/repo.git        # git URL (or local path)
+    ref: v1.2.0                                     # branch / tag / commit (SHA recommended)
+    subdir: src                                     # dir within the source to put on sys.path
+    pip_install: editable                           # false | editable | requirements
+
+  # Local directory source (no clone).
+  - cls: local_plugin.Thing
+    source: ./plugins/local_plugin
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `cls` | yes | Dotted path to the plugin class to load. |
+| `source` | no | Git URL or local path. A value ending in `.git` or starting with `http(s)://`, `git://`, `ssh://`, or `git@` is cloned; anything else is treated as a local path. Omit if the class is already importable. |
+| `ref` | no | Git branch, tag, or commit to check out. Pin to a commit SHA for reproducibility. |
+| `subdir` | no | Subdirectory within the source added to `sys.path`. |
+| `pip_install` | no | `false` (default) injects the path only; `editable` runs `pip install -e` on the source (falling back to `requirements` if it isn't a package); `requirements` installs `requirements.txt` only. |
+| `update` | no | Re-fetch and re-checkout a cached git source. |
+
+### Cache directory
+
+Cloned sources live in `./.axolotl_plugins/` by default. Override with the
+`plugin_cache_dir:` config key or the `AXOLOTL_PLUGIN_CACHE_DIR` environment
+variable (e.g. `~/.cache/axolotl/plugins` to share clones across checkouts). The
+cache directory writes its own `.gitignore`, so a vanilla Axolotl checkout stays
+clean without edits to the repo's root `.gitignore`.
+
+::: {.callout-warning}
+
+External sources execute arbitrary code at import time — only point `source:` at
+repositories you trust, and pin `ref:` to a specific commit. Cloning itself runs no
+repository code, and no automatic installation happens unless you set
+`pip_install`. When `pip_install` is set, only the plugin and its dependencies are
+installed; the Axolotl install itself is never modified.
+
+:::
