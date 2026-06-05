@@ -683,13 +683,14 @@ class TestNVFP4Training:
         k0 = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
         v0 = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
         upstream = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+        upstream_zshd = upstream.transpose(1, 2).contiguous()
 
-        def run(fn):
+        def run(fn, upstream_=upstream):
             q = q0.clone().requires_grad_(True)
             k = k0.clone().requires_grad_(True)
             v = v0.clone().requires_grad_(True)
             out = fn(q, k, v)
-            (out.float() * upstream.float()).sum().backward()
+            (out.float() * upstream_.float()).sum().backward()
             return out.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
 
         common = dict(
@@ -716,14 +717,33 @@ class TestNVFP4Training:
             for ref_t, got_t in zip(ref, got, strict=False):
                 assert torch.equal(ref_t, got_t)
 
+        ref_zshd = run(
+            lambda q, k, v: nvfp4_flash_attn_func(
+                q, k, v, scale, **common
+            ).transpose(1, 2),
+            upstream_zshd,
+        )
+        got_zshd = run(
+            lambda q, k, v: nvfp4_flash_attn_train_custom_op(
+                q, k, v, scale, **common, out_layout="zshd"
+            ),
+            upstream_zshd,
+        )
+        assert got_zshd[0].shape == (z, s, h, d)
+        assert got_zshd[0].is_contiguous()
+        for ref_t, got_t in zip(ref_zshd, got_zshd, strict=False):
+            assert torch.equal(ref_t, got_t)
+
         q = q0.clone().requires_grad_(True)
         k = k0.clone().requires_grad_(True)
         v = v0.clone().requires_grad_(True)
         compiled_opts = {**common, "save_backward_packs": True}
 
         def loss_fn(q, k, v):
-            out = nvfp4_flash_attn_train_custom_op(q, k, v, scale, **compiled_opts)
-            return (out.float() * upstream.float()).sum()
+            out = nvfp4_flash_attn_train_custom_op(
+                q, k, v, scale, **compiled_opts, out_layout="zshd"
+            )
+            return (out.float() * upstream_zshd.float()).sum()
 
         prev = dyn.config.suppress_errors
         dyn.config.suppress_errors = False

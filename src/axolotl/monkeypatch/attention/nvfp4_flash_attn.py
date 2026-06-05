@@ -429,7 +429,8 @@ def make_nvfp4_forward(orig_forward):
                         save_backward_packs=getattr(
                             self, "_nvfp4_save_backward_packs", False
                         ),
-                    ).transpose(1, 2)
+                        out_layout="zshd",
+                    )
                     # trailing half of the isolating break (see the leading one above)
                     torch._dynamo.graph_break()
                 else:

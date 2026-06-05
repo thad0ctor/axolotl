@@ -218,6 +218,7 @@ def _flash_attention_train_op(
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
     save_backward_packs: bool,
+    out_zshd: bool,
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -257,6 +258,7 @@ def _flash_attention_train_op(
             num_stages=num_stages,
             return_lse=True,
             return_packs=True,
+            out_layout="zshd" if out_zshd else "zhsd",
         )
     else:
         out, lse = nvfp4_flash_attention(
@@ -272,6 +274,7 @@ def _flash_attention_train_op(
             num_warps=num_warps,
             num_stages=num_stages,
             return_lse=True,
+            out_layout="zshd" if out_zshd else "zhsd",
         )
         packs = _empty_pack_outputs(query)
     return (out, lse, *packs)
@@ -292,6 +295,7 @@ def _(
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
     save_backward_packs: bool,
+    out_zshd: bool,
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -302,7 +306,7 @@ def _(
     del dkdv_scratch_bf16, num_warps, num_stages
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
-    out = query.new_empty((z, h, s_q, d))
+    out = query.new_empty((z, s_q, h, d) if out_zshd else (z, h, s_q, d))
     lse = query.new_empty((z * h, s_q), dtype=torch.float32)
     if not _use_saved_train_packs(save_backward_packs, s_q, s_kv):
         return (out, lse, *_empty_pack_outputs(query))
@@ -341,6 +345,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         backward_ds_dq_sr,
         dkdv_scratch_bf16,
         save_backward_packs,
+        out_zshd,
         block_m,
         block_n,
         num_warps,
@@ -386,6 +391,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.backward_ds_dq_sr = backward_ds_dq_sr
     ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
     ctx.save_backward_packs = use_saved_packs
+    ctx.out_zshd = bool(out_zshd)
     ctx.tiles = (block_m, block_n, num_warps, num_stages)
 
 
@@ -420,6 +426,7 @@ def _flash_attention_train_bwd_op(
     s_kv: int,
     d: int,
     save_backward_packs: bool,
+    out_zshd: bool,
     scaling: float,
     causal: bool,
     sr: bool,
@@ -433,8 +440,12 @@ def _flash_attention_train_bwd_op(
     num_stages: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias.to(torch.float32)
-    do = grad_out.reshape(z * h, s_q, d).contiguous()
-    o = out.reshape(z * h, s_q, d).contiguous()
+    if out_zshd:
+        do = grad_out
+        o = out
+    else:
+        do = grad_out.reshape(z * h, s_q, d).contiguous()
+        o = out.reshape(z * h, s_q, d).contiguous()
     if save_backward_packs:
         # HP q/k/v were intentionally not saved. _run_bwd does not dereference them
         # when LSE plus all deterministic forward packs are supplied; it only needs
@@ -479,6 +490,8 @@ def _flash_attention_train_bwd_op(
         vsc_saved=vdsc if vdsc.numel() else None,
         ktnv_saved=ktnv if ktnv.numel() else None,
         ktsc_saved=ktsc if ktsc.numel() else None,
+        do_zshd=out_zshd,
+        o_zshd=out_zshd,
     )
     dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype).contiguous()
     ng = h // hk
@@ -516,6 +529,7 @@ def _(
     s_kv: int,
     d: int,
     save_backward_packs: bool,
+    out_zshd: bool,
     scaling: float,
     causal: bool,
     sr: bool,
@@ -530,7 +544,7 @@ def _(
 ):
     del grad_out, out, key_pad_bias, lse
     del qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
-    del scaling, causal, sr, save_backward_packs
+    del scaling, causal, sr, save_backward_packs, out_zshd
     del backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr, dkdv_scratch_bf16
     del block_m, block_n, num_warps, num_stages
     # The real op returns CONTIGUOUS dq/dk/dv (reshape / GQA-reduce empty), even when
@@ -603,6 +617,7 @@ def _flash_attention_train_backward(
         s_kv,
         d,
         ctx.save_backward_packs,
+        ctx.out_zshd,
         ctx.scaling,
         ctx.causal,
         ctx.sr,
@@ -615,11 +630,12 @@ def _flash_attention_train_backward(
         num_warps,
         num_stages,
     )
-    # one grad slot per forward input (17 inputs)
+    # one grad slot per forward input (18 inputs)
     return (
         dq,
         dk,
         dv,
+        None,
         None,
         None,
         None,
@@ -659,6 +675,7 @@ def nvfp4_flash_attn_train_custom_op(
     backward_ds_dq_stochastic_rounding: bool | None = None,
     dkdv_scratch_bf16: bool = False,
     save_backward_packs: bool = False,
+    out_layout: str = "zhsd",
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -671,7 +688,10 @@ def nvfp4_flash_attn_train_custom_op(
     subgraph). All SR knobs are op arguments (so they survive compile/serialization);
     the bwd reuses the forward LSE and, when requested, the deterministic forward
     FP4 packs across the opaque boundary for short/mid static sequence lengths.
+    ``out_layout="zshd"`` writes the HF attention layout directly.
     """
+    if out_layout not in ("zhsd", "zshd"):
+        raise ValueError("out_layout must be 'zhsd' or 'zshd'")
     bias = (
         query.new_empty((0,), dtype=torch.float32)
         if key_pad_bias is None
@@ -707,6 +727,7 @@ def nvfp4_flash_attn_train_custom_op(
         ds_dq,
         dkdv_scratch_bf16,
         save_backward_packs,
+        out_layout == "zshd",
         block_m,
         block_n,
         num_warps,
