@@ -173,6 +173,7 @@ class PatchManager:
         self._apply_nvfp4_training(model)
         self._apply_qwen3_5_native_nvfp4_patches(model)
         self._apply_tiled_mlp_post_load(model)
+        self._mark_nvfp4_ddp_ignore(model)
 
     def _apply_gemma_hybrid_attention(self, model: PreTrainedModel):
         """Apply hybrid attention: FA2 for sliding window layers, SDPA for global layers.
@@ -517,6 +518,39 @@ class PatchManager:
             )
 
             patch_model_bf16_lm_head_cross_entropy(model)
+
+    def _mark_nvfp4_ddp_ignore(self, model: PreTrainedModel):
+        """Exclude NVFP4 frozen-base buffers from DDP's param/buffer sync.
+
+        DDP NCCL-broadcasts module states across ranks (at init and, with
+        broadcast_buffers, every step), but NCCL has no support for the packed
+        ``Float4_e2m1fn_x2`` / fp8-scale dtypes the NVFP4 base stores — it raises
+        "Input tensor data type is not supported for NCCL process group". Those
+        buffers are frozen and bit-identical on every rank (deterministic quant),
+        so they never need syncing; naming them in
+        ``_ddp_params_and_buffers_to_ignore`` (read natively by DDP) skips them.
+        """
+        nvfp4 = self.cfg.nvfp4_training
+        if not (nvfp4 and nvfp4.enabled):
+            return
+
+        exotic = {torch.float8_e4m3fn, torch.float8_e5m2}
+        fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4 is not None:
+            exotic.add(fp4)
+
+        ignore = [
+            name
+            for name, buf in model.named_buffers()
+            if buf is not None
+            and (type(buf).__name__ == "NVFP4Tensor" or buf.dtype in exotic)
+        ]
+        if not ignore:
+            return
+
+        existing = list(getattr(model, "_ddp_params_and_buffers_to_ignore", []))
+        model._ddp_params_and_buffers_to_ignore = list(dict.fromkeys(existing + ignore))
+        LOG.info("NVFP4: excluded %d FP4 base buffers from DDP sync", len(ignore))
 
     def _apply_qwen3_5_native_nvfp4_patches(self, model: PreTrainedModel):
         nvfp4 = self.cfg.nvfp4_training
