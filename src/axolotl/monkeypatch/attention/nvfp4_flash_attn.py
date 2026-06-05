@@ -426,6 +426,9 @@ def make_nvfp4_forward(orig_forward):
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
+                        save_backward_packs=getattr(
+                            self, "_nvfp4_save_backward_packs", False
+                        ),
                     ).transpose(1, 2)
                     # trailing half of the isolating break (see the leading one above)
                     torch._dynamo.graph_break()

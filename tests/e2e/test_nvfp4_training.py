@@ -664,7 +664,7 @@ class TestNVFP4Training:
 
     def test_attention_train_custom_op_reuses_lse_and_compiles(self):
         """The opaque compile custom op keeps native-attention grads identical while
-        carrying forward LSE as a non-differentiable auxiliary output."""
+        carrying forward LSE and optional saved packs as non-diff auxiliaries."""
         import torch._dynamo as dyn
 
         from axolotl.kernels.attn_nvfp4_custom_op import (
@@ -698,21 +698,28 @@ class TestNVFP4Training:
             backward_ds_dq_stochastic_rounding=False,
             dkdv_scratch_bf16=True,
         )
-        ref = run(lambda q, k, v: nvfp4_flash_attn_func(q, k, v, scale, **common))
-        got = run(
-            lambda q, k, v: nvfp4_flash_attn_train_custom_op(
-                q, k, v, scale, **common
+        for save_packs in (False, True):
+            opts = {**common, "save_backward_packs": save_packs}
+            ref = run(
+                lambda q, k, v, opts=opts: nvfp4_flash_attn_func(
+                    q, k, v, scale, **opts
+                )
             )
-        )
-        for ref_t, got_t in zip(ref, got, strict=False):
-            assert torch.equal(ref_t, got_t)
+            got = run(
+                lambda q, k, v, opts=opts: nvfp4_flash_attn_train_custom_op(
+                    q, k, v, scale, **opts
+                )
+            )
+            for ref_t, got_t in zip(ref, got, strict=False):
+                assert torch.equal(ref_t, got_t)
 
         q = q0.clone().requires_grad_(True)
         k = k0.clone().requires_grad_(True)
         v = v0.clone().requires_grad_(True)
+        compiled_opts = {**common, "save_backward_packs": True}
 
         def loss_fn(q, k, v):
-            out = nvfp4_flash_attn_train_custom_op(q, k, v, scale, **common)
+            out = nvfp4_flash_attn_train_custom_op(q, k, v, scale, **compiled_opts)
             return (out.float() * upstream.float()).sum()
 
         prev = dyn.config.suppress_errors

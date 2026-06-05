@@ -52,8 +52,8 @@ class NVFP4AttentionBackwardConfig(BaseModel):
             "description": "Route the native NVFP4 flash attention through an opaque "
             "torch custom op (torch.compile escape hatch). Tri-state: None "
             "auto-enables it whenever torch_compile is on; True/False force it. "
-            "The op reuses forward LSE in backward, while save_packs remains an "
-            "eager-only memory/throughput tradeoff."
+            "The op reuses forward LSE in backward and honors save_packs by carrying "
+            "the deterministic forward FP4 packs across the opaque boundary."
         },
     )
 

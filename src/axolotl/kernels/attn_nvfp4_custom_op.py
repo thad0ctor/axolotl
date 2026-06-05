@@ -6,6 +6,7 @@ import torch
 
 from axolotl.kernels.attn_nvfp4_flash import (
     _gqa_reduce_cast_dkdv,
+    _next_mult,
     _run_bwd,
     nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
@@ -33,6 +34,10 @@ def _code_to_dtype(code: int) -> torch.dtype:
         raise TypeError(
             f"unsupported NVFP4 attention output dtype code: {code}"
         ) from exc
+
+
+def _empty_pack_outputs(tensor: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    return tuple(tensor.new_empty((0,), dtype=torch.uint8) for _ in range(10))
 
 
 @torch.library.custom_op("axolotl_nvfp4::flash_attention_packed", mutates_args=())
@@ -176,10 +181,10 @@ def nvfp4_flash_attention_packed_custom_op(
 # subgraph), while the registered backward computes the SAME native-NVFP4 grads as
 # nvfp4_flash_attn_func.
 #
-# The forward returns ``out`` plus the per-row LSE as an auxiliary output. The LSE
-# is marked non-differentiable in setup_context, so the public wrapper still
-# exposes a single differentiable tensor while backward can reuse the forward
-# softmax stats and skip the extra FA2-prep QK^T pass.
+# The forward returns ``out`` plus non-differentiable auxiliary outputs: per-row
+# LSE, and optionally the forward Q/K/V FP4 packs needed by backward. The public
+# wrapper still exposes a single differentiable tensor while backward can reuse
+# those tensors across the opaque boundary.
 # ---------------------------------------------------------------------------
 @torch.library.custom_op("axolotl_nvfp4::flash_attention_train", mutates_args=())
 def _flash_attention_train_op(
@@ -195,29 +200,61 @@ def _flash_attention_train_op(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
+    save_backward_packs: bool,
     block_m: int,
     block_n: int,
     num_warps: int,
     num_stages: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
     del dkdv_scratch_bf16
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
-    out, lse = nvfp4_flash_attention(
-        query,
-        key,
-        value,
-        scaling,
-        causal=causal,
-        num_key_value_groups=num_key_value_groups,
-        key_pad_bias=bias,
-        block_m=block_m,
-        block_n=block_n,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        return_lse=True,
-    )
-    return out, lse
+    if save_backward_packs:
+        out, lse, packs = nvfp4_flash_attention(
+            query,
+            key,
+            value,
+            scaling,
+            causal=causal,
+            num_key_value_groups=num_key_value_groups,
+            key_pad_bias=bias,
+            block_m=block_m,
+            block_n=block_n,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            return_lse=True,
+            return_packs=True,
+        )
+    else:
+        out, lse = nvfp4_flash_attention(
+            query,
+            key,
+            value,
+            scaling,
+            causal=causal,
+            num_key_value_groups=num_key_value_groups,
+            key_pad_bias=bias,
+            block_m=block_m,
+            block_n=block_n,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            return_lse=True,
+        )
+        packs = _empty_pack_outputs(query)
+    return (out, lse, *packs)
 
 
 @_flash_attention_train_op.register_fake
@@ -234,17 +271,38 @@ def _(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
+    save_backward_packs: bool,
     block_m: int,
     block_n: int,
     num_warps: int,
     num_stages: int,
 ):
-    del key, value, key_pad_bias, scaling, causal, num_key_value_groups
+    del key_pad_bias, scaling, causal, num_key_value_groups
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
-    del dkdv_scratch_bf16, block_m, block_n, num_warps, num_stages
+    del dkdv_scratch_bf16, num_warps, num_stages
     z, h, s_q, d = query.shape
-    return query.new_empty((z, h, s_q, d)), query.new_empty(
-        (z * h, s_q), dtype=torch.float32
+    _, hk, s_kv, _ = key.shape
+    out = query.new_empty((z, h, s_q, d))
+    lse = query.new_empty((z * h, s_q), dtype=torch.float32)
+    if not save_backward_packs:
+        return (out, lse, *_empty_pack_outputs(query))
+
+    bwd_block_m = min(block_m, 64)
+    s_q_bwd_pad = _next_mult(s_q, max(bwd_block_m, 32))
+    s_kv_bwd_pad = _next_mult(s_kv, 64)
+    return (
+        out,
+        lse,
+        query.new_empty((z * h, s_q, d // 2), dtype=torch.uint8),
+        query.new_empty((z * h, s_q, d // 16), dtype=torch.uint8),
+        query.new_empty((z * h, d, s_q_bwd_pad // 2), dtype=torch.uint8),
+        query.new_empty((z * h, d, s_q_bwd_pad // 16), dtype=torch.uint8),
+        key.new_empty((z * hk, s_kv, d // 2), dtype=torch.uint8),
+        key.new_empty((z * hk, s_kv, d // 16), dtype=torch.uint8),
+        value.new_empty((z * hk, s_kv, d // 2), dtype=torch.uint8),
+        value.new_empty((z * hk, s_kv, d // 16), dtype=torch.uint8),
+        key.new_empty((z * hk, d, s_kv_bwd_pad // 2), dtype=torch.uint8),
+        key.new_empty((z * hk, d, s_kv_bwd_pad // 16), dtype=torch.uint8),
     )
 
 
@@ -262,16 +320,43 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         backward_dot_dv_sr,
         backward_ds_dq_sr,
         dkdv_scratch_bf16,
+        save_backward_packs,
         block_m,
         block_n,
         num_warps,
         num_stages,
     ) = inputs
     del num_key_value_groups
-    out, lse = output
+    out, lse, qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc = output
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(lse)
-    ctx.save_for_backward(query, key, value, out, key_pad_bias, lse)
+    ctx.mark_non_differentiable(
+        lse, qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
+    )
+    if save_backward_packs:
+        query_save = key_save = value_save = out
+    else:
+        query_save, key_save, value_save = query, key, value
+    ctx.save_for_backward(
+        query_save,
+        key_save,
+        value_save,
+        out,
+        key_pad_bias,
+        lse,
+        qnv,
+        qsc,
+        qtnv,
+        qtsc,
+        knv,
+        ksc,
+        vdnv,
+        vdsc,
+        ktnv,
+        ktsc,
+    )
+    z, h, s_q, d = query.shape
+    _, hk, s_kv, _ = key.shape
+    ctx.dims = (z, h, hk, s_q, s_kv, d)
     ctx.scaling = scaling
     ctx.causal = causal
     ctx.sr = sr
@@ -279,6 +364,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.backward_dot_dv_sr = backward_dot_dv_sr
     ctx.backward_ds_dq_sr = backward_ds_dq_sr
     ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
+    ctx.save_backward_packs = save_backward_packs
     ctx.tiles = (block_m, block_n, num_warps, num_stages)
 
 
@@ -296,6 +382,23 @@ def _flash_attention_train_bwd_op(
     out: torch.Tensor,  # [Z, H, Sq, D]
     key_pad_bias: torch.Tensor,  # [Z, Skv] fp32 or empty
     lse: torch.Tensor,  # [Z*H, Sq] fp32, forward softmax stats
+    qnv: torch.Tensor,
+    qsc: torch.Tensor,
+    qtnv: torch.Tensor,
+    qtsc: torch.Tensor,
+    knv: torch.Tensor,
+    ksc: torch.Tensor,
+    vdnv: torch.Tensor,
+    vdsc: torch.Tensor,
+    ktnv: torch.Tensor,
+    ktsc: torch.Tensor,
+    z: int,
+    h: int,
+    hk: int,
+    s_q: int,
+    s_kv: int,
+    d: int,
+    save_backward_packs: bool,
     scaling: float,
     causal: bool,
     sr: bool,
@@ -308,16 +411,24 @@ def _flash_attention_train_bwd_op(
     num_warps: int,
     num_stages: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    z, h, s_q, d = query.shape
-    _, hk, s_kv, _ = key.shape
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias.to(torch.float32)
     do = grad_out.reshape(z * h, s_q, d).contiguous()
+    o = out.reshape(z * h, s_q, d).contiguous()
+    if save_backward_packs:
+        # HP q/k/v were intentionally not saved. _run_bwd does not dereference them
+        # when LSE plus all deterministic forward packs are supplied; it only needs
+        # a same-device tensor for scratch allocations and dummy bias pointers.
+        query_bwd = key_bwd = value_bwd = o
+    else:
+        query_bwd = query.reshape(z * h, s_q, d).contiguous()
+        key_bwd = key.reshape(z * hk, s_kv, d).contiguous()
+        value_bwd = value.reshape(z * hk, s_kv, d).contiguous()
     dq, dk, dv = _run_bwd(
-        query.reshape(z * h, s_q, d).contiguous(),
-        key.reshape(z * hk, s_kv, d).contiguous(),
-        value.reshape(z * hk, s_kv, d).contiguous(),
+        query_bwd,
+        key_bwd,
+        value_bwd,
         do,
-        out.reshape(z * h, s_q, d).contiguous(),
+        o,
         bias,
         z,
         h,
@@ -337,6 +448,16 @@ def _flash_attention_train_bwd_op(
         sr_dot_dv=backward_dot_dv_sr,
         sr_ds_dq=backward_ds_dq_sr,
         dkdv_scratch_bf16=dkdv_scratch_bf16,
+        qnv_saved=qnv if qnv.numel() else None,
+        qsc_saved=qsc if qsc.numel() else None,
+        qtnv_saved=qtnv if qtnv.numel() else None,
+        qtsc_saved=qtsc if qtsc.numel() else None,
+        knv_saved=knv if knv.numel() else None,
+        ksc_saved=ksc if ksc.numel() else None,
+        vnv_saved=vdnv if vdnv.numel() else None,
+        vsc_saved=vdsc if vdsc.numel() else None,
+        ktnv_saved=ktnv if ktnv.numel() else None,
+        ktsc_saved=ktsc if ktsc.numel() else None,
     )
     dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype).contiguous()
     ng = h // hk
@@ -357,6 +478,23 @@ def _(
     out,
     key_pad_bias,
     lse,
+    qnv,
+    qsc,
+    qtnv,
+    qtsc,
+    knv,
+    ksc,
+    vdnv,
+    vdsc,
+    ktnv,
+    ktsc,
+    z: int,
+    h: int,
+    hk: int,
+    s_q: int,
+    s_kv: int,
+    d: int,
+    save_backward_packs: bool,
     scaling: float,
     causal: bool,
     sr: bool,
@@ -369,20 +507,55 @@ def _(
     num_warps: int,
     num_stages: int,
 ):
-    del grad_out, out, key_pad_bias, lse, scaling, causal, sr
+    del grad_out, out, key_pad_bias, lse
+    del qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
+    del scaling, causal, sr, save_backward_packs
     del backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr, dkdv_scratch_bf16
     del block_m, block_n, num_warps, num_stages
     # The real op returns CONTIGUOUS dq/dk/dv (reshape / GQA-reduce empty), even when
     # the q/k/v inputs are non-contiguous roped views — the fake must match strides.
-    dq = query.new_empty(query.shape)
-    dk = key.new_empty(key.shape)
-    dv = value.new_empty(value.shape)
+    dq = query.new_empty((z, h, s_q, d))
+    dk = key.new_empty((z, hk, s_kv, d))
+    dv = value.new_empty((z, hk, s_kv, d))
     return dq, dk, dv
 
 
-def _flash_attention_train_backward(ctx, grad_out, grad_lse):
-    del grad_lse
-    query, key, value, out, key_pad_bias, lse = ctx.saved_tensors
+def _flash_attention_train_backward(
+    ctx,
+    grad_out,
+    grad_lse,
+    grad_qnv,
+    grad_qsc,
+    grad_qtnv,
+    grad_qtsc,
+    grad_knv,
+    grad_ksc,
+    grad_vdnv,
+    grad_vdsc,
+    grad_ktnv,
+    grad_ktsc,
+):
+    del grad_lse, grad_qnv, grad_qsc, grad_qtnv, grad_qtsc
+    del grad_knv, grad_ksc, grad_vdnv, grad_vdsc, grad_ktnv, grad_ktsc
+    (
+        query,
+        key,
+        value,
+        out,
+        key_pad_bias,
+        lse,
+        qnv,
+        qsc,
+        qtnv,
+        qtsc,
+        knv,
+        ksc,
+        vdnv,
+        vdsc,
+        ktnv,
+        ktsc,
+    ) = ctx.saved_tensors
+    z, h, hk, s_q, s_kv, d = ctx.dims
     block_m, block_n, num_warps, num_stages = ctx.tiles
     dq, dk, dv = torch.ops.axolotl_nvfp4.flash_attention_train_bwd(
         grad_out.contiguous(),
@@ -392,6 +565,23 @@ def _flash_attention_train_backward(ctx, grad_out, grad_lse):
         out,
         key_pad_bias,
         lse,
+        qnv,
+        qsc,
+        qtnv,
+        qtsc,
+        knv,
+        ksc,
+        vdnv,
+        vdsc,
+        ktnv,
+        ktsc,
+        z,
+        h,
+        hk,
+        s_q,
+        s_kv,
+        d,
+        ctx.save_backward_packs,
         ctx.scaling,
         ctx.causal,
         ctx.sr,
@@ -404,11 +594,12 @@ def _flash_attention_train_backward(ctx, grad_out, grad_lse):
         num_warps,
         num_stages,
     )
-    # one grad slot per forward input (16 inputs)
+    # one grad slot per forward input (17 inputs)
     return (
         dq,
         dk,
         dv,
+        None,
         None,
         None,
         None,
@@ -446,6 +637,7 @@ def nvfp4_flash_attn_train_custom_op(
     backward_dot_dv_stochastic_rounding: bool | None = None,
     backward_ds_dq_stochastic_rounding: bool | None = None,
     dkdv_scratch_bf16: bool = False,
+    save_backward_packs: bool = False,
     block_m: int = 64,
     block_n: int = 128,
     num_warps: int = 8,
@@ -456,8 +648,8 @@ def nvfp4_flash_attn_train_custom_op(
     Same forward/backward math as ``nvfp4_flash_attn_func`` but wrapped so Inductor
     compiles around it (no ``tl.dot_scaled`` trace, no eager fallback of the bwd
     subgraph). All SR knobs are op arguments (so they survive compile/serialization);
-    the bwd reuses the forward LSE but recomputes the FP4 packs (no saved-pack reuse
-    across the opaque boundary).
+    the bwd reuses the forward LSE and, when requested, the deterministic forward
+    FP4 packs across the opaque boundary.
     """
     bias = (
         query.new_empty((0,), dtype=torch.float32)
@@ -480,7 +672,7 @@ def nvfp4_flash_attn_train_custom_op(
         if backward_ds_dq_stochastic_rounding is None
         else backward_ds_dq_stochastic_rounding
     )
-    out, _lse = torch.ops.axolotl_nvfp4.flash_attention_train(
+    out, *_aux = torch.ops.axolotl_nvfp4.flash_attention_train(
         query,
         key,
         value,
@@ -493,6 +685,7 @@ def nvfp4_flash_attn_train_custom_op(
         dot_dv,
         ds_dq,
         dkdv_scratch_bf16,
+        save_backward_packs,
         block_m,
         block_n,
         num_warps,
