@@ -572,17 +572,21 @@ loads from the checkpoint and the frozen base reconstructs/reloads identically).
   `--nproc_per_node` yourself (or use `accelerate launch`). Do **not** set
   `HF_HUB_OFFLINE` unless the `kernels-community/flash-attn2` kernel is already
   cached, or the worker ranks cannot resolve flash-attention.
-- **Multi-GPU FSDP2: single-process only.** FFT and LoRA+FP4-compute keep a plain
+- **Multi-GPU FSDP2: supported (cross-rank).** FFT and LoRA+FP4-compute keep a plain
   bf16 `nn.Parameter` master weight, which FSDP2 shards as a normal DTensor.
   NVFP4-QLoRA (FP4-stored base) ships custom `fsdp_pre/post_all_gather` hooks that
   shard the packed FP4 weight by row (the global per-tensor scale is replicated)
-  and reconstruct it bit-exactly — all three pass single-process (`world_size=1`)
-  forward + backward + step. **Cross-rank FSDP2 does not yet work:** the FP4-stored
-  base trips FSDP2's sharding init, which calls `aten.empty_like` on the torchao
-  `NVFP4Tensor` and `c10d.broadcast_` on the custom `FSDPNVFP4Tensor` — neither op
-  is implemented on the packed-FP4 subclass (`NotImplementedError`). Multi-rank
-  FSDP2 needs the FP4 tensor subclass to implement FSDP2's full sharding dispatch;
-  until then, use **DDP** for multi-GPU LoRA.
+  and reconstruct it bit-exactly. Cross-rank training was validated on two physical
+  Blackwell ranks with `torch_compile` on (loss converges, grad finite). It required
+  three fixes now in place: `FSDPNVFP4Tensor` implements `aten.empty_like`/`copy_`
+  and re-asserts its type on torchao's op outputs (so the all-gather hooks survive
+  sharding); the frozen-base backward snapshots the packed FP4 weight (FSDP2 frees
+  the all-gathered weight after forward and does not re-gather the no-grad base);
+  and the slow SR quant path clamps amax (an all-zero dgrad tile otherwise gives a
+  zero per-tensor scale and `0*inf=NaN`). Launch via `torchrun --nproc_per_node=N`.
+  Disable the fused LoRA Triton kernels (`lora_*_kernel: false`) — they bypass the
+  FP4 base. DDP remains simpler for models that fit replicated (the FP4 base is
+  3.5x smaller); use FSDP2 when the base must be sharded.
 - **Checkpoint resume:** the FP4-stored QLoRA base is registered as a buffer, so
   it is saved in `state_dict` and reloads bit-exactly — resume works.
 - **Full fine-tune has the most validation coverage.** The convergence and
