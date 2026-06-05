@@ -974,6 +974,60 @@ class TestNVFP4Training:
         finally:
             dyn.config.suppress_errors = prev
 
+    def test_shared_base_fprop_many_matches_individual(self):
+        """Shared activation packing must match calling each NVFP4 base fprop."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4Recipe,
+            nvfp4_base_fprop,
+            nvfp4_base_fprop_many,
+        )
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        bases = [
+            NVFP4ComputeBaseLinear.from_linear(
+                nn.Linear(256, out, bias=False).cuda().bfloat16(), recipe
+            )
+            for out in (512, 384, 640)
+        ]
+        x = torch.randn(2, 19, 256, device="cuda", dtype=torch.bfloat16)
+        shared = nvfp4_base_fprop_many(x, bases)
+        assert shared is not None
+        individual = [nvfp4_base_fprop(x.reshape(-1, 256), base) for base in bases]
+        for got, ref in zip(shared, individual, strict=False):
+            assert got.shape == (2, 19, ref.shape[-1])
+            assert torch.equal(got.reshape(-1, got.shape[-1]), ref)
+
+    def test_shared_fast_base_fprop_many_matches_individual(self):
+        """MSLK fast compute-base fprops can share one single-level activation pack."""
+        from axolotl.utils.nvfp4_training import (
+            NVFP4FastComputeBaseLinear,
+            NVFP4Recipe,
+            _mslk_available,
+            nvfp4_base_fprop,
+            nvfp4_base_fprop_many,
+        )
+
+        if not _mslk_available():
+            pytest.skip("MSLK not available")
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        bases = [
+            NVFP4FastComputeBaseLinear.from_linear(
+                nn.Linear(256, out, bias=False).cuda().bfloat16(), recipe
+            )
+            for out in (512, 384, 640)
+        ]
+        x = torch.randn(2, 19, 256, device="cuda", dtype=torch.bfloat16)
+        shared = nvfp4_base_fprop_many(x, bases)
+        assert shared is not None
+        individual = [nvfp4_base_fprop(x.reshape(-1, 256), base) for base in bases]
+        for got, ref in zip(shared, individual, strict=False):
+            assert got.shape == (2, 19, ref.shape[-1])
+            assert torch.equal(got.reshape(-1, got.shape[-1]), ref)
+
     def test_sr_unbiased(self):
         """Averaging stochastic-rounded quant converges to the true value; RTN
         keeps a systematic bias."""

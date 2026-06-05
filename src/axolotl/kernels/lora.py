@@ -329,6 +329,37 @@ def matmul_lora(
     return out.view(batch, seq_len, -1) if reshape else out
 
 
+def _shared_nvfp4_base_fprop(
+    X: torch.Tensor,
+    quants: list[QuantState | torch.Tensor | nn.Module | None],
+    biases: list[torch.Tensor | None],
+) -> list[torch.Tensor] | None:
+    """Shared activation-pack fprop for fused LoRA projections on NVFP4 bases."""
+    from axolotl.utils.nvfp4_training import nvfp4_base_fprop_many
+
+    outs = nvfp4_base_fprop_many(X, quants)
+    if outs is None:
+        return None
+    for out, bias in zip(outs, biases, strict=False):
+        if bias is not None:
+            out += bias
+    return outs
+
+
+def _add_lora_to_base(
+    base: torch.Tensor,
+    X_lora: torch.Tensor,
+    A: torch.Tensor | None,
+    B: torch.Tensor | None,
+    scale: float,
+    lora_bias: torch.Tensor | None,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if A is not None:
+        base += _lora_only(X_lora, A, B, scale, lora_bias, dtype)
+    return base
+
+
 def _batched_lora_forward(
     X: torch.Tensor,
     bases: list[torch.Tensor],
@@ -486,8 +517,16 @@ class LoRA_MLP(torch.autograd.Function):
             gate_combined = gate_base + gate_lora
             up_combined = up_base + up_lora
         elif can_batch_gu:
-            gate = matmul_lora(X, gate_weight, gate_bias, gate_quant, None, None, None)
-            up = matmul_lora(X, up_weight, up_bias, up_quant, None, None, None)
+            shared = _shared_nvfp4_base_fprop(
+                X, [gate_quant, up_quant], [gate_bias, up_bias]
+            )
+            if shared is None:
+                gate = matmul_lora(
+                    X, gate_weight, gate_bias, gate_quant, None, None, None
+                )
+                up = matmul_lora(X, up_weight, up_bias, up_quant, None, None, None)
+            else:
+                gate, up = shared
             _batched_lora_forward(
                 X,
                 [gate, up],
@@ -496,28 +535,40 @@ class LoRA_MLP(torch.autograd.Function):
                 [gate_scale, up_scale],
             )
         else:
-            gate = matmul_lora(
-                X,
-                gate_weight,
-                gate_bias,
-                gate_quant,
-                gate_A,
-                gate_B,
-                gate_scale,
-                X_drop=X_drop,
-                lora_bias=gate_lora_bias,
+            shared = _shared_nvfp4_base_fprop(
+                X, [gate_quant, up_quant], [gate_bias, up_bias]
             )
-            up = matmul_lora(
-                X,
-                up_weight,
-                up_bias,
-                up_quant,
-                up_A,
-                up_B,
-                up_scale,
-                X_drop=X_drop,
-                lora_bias=up_lora_bias,
-            )
+            if shared is None:
+                gate = matmul_lora(
+                    X,
+                    gate_weight,
+                    gate_bias,
+                    gate_quant,
+                    gate_A,
+                    gate_B,
+                    gate_scale,
+                    X_drop=X_drop,
+                    lora_bias=gate_lora_bias,
+                )
+                up = matmul_lora(
+                    X,
+                    up_weight,
+                    up_bias,
+                    up_quant,
+                    up_A,
+                    up_B,
+                    up_scale,
+                    X_drop=X_drop,
+                    lora_bias=up_lora_bias,
+                )
+            else:
+                gate, up = shared
+                gate = _add_lora_to_base(
+                    gate, X_lora, gate_A, gate_B, gate_scale, gate_lora_bias, dtype
+                )
+                up = _add_lora_to_base(
+                    up, X_lora, up_A, up_B, up_scale, up_lora_bias, dtype
+                )
 
         # Activation
         hidden = activation_fn(gate, up)
@@ -1110,9 +1161,15 @@ class LoRA_QKV(torch.autograd.Function):
             )
         elif can_batch:
             # Base outputs only (X @ W), then one fused A-GEMM for all LoRA paths.
-            Q = matmul_lora(X, q_weight, q_bias, q_quant, None, None, None)
-            K = matmul_lora(X, k_weight, k_bias, k_quant, None, None, None)
-            V = matmul_lora(X, v_weight, v_bias, v_quant, None, None, None)
+            shared = _shared_nvfp4_base_fprop(
+                X, [q_quant, k_quant, v_quant], [q_bias, k_bias, v_bias]
+            )
+            if shared is None:
+                Q = matmul_lora(X, q_weight, q_bias, q_quant, None, None, None)
+                K = matmul_lora(X, k_weight, k_bias, k_quant, None, None, None)
+                V = matmul_lora(X, v_weight, v_bias, v_quant, None, None, None)
+            else:
+                Q, K, V = shared
             _batched_lora_forward(
                 X,
                 [Q, K, V],
@@ -1137,39 +1194,56 @@ class LoRA_QKV(torch.autograd.Function):
             )
         else:
             # Standard LoRA (with optional dropout and bias)
-            Q = matmul_lora(
-                X,
-                q_weight,
-                q_bias,
-                q_quant,
-                q_A,
-                q_B,
-                q_scale,
-                X_drop=X_drop,
-                lora_bias=q_lora_bias,
+            shared = _shared_nvfp4_base_fprop(
+                X, [q_quant, k_quant, v_quant], [q_bias, k_bias, v_bias]
             )
-            K = matmul_lora(
-                X,
-                k_weight,
-                k_bias,
-                k_quant,
-                k_A,
-                k_B,
-                k_scale,
-                X_drop=X_drop,
-                lora_bias=k_lora_bias,
-            )
-            V = matmul_lora(
-                X,
-                v_weight,
-                v_bias,
-                v_quant,
-                v_A,
-                v_B,
-                v_scale,
-                X_drop=X_drop,
-                lora_bias=v_lora_bias,
-            )
+            if shared is None:
+                Q = matmul_lora(
+                    X,
+                    q_weight,
+                    q_bias,
+                    q_quant,
+                    q_A,
+                    q_B,
+                    q_scale,
+                    X_drop=X_drop,
+                    lora_bias=q_lora_bias,
+                )
+                K = matmul_lora(
+                    X,
+                    k_weight,
+                    k_bias,
+                    k_quant,
+                    k_A,
+                    k_B,
+                    k_scale,
+                    X_drop=X_drop,
+                    lora_bias=k_lora_bias,
+                )
+                V = matmul_lora(
+                    X,
+                    v_weight,
+                    v_bias,
+                    v_quant,
+                    v_A,
+                    v_B,
+                    v_scale,
+                    X_drop=X_drop,
+                    lora_bias=v_lora_bias,
+                )
+            else:
+                dtype = X.dtype
+                X_lora = X_drop if has_dropout else X
+                Q, K, V = shared
+                Q = _add_lora_to_base(
+                    Q, X_lora, q_A, q_B, q_scale, q_lora_bias, dtype
+                )
+                K = _add_lora_to_base(
+                    K, X_lora, k_A, k_B, k_scale, k_lora_bias, dtype
+                )
+                V = _add_lora_to_base(
+                    V, X_lora, v_A, v_B, v_scale, v_lora_bias, dtype
+                )
 
             # Pre-convert LoRA matrices to compute dtype to avoid
             # redundant fp32→bf16 conversion in backward
@@ -1628,28 +1702,42 @@ class LoRA_QK(torch.autograd.Function):
             )
         else:
             # Standard LoRA (with optional dropout and bias)
-            Q = matmul_lora(
-                X,
-                q_weight,
-                q_bias,
-                q_quant,
-                q_A,
-                q_B,
-                q_scale,
-                X_drop=X_drop,
-                lora_bias=q_lora_bias,
+            shared = _shared_nvfp4_base_fprop(
+                X, [q_quant, k_quant], [q_bias, k_bias]
             )
-            K = matmul_lora(
-                X,
-                k_weight,
-                k_bias,
-                k_quant,
-                k_A,
-                k_B,
-                k_scale,
-                X_drop=X_drop,
-                lora_bias=k_lora_bias,
-            )
+            if shared is None:
+                Q = matmul_lora(
+                    X,
+                    q_weight,
+                    q_bias,
+                    q_quant,
+                    q_A,
+                    q_B,
+                    q_scale,
+                    X_drop=X_drop,
+                    lora_bias=q_lora_bias,
+                )
+                K = matmul_lora(
+                    X,
+                    k_weight,
+                    k_bias,
+                    k_quant,
+                    k_A,
+                    k_B,
+                    k_scale,
+                    X_drop=X_drop,
+                    lora_bias=k_lora_bias,
+                )
+            else:
+                dtype = X.dtype
+                X_lora = X_drop if has_dropout else X
+                Q, K = shared
+                Q = _add_lora_to_base(
+                    Q, X_lora, q_A, q_B, q_scale, q_lora_bias, dtype
+                )
+                K = _add_lora_to_base(
+                    K, X_lora, k_A, k_B, k_scale, k_lora_bias, dtype
+                )
 
             dtype = X.dtype
             ctx.save_for_backward(

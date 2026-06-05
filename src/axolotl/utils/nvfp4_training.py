@@ -1874,6 +1874,80 @@ def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
     return out[:m]
 
 
+def nvfp4_base_fprop_many(
+    x: torch.Tensor, bases: list | tuple
+) -> list[torch.Tensor] | None:
+    """Run several NVFP4 frozen-base fprops while sharing one activation pack.
+
+    Fused LoRA QKV and gate/up projections all consume the same activation. The
+    single-base helper quantizes that activation once per projection; this helper
+    quantizes it once and feeds each pre-quantized base weight. Returns ``None``
+    when any base is not a compatible frozen NVFP4 base so callers can fall back
+    to the existing per-projection path.
+    """
+    if not bases or not all(is_nvfp4_base(base) for base in bases):
+        return None
+    if not all(
+        isinstance(
+            base,
+            (
+                NVFP4FastComputeBaseLinear,
+                NVFP4FastFrozenBaseLinear,
+                NVFP4ComputeBaseLinear,
+                NVFP4FrozenBaseLinear,
+            ),
+        )
+        for base in bases
+    ):
+        # NVFP4Linear has a live high-precision master weight and per-call weight
+        # quantization, so only the frozen pre-quantized base modes are shared.
+        return None
+
+    orig_shape = x.shape
+    x2d = x.reshape(-1, orig_shape[-1])
+    xp, m = _pad_to_block(x2d, 0)
+    lead = orig_shape[:-1]
+    outs: list[torch.Tensor] = []
+
+    if all(
+        isinstance(base, (NVFP4FastComputeBaseLinear, NVFP4FastFrozenBaseLinear))
+        for base in bases
+    ):
+        xq, xsc = _mslk_quantize_sl(xp)
+        for base in bases:
+            if isinstance(base, NVFP4FastComputeBaseLinear):
+                out = _mslk_fprop_mm(
+                    xq, xsc, base.wq_f, base.wsc_f, base.w_inv_f, x.dtype
+                )
+            else:
+                out = _mslk_fprop_mm(
+                    xq, xsc, base.wq, base.wsc, base.w_inv, x.dtype
+                )
+            outs.append(out[:m].reshape(*lead, base.out_features))
+        return outs
+
+    if all(
+        isinstance(base, (NVFP4ComputeBaseLinear, NVFP4FrozenBaseLinear))
+        for base in bases
+    ):
+        from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
+
+        a_q = _quantize(xp, QuantPolicy())
+        for base in bases:
+            if isinstance(base, NVFP4ComputeBaseLinear):
+                out = _addmm_nvfp4_dispatch(
+                    a_q, base.w_fprop, torch.ops.aten.mm.default
+                )
+                out_features = base.out_features
+            else:
+                out = _addmm_nvfp4_dispatch(a_q, base.w_q.t(), torch.ops.aten.mm.default)
+                out_features = base.out_features
+            outs.append(out[:m].reshape(*lead, out_features))
+        return outs
+
+    return None
+
+
 def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
     """``g @ W`` in FP4 (the base contribution to the input gradient), 2D ``g``."""
     from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
