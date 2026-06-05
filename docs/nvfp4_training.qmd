@@ -178,6 +178,7 @@ checkpointing path measured so far is:
 - `attention.backward.dkdv_scratch_bf16: true`
 - `fla_causal_conv_compile_boundary: true`
 - `fuse_rmsnorm: false`
+- `shared_lora_base_fprop: false`
 - `max_grad_norm: 1.0`
 
 The saved-pack flag reuses deterministic FP4 attention packs from the forward pass
@@ -195,6 +196,12 @@ Prepared sample-packing data must also be held fixed across comparisons; changin
 The existing fused RMSNorm-to-FP4 prequant path is also left off here; it is
 functionally present in this branch but was not part of the measured fastest
 Qwen3.5 training profile.
+
+The shared LoRA base fprop path (`shared_lora_base_fprop`) is also left off for
+this Qwen3.5-9B profile. It reuses one NVFP4 activation pack across fused LoRA
+QKV/QK base fprops; the isolated QKV forward+backward path measured faster, but
+the end-to-end step delta on this 8-full-attention-layer hybrid model sat within
+whole-step noise. Try `true` on models with many more full-attention LoRA layers.
 
 Measured with `scripts/bench_nvfp4.sh` using marginal `train_runtime` delta,
 sequence length 2048, sample packing, no gradient checkpointing:
@@ -362,7 +369,8 @@ torch_compile: true
 
 nvfp4_training:
   enabled: true
-  quantize_base: false   # base weight stored high-precision; only the GEMM runs in FP4
+  base_mode: compute
+  shared_lora_base_fprop: false  # try true on models with many attention layers
 ```
 
 ### Mode 3 — NVFP4-QLoRA
@@ -540,6 +548,7 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). **Incompatible with tied embeddings and `cut_cross_entropy` (both raise).** `embed_tokens` stays excluded. |
 | `fused_fp4_cross_entropy` | `bool` | `false` | Opt-in. Requires `quantize_lm_head`. Computes CE while tiling over the NVFP4 lm_head so logits are not materialized. This is a memory feature, not a tensor-core FP4 lm_head throughput feature. |
 | `fp8_lm_head_cross_entropy` | `bool` | `false` | Opt-in. Requires a frozen bias-free plain `nn.Linear` lm_head. Streams FP8 lm_head vocab tiles into CE without full logits materialization and uses FP8 scaled matmul for `dL/dhidden`; no lm_head weight grad. Memory/batch-size feature; not currently the fastest b4 max-throughput path. |
+| `shared_lora_base_fprop` | `bool \| null` | `null` (env fallback; off) | Experimental LoRA/QLoRA native-backend option. For fused LoRA QKV/QK projections with pre-quantized NVFP4 frozen bases, pack the shared activation once and reuse it across base fprops. YAML `true`/`false` wins; omitted/null falls back to `AXOLOTL_NVFP4_SHARED_BASE_FPROP`. Leave off unless an end-to-end bench on a many-attention-layer model shows a win. |
 | `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
 | `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
 | `save_nvfp4` | `bool` | `false` | Opt-in. Store eligible weights NVFP4-packed (qdata + scales) in a `torch.save` sidecar for ~3.5× smaller weight files. See [FP4-packed save](#fp4-packed-save-save_nvfp4) below. **Lossy for FFT resume** (no bf16 master kept); bit-exact for frozen weights. Off by default (bf16 save, unchanged). |
