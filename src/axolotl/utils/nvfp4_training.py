@@ -252,7 +252,11 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
         )
     if policy.hadamard:
         t = _apply_rht(t).contiguous()
-    per_tensor_scale = per_tensor_amax_to_scale(_abs_amax(t))
+    # Clamp amax like the mslk fast path (_mslk_quantize_recipe_op): an all-zero
+    # tile (e.g. a frozen-base dgrad with no contribution for a packed micro-batch
+    # under FSDP) gives per_tensor_scale=0, and the SR dither's 1/per_tensor_scale
+    # then makes 0*inf=NaN. A positive floor keeps it 0*finite=0.
+    per_tensor_scale = per_tensor_amax_to_scale(_abs_amax(t).clamp(min=1e-12))
     if policy.stochastic:
         t = _sr_dither(t, per_tensor_scale).contiguous()
     # RHT/SR rewrite the whole tensor up front (no per-block-row independence), so
@@ -444,6 +448,22 @@ class NVFP4Linear(nn.Module):
         return cls(linear.weight, linear.bias, recipe)
 
 
+def _clone_nvfp4_data(w_q):
+    """Plain NVFP4Tensor with cloned packed storage, independent of FSDP's
+    all-gather buffer, for the frozen-base backward dgrad."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+    pts = w_q.per_tensor_scale
+    inner = {
+        "qdata": w_q.qdata.clone(),
+        "scale": w_q.scale.clone(),
+        "per_tensor_scale": None if pts is None else pts.clone(),
+    }
+    return NVFP4Tensor.__tensor_unflatten__(
+        inner, w_q.__tensor_flatten__()[1], None, None
+    )
+
+
 class NVFP4FrozenBaseFunction(torch.autograd.Function):
     """Forward GEMM against a pre-quantized FROZEN weight; dgrad only.
 
@@ -467,7 +487,15 @@ class NVFP4FrozenBaseFunction(torch.autograd.Function):
         out = _addmm_nvfp4_dispatch(
             _quantize(x2d_p, QuantPolicy()), w_q.t(), torch.ops.aten.mm.default
         )[:m]
-        ctx.w_q = w_q
+        # FSDP2 frees the all-gathered weight storage after forward and does not
+        # re-gather the FROZEN base for backward, so the saved reference would
+        # dequantize freed memory (-> NaN grads). Under FSDP, snapshot the packed
+        # FP4 data (small; ~3.5x under bf16) into independent storage; the plain
+        # single-GPU path keeps the zero-copy reference.
+        if hasattr(w_q, "fsdp_pre_all_gather"):
+            ctx.w_q = _clone_nvfp4_data(w_q)
+        else:
+            ctx.w_q = w_q
         ctx.recipe = recipe
         ctx.x_shape = orig_shape
         return out.reshape(*orig_shape[:-1], w_q.shape[0])
@@ -506,6 +534,8 @@ def _fsdp_nvfp4_class():
         return _FSDP_NVFP4_CLS
     from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 
+    aten = torch.ops.aten
+
     class FSDPNVFP4Tensor(NVFP4Tensor):
         # The frozen FP4 base shards along dim 0: qdata and scale both split by
         # row; the global per_tensor_scale (computed once over the whole weight,
@@ -531,6 +561,76 @@ def _fsdp_nvfp4_class():
             }
             rebuilt = type(self).__tensor_unflatten__(inner, ctx, None, None)
             return rebuilt, (qdata, scale)
+
+        @classmethod
+        def _rewrap(cls, t):
+            # torchao's NVFP4 ops hardcode the NVFP4Tensor type for their outputs,
+            # dropping this subclass (and its all-gather hooks). FSDP2 sharding
+            # slices/copies the param, so re-assert the subclass on any NVFP4Tensor
+            # result to keep the hooks alive on the sharded parameter.
+            if type(t) is NVFP4Tensor:
+                return cls(
+                    t.qdata,
+                    t.scale,
+                    t.block_size,
+                    t.orig_dtype,
+                    t.per_tensor_scale,
+                    t.act_per_tensor_scale,
+                    t.is_swizzled_scales,
+                    t.use_triton_kernel,
+                    t.act_quant_kwargs,
+                )
+            return t
+
+        @classmethod
+        def __torch_dispatch__(cls, func, types, args, kwargs=None):
+            kwargs = kwargs or {}
+
+            # FSDP2 allocates the sharded param storage with empty_like, then
+            # populates it with copy_ — neither is in torchao's op table.
+            if func is aten.empty_like.default:
+                src = args[0]
+                dev = kwargs.get("device", None)
+
+                def _empty(t):
+                    return (
+                        torch.empty_like(t, device=dev)
+                        if dev is not None
+                        else torch.empty_like(t)
+                    )
+
+                pts = src.per_tensor_scale
+                return cls(
+                    _empty(src.qdata),
+                    _empty(src.scale),
+                    src.block_size,
+                    src.orig_dtype,
+                    None if pts is None else _empty(pts),
+                    src.act_per_tensor_scale,
+                    src.is_swizzled_scales,
+                    src.use_triton_kernel,
+                    src.act_quant_kwargs,
+                )
+            if func is aten.copy_.default:
+                dst, src = args[0], args[1]
+                dst.qdata.copy_(src.qdata)
+                dst.scale.copy_(src.scale)
+                if (
+                    dst.per_tensor_scale is not None
+                    and getattr(src, "per_tensor_scale", None) is not None
+                ):
+                    dst.per_tensor_scale.copy_(src.per_tensor_scale)
+                return dst
+
+            out = super().__torch_dispatch__(func, types, args, kwargs)
+            if isinstance(out, NVFP4Tensor):
+                return cls._rewrap(out)
+            if isinstance(out, (tuple, list)):
+                rewrapped = [
+                    cls._rewrap(o) if isinstance(o, NVFP4Tensor) else o for o in out
+                ]
+                return type(out)(rewrapped)
+            return out
 
     _FSDP_NVFP4_CLS = FSDPNVFP4Tensor
     return _FSDP_NVFP4_CLS
