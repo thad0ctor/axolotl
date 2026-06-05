@@ -1920,9 +1920,7 @@ def nvfp4_base_fprop_many(
                     xq, xsc, base.wq_f, base.wsc_f, base.w_inv_f, x.dtype
                 )
             else:
-                out = _mslk_fprop_mm(
-                    xq, xsc, base.wq, base.wsc, base.w_inv, x.dtype
-                )
+                out = _mslk_fprop_mm(xq, xsc, base.wq, base.wsc, base.w_inv, x.dtype)
             outs.append(out[:m].reshape(*lead, base.out_features))
         return outs
 
@@ -1940,7 +1938,9 @@ def nvfp4_base_fprop_many(
                 )
                 out_features = base.out_features
             else:
-                out = _addmm_nvfp4_dispatch(a_q, base.w_q.t(), torch.ops.aten.mm.default)
+                out = _addmm_nvfp4_dispatch(
+                    a_q, base.w_q.t(), torch.ops.aten.mm.default
+                )
                 out_features = base.out_features
             outs.append(out[:m].reshape(*lead, out_features))
         return outs

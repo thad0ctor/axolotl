@@ -705,9 +705,7 @@ class TestNVFP4Training:
         for save_packs in (False, True):
             opts = {**common, "save_backward_packs": save_packs}
             ref = run(
-                lambda q, k, v, opts=opts: nvfp4_flash_attn_func(
-                    q, k, v, scale, **opts
-                )
+                lambda q, k, v, opts=opts: nvfp4_flash_attn_func(q, k, v, scale, **opts)
             )
             got = run(
                 lambda q, k, v, opts=opts: nvfp4_flash_attn_train_custom_op(
@@ -718,9 +716,9 @@ class TestNVFP4Training:
                 assert torch.equal(ref_t, got_t)
 
         ref_zshd = run(
-            lambda q, k, v: nvfp4_flash_attn_func(
-                q, k, v, scale, **common
-            ).transpose(1, 2),
+            lambda q, k, v: nvfp4_flash_attn_func(q, k, v, scale, **common).transpose(
+                1, 2
+            ),
             upstream_zshd,
         )
         got_zshd = run(

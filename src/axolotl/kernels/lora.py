@@ -525,9 +525,7 @@ class LoRA_MLP(torch.autograd.Function):
             gate_combined = gate_base + gate_lora
             up_combined = up_base + up_lora
         elif can_batch_gu:
-            gate = matmul_lora(
-                X, gate_weight, gate_bias, gate_quant, None, None, None
-            )
+            gate = matmul_lora(X, gate_weight, gate_bias, gate_quant, None, None, None)
             up = matmul_lora(X, up_weight, up_bias, up_quant, None, None, None)
             _batched_lora_forward(
                 X,
@@ -1225,15 +1223,9 @@ class LoRA_QKV(torch.autograd.Function):
                 dtype = X.dtype
                 X_lora = X_drop if has_dropout else X
                 Q, K, V = shared
-                Q = _add_lora_to_base(
-                    Q, X_lora, q_A, q_B, q_scale, q_lora_bias, dtype
-                )
-                K = _add_lora_to_base(
-                    K, X_lora, k_A, k_B, k_scale, k_lora_bias, dtype
-                )
-                V = _add_lora_to_base(
-                    V, X_lora, v_A, v_B, v_scale, v_lora_bias, dtype
-                )
+                Q = _add_lora_to_base(Q, X_lora, q_A, q_B, q_scale, q_lora_bias, dtype)
+                K = _add_lora_to_base(K, X_lora, k_A, k_B, k_scale, k_lora_bias, dtype)
+                V = _add_lora_to_base(V, X_lora, v_A, v_B, v_scale, v_lora_bias, dtype)
 
             # Pre-convert LoRA matrices to compute dtype to avoid
             # redundant fp32→bf16 conversion in backward
@@ -1692,9 +1684,7 @@ class LoRA_QK(torch.autograd.Function):
             )
         else:
             # Standard LoRA (with optional dropout and bias)
-            shared = _shared_nvfp4_base_fprop(
-                X, [q_quant, k_quant], [q_bias, k_bias]
-            )
+            shared = _shared_nvfp4_base_fprop(X, [q_quant, k_quant], [q_bias, k_bias])
             if shared is None:
                 Q = matmul_lora(
                     X,
@@ -1722,12 +1712,8 @@ class LoRA_QK(torch.autograd.Function):
                 dtype = X.dtype
                 X_lora = X_drop if has_dropout else X
                 Q, K = shared
-                Q = _add_lora_to_base(
-                    Q, X_lora, q_A, q_B, q_scale, q_lora_bias, dtype
-                )
-                K = _add_lora_to_base(
-                    K, X_lora, k_A, k_B, k_scale, k_lora_bias, dtype
-                )
+                Q = _add_lora_to_base(Q, X_lora, q_A, q_B, q_scale, q_lora_bias, dtype)
+                K = _add_lora_to_base(K, X_lora, k_A, k_B, k_scale, k_lora_bias, dtype)
 
             dtype = X.dtype
             ctx.save_for_backward(
