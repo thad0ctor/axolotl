@@ -63,6 +63,18 @@ def test_schema_backend_defaults_native_and_accepts_te(monkeypatch):
     assert cfg.nvfp4_training.backend == "te"
 
 
+def test_schema_accepts_shared_lora_base_fprop(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        nvfp4_training={"enabled": True, "shared_lora_base_fprop": True},
+    )
+    assert cfg.nvfp4_training.shared_lora_base_fprop is True
+
+    cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True})
+    assert cfg.nvfp4_training.shared_lora_base_fprop is None
+
+
 def test_schema_accepts_fp8_lm_head_eval_knobs(monkeypatch):
     _supported(monkeypatch, True)
     cfg = AxolotlInputConfig(
@@ -577,6 +589,51 @@ def test_apply_selects_lora_compute_mode(monkeypatch):
     assert not any(
         isinstance(b, (NVFP4FrozenBaseLinear, NVFP4FastFrozenBaseLinear)) for b in bases
     )
+
+
+def test_apply_sets_shared_lora_base_fprop_flag(monkeypatch):
+    _supported(monkeypatch, True)
+    from axolotl.kernels import lora as lora_mod
+    from axolotl.loaders.patch_manager import PatchManager
+    from axolotl.utils import nvfp4_training as nvfp4_training_mod
+
+    monkeypatch.setattr(
+        nvfp4_training_mod,
+        "convert_lora_base_to_nvfp4",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        PatchManager, "_nvfp4_apply_tied_or_lm_head", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        PatchManager, "_nvfp4_load_packed_sidecar", lambda *args, **kwargs: None
+    )
+
+    pm = _patch_manager(
+        {
+            "adapter": "lora",
+            "nvfp4_training": {
+                "enabled": True,
+                "shared_lora_base_fprop": True,
+                "fuse_rmsnorm": False,
+            },
+        }
+    )
+    pm._apply_nvfp4_training(object())
+    assert lora_mod._NVFP4_SHARED_BASE_FPROP is True
+
+    pm = _patch_manager(
+        {
+            "adapter": "lora",
+            "nvfp4_training": {
+                "enabled": True,
+                "shared_lora_base_fprop": False,
+                "fuse_rmsnorm": False,
+            },
+        }
+    )
+    pm._apply_nvfp4_training(object())
+    assert lora_mod._NVFP4_SHARED_BASE_FPROP is False
 
 
 def test_apply_selects_hp_mode_when_requested(monkeypatch):

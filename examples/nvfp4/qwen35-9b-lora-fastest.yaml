@@ -104,6 +104,10 @@ nvfp4_training:
   skip_first_n_blocks: 0
   skip_last_n_blocks: 0
   fuse_rmsnorm: false
+  # Reuse one NVFP4 activation pack across fused LoRA QKV/QK base fprops.
+  # Locally faster in the QKV microbench, but below whole-step noise on this
+  # 8-full-attention-layer hybrid model. Try true on models with more attention layers.
+  shared_lora_base_fprop: false
 
   # Native full-attention training path. save_packs is the measured throughput
   # win; rtn_grad_packs keeps the safe gradient-side packs deterministic.

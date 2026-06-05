@@ -326,6 +326,19 @@ class NVFP4TrainingConfig(BaseModel):
             "attention matmul itself unchanged. OFF by default."
         },
     )
+    shared_lora_base_fprop: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Experimental, LoRA/QLoRA native backend only. For fused "
+            "LoRA QKV/QK projections whose frozen base layers are pre-quantized NVFP4 "
+            "compute/storage bases, quantize and pack the shared activation once and "
+            "reuse it across the base fprops. Omitted/null uses the "
+            "AXOLOTL_NVFP4_SHARED_BASE_FPROP environment fallback (default off); "
+            "set true or false in YAML to make the choice explicit. On Qwen3.5-9B "
+            "with only 8 full-attention layers this was below whole-step noise, but "
+            "models with more full-attention LoRA layers may benefit."
+        },
+    )
     skip_first_n_blocks: int = Field(
         default=0,
         ge=0,

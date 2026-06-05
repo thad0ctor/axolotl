@@ -343,6 +343,7 @@ class PatchManager:
         if self.cfg.merge_lora:
             return
 
+        from axolotl.kernels.lora import set_nvfp4_shared_base_fprop
         from axolotl.utils.nvfp4_training import (
             NVFP4Recipe,
             convert_lora_base_to_nvfp4,
@@ -353,6 +354,9 @@ class PatchManager:
             stochastic_rounding=nvfp4.stochastic_rounding,
             hadamard=nvfp4.hadamard,
         )
+        shared_lora_base_fprop = set_nvfp4_shared_base_fprop(
+            getattr(nvfp4, "shared_lora_base_fprop", None)
+        )
         exclude_modules = list(nvfp4.exclude_modules or [])
         if getattr(nvfp4, "quantize_lm_head", False):
             exclude_modules = self._nvfp4_unexclude_lm_head(model, exclude_modules)
@@ -361,6 +365,8 @@ class PatchManager:
         )
 
         adapter = self.cfg.adapter
+        if shared_lora_base_fprop:
+            LOG.info("NVFP4 LoRA shared base fprop enabled")
 
         # Transformer Engine backend: swap eligible linears to te.Linear; the
         # trainer wraps the step in te.fp8_autocast (set up below via a stored

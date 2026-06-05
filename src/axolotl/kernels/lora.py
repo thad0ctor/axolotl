@@ -24,9 +24,28 @@ from .quantize import dequantize
 from .swiglu import swiglu_backward, swiglu_forward
 from .utils import torch_amp_custom_bwd, torch_amp_custom_fwd
 
-_NVFP4_SHARED_BASE_FPROP = os.environ.get(
-    "AXOLOTL_NVFP4_SHARED_BASE_FPROP", ""
-).lower() in {"1", "true", "yes", "on"}
+_NVFP4_SHARED_BASE_FPROP_ENV = "AXOLOTL_NVFP4_SHARED_BASE_FPROP"
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def set_nvfp4_shared_base_fprop(enabled: bool | None) -> bool:
+    """Configure the experimental shared NVFP4 LoRA base fprop path.
+
+    ``None`` preserves the environment fallback for quick experiments; an explicit
+    YAML boolean wins over the environment.
+    """
+    global _NVFP4_SHARED_BASE_FPROP  # noqa: PLW0603
+
+    _NVFP4_SHARED_BASE_FPROP = (
+        _truthy_env(_NVFP4_SHARED_BASE_FPROP_ENV) if enabled is None else bool(enabled)
+    )
+    return _NVFP4_SHARED_BASE_FPROP
+
+
+_NVFP4_SHARED_BASE_FPROP = set_nvfp4_shared_base_fprop(None)
 
 
 def get_lora_parameters(
