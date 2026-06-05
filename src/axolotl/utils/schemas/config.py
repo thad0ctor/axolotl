@@ -1866,16 +1866,19 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "requires bf16/fp32). Set bf16: true."
             )
 
-        # NVFP4-QLoRA under FSDP shards the FP4 base via custom all-gather hooks
-        # (NVFP4FrozenBaseLinear is built with fsdp=True). The hooks are verified
-        # single-process; multi-rank gather correctness is exercised but not yet
-        # validated across physical ranks (hardware-limited), so allow it with a
-        # warning rather than refuse.
-        if wants_fp4_storage and (self.fsdp_config or self.fsdp):
+        # NVFP4-QLoRA under FSDP2 shards the FP4 base via custom all-gather hooks
+        # (NVFP4FrozenBaseLinear is built with fsdp=True). Cross-rank training is
+        # validated; the fused LoRA Triton kernels bypass the FP4 base, so warn to
+        # disable them on this path.
+        if (
+            wants_fp4_storage
+            and (self.fsdp_config or self.fsdp)
+            and (self.lora_mlp_kernel or self.lora_qkv_kernel or self.lora_o_kernel)
+        ):
             LOG.warning(
-                "nvfp4_training FP4-storage QLoRA under FSDP uses custom NVFP4 "
-                "all-gather hooks; validated single-process but not yet across "
-                "multiple physical ranks. Verify loss parity on your setup."
+                "nvfp4_training FP4-storage QLoRA under FSDP: set "
+                "lora_mlp_kernel/lora_qkv_kernel/lora_o_kernel to false — the fused "
+                "LoRA kernels bypass the FP4 base."
             )
 
         # Under torch.compile, variable batch lengths recompile the FP4 GEMM path
