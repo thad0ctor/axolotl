@@ -205,12 +205,18 @@ def add_length(sample):
     return sample
 
 
-def drop_long_seq(sample, sequence_len=2048, min_sequence_len=2):
+def filter_sequences_by_length(
+    sample, sequence_len=2048, min_sequence_len=2, raise_on_drop=False
+):
     """
-    Drop samples whose sequence length is either too long (> sequence_len)
-    or too short (< min_sequence_len).
+    Filter sequences outside valid length range [min_sequence_len, sequence_len].
+
+    Drops samples that are either too short (< min_sequence_len) or too long (> sequence_len).
 
     Works for both single-example (list[int]) or batched (list[list[int]]).
+
+    If raise_on_drop is set, the code raises a ValueError if a sample is
+    encountered that is too long and would have been dropped.
     """
     min_sequence_len = min_sequence_len or 2
 
@@ -225,12 +231,20 @@ def drop_long_seq(sample, sequence_len=2048, min_sequence_len=2):
     if isinstance(input_ids[0], int):
         # Single example (input_ids is a list of int)
         length = len(input_ids)
+        if raise_on_drop and length > sequence_len:
+            raise ValueError(
+                f"Sequence encountered with {length} tokens, which exceeds the maximum {sequence_len}."
+            )
         return min_sequence_len <= length <= sequence_len
 
     # Batched (input_ids is a list of lists)
     results = []
     for seq in input_ids:
         length = len(seq)
+        if raise_on_drop and length > sequence_len:
+            raise ValueError(
+                f"Sequence encountered with {length} tokens, which exceeds the maximum {sequence_len}."
+            )
         results.append(min_sequence_len <= length <= sequence_len)
     return results
 
@@ -372,10 +386,10 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
 def process_pretraining_datasets_for_packing(
     train_dataset, sequence_len, skip_position_ids=True, drop_attention_mask=False
 ):
-    drop_long = partial(drop_long_seq, sequence_len=sequence_len)
+    drop_outside_range = partial(filter_sequences_by_length, sequence_len=sequence_len)
 
     train_dataset = train_dataset.filter(
-        drop_long,
+        drop_outside_range,
         desc="Dropping Long Sequences",
         load_from_cache_file=False,
     )
@@ -443,14 +457,12 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                     - 1
                 )
                 * cfg.num_epochs
-                * cfg.context_parallel_size
-                * cfg.tensor_parallel_size
             )
             LOG.debug(
                 f"total_num_tokens: {cfg.total_num_tokens:_}, total_num_steps: {total_num_steps:_}"
             )
         else:
-            if cfg.flash_attention and not cfg.multipack_real_batches:
+            if cfg.attn_supports_packing and not cfg.multipack_real_batches:
                 sampler_batch_size = 1
                 batch_max_len = cfg.micro_batch_size * cfg.sequence_len
             else:
@@ -469,7 +481,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 bin_size=cfg.sample_packing_bin_size,
                 sequential=cfg.sample_packing_sequentially,
                 drop_last=True,
-                num_processes=cfg.dataset_prcoesses,
+                num_processes=cfg.dataset_num_proc,
                 mp_start_method=cfg.sample_packing_mp_start_method or "fork",
             )
 
@@ -483,14 +495,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
             LOG.debug(f"data_loader_len: {data_loader_len}")
             # FIXME: is there a bug here somewhere? the total num steps depends
             # on the agreed on value for sample_packing_eff_est
-            total_num_steps = int(
-                math.floor(
-                    data_loader_len
-                    * cfg.num_epochs
-                    * cfg.context_parallel_size
-                    * cfg.tensor_parallel_size
-                )
-            )
+            total_num_steps = int(math.floor(data_loader_len * cfg.num_epochs))
             if cfg.dataloader_drop_last:
                 # drop the last batch for each epoch
                 total_num_steps -= int(math.ceil(cfg.num_epochs))
@@ -511,13 +516,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
             LOG.debug(f"sample_packing_eff_est: {cfg.sample_packing_eff_est}")
     else:
         total_num_steps = int(
-            math.ceil(
-                len(train_dataset)
-                * cfg.num_epochs
-                * cfg.context_parallel_size
-                * cfg.tensor_parallel_size
-                / cfg.batch_size
-            )
+            math.ceil(len(train_dataset) * cfg.num_epochs / cfg.batch_size)
         )
     LOG.debug(f"total_num_steps: {total_num_steps}")
     return total_num_steps
@@ -634,6 +633,20 @@ def setup_parallelism_envs(cfg):
         set_accelerate_parallelism_config = True
         os.environ["PARALLELISM_CONFIG_CP_SIZE"] = str(cfg.context_parallel_size)
         os.environ["ACCELERATE_ALLOW_CP_STANDALONE"] = "true"
+        from axolotl.monkeypatch.accelerate.parallelism_config import patch_prepare_cp
+
+        patch_prepare_cp()
+    # Expert Parallel patch must apply before the first `Accelerator()`
+    # call so `ep_size` lands in the mesh.
+    if cfg.expert_parallel_size and cfg.expert_parallel_size > 1:
+        os.environ["PARALLELISM_CONFIG_EP_SIZE"] = str(cfg.expert_parallel_size)
+        if cfg.dp_shard_size and cfg.dp_shard_size > 1:
+            set_accelerate_parallelism_config = True
+        from axolotl.monkeypatch.accelerate.parallelism_config import (
+            patch_parallelism_config,
+        )
+
+        patch_parallelism_config()
     if set_accelerate_parallelism_config:
         os.environ["ACCELERATE_USE_PARALLELISM_CONFIG"] = "true"
 
@@ -645,7 +658,7 @@ def prepare_optim_env(cfg):
             os.environ["NCCL_P2P_DISABLE"] = "1"
     # TODO @SalmanMohammadi remove the cfg.fsdp check in 0.12
     if cfg.fsdp or cfg.fsdp_config:
-        cfg.fsdp = True if not cfg.fsdp else cfg.fsdp
+        # fsdp_config is source of truth; mutating cfg.fsdp to bool breaks Ray worker schema validation
         setup_fsdp_envs(cfg)
     elif cfg.deepspeed:
         stage = None

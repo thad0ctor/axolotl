@@ -9,6 +9,11 @@ from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 
+try:
+    from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+except ImportError:
+    fla_causal_conv1d = None
+
 
 def get_cu_seqlens(position_ids):
     """
@@ -106,7 +111,6 @@ def patch_qwen3_next_gateddelta_layer():
     """Patch Qwen3NextGatedDeltaNet to parse cu_seqlens and pass to chunk_gated_delta_rule"""
     try:
         from transformers.models.qwen3_next.modeling_qwen3_next import (
-            Qwen3NextDynamicCache,
             Qwen3NextGatedDeltaNet,
             apply_mask_to_padding_states,
         )
@@ -120,8 +124,7 @@ def patch_qwen3_next_gateddelta_layer():
     def patched_gated_delta_net_forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional[Qwen3NextDynamicCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        cache_params=None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
@@ -132,15 +135,19 @@ def patch_qwen3_next_gateddelta_layer():
 
         use_precomputed_states = (
             cache_params is not None
-            and cache_params.has_previous_state
+            and cache_params.has_previous_state(self.layer_idx)
             and seq_len == 1
-            and cache_position is not None
         )
 
+        # Compute cu_seqlens early for use by both causal_conv1d and chunk_gated_delta_rule
+        cu_seqlens = None
+        if not use_precomputed_states and position_ids is not None:
+            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
+
         # getting projected states from cache if it exists
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
@@ -151,12 +158,10 @@ def patch_qwen3_next_gateddelta_layer():
             x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value)
         )
 
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        mixed_qkv = torch.cat((query, key, value), dim=-1)  # [B, T, D]
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, D, T]
 
         if use_precomputed_states:
-            # 2. Convolution sequence transformation
-            # NOTE: the conv state is updated in `causal_conv1d_update`
             mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -167,10 +172,23 @@ def patch_qwen3_next_gateddelta_layer():
         else:
             if cache_params is not None:
                 conv_state = F.pad(
-                    mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0)
+                    mixed_qkv,
+                    (self.conv_kernel_size - mixed_qkv.shape[-1], 0),
                 )
-                cache_params.conv_states[self.layer_idx] = conv_state
-            if self.causal_conv1d_fn is not None:
+                cache_params.update_conv_state(conv_state, self.layer_idx)
+
+            if fla_causal_conv1d is not None:
+                # FLA Triton causal_conv1d: [B, T, D] in/out, with cu_seqlens support
+                mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, T, D] for FLA
+                mixed_qkv, _ = fla_causal_conv1d(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    cu_seqlens=cu_seqlens,
+                )
+                mixed_qkv = mixed_qkv.transpose(1, 2)  # back to [B, D, T]
+            elif self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
@@ -179,9 +197,18 @@ def patch_qwen3_next_gateddelta_layer():
                     seq_idx=None,
                 )
             else:
+                # PyTorch fallback (no cu_seqlens support)
+                if cu_seqlens is not None and cu_seqlens.shape[0] > batch_size + 1:
+                    raise RuntimeError(
+                        "Packed sequences require fla.modules.convolution.causal_conv1d "
+                        "(cu_seqlens support). Install flash-linear-attention or disable packing."
+                    )
+                LOG.warning_once(
+                    "FLA causal_conv1d not available. Falling back to PyTorch conv1d."
+                )
                 mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, T, D]
         query, key, value = torch.split(
             mixed_qkv,
             [
@@ -203,7 +230,6 @@ def patch_qwen3_next_gateddelta_layer():
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                 query,
                 key,
@@ -230,7 +256,7 @@ def patch_qwen3_next_gateddelta_layer():
 
         # Update cache
         if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor

@@ -19,7 +19,7 @@ python scripts/cutcrossentropy_install.py | sh
 
 - If you are installing from pip
 ```bash
-pip3 uninstall -y cut-cross-entropy && pip3 install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@5eff953"
+pip3 uninstall -y cut-cross-entropy && pip3 install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@fec1a88"
 ```
 
 ## Usage
@@ -31,29 +31,38 @@ plugins:
 
 ## Supported Models
 
+- afmoe
 - apertus
 - arcee
 - cohere
 - cohere2
 - deepseek_v3
+- exaone4
 - gemma
 - gemma2
 - gemma3
 - gemma3_text
 - gemma3n
 - gemma3n_text
+- gemma4
 - glm
 - glm4
 - glm4_moe
+- glm4_moe_lite
+- glm46v
 - glm4v
 - glm4v_moe
+- glm_image
+- glm_moe_dsa
 - gpt_oss
 - granite
 - granitemoe
-- granitemoeshared
 - granitemoehybrid
+- granitemoeshared
 - hunyuan_v1_dense
 - hunyuan_v1_moe
+- internvl
+- kimi_linear
 - lfm2
 - lfm2_moe
 - lfm2_vl
@@ -61,27 +70,37 @@ plugins:
 - llama4
 - llama4_text
 - llava
+- ministral
+- ministral3
 - mistral
 - mistral3
+- mistral4
 - mixtral
 - mllama
+- nemotron_h
 - olmo
 - olmo2
 - olmo3
+- olmoe
 - phi
 - phi3
 - phi4_multimodal
 - qwen2
-- qwen2_vl
-- qwen2_moe
 - qwen2_5_vl
+- qwen2_moe
+- qwen2_vl
 - qwen3
+- qwen3_5
+- qwen3_5_text
+- qwen3_5_moe
+- qwen3_5_moe_text
 - qwen3_moe
+- qwen3_next
 - qwen3_vl
 - qwen3_vl_moe
-- qwen3_next
-- smollm3
 - seed_oss
+- smollm3
+- step3p5
 - voxtral
 
 ## Citation

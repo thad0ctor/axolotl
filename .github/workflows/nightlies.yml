@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '0 0 * * *'  # Runs at 00:00 UTC every day
 
+permissions:
+  contents: read
+
 jobs:
   build-axolotl:
     if: ${{ ! contains(github.event.commits[0].message, '[skip docker]') && github.repository_owner == 'axolotl-ai-cloud' }}
@@ -12,15 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - cuda: 126
-            cuda_version: 12.6.3
-            python_version: "3.11"
-            pytorch: 2.7.1
-            axolotl_extras:
           - cuda: 128
             cuda_version: 12.8.1
             python_version: "3.11"
-            pytorch: 2.8.0
+            pytorch: 2.9.1
             axolotl_extras:
     runs-on: axolotl-gpu-runner
     steps:
@@ -64,15 +62,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - cuda: 126
-            cuda_version: 12.6.3
-            python_version: "3.11"
-            pytorch: 2.7.1
-            axolotl_extras:
           - cuda: 128
             cuda_version: 12.8.1
             python_version: "3.11"
-            pytorch: 2.8.0
+            pytorch: 2.9.1
             axolotl_extras:
     runs-on: axolotl-gpu-runner
     steps:

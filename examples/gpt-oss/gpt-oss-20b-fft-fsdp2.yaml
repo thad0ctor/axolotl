@@ -28,6 +28,10 @@ wandb_watch:
 wandb_name:
 wandb_log_model:
 
+trackio_project_name:
+trackio_run_name:
+trackio_space_id:
+
 gradient_accumulation_steps: 2
 micro_batch_size: 1
 num_epochs: 1
@@ -39,7 +43,6 @@ learning_rate: 2e-5
 bf16: true
 tf32: true
 
-flash_attention: true
 attn_implementation: kernels-community/vllm-flash-attn3  # this is not needed if using flash_attn >= 2.8.3
 
 gradient_checkpointing: true

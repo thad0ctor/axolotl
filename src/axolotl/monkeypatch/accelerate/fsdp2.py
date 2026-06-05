@@ -4,6 +4,7 @@ monkeypatch for accelerate fsdp2 fix when modifying ordereddict during interatio
 
 import copy
 import functools
+import gc
 import os
 import sys
 
@@ -12,6 +13,7 @@ import torch.distributed as dist
 from torch import nn
 
 from axolotl.utils.bench import log_gpu_memory_usage
+from axolotl.utils.fp32_norms import get_fp32_norm_patterns, shard_norms_fp32
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -60,6 +62,13 @@ def fsdp2_load_full_state_dict(
                 sharded_meta_param.placements,
                 src_data_rank=0,
             )
+            # Clone the local shard to allow full_tensor to be freed.
+            if (
+                sharded_param._local_tensor.untyped_storage().size()
+                > sharded_param._local_tensor.nelement()
+                * sharded_param._local_tensor.element_size()
+            ):
+                sharded_param = sharded_param.clone()
         else:
             # Non-sharded parameters
             if _accelerator.is_main_process:
@@ -150,16 +159,32 @@ def get_state_dict(self, model, unwrap=True):
             )
     elif self.is_fsdp2:
         # https://github.com/pytorch/torchtune/blob/main/torchtune/training/_distributed.py#L465
+        from torch.distributed.tensor import DTensor
+
         state_dict = {}
         sharded_state_dict = model.state_dict()
+        is_rank_zero = torch.distributed.get_rank() == 0
         for param_name, param in sharded_state_dict.items():
             if param.is_cpu:
                 param = param.to(torch.device("cuda"))
 
-            param = param.full_tensor()
-            if torch.distributed.get_rank() == 0:
+            if isinstance(param, DTensor):
+                param = param.full_tensor()
+
+            if is_rank_zero:
                 state_dict[param_name] = param.cpu()
+            # Drop the GPU-resident gathered tensor before the next iteration
+            # allocates the next one; otherwise the caching allocator holds
+            # both reservations and we accumulate ~model-size of VRAM.
+            del param
             torch.distributed.barrier()
+
+        # Release the sharded view and force the allocator to give back the
+        # gather buffers.
+        del sharded_state_dict
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     elif self.distributed_type == DistributedType.FSDP:
         from torch.distributed.fsdp import (
             FullStateDictConfig,
@@ -182,9 +207,55 @@ def get_state_dict(self, model, unwrap=True):
     return state_dict
 
 
+def patch_peft_param_wrapper_for_fsdp2():
+    """Patch PEFT's _LoraParameterProxy.forward for FSDP2 DTensor compatibility.
+
+    PEFT's ParamWrapper applies LoRA via torch.nn.utils.parametrize, which adds
+    delta_weight to the base weight W inside _LoraParameterProxy.forward().
+    Under FSDP2, W may be a DTensor (from FSDP unshard) while delta_weight is a
+    regular Tensor (or vice versa), causing a RuntimeError on mixed types.
+
+    This patch promotes the non-DTensor operand to match the DTensor's spec
+    using DTensor.from_local(), which is free for Replicate placement (just
+    metadata wrapping, no communication).
+    """
+    from peft.tuners.lora.layer import _LoraParameterProxy
+
+    if getattr(_LoraParameterProxy, "_axolotl_fsdp2_patched", False):
+        return
+
+    _original_forward = _LoraParameterProxy.forward
+
+    # NOTE: Replaces (not wraps) forward; assumes original is just `W + self.delta_weight`.
+    def _patched_forward(self, W):
+        from torch.distributed.tensor import DTensor
+
+        delta = self.delta_weight
+        w_is_dt = isinstance(W, DTensor)
+        d_is_dt = isinstance(delta, DTensor)
+
+        with torch.nn.utils.parametrize.cached():
+            if w_is_dt == d_is_dt:
+                return W + delta
+            if w_is_dt:
+                return W + DTensor.from_local(delta, W.device_mesh, W.placements)
+            return DTensor.from_local(W, delta.device_mesh, delta.placements) + delta
+
+    _LoraParameterProxy.forward = _patched_forward
+    _LoraParameterProxy._axolotl_fsdp2_patched = True
+    LOG.info("Patched PEFT _LoraParameterProxy.forward for FSDP2 DTensor compatibility")
+
+
 def _process_lora_module_for_fsdp(module, fsdp2_kwargs):
     """Helper function to process LoRA modules for FSDP2."""
+    from peft.tuners.lora.layer import ParamWrapper
     from torch.distributed.fsdp import fully_shard
+
+    # Skip ParamWrapper — its lora_A/B must not be independently sharded.
+    # The parent decoder layer's FSDP wrapper handles unsharding them.
+    # TODO: review if we even need to shard them separately in first place.
+    if isinstance(module, ParamWrapper):
+        return False
 
     log_bias_dtype_mismatch = False
 
@@ -202,12 +273,20 @@ def _process_lora_module_for_fsdp(module, fsdp2_kwargs):
             fully_shard(module.lora_A[active_adapter], **fsdp2_kwargs)
         if module.lora_B:
             fully_shard(module.lora_B[active_adapter], **fsdp2_kwargs)
-        if module.lora_embedding_A:
-            fully_shard(module.lora_embedding_A[active_adapter], **fsdp2_kwargs)
-        if module.lora_embedding_B:
-            fully_shard(module.lora_embedding_B[active_adapter], **fsdp2_kwargs)
         if module.lora_magnitude_vector:
             fully_shard(module.lora_magnitude_vector[active_adapter], **fsdp2_kwargs)
+
+    # lora_embedding_A/B are ParameterDicts containing nn.Parameter (Tensors),
+    # not nn.Module. fully_shard() only accepts nn.Module, so we cannot shard
+    # individual embedding Parameters. Instead, shard the entire LoraLayer module. fully_shard() can be used hierarchically because it does not
+    # override groups already assigned by fully_shard(), so modules
+    # where fully_shard() was already called are not affected [see https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html]
+    if module.lora_embedding_A or module.lora_embedding_B:
+        from torch.distributed.fsdp import FSDPModule
+
+        if not isinstance(module, FSDPModule):
+            fully_shard(module, **fsdp2_kwargs)
+
     return log_bias_dtype_mismatch
 
 
@@ -327,8 +406,35 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
     is_peft_model = isinstance(model, PeftModel)
 
+    # Patch PEFT's _LoraParameterProxy for DTensor compatibility if any
+    # ParamWrapper modules exist (used for target_parameters / 3D expert params).
+    if is_peft_model:
+        from peft.tuners.lora.layer import ParamWrapper
+
+        if any(isinstance(m, ParamWrapper) for m in model.modules()):
+            patch_peft_param_wrapper_for_fsdp2()
+
+    # EP+FSDP: pre-wrap experts on `dp_shard` before the outer auto-wrap so
+    # the walker skips them. See `expert_parallel/README.md`.
+    if (
+        mesh is not None
+        and "ep" in getattr(mesh, "mesh_dim_names", ())
+        and "dp_shard" in mesh.mesh_dim_names
+    ):
+        from axolotl.integrations.expert_parallel.plugin import ExpertParallelPlugin
+
+        ExpertParallelPlugin.fully_shard_experts(model, mesh["dp_shard"], fsdp2_kwargs)
+
     auto_wrap_policy = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
     log_bias_dtype_mismatch = False
+    fp32_norm_patterns = get_fp32_norm_patterns(model)
+    if fp32_norm_patterns:
+        shard_norms_fp32(
+            model,
+            patterns=fp32_norm_patterns,
+            fully_shard_kwargs=fsdp2_kwargs,
+        )
+
     if auto_wrap_policy is not None:
         for module in get_module_children_bottom_up(model)[:-1]:
             if is_peft_model and isinstance(module, LoraLayer):
@@ -374,6 +480,83 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
     return model
+
+
+def patch_tied_keys_for_meta_device():
+    """Patch _adjust_tied_keys_with_tied_pointers to skip meta tensors.
+
+    Meta tensors all share data_ptr()==0, causing every parameter to be incorrectly
+    grouped as "tied". Skipping them is safe since they have no real storage.
+    """
+    from collections import defaultdict
+
+    from transformers import PreTrainedModel
+
+    def _patched_adjust_tied_keys_with_tied_pointers(self, missing_keys):
+        param_pointers = defaultdict(list)
+        for param_name, param_value in self.state_dict().items():
+            if param_value.is_meta:
+                continue
+            param_pointers[param_value.data_ptr()].append(param_name)
+
+        tied_param_names = [
+            names
+            for names in param_pointers.values()
+            if len(names) > 1
+            and not any(name in self.all_tied_weights_keys.keys() for name in names)
+            and not all(name in missing_keys for name in names)
+        ]
+
+        tied_weights_keys_by_pointers = {
+            param_name: group[0]
+            for group in tied_param_names
+            for param_name in group[1:]
+        }
+        self.all_tied_weights_keys.update(tied_weights_keys_by_pointers)
+
+    PreTrainedModel._adjust_tied_keys_with_tied_pointers = (
+        _patched_adjust_tied_keys_with_tied_pointers
+    )
+
+
+def patch_initialize_missing_keys_for_fsdp():
+    """Patch _initialize_missing_keys to skip re-initialization on FSDP non-rank-0.
+
+    When using cpu_ram_efficient_loading, non-rank-0 processes load weights on
+    meta device and move them to CPU as empty tensors. Without this patch,
+    initialize_weights() re-initializes ALL parameters (via guarded init
+    functions), which is slow and uses extra RAM per process.
+
+    The fix marks all params/buffers with _is_hf_initialized=True before calling
+    the original method, so guarded init functions (init.normal_, init.zeros_,
+    etc.) become no-ops on non-rank-0 processes. The real weights arrive later
+    via FSDP broadcast from rank 0.
+
+    Upstream fix: https://github.com/huggingface/transformers/pull/44473
+    Remove this patch once transformers includes the fix in a stable release.
+    """
+    from transformers import PreTrainedModel
+    from transformers.modeling_utils import is_fsdp_enabled, is_local_dist_rank_0
+
+    if getattr(PreTrainedModel._initialize_missing_keys, "_axolotl_patched", False):
+        return
+
+    _original_initialize_missing_keys = PreTrainedModel._initialize_missing_keys
+
+    def _patched_initialize_missing_keys(self, is_quantized: bool) -> None:
+        if is_fsdp_enabled() and not is_local_dist_rank_0():
+            for key in self.state_dict():
+                try:
+                    param_or_buffer = self.get_parameter_or_buffer(key)
+                    param_or_buffer._is_hf_initialized = True
+                except AttributeError:
+                    pass  # may happen when handling pre-quantized weights
+            self._is_hf_initialized = True
+
+        _original_initialize_missing_keys(self, is_quantized)
+
+    PreTrainedModel._initialize_missing_keys = _patched_initialize_missing_keys
+    PreTrainedModel._initialize_missing_keys._axolotl_patched = True
 
 
 def patch_accelerate_fsdp2():

@@ -1,6 +1,6 @@
 """Pydantic models for PEFT-related configuration"""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -41,7 +41,7 @@ class LoraConfig(BaseModel):
     adapter: str | None = Field(
         default=None,
         json_schema_extra={
-            "description": "If you want to use 'lora' or 'qlora' or leave blank to train all parameters in original model"
+            "description": "If you want to use a built-in or plugin adapter, or leave blank to train all parameters in original model"
         },
     )
     lora_model_dir: str | None = Field(
@@ -109,6 +109,12 @@ class LoraConfig(BaseModel):
             )
         },
     )
+    peft_autocast_adapter_dtype: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Whether to upcast the LoRA adapter to fp32. This is enabled by default in PEFT."
+        },
+    )
 
     qlora_sharded_model_loading: bool | None = Field(
         default=False,
@@ -149,6 +155,12 @@ class LoraConfig(BaseModel):
     )
 
     merge_lora: bool | None = None
+    merge_method: Literal["legacy", "memory_efficient"] | None = Field(
+        default="memory_efficient",
+        json_schema_extra={
+            "description": "Method to use for LoRA merging. 'memory_efficient' (default) processes shards individually to reduce memory usage, 'legacy' loads the full model into memory."
+        },
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -162,6 +174,16 @@ class LoraConfig(BaseModel):
                 "load_in_8bit and load_in_4bit are not supported without setting an adapter for training."
                 "If you want to full finetune, please turn off load_in_8bit and load_in_4bit."
             )
+        adapter = data.get("adapter")
+        if adapter and adapter not in ("lora", "qlora", "llama-adapter"):
+            from axolotl.integrations.base import PluginManager
+
+            plugin_manager = PluginManager.get_instance()
+            if not plugin_manager.supports_adapter(adapter):
+                raise ValueError(
+                    f"Adapter '{adapter}' is not built in and was not registered by "
+                    "a plugin. Add the plugin that provides this adapter to `plugins:`."
+                )
         return data
 
     @model_validator(mode="after")
@@ -203,6 +225,19 @@ class LoraConfig(BaseModel):
             data["lora_dropout"] = 0.0
         return data
 
+    @model_validator(mode="after")
+    def validate_lora_target_parameters_dropout(self):
+        if (
+            self.lora_target_parameters
+            and self.lora_dropout
+            and self.lora_dropout != 0.0
+        ):
+            raise ValueError(
+                "lora_dropout must be 0 when lora_target_parameters is set. "
+                "PEFT's ParamWrapper does not support lora_dropout != 0."
+            )
+        return self
+
 
 class ReLoRAConfig(BaseModel):
     """ReLoRA configuration subset"""
@@ -215,8 +250,28 @@ class ReLoRAConfig(BaseModel):
     )
     relora_prune_ratio: float | None = Field(
         default=None,
+        ge=0.0,
+        le=1.0,
         json_schema_extra={
-            "description": "threshold for optimizer magnitude when pruning"
+            "description": (
+                "Fraction of optimizer state values to zero on each ReLoRA restart. "
+                "When relora_prune_method='reset' and this is omitted, defaults to "
+                "0.999 (paper-style near-full reset). For other methods, defaults to 0.9."
+            )
+        },
+    )
+    relora_prune_method: Literal["magnitude", "random", "reset"] | None = Field(
+        default="magnitude",
+        json_schema_extra={
+            "description": (
+                "Optimizer state pruning method on each ReLoRA restart. "
+                "'magnitude' (default) keeps top-k by absolute value; "
+                "'random' keeps a random subset at relora_prune_ratio; "
+                "'reset' uses near-full random pruning (default ratio 0.999, "
+                "honoring relora_prune_ratio when explicitly set). "
+                "Paper-style recipe: relora_prune_method='reset' with no "
+                "relora_prune_ratio, equivalent to 'random' with ratio=0.999."
+            )
         },
     )
     relora_cpu_offload: bool | None = Field(

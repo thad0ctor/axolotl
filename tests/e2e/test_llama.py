@@ -2,6 +2,8 @@
 E2E tests for llama
 """
 
+import pytest
+
 from axolotl.common.datasets import load_datasets
 from axolotl.train import train
 from axolotl.utils.config import normalize_config, validate_config
@@ -43,7 +45,6 @@ class TestLlama:
                 "flash_attention": True,
                 "sample_packing": True,
                 "bf16": True,
-                "save_safetensors": True,
                 "save_first_step": False,
             }
         )
@@ -90,7 +91,6 @@ class TestLlama:
                 "flash_attention": True,
                 "sample_packing": True,
                 "bf16": True,
-                "save_safetensors": True,
                 "save_first_step": False,
             }
         )
@@ -134,7 +134,6 @@ class TestLlama:
                 "flash_attention": True,
                 "sample_packing": True,
                 "bf16": True,
-                "save_safetensors": True,
                 "save_first_step": False,
             }
         )
@@ -146,7 +145,8 @@ class TestLlama:
         train(cfg=cfg, dataset_meta=dataset_meta)
         check_model_output_exists(temp_dir, cfg)
 
-    def test_batch_flattening(self, temp_dir):
+    @pytest.mark.parametrize("tf32", ["auto", False])
+    def test_batch_flattening(self, tf32, temp_dir):
         cfg = DictDefault(
             {
                 "base_model": "HuggingFaceTB/SmolLM2-135M",
@@ -174,7 +174,7 @@ class TestLlama:
                 "sample_packing": False,
                 "batch_flattening": True,
                 "bf16": True,
-                "save_safetensors": True,
+                "tf32": tf32,
                 "save_first_step": False,
             }
         )

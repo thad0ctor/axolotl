@@ -1,6 +1,8 @@
 project:
   type: website
-  pre-render: docs/scripts/generate_config_docs.py
+  pre-render:
+   - docs/scripts/generate_config_docs.py
+   - docs/scripts/generate_examples_docs.py
 
 quartodoc:
   dir: docs/api
@@ -126,15 +128,12 @@ quartodoc:
         - monkeypatch.mistral_attn_hijack_flash
         - monkeypatch.multipack
         - monkeypatch.relora
-        - monkeypatch.llama_expand_mask
         - monkeypatch.lora_kernels
         - monkeypatch.utils
         - monkeypatch.btlm_attn_hijack_flash
-        - monkeypatch.llama_patch_multipack
         - monkeypatch.stablelm_attn_hijack_flash
         - monkeypatch.trainer_fsdp_optim
         - monkeypatch.transformers_fa_utils
-        - monkeypatch.unsloth_
         - monkeypatch.data.batch_dataset_fetcher
         - monkeypatch.mixtral
         - monkeypatch.gradient_checkpointing.offload_cpu
@@ -238,8 +237,49 @@ website:
         - section: "Getting Started"
           contents:
             - docs/getting-started.qmd
+            - docs/choosing_method.qmd
             - docs/installation.qmd
             - docs/inference.qmd
+            - section: "Model Guides"
+              contents:
+                - docs/models/kimi-linear.qmd
+                - docs/models/plano.qmd
+                - docs/models/mimo.qmd
+                - docs/models/internvl3_5.qmd
+                - docs/models/olmo3.qmd
+                - docs/models/trinity.qmd
+                - docs/models/arcee.qmd
+                - section: "Ministral3"
+                  contents:
+                    - docs/models/ministral3.qmd
+                    - docs/models/ministral3/think.qmd
+                    - docs/models/ministral3/vision.qmd
+                - section: "Magistral"
+                  contents:
+                    - docs/models/magistral.qmd
+                    - docs/models/magistral/think.qmd
+                    - docs/models/magistral/vision.qmd
+                - docs/models/ministral.qmd
+                - docs/models/mistral-small.qmd
+                - docs/models/voxtral.qmd
+                - docs/models/devstral.qmd
+                - docs/models/mistral.qmd
+                - docs/models/llama-4.qmd
+                - docs/models/llama-2.qmd
+                - docs/models/qwen3-next.qmd
+                - docs/models/qwen3.qmd
+                - docs/models/gemma3n.qmd
+                - docs/models/apertus.qmd
+                - docs/models/gpt-oss.qmd
+                - docs/models/seed-oss.qmd
+                - docs/models/phi.qmd
+                - docs/models/smolvlm2.qmd
+                - docs/models/granite4.qmd
+                - docs/models/LiquidAI.qmd
+                - docs/models/hunyuan.qmd
+                - docs/models/jamba.qmd
+                - docs/models/orpheus.qmd
+
             - docs/cli.qmd
             - docs/telemetry.qmd
             - docs/config-reference.qmd
@@ -262,12 +302,16 @@ website:
           contents:
             - docs/multimodal.qmd
             - docs/rlhf.qmd
+            - docs/grpo.qmd
+            - docs/ebft.qmd
+            - docs/vllm_serving.qmd
             - docs/reward_modelling.qmd
             - docs/lr_groups.qmd
             - docs/lora_optims.qmd
             - docs/dataset_loading.qmd
             - docs/qat.qmd
             - docs/quantize.qmd
+            - docs/1_58bit_finetuning.qmd
             - docs/optimizations.qmd
 
         - section: "Core Concepts"
@@ -278,20 +322,22 @@ website:
             - docs/multipack.qmd
             - docs/mixed_precision.qmd
             - docs/optimizers.qmd
+            - docs/attention.qmd
 
         - section: "Advanced Features"
           contents:
             - docs/fsdp_qlora.qmd
-            - docs/unsloth.qmd
             - docs/torchao.qmd
             - docs/custom_integrations.qmd
             - docs/sequence_parallelism.qmd
             - docs/gradient_checkpointing.qmd
             - docs/nd_parallelism.qmd
+            - docs/expert_quantization.qmd
 
         - section: "Troubleshooting"
           contents:
             - docs/faq.qmd
+            - docs/training_stability.qmd
             - docs/debugging.qmd
             - docs/nccl.qmd
 

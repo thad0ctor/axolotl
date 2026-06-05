@@ -35,7 +35,7 @@ LOG = get_logger(__name__)
 
 _CCE_INSTALL_MESSAGE = (
     "Please install Axolotl's fork of cut_cross_entropy with transformers support using "
-    '`pip install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@5eff953"`'
+    '`pip uninstall -y cut-cross-entropy && pip install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@fec1a88"`'
 )
 
 
@@ -96,18 +96,27 @@ class CutCrossEntropyPlugin(BasePlugin):
             )
 
             # The patch checks model_type internally
-            cce_patch(cfg.model_config_type)
+
+            cce_patch(
+                cfg.model_config_type,
+                remote_model_id=cfg.base_model if cfg.trust_remote_code else None,
+            )
 
     def patch_llama_like(
         self,
-        model_type: str,
+        model_type_to_patch: str,
     ) -> None:
         """
         Generic patch for model architectures with causal lm similar to llama
         """
         from cut_cross_entropy.transformers.patch import PATCH_FNS
 
-        def patch_generic(maybe_model, patch_options, model_type: str):
+        def patch_generic(
+            maybe_model,
+            patch_options,
+            remote_model_id: str | None,
+            model_type: str,
+        ):
             import cut_cross_entropy.transformers.llama
             from cut_cross_entropy.transformers.llama import cce_forward
 
@@ -130,11 +139,13 @@ class CutCrossEntropyPlugin(BasePlugin):
                     f"Error: {str(e)}"
                 ) from e
 
-        if model_type not in PATCH_FNS:
+        if model_type_to_patch not in PATCH_FNS:
             LOG.warning_once(
-                "Setting up generic cce patch for model type: %s", model_type
+                "Setting up generic cce patch for model type: %s", model_type_to_patch
             )
             LOG.warning_once(
-                f"Generic Cut Cross Entropy + {model_type} support is experimental and may not work as expected."
+                f"Generic Cut Cross Entropy + {model_type_to_patch} support is experimental and may not work as expected."
             )
-            PATCH_FNS[model_type] = partial(patch_generic, model_type=model_type)
+            PATCH_FNS[model_type_to_patch] = partial(
+                patch_generic, model_type=model_type_to_patch
+            )

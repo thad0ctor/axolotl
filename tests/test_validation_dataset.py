@@ -68,6 +68,7 @@ class TestValidationCheckDatasetConfig(BaseValidation):
             cfg,
             capabilities={
                 "bf16": "false",
+                "tf32": "false",
                 "n_gpu": 1,
                 "compute_capability": "8.0",
             },
@@ -363,5 +364,5 @@ class TestOptimizerValidation(BaseValidation):
             }
         )
 
-        with pytest.raises(ValueError, match=r".*is currently incompatible with*"):
+        with pytest.raises(ValueError, match=r".*only compatible with FSDP2.*"):
             validate_config(cfg)

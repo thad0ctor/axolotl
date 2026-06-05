@@ -5,6 +5,7 @@ from typing import Type
 
 import addict
 import torch
+import transformers
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 
 from axolotl.utils.dict import DictDefault
@@ -79,7 +80,11 @@ def check_model_config(cfg: DictDefault, model_config: PretrainedConfig):
             and hasattr(model_config, "vision_config")
             and hasattr(model_config.vision_config, "image_size")
         ):
-            cfg.image_size = model_config.vision_config.image_size
+            image_size = model_config.vision_config.image_size
+            if isinstance(image_size, list):
+                cfg.image_size = tuple(image_size)
+            else:
+                cfg.image_size = image_size
             LOG.debug(f"Loaded image size: {cfg.image_size} from model config")
 
     quant_config_exists = (
@@ -149,6 +154,9 @@ def load_model_config(cfg: DictDefault) -> PretrainedConfig | addict.Dict:
     This function determines the appropriate model config source, loads it, applies any
     necessary overrides, and validates it for compatibility with the `axolotl` config.
 
+    If `cfg.cls_model_config` is set, a custom config class from transformers will be
+    used instead of `AutoConfig` (e.g., 'LlamaConfig', 'MistralConfig').
+
     Args:
         cfg: Dictionary mapping `axolotl` config keys to values.
 
@@ -170,8 +178,13 @@ def load_model_config(cfg: DictDefault) -> PretrainedConfig | addict.Dict:
     if cfg.num_labels:
         # num_labels is used to initialize classifier models
         config_kwargs["num_labels"] = cfg.num_labels
+
+    config_cls = AutoConfig
+    if cfg.cls_model_config:
+        config_cls = getattr(transformers, cfg.cls_model_config)
+
     try:
-        model_config = AutoConfig.from_pretrained(
+        model_config = config_cls.from_pretrained(
             model_config_name,
             trust_remote_code=trust_remote_code,
             **config_kwargs,
@@ -221,4 +234,6 @@ def get_linear_embedding_layers(model_type: str) -> list[str]:
         return ["embed_in", "embed_out"]
     if model_type == "falcon":
         return ["word_embeddings", "lm_head"]
+    if model_type == "nemotron_h":
+        return ["embeddings", "lm_head"]
     return ["embed_tokens", "lm_head"]

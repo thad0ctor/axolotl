@@ -10,6 +10,7 @@ class TorchAOQuantDType(Enum):
     int8 = torch.int8
     float8_e4m3fn = torch.float8_e4m3fn
     nvfp4 = "nvfp4"
+    mxfp4 = "mxfp4"
 
     def from_string(str):
         if str == "int4":
@@ -20,17 +21,21 @@ class TorchAOQuantDType(Enum):
             return TorchAOQuantDType.float8_e4m3fn
         if str == "nvfp4":
             return TorchAOQuantDType.nvfp4
+        if str == "mxfp4":
+            return TorchAOQuantDType.mxfp4
 
 
 class RLType(str, Enum):
     """RL trainer type configuration subset"""
 
     DPO = "dpo"
+    GDPO = "gdpo"
     GRPO = "grpo"
     IPO = "ipo"
     ORPO = "orpo"
     KTO = "kto"
     SIMPO = "simpo"
+    EBFT = "ebft"
 
 
 class ChatTemplate(str, Enum):
@@ -55,15 +60,19 @@ class ChatTemplate(str, Enum):
     jinja = "jinja"
     qwen_25 = "qwen_25"
     qwen3 = "qwen3"
+    qwen3_5 = "qwen3_5"
     falcon_h1 = "falcon_h1"
+    nemotron_h = "nemotron_h"
     tokenizer_default = "tokenizer_default"
     exaone = "exaone"
+    exaone4 = "exaone4"
     metharme = "metharme"
     pixtral = "pixtral"
     llava = "llava"
     qwen2_vl = "qwen2_vl"
     gemma3 = "gemma3"
     gemma3n = "gemma3n"
+    gemma4 = "gemma4"
     command_a = "command_a"
     command_a_tool_use = "command_a_tool_use"
     command_a_rag = "command_a_rag"
@@ -81,6 +90,71 @@ class CustomSupportedOptimizers(str, Enum):
     came_pytorch = "came_pytorch"
     muon = "muon"
     dion = "dion"
+    flash_adamw = "flash_adamw"
+    flash_adam = "flash_adam"
+    flash_sgd = "flash_sgd"
+    flash_sgdw = "flash_sgdw"
+    flash_lion = "flash_lion"
+    q_galore_adamw8bit = "q_galore_adamw8bit"
+
+
+# Accepted canonical names; hub-kernel paths (containing "/") bypass this set.
+CANONICAL_ATTN_IMPLS = frozenset(
+    {
+        "eager",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+        "flex_attention",
+        "xformers",
+        "sage",
+        "fp8",
+    }
+)
+
+# Legacy boolean flags → canonical attn_implementation. Priority: specific before generic.
+LEGACY_ATTN_FLAG_TO_IMPL = {
+    "xformers_attention": "xformers",
+    "sage_attention": "sage",
+    "flex_attention": "flex_attention",
+    "flash_attention": "flash_attention_2",
+    "sdp_attention": "sdpa",
+    "eager_attention": "eager",
+}
+
+# Short-form aliases rejected at validation; mapped to canonical names for error messages.
+SHORT_FORM_ALIAS_TO_CANONICAL = {
+    "flash": "flash_attention_2",
+    "flex": "flex_attention",
+    "sdp": "sdpa",
+}
+
+# Backends that support varlen sample packing via `position_ids`.
+ATTN_IMPLS_SUPPORTING_PACKING = frozenset(
+    {
+        "flash_attention_2",
+        "flash_attention_3",
+        "flex_attention",
+        "xformers",
+        "sage",
+        "kernels-community/flash-attn2",
+        "kernels-community/flash-attn3",
+        "kernels-community/sage-attention",
+    }
+)
+
+# Backends that require the flash_attn library for axolotl's own monkeypatches.
+ATTN_IMPLS_USING_FLASH_LIB = frozenset(
+    {
+        "flash_attention_2",
+        "flash_attention_3",
+        "kernels-community/flash-attn2",
+        "kernels-community/flash-attn3",
+    }
+)
+
+# Backends for which embeddings stay in fp32. Everything else needs fp16/bf16.
+ATTN_IMPLS_WITHOUT_DTYPE_CAST = frozenset({"eager", "sdpa"})
 
 
 class RingAttnFunc(str, Enum):

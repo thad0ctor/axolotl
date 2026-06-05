@@ -30,7 +30,7 @@ class TestStreamingDatasets:
                 "sample_packing": sample_packing,
                 "pretrain_multipack_attn": sample_packing,
                 "streaming_multipack_buffer_size": 10000,
-                "dataset_processes": 1,
+                "dataset_num_proc": 1,
                 "special_tokens": {
                     "pad_token": "<|endoftext|>",
                 },
@@ -50,7 +50,6 @@ class TestStreamingDatasets:
                 "learning_rate": 0.00001,
                 "optimizer": "adamw_torch_fused",
                 "lr_scheduler": "cosine",
-                "save_safetensors": True,
                 "bf16": "auto",
                 "use_tensorboard": True,
                 "save_first_step": False,

@@ -82,7 +82,7 @@ class ModalCloud(Cloud):
         return res
 
     def get_image(self):
-        docker_tag = "main-py3.11-cu126-2.7.1"
+        docker_tag = "main-py3.11-cu128-2.9.1"
         if self.config.docker_tag:
             docker_tag = self.config.docker_tag
         docker_image = f"axolotlai/axolotl:{docker_tag}"
@@ -90,9 +90,8 @@ class ModalCloud(Cloud):
         # grab the sha256 hash from docker hub for this image+tag
         # this ensures that we always get the latest image for this tag, even if it's already cached
         try:
-            manifest = subprocess.check_output(  # nosec B602
-                f"docker manifest inspect {docker_image}",
-                shell=True,
+            manifest = subprocess.check_output(  # nosec
+                ["docker", "manifest", "inspect", docker_image],
             ).decode("utf-8")
             sha256_hash = json.loads(manifest)["manifests"][0]["digest"]
         except subprocess.CalledProcessError:

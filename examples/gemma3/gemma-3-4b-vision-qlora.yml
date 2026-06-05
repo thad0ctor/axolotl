@@ -31,7 +31,7 @@ pad_to_sequence_len: false
 
 lora_r: 32
 lora_alpha: 16
-lora_dropout: 0.05
+lora_dropout: 0
 lora_target_modules: 'model.language_model.layers.[\d]+.(mlp|cross_attn|self_attn).(up|down|gate|q|k|v|o)_proj'
 
 wandb_project:
@@ -55,8 +55,7 @@ gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
 logging_steps: 1
-flash_attention: true
-eager_attention:
+attn_implementation: flash_attention_2
 
 warmup_ratio: 0.1
 evals_per_epoch: 1

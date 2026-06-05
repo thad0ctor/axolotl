@@ -1,5 +1,6 @@
 """Shared pytest fixtures"""
 
+import collections
 import functools
 import importlib
 import logging
@@ -15,6 +16,8 @@ import datasets
 import pytest
 import requests
 import torch
+import transformers.utils as _transformers_utils
+import transformers.utils.import_utils as _import_utils
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
 from tokenizers import AddedToken
@@ -28,6 +31,26 @@ from tests.hf_offline_utils import (
 )
 
 logging.getLogger("filelock").setLevel(logging.CRITICAL)
+
+# Shim for deepseek v3
+if not hasattr(_import_utils, "is_torch_fx_available"):
+
+    def _is_torch_fx_available():
+        try:
+            import torch.fx  # noqa: F401  # pylint: disable=unused-import
+
+            return True
+        except ImportError:
+            return False
+
+    _import_utils.is_torch_fx_available = _is_torch_fx_available
+
+if not hasattr(_transformers_utils, "is_flash_attn_greater_or_equal_2_10"):
+    from transformers.utils import is_flash_attn_greater_or_equal as _is_flash_attn_gte
+
+    _transformers_utils.is_flash_attn_greater_or_equal_2_10 = lambda: (
+        _is_flash_attn_gte("2.10")
+    )
 
 
 def retry_on_request_exceptions(max_retries=3, delay=1):
@@ -62,7 +85,7 @@ def snapshot_download_w_retry(*args, **kwargs):
     """
     with hf_offline_context(True):
         try:
-            return snapshot_download(*args, **kwargs)
+            return snapshot_download(*args, local_files_only=True, **kwargs)
         except LocalEntryNotFoundError:
             pass
     with hf_offline_context(False):
@@ -84,21 +107,61 @@ def download_smollm2_135m_model():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def download_smollm2_135m_instruct_model():
+    # download the model
+    snapshot_download_w_retry("HuggingFaceTB/SmolLM2-135M-Instruct", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
 def download_smollm2_135m_gptq_model():
     # download the model
     snapshot_download_w_retry("lilmeaty/SmolLM2-135M-Instruct-GPTQ", repo_type="model")
 
 
 @pytest.fixture(scope="session", autouse=True)
-def download_qwen_2_5_half_billion_model():
-    # download the model
-    snapshot_download_w_retry("Qwen/Qwen2.5-0.5B", repo_type="model")
+def download_qwen3_half_billion_model():
+    # download the model (still used as the KD teacher in tests/e2e/integrations/test_kd.py)
+    snapshot_download_w_retry("Qwen/Qwen3-0.6B", repo_type="model")
 
 
 @pytest.fixture(scope="session", autouse=True)
-def download_qwen3_half_billion_model():
-    # download the model
-    snapshot_download_w_retry("Qwen/Qwen3-0.6B", repo_type="model")
+def download_tiny_llama_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-llama-50m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_mistral_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-mistral-25m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_mixtral_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-mixtral-30m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_phi_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-phi-64m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_falcon_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-falcon-42m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_qwen2_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-qwen2-129m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_qwen3_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-qwen3-129m", repo_type="model")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_tiny_gemma2_model():
+    snapshot_download_w_retry("axolotl-ai-co/tiny-gemma2-137m", repo_type="model")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -143,12 +206,20 @@ def download_argilla_distilabel_intel_orca_dpo_dataset():
     )
 
 
-# @pytest.fixture(scope="session", autouse=True)
-# def download_argilla_ultrafeedback_binarized_preferences_cleaned_dataset():
-#     # download the dataset
-#     snapshot_download_w_retry(
-#         "argilla/ultrafeedback-binarized-preferences-cleaned", repo_type="dataset"
-#     )
+@pytest.fixture(scope="session", autouse=True)
+def download_argilla_ultrafeedback_binarized_preferences_cleaned_dataset():
+    # download the dataset
+    snapshot_download_w_retry(
+        "argilla/ultrafeedback-binarized-preferences-cleaned", repo_type="dataset"
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_argilla_ultrafeedback_binarized_preferences_cleaned_kto_dataset():
+    # download the dataset
+    snapshot_download_w_retry(
+        "argilla/ultrafeedback-binarized-preferences-cleaned-kto", repo_type="dataset"
+    )
 
 
 # @pytest.fixture(scope="session", autouse=True)
@@ -251,7 +322,9 @@ def download_llama_1b_model_fixture():
 def download_llama3_8b_model_fixture():
     # download the tokenizer only
     snapshot_download_w_retry(
-        "NousResearch/Meta-Llama-3-8B", repo_type="model", allow_patterns=["*token*"]
+        "NousResearch/Meta-Llama-3-8B",
+        repo_type="model",
+        allow_patterns=["*token*", "config.json"],
     )
 
 
@@ -261,7 +334,7 @@ def download_llama3_8b_instruct_model_fixture():
     snapshot_download_w_retry(
         "NousResearch/Meta-Llama-3-8B-Instruct",
         repo_type="model",
-        allow_patterns=["*token*"],
+        allow_patterns=["*token*", "config.json"],
     )
 
 
@@ -269,17 +342,29 @@ def download_llama3_8b_instruct_model_fixture():
 def download_phi_35_mini_model_fixture():
     # download the tokenizer only
     snapshot_download_w_retry(
-        "microsoft/Phi-3.5-mini-instruct", repo_type="model", allow_patterns=["*token*"]
+        "microsoft/Phi-3.5-mini-instruct",
+        repo_type="model",
+        allow_patterns=["*token*", "config.json"],
     )
 
 
 @pytest.fixture(scope="session", autouse=True)
-def download_phi_3_medium_model_fixture():
+def download_phi_4_reasoning_model_fixture():
     # download the tokenizer only
     snapshot_download_w_retry(
-        "microsoft/Phi-3-medium-128k-instruct",
+        "microsoft/Phi-4-reasoning",
         repo_type="model",
-        allow_patterns=["*token*"],
+        allow_patterns=["*token*", "config.json"],
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def download_phi_3_mini_model_fixture():
+    # download the tokenizer only
+    snapshot_download_w_retry(
+        "microsoft/Phi-3-mini-4k-instruct",
+        repo_type="model",
+        allow_patterns=["*token*", "config.json"],
     )
 
 
@@ -424,6 +509,18 @@ def temp_dir() -> Generator[str, None, None]:
 
 
 @pytest.fixture(scope="function", autouse=True)
+def reset_plugin_manager():
+    from axolotl.integrations.base import PluginManager
+
+    yield
+    PluginManager._cfg = None
+    # Don't reset _instance to None — module-level PLUGIN_MANAGER references
+    # in train.py, model.py, etc. would become stale
+    if PluginManager._instance is not None:
+        PluginManager._instance.plugins = collections.OrderedDict()
+
+
+@pytest.fixture(scope="function", autouse=True)
 def torch_manual_seed():
     torch.manual_seed(42)
 
@@ -557,11 +654,21 @@ def fixture_min_base_cfg():
 )
 def test_load_fixtures(
     download_smollm2_135m_model,
-    download_qwen_2_5_half_billion_model,
+    download_qwen3_half_billion_model,
+    download_tiny_llama_model,
+    download_tiny_mistral_model,
+    download_tiny_mixtral_model,
+    download_tiny_phi_model,
+    download_tiny_falcon_model,
+    download_tiny_qwen2_model,
+    download_tiny_qwen3_model,
+    download_tiny_gemma2_model,
     download_tatsu_lab_alpaca_dataset,
     download_mhenrichsen_alpaca_2k_dataset,
     download_mhenrichsen_alpaca_2k_w_revision_dataset,
     download_mlabonne_finetome_100k_dataset,
+    download_argilla_ultrafeedback_binarized_preferences_cleaned_dataset,
+    download_argilla_ultrafeedback_binarized_preferences_cleaned_kto_dataset,
     download_argilla_distilabel_capybara_dpo_7k_binarized_dataset,
     download_arcee_ai_distilabel_intel_orca_dpo_pairs_dataset,
     download_argilla_dpo_pairs_dataset,
@@ -573,6 +680,7 @@ def test_load_fixtures(
     download_llama3_8b_instruct_model_fixture,
     download_phi_35_mini_model_fixture,
     download_phi_3_medium_model_fixture,
+    download_phi_4_reasoning_model_fixture,
     download_mistral_7b_model_fixture,
     download_gemma_2b_model_fixture,
     download_gemma2_9b_model_fixture,

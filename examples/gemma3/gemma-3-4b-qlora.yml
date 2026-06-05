@@ -1,8 +1,5 @@
 base_model: google/gemma-3-4b-it
 
-# Need to set else transformers tries to load vision too
-model_type: Gemma3ForCausalLM
-
 load_in_4bit: true
 
 # gemma3 doesn't seem to play nice with ddp
@@ -23,6 +20,11 @@ dataset_prepared_path: last_run_prepared
 val_set_size: 0.01
 output_dir: ./outputs/out
 
+# Freeze vision tower
+unfrozen_parameters:
+  - ^model.language_model.*
+  - ^lm_head.*
+
 adapter: qlora
 lora_model_dir:
 
@@ -32,8 +34,8 @@ sample_packing: true
 
 lora_r: 32
 lora_alpha: 16
-lora_dropout: 0.05
-lora_target_modules: 'model.language_model.layers.[\d]+.(mlp|cross_attn|self_attn).(up|down|gate|q|k|v|o)_proj'
+lora_dropout: 0
+lora_target_linear: true
 
 wandb_project:
 wandb_entity:
@@ -56,8 +58,7 @@ gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
 logging_steps: 1
-flash_attention: true
-eager_attention:
+attn_implementation: flash_attention_2
 
 warmup_ratio: 0.1
 evals_per_epoch: 1

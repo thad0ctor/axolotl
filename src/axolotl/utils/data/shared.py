@@ -190,7 +190,7 @@ def _get_remote_filesystem(
         try:
             import gcsfs
 
-            storage_options = {"token": None}  # type: ignore
+            storage_options = {"token": None}  # type: ignore  # nosec B105
             return gcsfs.GCSFileSystem(**storage_options), storage_options
         except ImportError as exc:
             raise ImportError(
@@ -245,17 +245,23 @@ def _load_from_local_path(
         if dataset_type == "json" and is_mixed_content_dataset(dataset_config):
             # Use custom loader for mixed content JSONL files
             LOG.info("Using mixed content JSON loader for multimodal dataset")
-            
+
             # Warn about unsupported options
             if load_dataset_kwargs.get("split"):
-                LOG.warning(f"Split '{load_dataset_kwargs['split']}' is not supported by mixed content loader. Loading entire dataset.")
+                LOG.warning(
+                    f"Split '{load_dataset_kwargs['split']}' is not supported by mixed content loader. Loading entire dataset."
+                )
             if load_dataset_kwargs.get("streaming"):
-                LOG.warning("Streaming is not supported by mixed content loader. Loading entire dataset into memory.")
-            
+                LOG.warning(
+                    "Streaming is not supported by mixed content loader. Loading entire dataset into memory."
+                )
+
             return load_mixed_content_jsonl(dataset_config.path)
-        
-        # For single file datasets, HF always creates only a "train" split
-        if dataset_type in ("json", "csv", "text"):
+
+        # Single-file paths always expose only a "train" split regardless of format.
+        # Preserve any user-provided slice syntax (e.g. "train[:500]"); only
+        # fall back to "train" when no split was specified.
+        if not load_dataset_kwargs.get("split"):
             load_dataset_kwargs["split"] = "train"
 
         return load_dataset(
@@ -488,13 +494,11 @@ def load_preprocessed_dataset(cfg: DictDefault, dataset_hash: str) -> Dataset | 
     ):
         LOG.info(
             f"Loading prepared dataset from disk at {prepared_ds_path}...",
-            main_process_only=True,
         )
         return load_from_disk(str(prepared_ds_path))
 
     LOG.info(
         f"Unable to find prepared dataset in {prepared_ds_path}",
-        main_process_only=True,
     )
     return None
 
@@ -532,11 +536,21 @@ def generate_dataset_hash_from_config(
     Returns:
         MD5 hash string representing the configuration.
     """
+    # When added_tokens_overrides is set, tokenizer.name_or_path contains output_dir.
+    # Use the canonical tokenizer config + overrides content so the hash is stable across output_dir changes.
+    if cfg.get("added_tokens_overrides"):
+        tokenizer_fingerprint = f"{cfg.tokenizer_config}+overrides:" + ",".join(
+            f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
+        )
+    else:
+        tokenizer_fingerprint = tokenizer_name
+
     config_str = (
         f"{cfg.sequence_len}@{cfg.sample_packing}@{cfg.eval_sample_packing}@"
-        f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}|"
+        f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}@"
+        f"{cfg.dataset_exact_deduplication or False}|"
         f"{'|'.join(sorted([f'{d.path}:{d.type}:{d.shards}:{d.conversation}:{d.split}:{d.temperature or 1.0}' for d in cfg_datasets]))}"
-        f"|{tokenizer_name}"
+        f"|{tokenizer_fingerprint}"
     )
     return str(md5(config_str))
 

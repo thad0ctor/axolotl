@@ -31,7 +31,11 @@ PRs are **greatly welcome**!
 
 Please run below to setup env
 ```bash
-pip3 install -r requirements-dev.txt -r requirements-tests.txt
+# Install axolotl + dev and test dependencies
+export UV_TORCH_BACKEND=cu128  # or cu130
+uv venv --no-project --relocatable
+source .venv/bin/activate
+uv pip install --no-build-isolation -e '.[deepspeed]' --group dev --group test
 pre-commit install
 
 # test
@@ -68,7 +72,12 @@ You can skip certain CI checks by including specific keywords in your commit mes
 
 ### Code Style
 
-axolotl uses [{codestyle}]({URLofCodestyle}) as its code style guide. Please ensure that your code follows these guidelines.
+axolotl uses [Ruff](https://docs.astral.sh/ruff/) as its code style guide. Please ensure that your code follows these guidelines.
+
+Use the pre-commit linter to ensure that your code is formatted consistently.
+```bash
+pre-commit run --all-files
+```
 
 ### Commit Messages
 
@@ -78,6 +87,6 @@ Write clear and concise commit messages that briefly describe the changes made i
 
 - [GitHub Help](https://help.github.com/)
 - [GitHub Pull Request Documentation](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests)
-- [{codestyle}]({URLofCodestyle})
+- [Ruff](https://docs.astral.sh/ruff/)
 
 Thank you once again for your interest in contributing to axolotl. We look forward to collaborating with you and creating an even better project together!

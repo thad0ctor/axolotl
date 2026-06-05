@@ -5,7 +5,6 @@ import importlib
 import logging
 import os
 import platform
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -20,21 +19,6 @@ LOG = logging.getLogger(__name__)
 POSTHOG_HOST = "https://app.posthog.com"
 POSTHOG_WRITE_KEY = "phc_1kUR0o04oJKKTTeSsIz2Mfm5mpiVsQEf2WOlzljMD7y"
 
-OPT_OUT_WARNING_SLEEP_SECONDS = 10
-OPT_OUT_WARNING = (
-    "\nTelemetry is now enabled by default to help improve Axolotl. "
-    "If you'd like to disable it, set AXOLOTL_DO_NOT_TRACK=1 in your environment.\n\n"
-    "Telemetry data helps us understand:\n"
-    "- Which features are most used\n"
-    "- What hardware configurations to prioritize\n"
-    "- Where users encounter errors\n\n"
-    "Personally identifiable information (PII) is not collected.\n\n"
-    "To remove this warning, explicitly set AXOLOTL_DO_NOT_TRACK=0 (enable telemetry) "
-    "or AXOLOTL_DO_NOT_TRACK=1 (disable telemetry).\n\n"
-    "For details, see: https://docs.axolotl.ai/docs/telemetry.html\n\n"
-    f"Sleeping for {OPT_OUT_WARNING_SLEEP_SECONDS}s..."
-)
-
 WHITELIST_PATH = str(Path(__file__).parent / "whitelist.yaml")
 
 # NOTE: Need to keep these up to date with any config schema changes
@@ -46,8 +30,8 @@ FIELDS_TO_REDACT = {
     "resume_from_checkpoint",
     "hub_model_id",
 }
-PREFIXES_TO_REDACT = {"wandb_", "comet_", "mlflow_", "gradio_"}
-PATH_INDICATORS = {"path", "dir"}
+PREFIXES_TO_REDACT = {"wandb_", "comet_", "mlflow_", "gradio_", "trackio_", "swanlab_"}
+PATH_INDICATORS = {"path", "dir", "data_files"}
 
 # pylint: disable=duplicate-code
 RELEVANT_PACKAGES = {
@@ -172,38 +156,20 @@ class TelemetryManager:
         Returns:
             Boolean denoting whether telemetry is enabled or not.
         """
-        # Parse relevant env vars
-        axolotl_do_not_track = os.getenv("AXOLOTL_DO_NOT_TRACK")
-        do_not_track = os.getenv("DO_NOT_TRACK")
-
-        # Default to enabled (opt-out model)
-        if axolotl_do_not_track is None or axolotl_do_not_track.lower() not in (
-            "0",
-            "1",
-            "false",
-            "true",
-        ):
-            # Print opt-out info message for main process only
-            if is_main_process():
-                LOG.warning(OPT_OUT_WARNING)
-            time.sleep(OPT_OUT_WARNING_SLEEP_SECONDS)
-
-            return True
-
         # Only rank 0 will send telemetry
         if not is_main_process():
             return False
 
-        if do_not_track is None:
-            do_not_track = "0"
+        def is_truthy_env(var_name: str) -> bool:
+            value = os.getenv(var_name)
+            if value is None:
+                return False
+            return value.strip().lower() in ("1", "true")
 
-        # Respect AXOLOTL_DO_NOT_TRACK, DO_NOT_TRACK if enabled
-        enabled = axolotl_do_not_track.lower() not in (
-            "1",
-            "true",
-        ) and do_not_track.lower() not in ("1", "true")
-
-        return enabled
+        # Telemetry is enabled by default unless either opt-out var is set
+        return not (
+            is_truthy_env("AXOLOTL_DO_NOT_TRACK") or is_truthy_env("DO_NOT_TRACK")
+        )
 
     def _load_whitelist(self) -> dict:
         """Load HuggingFace Hub organization whitelist"""

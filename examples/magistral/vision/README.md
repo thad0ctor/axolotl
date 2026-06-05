@@ -5,13 +5,14 @@ This guide covers fine-tuning [Magistral Small 2509](https://huggingface.co/mist
 ## Prerequisites
 
 Before starting, ensure you have:
-- Installed Axolotl from source (see [main README](../README.md#getting-started))
+
+- Installed Axolotl from source (see [main README](../README.md))
 
 ## Getting started
 
 1. Install the required vision lib:
     ```bash
-    pip install 'mistral-common[opencv]==1.8.5'
+    uv pip install 'mistral-common[opencv]==1.8.5'
     ```
 
 2. Download the example dataset image:
