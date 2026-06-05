@@ -11,6 +11,7 @@ See "DoRA: Weight-Decomposed Low-Rank Adaptation" (https://arxiv.org/abs/2402.09
 Credit to `unsloth` (https://unsloth.ai/) for inspiration for this implementation.
 """
 
+import os
 from typing import Callable
 
 import torch
@@ -22,6 +23,10 @@ from .geglu import geglu_backward, geglu_forward
 from .quantize import dequantize
 from .swiglu import swiglu_backward, swiglu_forward
 from .utils import torch_amp_custom_bwd, torch_amp_custom_fwd
+
+_NVFP4_SHARED_BASE_FPROP = os.environ.get(
+    "AXOLOTL_NVFP4_SHARED_BASE_FPROP", ""
+).lower() in {"1", "true", "yes", "on"}
 
 
 def get_lora_parameters(
@@ -334,7 +339,10 @@ def _shared_nvfp4_base_fprop(
     quants: list[QuantState | torch.Tensor | nn.Module | None],
     biases: list[torch.Tensor | None],
 ) -> list[torch.Tensor] | None:
-    """Shared activation-pack fprop for fused LoRA projections on NVFP4 bases."""
+    """Opt-in shared activation-pack fprop for fused LoRA NVFP4 bases."""
+    if not _NVFP4_SHARED_BASE_FPROP:
+        return None
+
     from axolotl.utils.nvfp4_training import nvfp4_base_fprop_many
 
     outs = nvfp4_base_fprop_many(X, quants)
