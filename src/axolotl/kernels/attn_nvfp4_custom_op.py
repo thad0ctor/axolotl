@@ -176,13 +176,10 @@ def nvfp4_flash_attention_packed_custom_op(
 # subgraph), while the registered backward computes the SAME native-NVFP4 grads as
 # nvfp4_flash_attn_func.
 #
-# The forward returns ONLY ``out`` (a single differentiable tensor). It does NOT
-# expose the per-row LSE as a second output: under the full-model AOTAutograd graph
-# a multi-output op whose second output participates in autograd corrupted the
-# gradient (grad_norm exploded to ~1e5 then NaN, even though the same op was
-# bit-exact in isolation). The backward recomputes the LSE itself (the FA2 prep
-# QK^T pass), which costs one extra FP4 pass but keeps the op single-output and the
-# gradient correct under torch.compile.
+# The forward returns ``out`` plus the per-row LSE as an auxiliary output. The LSE
+# is marked non-differentiable in setup_context, so the public wrapper still
+# exposes a single differentiable tensor while backward can reuse the forward
+# softmax stats and skip the extra FA2-prep QK^T pass.
 # ---------------------------------------------------------------------------
 @torch.library.custom_op("axolotl_nvfp4::flash_attention_train", mutates_args=())
 def _flash_attention_train_op(
@@ -202,11 +199,11 @@ def _flash_attention_train_op(
     block_n: int,
     num_warps: int,
     num_stages: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
     del dkdv_scratch_bf16
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
-    out = nvfp4_flash_attention(
+    out, lse = nvfp4_flash_attention(
         query,
         key,
         value,
@@ -218,8 +215,9 @@ def _flash_attention_train_op(
         block_n=block_n,
         num_warps=num_warps,
         num_stages=num_stages,
+        return_lse=True,
     )
-    return out
+    return out, lse
 
 
 @_flash_attention_train_op.register_fake
@@ -245,7 +243,9 @@ def _(
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
     del dkdv_scratch_bf16, block_m, block_n, num_warps, num_stages
     z, h, s_q, d = query.shape
-    return query.new_empty((z, h, s_q, d))
+    return query.new_empty((z, h, s_q, d)), query.new_empty(
+        (z * h, s_q), dtype=torch.float32
+    )
 
 
 def _flash_attention_train_setup_context(ctx, inputs, output):
@@ -268,8 +268,10 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         num_stages,
     ) = inputs
     del num_key_value_groups
-    out = output
-    ctx.save_for_backward(query, key, value, out, key_pad_bias)
+    out, lse = output
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(lse)
+    ctx.save_for_backward(query, key, value, out, key_pad_bias, lse)
     ctx.scaling = scaling
     ctx.causal = causal
     ctx.sr = sr
@@ -293,6 +295,7 @@ def _flash_attention_train_bwd_op(
     value: torch.Tensor,  # [Z, Hk, Skv, D]
     out: torch.Tensor,  # [Z, H, Sq, D]
     key_pad_bias: torch.Tensor,  # [Z, Skv] fp32 or empty
+    lse: torch.Tensor,  # [Z*H, Sq] fp32, forward softmax stats
     scaling: float,
     causal: bool,
     sr: bool,
@@ -309,7 +312,6 @@ def _flash_attention_train_bwd_op(
     _, hk, s_kv, _ = key.shape
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias.to(torch.float32)
     do = grad_out.reshape(z * h, s_q, d).contiguous()
-    # lse=None -> the prep kernel recomputes the row logsumexp (one FP4 QK^T pass).
     dq, dk, dv = _run_bwd(
         query.reshape(z * h, s_q, d).contiguous(),
         key.reshape(z * hk, s_kv, d).contiguous(),
@@ -330,7 +332,7 @@ def _flash_attention_train_bwd_op(
         block_n,
         num_warps,
         num_stages,
-        lse=None,
+        lse=lse.reshape(z * h, s_q).contiguous(),
         sr_p_dv=backward_p_dv_sr,
         sr_dot_dv=backward_dot_dv_sr,
         sr_ds_dq=backward_ds_dq_sr,
@@ -354,6 +356,7 @@ def _(
     value,
     out,
     key_pad_bias,
+    lse,
     scaling: float,
     causal: bool,
     sr: bool,
@@ -366,7 +369,7 @@ def _(
     num_warps: int,
     num_stages: int,
 ):
-    del grad_out, out, key_pad_bias, scaling, causal, sr
+    del grad_out, out, key_pad_bias, lse, scaling, causal, sr
     del backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr, dkdv_scratch_bf16
     del block_m, block_n, num_warps, num_stages
     # The real op returns CONTIGUOUS dq/dk/dv (reshape / GQA-reduce empty), even when
@@ -377,8 +380,9 @@ def _(
     return dq, dk, dv
 
 
-def _flash_attention_train_backward(ctx, grad_out):
-    query, key, value, out, key_pad_bias = ctx.saved_tensors
+def _flash_attention_train_backward(ctx, grad_out, grad_lse):
+    del grad_lse
+    query, key, value, out, key_pad_bias, lse = ctx.saved_tensors
     block_m, block_n, num_warps, num_stages = ctx.tiles
     dq, dk, dv = torch.ops.axolotl_nvfp4.flash_attention_train_bwd(
         grad_out.contiguous(),
@@ -387,6 +391,7 @@ def _flash_attention_train_backward(ctx, grad_out):
         value,
         out,
         key_pad_bias,
+        lse,
         ctx.scaling,
         ctx.causal,
         ctx.sr,
@@ -451,7 +456,8 @@ def nvfp4_flash_attn_train_custom_op(
     Same forward/backward math as ``nvfp4_flash_attn_func`` but wrapped so Inductor
     compiles around it (no ``tl.dot_scaled`` trace, no eager fallback of the bwd
     subgraph). All SR knobs are op arguments (so they survive compile/serialization);
-    the bwd recomputes the FP4 packs (no saved-pack reuse across the opaque boundary).
+    the bwd reuses the forward LSE but recomputes the FP4 packs (no saved-pack reuse
+    across the opaque boundary).
     """
     bias = (
         query.new_empty((0,), dtype=torch.float32)
@@ -474,7 +480,7 @@ def nvfp4_flash_attn_train_custom_op(
         if backward_ds_dq_stochastic_rounding is None
         else backward_ds_dq_stochastic_rounding
     )
-    return torch.ops.axolotl_nvfp4.flash_attention_train(
+    out, _lse = torch.ops.axolotl_nvfp4.flash_attention_train(
         query,
         key,
         value,
@@ -492,3 +498,4 @@ def nvfp4_flash_attn_train_custom_op(
         num_warps,
         num_stages,
     )
+    return out

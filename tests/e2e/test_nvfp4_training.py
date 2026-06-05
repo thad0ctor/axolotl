@@ -662,6 +662,73 @@ class TestNVFP4Training:
             rel = (ref.float() - got.float()).norm() / (ref.float().norm() + 1e-9)
             assert rel < 1e-2, rel.item()
 
+    def test_attention_train_custom_op_reuses_lse_and_compiles(self):
+        """The opaque compile custom op keeps native-attention grads identical while
+        carrying forward LSE as a non-differentiable auxiliary output."""
+        import torch._dynamo as dyn
+
+        from axolotl.kernels.attn_nvfp4_custom_op import (
+            nvfp4_flash_attn_train_custom_op,
+        )
+        from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attn_func
+
+        torch.manual_seed(321)
+        z, h, hk, s, d = 1, 4, 2, 96, 128
+        groups = h // hk
+        scale = 1.0 / (d**0.5)
+        q0 = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+        k0 = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+        v0 = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
+        upstream = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
+
+        def run(fn):
+            q = q0.clone().requires_grad_(True)
+            k = k0.clone().requires_grad_(True)
+            v = v0.clone().requires_grad_(True)
+            out = fn(q, k, v)
+            (out.float() * upstream.float()).sum().backward()
+            return out.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
+
+        common = dict(
+            causal=True,
+            num_key_value_groups=groups,
+            stochastic_rounding=False,
+            backward_p_dv_stochastic_rounding=False,
+            backward_dot_dv_stochastic_rounding=False,
+            backward_ds_dq_stochastic_rounding=False,
+            dkdv_scratch_bf16=True,
+        )
+        ref = run(lambda q, k, v: nvfp4_flash_attn_func(q, k, v, scale, **common))
+        got = run(
+            lambda q, k, v: nvfp4_flash_attn_train_custom_op(
+                q, k, v, scale, **common
+            )
+        )
+        for ref_t, got_t in zip(ref, got, strict=False):
+            assert torch.equal(ref_t, got_t)
+
+        q = q0.clone().requires_grad_(True)
+        k = k0.clone().requires_grad_(True)
+        v = v0.clone().requires_grad_(True)
+
+        def loss_fn(q, k, v):
+            out = nvfp4_flash_attn_train_custom_op(q, k, v, scale, **common)
+            return (out.float() * upstream.float()).sum()
+
+        prev = dyn.config.suppress_errors
+        dyn.config.suppress_errors = False
+        try:
+            dyn.reset()
+            explanation = dyn.explain(loss_fn)(q, k, v)
+            assert explanation.graph_break_count == 0
+            compiled = torch.compile(loss_fn, fullgraph=True)
+            compiled(q, k, v).backward()
+            assert torch.isfinite(q.grad).all().item()
+            assert torch.isfinite(k.grad).all().item()
+            assert torch.isfinite(v.grad).all().item()
+        finally:
+            dyn.config.suppress_errors = prev
+
     def test_embedding_quant_forward_and_memory(self):
         """NVFP4Embedding lookup matches bf16 F.embedding within FP4 tolerance and
         the weight memory drops ~3.5x."""
