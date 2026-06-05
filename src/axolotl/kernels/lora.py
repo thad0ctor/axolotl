@@ -517,16 +517,10 @@ class LoRA_MLP(torch.autograd.Function):
             gate_combined = gate_base + gate_lora
             up_combined = up_base + up_lora
         elif can_batch_gu:
-            shared = _shared_nvfp4_base_fprop(
-                X, [gate_quant, up_quant], [gate_bias, up_bias]
+            gate = matmul_lora(
+                X, gate_weight, gate_bias, gate_quant, None, None, None
             )
-            if shared is None:
-                gate = matmul_lora(
-                    X, gate_weight, gate_bias, gate_quant, None, None, None
-                )
-                up = matmul_lora(X, up_weight, up_bias, up_quant, None, None, None)
-            else:
-                gate, up = shared
+            up = matmul_lora(X, up_weight, up_bias, up_quant, None, None, None)
             _batched_lora_forward(
                 X,
                 [gate, up],
@@ -535,40 +529,28 @@ class LoRA_MLP(torch.autograd.Function):
                 [gate_scale, up_scale],
             )
         else:
-            shared = _shared_nvfp4_base_fprop(
-                X, [gate_quant, up_quant], [gate_bias, up_bias]
+            gate = matmul_lora(
+                X,
+                gate_weight,
+                gate_bias,
+                gate_quant,
+                gate_A,
+                gate_B,
+                gate_scale,
+                X_drop=X_drop,
+                lora_bias=gate_lora_bias,
             )
-            if shared is None:
-                gate = matmul_lora(
-                    X,
-                    gate_weight,
-                    gate_bias,
-                    gate_quant,
-                    gate_A,
-                    gate_B,
-                    gate_scale,
-                    X_drop=X_drop,
-                    lora_bias=gate_lora_bias,
-                )
-                up = matmul_lora(
-                    X,
-                    up_weight,
-                    up_bias,
-                    up_quant,
-                    up_A,
-                    up_B,
-                    up_scale,
-                    X_drop=X_drop,
-                    lora_bias=up_lora_bias,
-                )
-            else:
-                gate, up = shared
-                gate = _add_lora_to_base(
-                    gate, X_lora, gate_A, gate_B, gate_scale, gate_lora_bias, dtype
-                )
-                up = _add_lora_to_base(
-                    up, X_lora, up_A, up_B, up_scale, up_lora_bias, dtype
-                )
+            up = matmul_lora(
+                X,
+                up_weight,
+                up_bias,
+                up_quant,
+                up_A,
+                up_B,
+                up_scale,
+                X_drop=X_drop,
+                lora_bias=up_lora_bias,
+            )
 
         # Activation
         hidden = activation_fn(gate, up)
