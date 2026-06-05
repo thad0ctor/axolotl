@@ -40,6 +40,23 @@ def _empty_pack_outputs(tensor: torch.Tensor) -> tuple[torch.Tensor, ...]:
     return tuple(tensor.new_empty((0,), dtype=torch.uint8) for _ in range(10))
 
 
+def _static_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _use_saved_train_packs(requested: bool, s_q, s_kv) -> bool:
+    if not requested:
+        return False
+    s_q_i = _static_int(s_q)
+    s_kv_i = _static_int(s_kv)
+    if s_q_i is None or s_kv_i is None:
+        return False
+    return max(s_q_i, s_kv_i) <= 4096
+
+
 @torch.library.custom_op("axolotl_nvfp4::flash_attention_packed", mutates_args=())
 def _flash_attention_packed_op(
     qnv: torch.Tensor,
@@ -222,7 +239,10 @@ def _flash_attention_train_op(
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
     del dkdv_scratch_bf16
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
-    if save_backward_packs:
+    use_saved_packs = _use_saved_train_packs(
+        save_backward_packs, query.shape[2], key.shape[2]
+    )
+    if use_saved_packs:
         out, lse, packs = nvfp4_flash_attention(
             query,
             key,
@@ -284,7 +304,7 @@ def _(
     _, hk, s_kv, _ = key.shape
     out = query.new_empty((z, h, s_q, d))
     lse = query.new_empty((z * h, s_q), dtype=torch.float32)
-    if not save_backward_packs:
+    if not _use_saved_train_packs(save_backward_packs, s_q, s_kv):
         return (out, lse, *_empty_pack_outputs(query))
 
     bwd_block_m = min(block_m, 64)
@@ -332,7 +352,8 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(
         lse, qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
     )
-    if save_backward_packs:
+    use_saved_packs = save_backward_packs and qnv.numel() > 0
+    if use_saved_packs:
         query_save = key_save = value_save = out
     else:
         query_save, key_save, value_save = query, key, value
@@ -364,7 +385,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.backward_dot_dv_sr = backward_dot_dv_sr
     ctx.backward_ds_dq_sr = backward_ds_dq_sr
     ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
-    ctx.save_backward_packs = save_backward_packs
+    ctx.save_backward_packs = use_saved_packs
     ctx.tiles = (block_m, block_n, num_warps, num_stages)
 
 
@@ -649,7 +670,7 @@ def nvfp4_flash_attn_train_custom_op(
     compiles around it (no ``tl.dot_scaled`` trace, no eager fallback of the bwd
     subgraph). All SR knobs are op arguments (so they survive compile/serialization);
     the bwd reuses the forward LSE and, when requested, the deterministic forward
-    FP4 packs across the opaque boundary.
+    FP4 packs across the opaque boundary for short/mid static sequence lengths.
     """
     bias = (
         query.new_empty((0,), dtype=torch.float32)

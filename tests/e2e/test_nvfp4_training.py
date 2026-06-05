@@ -668,6 +668,7 @@ class TestNVFP4Training:
         import torch._dynamo as dyn
 
         from axolotl.kernels.attn_nvfp4_custom_op import (
+            _use_saved_train_packs,
             nvfp4_flash_attn_train_custom_op,
         )
         from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attn_func
@@ -676,6 +677,8 @@ class TestNVFP4Training:
         z, h, hk, s, d = 1, 4, 2, 96, 128
         groups = h // hk
         scale = 1.0 / (d**0.5)
+        assert _use_saved_train_packs(True, s, s)
+        assert not _use_saved_train_packs(True, 8192, 8192)
         q0 = torch.randn(z, h, s, d, device="cuda", dtype=torch.bfloat16)
         k0 = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)
         v0 = torch.randn(z, hk, s, d, device="cuda", dtype=torch.bfloat16)

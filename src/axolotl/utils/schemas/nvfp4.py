@@ -35,7 +35,9 @@ class NVFP4AttentionBackwardConfig(BaseModel):
         json_schema_extra={
             "description": "Save the forward pass's deterministic Q/K/V NVFP4 packs "
             "(+ transposed backward layouts) and reuse them in backward — trades "
-            "activation memory for less backward pack-prep work."
+            "activation memory for less backward pack-prep work. The compile custom "
+            "op applies this only on short/mid static sequence lengths where the "
+            "forward dual-pack cost measured worthwhile."
         },
     )
     dkdv_scratch_bf16: bool = Field(
@@ -52,8 +54,9 @@ class NVFP4AttentionBackwardConfig(BaseModel):
             "description": "Route the native NVFP4 flash attention through an opaque "
             "torch custom op (torch.compile escape hatch). Tri-state: None "
             "auto-enables it whenever torch_compile is on; True/False force it. "
-            "The op reuses forward LSE in backward and honors save_packs by carrying "
-            "the deterministic forward FP4 packs across the opaque boundary."
+            "The op reuses forward LSE in backward and honors save_packs conditionally "
+            "by carrying deterministic forward FP4 packs across the opaque boundary "
+            "only for short/mid static sequence lengths."
         },
     )
 
