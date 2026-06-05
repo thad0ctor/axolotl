@@ -61,8 +61,12 @@ def _build_fla_rmsnorm_gated_op():
     # FakeTensors ("Cannot access data pointer").
     @torch.library.custom_op("axolotl_fla::rmsnorm_gated_bwd", mutates_args=())
     def _bwd_op(
-        grad: torch.Tensor, x: torch.Tensor, g: torch.Tensor, weight: torch.Tensor,
-        activation: str, eps: float,
+        grad: torch.Tensor,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        weight: torch.Tensor,
+        activation: str,
+        eps: float,
     ) -> list[torch.Tensor]:
         from fla.modules.fused_norm_gate import rms_norm_gated
 
@@ -78,7 +82,11 @@ def _build_fla_rmsnorm_gated_op():
 
     @torch.library.custom_op("axolotl_fla::rmsnorm_gated", mutates_args=())
     def _op(
-        x: torch.Tensor, g: torch.Tensor, weight: torch.Tensor, activation: str, eps: float
+        x: torch.Tensor,
+        g: torch.Tensor,
+        weight: torch.Tensor,
+        activation: str,
+        eps: float,
     ) -> torch.Tensor:
         from fla.modules.fused_norm_gate import rms_norm_gated
 
@@ -112,8 +120,14 @@ def _fla_rmsnorm_gated_compiled_forward(
     from fla.modules.fused_norm_gate import rms_norm_gated
 
     return rms_norm_gated(
-        x, g, self.weight, self.bias, self.activation,
-        residual=residual, eps=self.eps, prenorm=prenorm,
+        x,
+        g,
+        self.weight,
+        self.bias,
+        self.activation,
+        residual=residual,
+        eps=self.eps,
+        prenorm=prenorm,
         residual_in_fp32=residual_in_fp32,
     )
 
