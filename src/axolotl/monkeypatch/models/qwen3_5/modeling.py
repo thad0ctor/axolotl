@@ -71,7 +71,7 @@ def get_cu_seqlens(position_ids):
     )
 
 
-def _inject_fla_kernels(module) -> None:
+def _inject_fla_kernels(module, *, compile_boundary: bool = False) -> None:
     """Inject FLA kernels into a modeling module, bypassing is_flash_linear_attention_available."""
     try:
         from fla.modules import FusedRMSNormGated
@@ -79,6 +79,22 @@ def _inject_fla_kernels(module) -> None:
             chunk_gated_delta_rule,
             fused_recurrent_gated_delta_rule,
         )
+
+        if compile_boundary and not getattr(
+            FusedRMSNormGated, "_axolotl_compile_boundary", False
+        ):
+            # FLA's fused gated-norm backward (layer_norm_gated_bwd) calls
+            # aten.as_strided in a way torch.compile cannot meta-trace on torch
+            # >= 2.12 ("mismatch in length of strides and shape"), so dynamo bails
+            # on the whole attention frame. Run it at an eager boundary, same as
+            # fla causal_conv1d.
+            try:
+                import torch._dynamo as _dyn
+
+                FusedRMSNormGated.forward = _dyn.disable(FusedRMSNormGated.forward)
+                FusedRMSNormGated._axolotl_compile_boundary = True
+            except Exception:  # pragma: no cover
+                pass
 
         module.FusedRMSNormGated = FusedRMSNormGated
         module.chunk_gated_delta_rule = chunk_gated_delta_rule
@@ -282,8 +298,8 @@ def _apply_packing_patches(
         LOG.warning(f"{model_type} not found in transformers, skipping packing patches")
         return
 
-    _inject_fla_kernels(module)
     set_fla_causal_conv_compile_boundary(fla_causal_conv_compile_boundary)
+    _inject_fla_kernels(module, compile_boundary=fla_causal_conv_compile_boundary)
     getattr(module, f"{cls_prefix}DecoderLayer").forward = _patched_decoder_forward
     gated_cls = getattr(module, f"{cls_prefix}GatedDeltaNet")
     gated_cls.forward = forward_factory(module.apply_mask_to_padding_states)
