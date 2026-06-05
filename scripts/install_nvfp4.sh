@@ -28,9 +28,12 @@
 #     --mslk-index URL       index for mslk (default: nightly cu130)
 #     --mslk-stable          use the stable cu130 index for mslk (no --pre)
 #     --build-mslk           build mslk from source (github.com/pytorch/MSLK) instead
-#     --sage-repo URL        SageAttention-NVFP4 fork remote (default below)
-#     --sage-ref REF         fork branch/tag (default: nvfp4-attention)
-#     --sage-dir PATH        where to clone the fork (default: ../SageAttention-NVFP4)
+#     --editable-sage        ALSO clone the fork + install it editable, overriding
+#                            the git copy (for hacking the kernel). Default: the
+#                            fork is pulled from the nvfp4-attn extra's git dep only.
+#     --sage-repo URL        fork remote for --editable-sage (default: thad0ctor)
+#     --sage-ref REF         fork branch/tag for --editable-sage (default: nvfp4-attention)
+#     --sage-dir PATH        clone dir for --editable-sage (default: ../SageAttention-NVFP4)
 #     --no-axolotl           skip installing this Axolotl checkout (deps only)
 #     -h|--help              show this help
 set -euo pipefail
@@ -48,6 +51,7 @@ SAGE_REF="nvfp4-attention"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SAGE_DIR="$(dirname "$REPO_ROOT")/SageAttention-NVFP4"
 INSTALL_AXOLOTL=1
+EDITABLE_SAGE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,8 +65,9 @@ while [[ $# -gt 0 ]]; do
     --sage-repo) SAGE_REPO="$2"; shift 2;;
     --sage-ref) SAGE_REF="$2"; shift 2;;
     --sage-dir) SAGE_DIR="$2"; shift 2;;
+    --editable-sage) EDITABLE_SAGE=1; shift;;
     --no-axolotl) INSTALL_AXOLOTL=0; shift;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0;;
+    -h|--help) sed -n '2,42p' "$0"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -111,21 +116,32 @@ else
   PIP install $MSLK_PRE mslk --index-url "$MSLK_INDEX"
 fi
 
-# --- 4. SageAttention-NVFP4 fork (the attention kernel) ------------------------
-say "Installing the SageAttention-NVFP4 fork (Triton-only) at $SAGE_DIR"
-if [[ ! -d "$SAGE_DIR/.git" ]]; then
-  git clone --branch "$SAGE_REF" "$SAGE_REPO" "$SAGE_DIR"
-else
-  git -C "$SAGE_DIR" fetch --depth 1 origin "$SAGE_REF" && git -C "$SAGE_DIR" checkout "$SAGE_REF"
-fi
+# --- 4. Axolotl + the nvfp4-attn extra (pulls the SageAttention fork from git) -
+# The nvfp4-attn extra carries the fork as a git dependency
+# (sageattention @ git+.../SageAttention.git@nvfp4-attention), so the kernel is
+# installed here automatically — no separate clone for a normal install.
 # SAGEATTN_SKIP_CUDA_BUILD: the nvfp4 submodule is pure Triton; don't compile the
 # legacy SageAttention CUDA kernels just to import it.
-SAGEATTN_SKIP_CUDA_BUILD=1 PIP install -e "$SAGE_DIR" --no-build-isolation
-
-# --- 5. this Axolotl checkout + the nvfp4-attn extra ---------------------------
 if [[ "$INSTALL_AXOLOTL" == "1" ]]; then
-  say "Installing Axolotl (this checkout) with the nvfp4-attn extra"
-  PIP install -e "${REPO_ROOT}[nvfp4-attn]" --no-build-isolation
+  say "Installing Axolotl + nvfp4-attn extra (SageAttention fork pulled from git)"
+  SAGEATTN_SKIP_CUDA_BUILD=1 PIP install -e "${REPO_ROOT}[nvfp4-attn]" --no-build-isolation
+else
+  say "Installing just the SageAttention fork from git (--no-axolotl)"
+  SAGEATTN_SKIP_CUDA_BUILD=1 PIP install "sageattention @ git+${SAGE_REPO}@${SAGE_REF}"
+fi
+
+# --- 5. (opt-in) editable SageAttention fork for kernel development ------------
+# Overrides the git-installed copy with a local editable clone so you can hack on
+# the kernel and see changes without reinstalling. Off by default — the git dep
+# above is all a normal install needs.
+if [[ "$EDITABLE_SAGE" == "1" ]]; then
+  say "Editable SageAttention fork at $SAGE_DIR (dev override of the git copy)"
+  if [[ ! -d "$SAGE_DIR/.git" ]]; then
+    git clone --branch "$SAGE_REF" "$SAGE_REPO" "$SAGE_DIR"
+  else
+    git -C "$SAGE_DIR" fetch --depth 1 origin "$SAGE_REF" && git -C "$SAGE_DIR" checkout "$SAGE_REF"
+  fi
+  SAGEATTN_SKIP_CUDA_BUILD=1 PIP install -e "$SAGE_DIR" --no-build-isolation
 fi
 
 # --- 6. validate ---------------------------------------------------------------
