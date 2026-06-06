@@ -67,7 +67,18 @@ _TEST_MODULE_PREFIXES = {
     "sub_disc_plugin",
     "empty_pkg",
     "marker",
+    "multi_pkg",
 }
+
+
+def _make_multi_plugin_package(root, pkg="multi_pkg", classes=("Alpha", "Beta")):
+    pkgdir = root / pkg
+    pkgdir.mkdir(parents=True, exist_ok=True)
+    body = "from axolotl.integrations.base import BasePlugin\n"
+    for cls in classes:
+        body += f"class {cls}(BasePlugin):\n    pass\n"
+    (pkgdir / "__init__.py").write_text(body)
+    return [f"{pkg}.{c}" for c in classes]
 
 
 @pytest.fixture
@@ -206,12 +217,55 @@ def test_discovery_skips_tests_dir(tmp_path, monkeypatch, cleanup_syspath):
     assert cfg["plugins"] == [expected]
 
 
+def test_cls_list_one_source(tmp_path, monkeypatch, cleanup_syspath):
+    # A list of cls loads several plugins from one source block.
+    root = tmp_path / "repo"
+    expected = _make_multi_plugin_package(
+        root, pkg="multi_pkg", classes=("Alpha", "Beta")
+    )
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(root), "cls": expected}],
+    }
+    provision_plugins(cfg)
+    assert cfg["plugins"] == expected
+
+
+def test_cls_list_mixed_with_string_entries(tmp_path, monkeypatch, cleanup_syspath):
+    root = tmp_path / "repo"
+    expected = _make_multi_plugin_package(
+        root, pkg="multi_pkg", classes=("Alpha", "Beta")
+    )
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": ["builtin.Plugin", {"source": str(root), "cls": expected}],
+    }
+    provision_plugins(cfg)
+    assert cfg["plugins"] == ["builtin.Plugin", *expected]
+
+
+def test_empty_cls_list_falls_back_to_discovery(tmp_path, monkeypatch, cleanup_syspath):
+    # cls: [] behaves like an omitted cls -> discover the single plugin.
+    src = tmp_path / "repo"
+    expected = _make_plugin_package(src, pkg="disc_plugin", cls="DiscPlugin")
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(src), "cls": []}],
+    }
+    provision_plugins(cfg)
+    assert cfg["plugins"] == [expected]
+
+
 def test_pluginspec_requires_cls_or_source():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
         PluginSpec()
     assert PluginSpec(cls="a.B").cls == "a.B"
+    assert PluginSpec(cls=["a.B", "c.D"]).cls == ["a.B", "c.D"]
     assert PluginSpec(source="/x").source == "/x"
 
 

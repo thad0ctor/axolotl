@@ -290,7 +290,7 @@ def provision_plugins(cfg) -> None:
         spec = entry if isinstance(entry, PluginSpec) else PluginSpec(**dict(entry))
         search_path = _provision_one(spec, cache_dir, base_dir) if spec.source else None
         if spec.cls:
-            normalized.append(spec.cls)
+            normalized.extend([spec.cls] if isinstance(spec.cls, str) else spec.cls)
         elif search_path is not None:
             normalized.append(_discover_plugin_cls(search_path))
         else:

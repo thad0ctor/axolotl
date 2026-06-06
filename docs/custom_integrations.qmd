@@ -143,13 +143,18 @@ plugins:
     subdir: src                                     # dir within the source to put on sys.path
     pip_install: editable                           # false | editable | requirements
 
+  # Multiple plugins from one repo — cloned once, several classes loaded.
+  - source: https://github.com/org/multi-plugin.git
+    ref: v1.0.0
+    cls: [multi_pkg.AlphaPlugin, multi_pkg.BetaPlugin]
+
   # Local directory source (no clone).
   - source: ./plugins/local_plugin
 ```
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `cls` | no¹ | Dotted path to the plugin class to load. Auto-discovered from `source` when omitted (see convention below). |
+| `cls` | no¹ | Dotted path to the plugin class — a string, or a **list** to load several classes from one `source`. Auto-discovered from `source` when omitted (see convention below). |
 | `source` | no¹ | Git URL or local path. A value ending in `.git` or starting with `http(s)://`, `git://`, `ssh://`, or `git@` is cloned; anything else is treated as a local path. Omit if the class is already importable. |
 | `ref` | no | Git branch, tag, or commit to check out. Pin to a commit SHA for reproducibility. |
 | `subdir` | no | Subdirectory within the source added to `sys.path`. |

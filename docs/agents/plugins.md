@@ -20,6 +20,10 @@ plugins:
     pip_install: editable            # false | editable | requirements
     update: false                    # re-fetch a cached git source
 
+  # Multiple plugins from one repo (cloned once).
+  - source: https://github.com/org/multi-plugin.git
+    cls: [multi_pkg.AlphaPlugin, multi_pkg.BetaPlugin]
+
   # Local directory (no clone — resolved + path-injected).
   - source: ./plugins/local_plugin
 ```
@@ -30,7 +34,7 @@ The string form is unchanged and fully backward compatible. Mapping entries are 
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `cls` | no¹ | Dotted path to the plugin class (`module.ClassName`). Auto-discovered from `source` when omitted. |
+| `cls` | no¹ | Dotted path to the plugin class (`module.ClassName`) — a string, or a list to load several classes from one `source` (cloned once). Auto-discovered from `source` when omitted. |
 | `source` | no¹ | Git URL or local path. Cloned if it ends in `.git` or starts with `http(s)://`/`git://`/`ssh://`/`git@`; otherwise treated as a local path. Omit if `cls` is already importable. |
 | `ref` | no | Git branch, tag, or commit. Pin to a commit SHA for reproducibility. |
 | `subdir` | no | Subdirectory of the source to add to `sys.path`. |

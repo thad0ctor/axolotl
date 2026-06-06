@@ -72,10 +72,10 @@ class PluginSpec(BaseModel):
     """External plugin source: clone/resolve a plugin and load it without modifying
     the axolotl install."""
 
-    cls: str | None = Field(
+    cls: str | list[str] | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Dotted path to the plugin class, e.g. 'my_pkg.MyPlugin'. Optional when `source` is given: the single BasePlugin subclass exported by the source is auto-discovered."
+            "description": "Dotted path(s) to the plugin class(es): a string, or a list to load several classes from one `source`. Optional when `source` is given: the single BasePlugin subclass exported by the source is auto-discovered."
         },
     )
     source: str | None = Field(
