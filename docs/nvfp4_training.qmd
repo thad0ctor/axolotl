@@ -187,6 +187,25 @@ work. The BF16 dK/dV scratch flag halves the per-query-head dK/dV scratch dtype
 before GQA reduction; the final dK/dV tensors remain bf16 either way. See
 `examples/nvfp4/qwen35-9b-lora-fastest.yaml`.
 
+For stochastic-rounding policy validation, prefer testing narrower overrides before
+the coarse `rtn_grad_packs` switch:
+
+```yaml
+nvfp4_training:
+  attention:
+    backward:
+      # Tier 1: keep dK/dV-side SR, use deterministic dS pack for dQ.
+      rtn_grad_packs: false
+      ds_dq_stochastic_rounding: false
+
+      # Tier 2: add deterministic softmax-P pack for dV.
+      # p_dv_stochastic_rounding: false
+```
+
+The legacy/coarse `rtn_grad_packs: true` shortcut makes all three measured-safe
+attention grad packs deterministic (`p_dv`, `dot_dv`, and `ds_dq`) unless an
+individual override is set.
+
 Keep the no-grad/eval-only Qwen3.5 native MLP, native linear-attention, fused
 `v_proj`, and standalone `fp8_lm_head` switches out of this training-speed
 profile. A same-prepared-dataset lock-down ablation on the beta branch measured
@@ -556,7 +575,10 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `attention.fuse_vproj` | `bool \| null` | `null` | Run v_proj as a native NVFP4 GEMM with a key-axis pack epilogue on inference/cache-free prefill. `null`: on for inference, off for training. |
 | `attention.fp4_projections` | `bool` | `false` | Run q/k/o_proj as native NVFP4 GEMMs (q/k share one activation pack) on inference prefill. **Parity-affecting** (not bit-exact); speed-neutral on hybrid models, a per-layer win on dense models. Plain-`nn.Linear` only. |
 | `attention.backward.enabled` | `bool` | `false` | Requires `attention.enabled`. Use the native NVFP4 autograd attention path while training. |
-| `attention.backward.rtn_grad_packs` | `bool` | `false` | Deterministic round-to-nearest for the measured-safe gradient packs, leaving the dK and dPt packs governed by `stochastic_rounding`. |
+| `attention.backward.rtn_grad_packs` | `bool` | `false` | Coarse shortcut: deterministic round-to-nearest for the measured-safe gradient packs, leaving the dK and dPt packs governed by `stochastic_rounding`. Individual SR overrides below win over this shortcut. |
+| `attention.backward.p_dv_stochastic_rounding` | `bool \| null` | `null` | Override stochastic rounding for the softmax-P pack used by dV. `null` inherits the current backward grad-pack policy (`stochastic_rounding` unless `rtn_grad_packs: true`). Tier-2 validation candidate: `false`. |
+| `attention.backward.dot_dv_stochastic_rounding` | `bool \| null` | `null` | Override stochastic rounding for the transposed-dO pack used by dV. `null` inherits the current backward grad-pack policy. Leave `null`/inherited unless testing the coarse deterministic-pack policy. |
+| `attention.backward.ds_dq_stochastic_rounding` | `bool \| null` | `null` | Override stochastic rounding for the dS pack used by dQ. `null` inherits the current backward grad-pack policy. Tier-1 validation candidate: `false`. |
 | `attention.backward.save_packs` | `bool` | `false` | Save the forward Q/K/V FP4 packs (+ transposed backward layouts) and reuse them in backward — trades activation memory for higher throughput. Under the compile custom op, this is applied only on short/mid static sequence lengths where the forward dual-pack cost measured worthwhile. |
 | `attention.backward.dkdv_scratch_bf16` | `bool` | `false` | Store dQ and per-query-head dK/dV backward scratch in bf16 (accumulate fp32 in-register, downcast once at the store → bit-identical to fp32-then-`.to(bf16)`; a pure memory save on the largest backward scratch planes). |
 | `attention.backward.compile_custom_op` | `bool \| null` | `null` (auto) | Wrap the attention path in an opaque differentiable custom op so Inductor compiles *around* the Triton `tl.dot_scaled` (which otherwise raises an `InductorError` and silently drops the block to eager). `null` auto-enables it when `torch_compile` is on and `attention.enabled`; `true`/`false` force it. The op reuses forward LSE in backward and honors `attention.backward.save_packs` conditionally by carrying deterministic forward FP4 packs across the opaque boundary only for short/mid static sequence lengths. |

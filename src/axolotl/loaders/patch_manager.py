@@ -573,6 +573,15 @@ class PatchManager:
                 fuse_attn_proj=attn.fp4_projections,
                 train_backward=attn.backward.enabled,
                 backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
+                backward_p_dv_stochastic_rounding=(
+                    attn.backward.p_dv_stochastic_rounding
+                ),
+                backward_dot_dv_stochastic_rounding=(
+                    attn.backward.dot_dv_stochastic_rounding
+                ),
+                backward_ds_dq_stochastic_rounding=(
+                    attn.backward.ds_dq_stochastic_rounding
+                ),
                 save_backward_packs=attn.backward.save_packs,
                 dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
                 compile_custom_op=bool(attn.backward.compile_custom_op),

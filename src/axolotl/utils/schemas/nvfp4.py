@@ -26,8 +26,30 @@ class NVFP4AttentionBackwardConfig(BaseModel):
         json_schema_extra={
             "description": "Deterministic round-to-nearest for the measured-safe "
             "gradient packs (softmax P / transposed dO for dV, dS for dQ), leaving "
-            "the dK and dPt packs governed by stochastic_rounding. Faster in "
-            "microbenchmarks; convergence validation still required."
+            "the dK and dPt packs governed by stochastic_rounding. Individual "
+            "*_stochastic_rounding overrides below win over this coarse switch. "
+            "Faster in microbenchmarks; convergence validation still required."
+        },
+    )
+    p_dv_stochastic_rounding: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override stochastic rounding for the softmax P pack used "
+            "by dV. Null inherits the current backward gradient-pack policy."
+        },
+    )
+    dot_dv_stochastic_rounding: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override stochastic rounding for the transposed dO pack "
+            "used by dV. Null inherits the current backward gradient-pack policy."
+        },
+    )
+    ds_dq_stochastic_rounding: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Override stochastic rounding for the dS pack used by dQ. "
+            "Null inherits the current backward gradient-pack policy."
         },
     )
     save_packs: bool = Field(
@@ -115,6 +137,16 @@ class NVFP4AttentionConfig(BaseModel):
         if not self.backward.enabled:
             for sub in ("rtn_grad_packs", "save_packs", "dkdv_scratch_bf16"):
                 if getattr(self.backward, sub):
+                    raise ValueError(
+                        f"nvfp4_training.attention.backward.{sub} requires "
+                        "attention.backward.enabled: true."
+                    )
+            for sub in (
+                "p_dv_stochastic_rounding",
+                "dot_dv_stochastic_rounding",
+                "ds_dq_stochastic_rounding",
+            ):
+                if getattr(self.backward, sub) is not None:
                     raise ValueError(
                         f"nvfp4_training.attention.backward.{sub} requires "
                         "attention.backward.enabled: true."
