@@ -71,12 +71,12 @@ def _clone_target(cache_dir: Path, source: str, ref: str | None) -> Path:
     return cache_dir / f"{name}-{_source_key(source, ref)}"
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> None:
+def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> None:
     try:
         subprocess.run(  # nosec
             cmd,
             cwd=str(cwd) if cwd else None,
-            check=True,
+            check=check,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -97,10 +97,26 @@ def _clone_or_update(source: str, ref: str | None, target: Path, update: bool) -
         _run(["git", "clone", source, str(target)])
     elif update:
         LOG.info("Updating plugin source at %s", target)
-        _run(["git", "fetch", "--all", "--tags"], cwd=target)
+        _run(["git", "fetch", "--all", "--tags", "--prune"], cwd=target)
     if ref:
         _run(["git", "checkout", ref], cwd=target)
+    if update and _on_branch(target):
+        # `git checkout` alone does not advance an already-checked-out branch, so
+        # fast-forward it to the freshly fetched remote tip. Skipped when HEAD is
+        # detached at an immutable tag/commit (nothing to advance).
+        _run(["git", "merge", "--ff-only"], cwd=target, check=False)
     return target
+
+
+def _on_branch(target: Path) -> bool:
+    result = subprocess.run(  # nosec
+        ["git", "symbolic-ref", "-q", "HEAD"],
+        cwd=str(target),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def _resolve_local(source: str, base_dir: Path) -> Path:

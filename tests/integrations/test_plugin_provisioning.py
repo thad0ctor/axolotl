@@ -234,6 +234,87 @@ def test_git_clone_and_checkout(tmp_path, monkeypatch, cleanup_syspath):
     assert cfg2["plugins"] == ["git_plugin.GitPlugin"]
 
 
+def test_git_update_fast_forwards_default_branch(
+    tmp_path, monkeypatch, cleanup_syspath
+):
+    # update: true must advance the cached clone to the latest commit on the
+    # (moving) default branch — not silently stay at the originally cloned commit.
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "marker.txt").write_text("v1\n")
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "v1"], cwd=work)
+
+    bare = tmp_path / "repo.git"
+    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+
+    monkeypatch.chdir(tmp_path)
+    cache = tmp_path / "cache"
+    cfg = {
+        "plugin_cache_dir": str(cache),
+        "plugins": [
+            {"cls": "marker.X", "source": str(bare)}
+        ],  # no ref -> default branch
+    }
+    provision_plugins(cfg)
+    clone = next(
+        p for p in cache.iterdir() if p.is_dir() and p.name.startswith("repo-")
+    )
+    assert (clone / "marker.txt").read_text().strip() == "v1"
+
+    # advance the upstream default branch
+    (work / "marker.txt").write_text("v2\n")
+    _git(["commit", "-q", "-am", "v2"], cwd=work)
+    _git(["push", "-q", str(bare), "HEAD"], cwd=work)
+
+    # without update: still the old commit (cache reuse)
+    provision_plugins(dict(cfg))
+    assert (clone / "marker.txt").read_text().strip() == "v1"
+
+    # with update: fast-forwards to the new commit
+    cfg_update = {
+        "plugin_cache_dir": str(cache),
+        "plugins": [{"cls": "marker.X", "source": str(bare), "update": True}],
+    }
+    provision_plugins(cfg_update)
+    assert (clone / "marker.txt").read_text().strip() == "v2"
+
+
+def test_git_update_with_tag_ref_stays_pinned(tmp_path, monkeypatch, cleanup_syspath):
+    # update: true with an immutable tag ref leaves HEAD detached; provisioning
+    # must not error and must stay pinned even as the branch advances past it.
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "marker.txt").write_text("v1\n")
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "v1"], cwd=work)
+    _git(["tag", "rel1"], cwd=work)
+
+    bare = tmp_path / "repo.git"
+    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+
+    # advance the default branch past the tag
+    (work / "marker.txt").write_text("v2\n")
+    _git(["commit", "-q", "-am", "v2"], cwd=work)
+    _git(["push", "-q", str(bare), "HEAD"], cwd=work)
+
+    monkeypatch.chdir(tmp_path)
+    cache = tmp_path / "cache"
+    cfg = {
+        "plugin_cache_dir": str(cache),
+        "plugins": [
+            {"cls": "marker.X", "source": str(bare), "ref": "rel1", "update": True}
+        ],
+    }
+    provision_plugins(cfg)  # must not raise despite detached HEAD + update
+    clone = next(
+        p for p in cache.iterdir() if p.is_dir() and p.name.startswith("repo-")
+    )
+    assert (clone / "marker.txt").read_text().strip() == "v1"
+
+
 def test_pip_install_requirements_dispatch(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(provisioning, "_run", lambda cmd, cwd=None: calls.append(cmd))
