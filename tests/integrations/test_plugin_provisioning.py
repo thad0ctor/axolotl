@@ -43,13 +43,42 @@ def _make_plugin_module(root, modname="ext_plugin", cls="ExtPlugin"):
     return f"{modname}.{cls}"
 
 
+def _make_plugin_package(root, pkg="disc_plugin", cls="DiscPlugin"):
+    """A package whose __init__ exports a real BasePlugin subclass (for discovery)."""
+    pkgdir = root / pkg
+    pkgdir.mkdir(parents=True, exist_ok=True)
+    (pkgdir / "plugin.py").write_text(
+        "from axolotl.integrations.base import BasePlugin\n"
+        f"class {cls}(BasePlugin):\n    pass\n"
+    )
+    (pkgdir / "__init__.py").write_text(
+        f"from .plugin import {cls}\n__all__ = ['{cls}']\n"
+    )
+    return f"{pkg}.{cls}"
+
+
+_TEST_MODULE_PREFIXES = {
+    "ext_plugin",
+    "nested_plugin",
+    "git_plugin",
+    "utils_ext_plugin",
+    "disc_plugin",
+    "disc_plugin2",
+    "sub_disc_plugin",
+    "empty_pkg",
+    "marker",
+}
+
+
 @pytest.fixture
 def cleanup_syspath():
     before = list(sys.path)
+    before_mods = set(sys.modules)
     yield
     sys.path[:] = before
-    for mod in ("ext_plugin", "nested_plugin", "git_plugin", "utils_ext_plugin"):
-        sys.modules.pop(mod, None)
+    for name in list(sys.modules):
+        if name not in before_mods and name.split(".")[0] in _TEST_MODULE_PREFIXES:
+            sys.modules.pop(name, None)
 
 
 def test_looks_like_git():
@@ -109,6 +138,81 @@ def test_local_source_with_subdir(tmp_path, monkeypatch, cleanup_syspath):
     provision_plugins(cfg)
     assert str(sub) in sys.path
     assert str(root) not in sys.path
+
+
+def test_discovery_no_cls(tmp_path, monkeypatch, cleanup_syspath):
+    src = tmp_path / "repo"
+    expected = _make_plugin_package(src, pkg="disc_plugin", cls="DiscPlugin")
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(src)}],  # no cls -> auto-discover
+    }
+    provision_plugins(cfg)
+    assert cfg["plugins"] == [expected]
+
+
+def test_discovery_with_subdir_no_cls(tmp_path, monkeypatch, cleanup_syspath):
+    root = tmp_path / "repo"
+    expected = _make_plugin_package(root / "src", pkg="sub_disc_plugin", cls="SubDisc")
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(root), "subdir": "src"}],
+    }
+    provision_plugins(cfg)
+    assert cfg["plugins"] == [expected]
+
+
+def test_discovery_multiple_classes_raises(tmp_path, monkeypatch, cleanup_syspath):
+    src = tmp_path / "repo"
+    _make_plugin_package(src, pkg="disc_plugin", cls="DiscA")
+    _make_plugin_package(src, pkg="disc_plugin2", cls="DiscB")
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(src)}],
+    }
+    with pytest.raises(ValueError, match="Multiple plugin classes"):
+        provision_plugins(cfg)
+
+
+def test_discovery_no_class_raises(tmp_path, monkeypatch, cleanup_syspath):
+    src = tmp_path / "repo"
+    pkg = src / "empty_pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("X = 1\n")
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(src)}],
+    }
+    with pytest.raises(ValueError, match="No BasePlugin subclass"):
+        provision_plugins(cfg)
+
+
+def test_discovery_skips_tests_dir(tmp_path, monkeypatch, cleanup_syspath):
+    # A top-level `tests` package (even one with its own BasePlugin subclass) must be
+    # skipped, so discovery still resolves the single real plugin rather than erroring.
+    src = tmp_path / "repo"
+    expected = _make_plugin_package(src, pkg="disc_plugin", cls="DiscPlugin")
+    _make_plugin_package(src, pkg="tests", cls="TestHelperPlugin")  # must be ignored
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"source": str(src)}],
+    }
+    provision_plugins(cfg)
+    assert cfg["plugins"] == [expected]
+
+
+def test_pluginspec_requires_cls_or_source():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PluginSpec()
+    assert PluginSpec(cls="a.B").cls == "a.B"
+    assert PluginSpec(source="/x").source == "/x"
 
 
 def test_subdir_escape_raises(tmp_path, monkeypatch, cleanup_syspath):

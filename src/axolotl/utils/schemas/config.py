@@ -72,9 +72,10 @@ class PluginSpec(BaseModel):
     """External plugin source: clone/resolve a plugin and load it without modifying
     the axolotl install."""
 
-    cls: str = Field(
+    cls: str | None = Field(
+        default=None,
         json_schema_extra={
-            "description": "Dotted path to the plugin class, e.g. 'my_pkg.MyPlugin'."
+            "description": "Dotted path to the plugin class, e.g. 'my_pkg.MyPlugin'. Optional when `source` is given: the single BasePlugin subclass exported by the source is auto-discovered."
         },
     )
     source: str | None = Field(
@@ -114,6 +115,12 @@ class PluginSpec(BaseModel):
         if value is True:
             return "editable"
         return value
+
+    @model_validator(mode="after")
+    def _require_cls_or_source(self):
+        if not self.cls and not self.source:
+            raise ValueError("plugin entry needs at least one of `cls` or `source`")
+        return self
 
 
 class EBFTConfig(BaseModel):

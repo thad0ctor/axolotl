@@ -9,17 +9,19 @@ plugins:
   # Dotted class path — built-in or any package already on PYTHONPATH.
   - axolotl.integrations.liger.LigerPlugin
 
-  # External source: cloned + put on sys.path, no manual install needed.
-  - cls: my_plugin.MyPlugin          # dotted path to the plugin class
-    source: https://github.com/org/repo.git   # git URL or local path
+  # External source, `cls` auto-discovered from the package.
+  - source: https://github.com/org/repo.git   # git URL or local path
     ref: v1.2.0                      # branch / tag / commit (SHA recommended)
+
+  # Explicit class + options.
+  - cls: my_plugin.MyPlugin          # dotted path to the plugin class
+    source: https://github.com/org/repo.git
     subdir: src                      # dir within source added to sys.path
     pip_install: editable            # false | editable | requirements
     update: false                    # re-fetch a cached git source
 
   # Local directory (no clone — resolved + path-injected).
-  - cls: local_plugin.Thing
-    source: ./plugins/local_plugin
+  - source: ./plugins/local_plugin
 ```
 
 The string form is unchanged and fully backward compatible. Mapping entries are normalized to dotted class paths before validation, so all downstream code still sees `list[str]`.
@@ -28,14 +30,26 @@ The string form is unchanged and fully backward compatible. Mapping entries are 
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `cls` | yes | Dotted path to the plugin class to load (`module.ClassName`). |
-| `source` | no | Git URL or local path. Cloned if it ends in `.git` or starts with `http(s)://`/`git://`/`ssh://`/`git@`; otherwise treated as a local path. Omit if `cls` is already importable. |
+| `cls` | no¹ | Dotted path to the plugin class (`module.ClassName`). Auto-discovered from `source` when omitted. |
+| `source` | no¹ | Git URL or local path. Cloned if it ends in `.git` or starts with `http(s)://`/`git://`/`ssh://`/`git@`; otherwise treated as a local path. Omit if `cls` is already importable. |
 | `ref` | no | Git branch, tag, or commit. Pin to a commit SHA for reproducibility. |
 | `subdir` | no | Subdirectory of the source to add to `sys.path`. |
 | `pip_install` | no | `false` (default) = path injection only; `editable` = `pip install -e` (falls back to `requirements` if not a package); `requirements` = `pip install -r requirements.txt`. |
 | `update` | no | Re-fetch + re-checkout a cached git source. |
 
+¹ At least one of `cls` or `source` is required.
+
 `pip_install` only ever installs the plugin and its deps — it never modifies the axolotl install.
+
+## Auto-discovery convention
+
+When `cls` is omitted, Axolotl imports the package(s) under the source (or its `subdir`) and uses the single `BasePlugin` subclass found. For a plugin to be discoverable: ship it as an importable package whose top-level `__init__.py` exports **exactly one** `BasePlugin` subclass. Discovery skips `tests/`, `docs/`, `examples/`, `build/`, `dist/`. Zero or multiple matches → it raises and asks for an explicit `cls`. Simplest discoverable layout (no `subdir` needed):
+
+```
+my-plugin/pyproject.toml
+my-plugin/my_plugin/__init__.py   # from .plugin import MyPlugin; __all__ = ["MyPlugin"]
+my-plugin/my_plugin/plugin.py     # class MyPlugin(BasePlugin): ...
+```
 
 ## Cache Directory
 

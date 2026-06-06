@@ -23,6 +23,7 @@ class paths, so every downstream consumer keeps seeing ``list[str]``.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import os
 import subprocess  # nosec
 import sys
@@ -168,8 +169,12 @@ def _add_to_syspath(path: Path) -> None:
         LOG.info("Added plugin path to sys.path: %s", p)
 
 
-def _provision_one(spec, cache_dir: Path, base_dir: Path) -> None:
-    """Clone/resolve a single external plugin and wire it into the environment."""
+def _provision_one(spec, cache_dir: Path, base_dir: Path) -> Path:
+    """Clone/resolve a single external plugin and wire it into the environment.
+
+    Returns the directory the plugin package lives under (root + subdir), used both
+    for sys.path injection and for class auto-discovery.
+    """
     # Serialize clone + install across ranks/processes that share this cache.
     lock = FileLock(str(cache_dir / f"{_source_key(spec.source, spec.ref)}.lock"))
     with lock:
@@ -184,10 +189,84 @@ def _provision_one(spec, cache_dir: Path, base_dir: Path) -> None:
             root = _resolve_local(spec.source, base_dir)
         if spec.pip_install:
             _pip_install(spec.pip_install, root)
+    search_path = _resolve_subdir(root, spec.subdir)
     # An editable install already exposes the package; sys.path injection is only
     # needed when we load the plugin straight from the source tree.
     if spec.pip_install != "editable":
-        _add_to_syspath(_resolve_subdir(root, spec.subdir))
+        _add_to_syspath(search_path)
+    return search_path
+
+
+# Directories/modules that are never the plugin package; skip during discovery.
+_DISCOVERY_SKIP_DIRS = {
+    "tests",
+    "test",
+    "docs",
+    "examples",
+    "benchmarks",
+    "build",
+    "dist",
+}
+_DISCOVERY_SKIP_MODS = {"setup", "conftest"}
+
+
+def _candidate_modules(search_dir: Path) -> list[str]:
+    """Top-level importable names under search_dir, preferring packages over modules."""
+    packages, modules = [], []
+    for entry in sorted(search_dir.iterdir()):
+        name = entry.name
+        if name.startswith((".", "_")):
+            continue
+        if entry.is_dir() and (entry / "__init__.py").exists():
+            if name not in _DISCOVERY_SKIP_DIRS:
+                packages.append(name)
+        elif entry.is_file() and name.endswith(".py"):
+            mod = name[:-3]
+            if mod not in _DISCOVERY_SKIP_MODS and not mod.startswith("test_"):
+                modules.append(mod)
+    # Loose modules (e.g. setup.py) are only imported when there's no real package.
+    return packages or modules
+
+
+def _discover_plugin_cls(search_dir: Path) -> str:
+    """Find the single BasePlugin subclass exported by the package(s) under search_dir.
+
+    Standard plugin layout: an importable package whose top-level ``__init__`` exports
+    exactly one ``BasePlugin`` subclass. Raises if zero or several are found, so the
+    user knows to set ``cls`` explicitly.
+    """
+    from axolotl.integrations.base import BasePlugin
+
+    found: list[str] = []
+    for modname in _candidate_modules(search_dir):
+        try:
+            module = importlib.import_module(modname)
+        except Exception as exc:  # a non-plugin or dep-short module; skip it
+            LOG.debug("Skipping %s during plugin discovery: %s", modname, exc)
+            continue
+        for attr, obj in vars(module).items():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, BasePlugin)
+                and obj is not BasePlugin
+                and (
+                    obj.__module__ == modname
+                    or obj.__module__.startswith(modname + ".")
+                )
+            ):
+                found.append(f"{modname}.{attr}")
+
+    found = sorted(set(found))
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise ValueError(
+            f"No BasePlugin subclass found under {search_dir}. Export your plugin "
+            "from the package's __init__, or set `cls` explicitly."
+        )
+    raise ValueError(
+        f"Multiple plugin classes found ({', '.join(found)}); set `cls` to pick one."
+    )
 
 
 def provision_plugins(cfg) -> None:
@@ -209,7 +288,11 @@ def provision_plugins(cfg) -> None:
             normalized.append(entry)
             continue
         spec = entry if isinstance(entry, PluginSpec) else PluginSpec(**dict(entry))
-        if spec.source:
-            _provision_one(spec, cache_dir, base_dir)
-        normalized.append(spec.cls)
+        search_path = _provision_one(spec, cache_dir, base_dir) if spec.source else None
+        if spec.cls:
+            normalized.append(spec.cls)
+        elif search_path is not None:
+            normalized.append(_discover_plugin_cls(search_path))
+        else:
+            raise ValueError("plugin entry needs `cls` when no `source` is given")
     cfg["plugins"] = normalized
