@@ -135,6 +135,16 @@ def _pip_install(mode: str, repo: Path) -> None:
             LOG.warning("No requirements.txt found in %s; nothing to install", repo)
 
 
+def _resolve_subdir(root: Path, subdir: str | None) -> Path:
+    if not subdir:
+        return root
+    root = root.resolve()
+    path = (root / subdir).resolve()
+    if path != root and not path.is_relative_to(root):
+        raise ValueError(f"subdir {subdir!r} escapes the plugin source root {root}")
+    return path
+
+
 def _add_to_syspath(path: Path) -> None:
     p = str(path)
     if p not in sys.path:
@@ -161,7 +171,7 @@ def _provision_one(spec, cache_dir: Path, base_dir: Path) -> None:
     # An editable install already exposes the package; sys.path injection is only
     # needed when we load the plugin straight from the source tree.
     if spec.pip_install != "editable":
-        _add_to_syspath(root / spec.subdir if spec.subdir else root)
+        _add_to_syspath(_resolve_subdir(root, spec.subdir))
 
 
 def provision_plugins(cfg) -> None:

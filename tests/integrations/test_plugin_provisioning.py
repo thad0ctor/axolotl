@@ -48,7 +48,7 @@ def cleanup_syspath():
     before = list(sys.path)
     yield
     sys.path[:] = before
-    for mod in ("ext_plugin", "nested_plugin", "git_plugin"):
+    for mod in ("ext_plugin", "nested_plugin", "git_plugin", "utils_ext_plugin"):
         sys.modules.pop(mod, None)
 
 
@@ -109,6 +109,51 @@ def test_local_source_with_subdir(tmp_path, monkeypatch, cleanup_syspath):
     provision_plugins(cfg)
     assert str(sub) in sys.path
     assert str(root) not in sys.path
+
+
+def test_subdir_escape_raises(tmp_path, monkeypatch, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    _make_plugin_module(src)
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"cls": "x.Y", "source": str(src), "subdir": "../../etc"}],
+    }
+    with pytest.raises(ValueError):
+        provision_plugins(cfg)
+
+
+def test_absolute_subdir_escape_raises(tmp_path, monkeypatch, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    _make_plugin_module(src)
+    monkeypatch.chdir(tmp_path)
+    cfg = {
+        "plugin_cache_dir": str(tmp_path / "cache"),
+        "plugins": [{"cls": "x.Y", "source": str(src), "subdir": "/etc"}],
+    }
+    with pytest.raises(ValueError):
+        provision_plugins(cfg)
+
+
+def test_utils_config_prepare_plugins_provisions(
+    tmp_path, monkeypatch, cleanup_syspath
+):
+    # The `axolotl.utils.config` entry point (used by tests/docs) must provision
+    # external sources too, not just `axolotl.cli.config`.
+    from axolotl.utils.config import prepare_plugins as utils_prepare_plugins
+    from axolotl.utils.dict import DictDefault
+
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src, modname="utils_ext_plugin", cls="UtilsPlugin")
+    monkeypatch.chdir(tmp_path)
+    cfg = DictDefault(
+        {
+            "plugin_cache_dir": str(tmp_path / "cache"),
+            "plugins": [{"cls": cls, "source": str(src)}],
+        }
+    )
+    utils_prepare_plugins(cfg)
+    assert cfg["plugins"] == [cls]
 
 
 def test_relative_local_source_missing_raises(tmp_path, monkeypatch):
