@@ -38,7 +38,7 @@ done
 [[ ${#CFGS[@]} -gt 0 ]] || { echo "usage: $0 [--gpu N] [--steps N2] cfg.yaml ..."; exit 2; }
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src"
-PY="$VENV/bin/python"; AX="$VENV/bin/axolotl"
+PY="$VENV/bin/python"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH="$SRC"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -64,7 +64,7 @@ runwall(){ # $1=cfg $2=steps -> echoes train_runtime (or empty on fail); writes 
   # if the config had no max_steps line, sed leaves it absent -> the run would do
   # a FULL EPOCH and the marginal math is wrong. Force it.
   grep -q "^max_steps:" "$LOGDIR/run.yaml" || echo "max_steps: $steps" >> "$LOGDIR/run.yaml"
-  "$AX" train "$LOGDIR/run.yaml" --launcher python > "$log" 2>&1 || true
+  "$PY" -m axolotl.cli.main train "$LOGDIR/run.yaml" --launcher python > "$log" 2>&1 || true
   grep -oE "train_runtime': '([0-9.]+)'" "$log" | grep -oE "[0-9.]+" | tail -1 || true
 }
 
