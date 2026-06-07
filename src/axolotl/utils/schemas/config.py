@@ -1799,42 +1799,29 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "validation and these flags will be ignored on any other architecture."
             )
 
-        # Resolve base_mode the same way patch_manager does (explicit wins; else
-        # qlora/quantize_base => storage, else compute). FSDP all-gather hooks are
-        # only wired for the storage path (NVFP4FrozenBaseLinear); compute-base FP4
-        # buffers would be sharded with no reassembly -> silent wrong results.
-        _resolved_base_mode = self.nvfp4_training.base_mode
-        if _resolved_base_mode is None:
-            _resolved_base_mode = (
-                "storage"
-                if (self.nvfp4_training.quantize_base or self.adapter == "qlora")
-                else "compute"
-            )
+        # compute-base + FSDP shards via the all-gather hooks (all-ranks loading).
+        # rank-0 broadcast loading (cpu_ram_efficient_loading) of the transposed
+        # compute FP4 layouts is unstable (segfault), so require it off for
+        # compute+FSDP. storage+FSDP supports it via the FP4 broadcast handler.
         if (
             self.adapter
-            and _resolved_base_mode == "compute"
             and self.fsdp_config is not None
-        ):
-            raise ValueError(
-                "nvfp4_training base_mode=compute is not supported under FSDP: the "
-                "compute-base FP4 buffers have no FSDP all-gather hooks, so sharding "
-                "produces silently wrong results. Use nvfp4_training.base_mode: "
-                "storage under FSDP, or run compute-base with DDP."
-            )
-        # FSDP cpu_ram_efficient_loading broadcasts rank-0 params at init via
-        # c10d.broadcast_, which the packed FP4 base tensor (FSDPNVFP4Tensor) does
-        # not implement -> "attempting to run unimplemented operator c10d.broadcast_".
-        # Storage+FSDP works with all-ranks loading instead.
-        if (
-            self.fsdp_config is not None
             and getattr(self.fsdp_config, "cpu_ram_efficient_loading", None)
         ):
-            raise ValueError(
-                "nvfp4_training under FSDP requires fsdp_config.cpu_ram_efficient_"
-                "loading: false — the packed NVFP4 base tensor cannot be NCCL-"
-                "broadcast from rank 0 at init. Set it to false so every rank loads "
-                "the base weights locally."
-            )
+            _bm = self.nvfp4_training.base_mode
+            if _bm is None:
+                _bm = (
+                    "storage"
+                    if (self.nvfp4_training.quantize_base or self.adapter == "qlora")
+                    else "compute"
+                )
+            if _bm == "compute":
+                raise ValueError(
+                    "nvfp4_training base_mode=compute under FSDP requires "
+                    "fsdp_config.cpu_ram_efficient_loading: false (the transposed "
+                    "compute FP4 layouts can't be safely rank-0 broadcast). Set it "
+                    "false, or use nvfp4_training.base_mode: storage."
+                )
 
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
         # modules (detected via is_nvfp4_base in kernels/lora.py), so the native

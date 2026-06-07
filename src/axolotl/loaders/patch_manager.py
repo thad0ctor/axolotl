@@ -443,8 +443,11 @@ class PatchManager:
                         "torchao fallback (MSLK not installed); this is compile-safe "
                         "but slower. Install MSLK for the faster custom-op quant path."
                     )
-            # FP4-stored base needs the NVFP4 all-gather hooks to shard under FSDP2.
-            use_fsdp = quantized_storage and bool(self.cfg.fsdp_config)
+            # Both FP4 base modes need the NVFP4 all-gather hooks to shard under
+            # FSDP2 (storage: one layout; compute: fprop+dgrad layouts).
+            use_fsdp = (quantized_storage or compute_base) and bool(
+                self.cfg.fsdp_config
+            )
             count = convert_lora_base_to_nvfp4(
                 model,
                 recipe,

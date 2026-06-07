@@ -586,6 +586,34 @@ def _fsdp_nvfp4_class():
         def __torch_dispatch__(cls, func, types, args, kwargs=None):
             kwargs = kwargs or {}
 
+            # cpu_ram_efficient_loading broadcasts rank-0 params at init. The base
+            # NVFP4Tensor op table has no c10d.broadcast_, so broadcast each inner
+            # component (qdata/scale/per_tensor_scale) with the same collective args
+            # — the op is in-place, so the wrapper's storage updates. Schema returns
+            # (Tensor[], Work); hand back the original wrappers + the last Work for
+            # the caller (dist.broadcast, async_op=False) to wait on.
+            if func is torch.ops.c10d.broadcast_.default:
+                tensors = args[0]
+                rest = args[1:]
+                last_work = None
+                for t in tensors:
+                    if isinstance(t, NVFP4Tensor):
+                        comps = (t.qdata, t.scale, t.per_tensor_scale)
+                    else:
+                        comps = (t,)
+                    for inner in comps:
+                        if inner is None:
+                            continue
+                        # Inner components are contiguous for the storage layout.
+                        # (compute's transposed layouts are not broadcast-loaded —
+                        # the validator requires cpu_ram_efficient_loading:false for
+                        # compute+FSDP, since broadcasting the sharded transposed
+                        # FP4 views is unstable.)
+                        _out, last_work = torch.ops.c10d.broadcast_.default(
+                            [inner], *rest
+                        )
+                return tensors, last_work
+
             # FSDP2 allocates the sharded param storage with empty_like, then
             # populates it with copy_ — neither is in torchao's op table.
             if func is aten.empty_like.default:
@@ -867,7 +895,15 @@ class NVFP4ComputeBaseFunction(torch.autograd.Function):
         out = _addmm_nvfp4_dispatch(
             _quantize(x2d_p, QuantPolicy()), w_fprop, torch.ops.aten.mm.default
         )[:m]
-        ctx.w_dgrad = w_dgrad
+        # FSDP2 frees the all-gathered weight after forward and does not re-gather
+        # the FROZEN base for backward, so a saved reference would read freed
+        # storage (-> NaN dgrad). Under FSDP, snapshot the packed FP4 dgrad layout
+        # into independent storage; the plain path keeps the zero-copy reference.
+        ctx.w_dgrad = (
+            _clone_nvfp4_data(w_dgrad)
+            if hasattr(w_dgrad, "fsdp_pre_all_gather")
+            else w_dgrad
+        )
         ctx.recipe = recipe
         ctx.x_shape = orig_shape
         ctx.out_features = w_fprop.shape[1]
@@ -922,13 +958,19 @@ class NVFP4ComputeBaseLinear(nn.Module):
 
     @classmethod
     def from_linear(
-        cls, linear: nn.Linear, recipe: NVFP4Recipe
+        cls, linear: nn.Linear, recipe: NVFP4Recipe, *, fsdp: bool = False
     ) -> "NVFP4ComputeBaseLinear":
         w = linear.weight.detach()  # [N, K]
         # fprop b-operand represents W.T ([K,N]): quantize W then transpose.
         w_fprop = _quantize(w, QuantPolicy()).t()
         # dgrad b-operand represents W ([N,K]) blocked along N: quantize W.T then transpose.
         w_dgrad = _quantize(w.t().contiguous(), QuantPolicy()).t()
+        # FSDP2 shards each FP4 layout by row; the all-gather hooks live on the
+        # FSDP subclass. Wrap both buffers independently (they shard on different
+        # axes — fprop along K, dgrad along N — but each reassembles on its own).
+        if fsdp:
+            w_fprop = _to_fsdp_nvfp4(w_fprop)
+            w_dgrad = _to_fsdp_nvfp4(w_dgrad)
         return cls(w_fprop, w_dgrad, linear.bias, recipe)
 
 
@@ -2726,9 +2768,16 @@ def convert_lora_base_to_nvfp4(
             base = base.to(target)  # stream this layer to the GPU
             streamed = True
         if compute_base:
-            fast = _mslk_available()
-            cls = NVFP4FastComputeBaseLinear if fast else NVFP4ComputeBaseLinear
-            module.base_layer = cls.from_linear(base, recipe)
+            # MSLK-fast compute stores raw uint8/fp8 buffers (no NVFP4Tensor
+            # subclass to hook), so it can't shard under FSDP — fall back to the
+            # torchao compute class (which carries the all-gather hooks) under FSDP.
+            fast = _mslk_available() and not fsdp
+            if fast:
+                module.base_layer = NVFP4FastComputeBaseLinear.from_linear(base, recipe)
+            else:
+                module.base_layer = NVFP4ComputeBaseLinear.from_linear(
+                    base, recipe, fsdp=fsdp
+                )
         elif quantized_storage:
             # MSLK-fused storage has no FSDP all-gather hooks yet, so keep the
             # torchao NVFP4FrozenBaseLinear (which carries them) under FSDP.
@@ -2765,7 +2814,7 @@ def convert_lora_base_to_nvfp4(
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
     if compute_base:
-        mode = "compute (mslk-fast)" if _mslk_available() else "compute"
+        mode = "compute (mslk-fast)" if (_mslk_available() and not fsdp) else "compute"
     elif quantized_storage:
         mode = "storage (mslk-fast)" if (_mslk_available() and not fsdp) else "storage"
     else:
