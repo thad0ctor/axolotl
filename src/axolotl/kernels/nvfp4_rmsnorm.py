@@ -126,6 +126,9 @@ def _fused_rmsnorm_nvfp4_kernel(
     tl.store(q_ptr + (q_offs_m * (N // 2) + q_offs_n), x_fp4x2, mask=q_mask)
 
 
+# See kernels/swiglu.py: run eager under torch.compile so the raw triton launch
+# isn't traced into the compiled graph (decompose_triton_kernel_wrapper_functional).
+@torch.compiler.disable
 def fused_rmsnorm_nvfp4(
     x: torch.Tensor,
     weight: torch.Tensor,

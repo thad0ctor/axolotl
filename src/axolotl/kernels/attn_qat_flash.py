@@ -556,6 +556,11 @@ class _AttnQatFlash(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None
 
 
+# See kernels/swiglu.py: run eager under torch.compile so the raw triton flash
+# kernels don't leak into the compiled backward (decompose_triton_kernel_wrapper_
+# functional). Inductor compiles around this op (graph break), like the native
+# NVFP4 attention path.
+@torch.compiler.disable
 def fused_nvfp4_qat_attention(
     query: torch.Tensor,
     key: torch.Tensor,
