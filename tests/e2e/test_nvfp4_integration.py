@@ -236,6 +236,69 @@ def test_gate_refuses_qwen3_5_switch_on_other_model(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("mct", ["qwen3_vl", "qwen3_5", "qwen3_5_moe"])
+def test_gate_allows_nvfp4_attention_on_supported_models(monkeypatch, mct):
+    # The native NVFP4 attention path (attention.enabled + backward.*) is allowed
+    # on Qwen3.5/MoE AND Qwen3-VL (each has its own forward patch).
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        model_config_type=mct,
+        nvfp4_training={
+            "enabled": True,
+            "attention": {
+                "enabled": True,
+                "backward": {"enabled": True, "save_packs": True},
+            },
+        },
+    )
+    assert cfg.nvfp4_training.attention.enabled is True
+
+
+def test_gate_refuses_nvfp4_attention_on_unsupported_model(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="nvfp4_training.attention requires"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="llama",
+            nvfp4_training={"enabled": True, "attention": {"enabled": True}},
+        )
+
+
+@pytest.mark.parametrize(
+    "attn_extra",
+    [{"fuse_vproj": True}, {"fp4_projections": True}],
+)
+def test_gate_refuses_qwen3_5_only_attn_flags_on_qwen3_vl(monkeypatch, attn_extra):
+    # fuse_vproj / fp4_projections are Qwen3.5/MoE-only fast paths; not on Qwen3-VL.
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="Qwen3.5/MoE-only"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_vl",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {"enabled": True, **attn_extra},
+            },
+        )
+
+
+@pytest.mark.parametrize("flag", ["linear_attn", "mlp"])
+def test_gate_refuses_qwen3_5_only_module_flags_on_qwen3_vl(monkeypatch, flag):
+    # DeltaNet linear_attn / Qwen3.5 MLP are Qwen3.5/MoE-only; not on Qwen3-VL.
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="Qwen3.5/MoE-only"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_vl",
+            nvfp4_training={"enabled": True, flag: True},
+        )
+
+
 def test_gate_refuses_unsupported_hardware(monkeypatch):
     _supported(monkeypatch, False, "no Blackwell here")
     with pytest.raises(ValueError, match="no Blackwell here"):
@@ -522,6 +585,82 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
     assert captured["save_backward_packs"] is True
     assert captured["dkdv_scratch_bf16"] is True
     assert captured["train_backward"] is True
+
+
+def test_apply_qwen3_vl_routes_to_vl_attention_not_qwen3_5(monkeypatch):
+    # qwen3_vl must dispatch to the VL patch (standard attn + mRoPE), NOT the
+    # Qwen3.5 gated patch, and forward the backward/SR knobs. fuse_vproj/
+    # fp4_projections are Qwen3.5-only and must not be passed to the VL patch.
+    _supported(monkeypatch, True)
+    from axolotl.monkeypatch.attention import nvfp4_flash_attn, nvfp4_flash_attn_vl
+
+    vl_captured = {}
+
+    def fake_vl(_model, **kwargs):
+        vl_captured.update(kwargs)
+        return 36
+
+    def fail_qwen35(*_a, **_k):  # pragma: no cover - must not be called
+        raise AssertionError("qwen3_vl must not call the Qwen3.5 attention patch")
+
+    monkeypatch.setattr(
+        nvfp4_flash_attn_vl, "patch_qwen3_vl_nvfp4_attention", fake_vl
+    )
+    monkeypatch.setattr(
+        nvfp4_flash_attn, "patch_qwen3_5_nvfp4_attention", fail_qwen35
+    )
+    pm = _patch_manager(
+        {
+            "model_config_type": "qwen3_vl",
+            "nvfp4_training": {
+                "enabled": True,
+                "stochastic_rounding": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {
+                        "enabled": True,
+                        "rtn_grad_packs": True,
+                        "save_packs": True,
+                        "dkdv_scratch_bf16": True,
+                    },
+                },
+            },
+        }
+    )
+
+    pm._apply_qwen3_5_native_nvfp4_patches(object())
+
+    assert vl_captured["train_backward"] is True
+    assert vl_captured["save_backward_packs"] is True
+    assert vl_captured["dkdv_scratch_bf16"] is True
+    assert vl_captured["backward_rtn_grad_packs"] is True
+    assert vl_captured["stochastic_rounding"] is True
+    # VL patch has no fuse_vproj / fp4_projections params.
+    assert "fuse_vproj" not in vl_captured
+    assert "fuse_attn_proj" not in vl_captured
+
+
+def test_apply_qwen3_vl_skips_attention_when_disabled(monkeypatch):
+    _supported(monkeypatch, True)
+    from axolotl.monkeypatch.attention import nvfp4_flash_attn_vl
+
+    called = {"n": 0}
+
+    def fake_vl(_model, **_kwargs):
+        called["n"] += 1
+        return 0
+
+    monkeypatch.setattr(
+        nvfp4_flash_attn_vl, "patch_qwen3_vl_nvfp4_attention", fake_vl
+    )
+    pm = _patch_manager(
+        {
+            "model_config_type": "qwen3_vl",
+            "nvfp4_training": {"enabled": True, "attention": {"enabled": False}},
+        }
+    )
+    pm._apply_qwen3_5_native_nvfp4_patches(object())
+    assert called["n"] == 0
 
 
 def test_qwen3_5_packing_patch_forwards_fla_compile_boundary(monkeypatch):
