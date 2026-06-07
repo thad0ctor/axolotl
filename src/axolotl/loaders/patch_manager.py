@@ -574,10 +574,31 @@ class PatchManager:
         nvfp4 = self.cfg.nvfp4_training
         if not (nvfp4 and nvfp4.enabled):
             return
+        attn = nvfp4.attention
+
+        # Qwen3-VL: standard (non-gated) attention + multimodal mRoPE -> dedicated
+        # VL patch (the Qwen3.5 patch assumes gated q + plain RoPE). Only the
+        # attention path applies; VL has no DeltaNet linear_attn / Qwen3.5 MLP.
+        if self.cfg.model_config_type == "qwen3_vl":
+            if attn.enabled:
+                from axolotl.monkeypatch.attention.nvfp4_flash_attn_vl import (
+                    patch_qwen3_vl_nvfp4_attention,
+                )
+
+                patch_qwen3_vl_nvfp4_attention(
+                    model,
+                    train_backward=attn.backward.enabled,
+                    backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
+                    save_backward_packs=attn.backward.save_packs,
+                    dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
+                    compile_custom_op=bool(attn.backward.compile_custom_op),
+                    stochastic_rounding=nvfp4.stochastic_rounding,
+                )
+            return
+
         if self.cfg.model_config_type not in ("qwen3_5", "qwen3_5_moe"):
             return
 
-        attn = nvfp4.attention
         if attn.enabled:
             from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
                 patch_qwen3_5_nvfp4_attention,

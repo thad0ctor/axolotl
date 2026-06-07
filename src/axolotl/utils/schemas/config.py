@@ -1761,13 +1761,18 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "fused_fp4_cross_entropy/fp8_lm_head_cross_entropy."
             )
         _attn = self.nvfp4_training.attention
-        qwen3_5_native_flags = (
+        # The native NVFP4 attention path (attention.enabled + its backward knobs)
+        # is supported on Qwen3.5/MoE AND Qwen3-VL (each has its own forward patch).
+        attn_native_flags = (
             _attn.enabled,
             _attn.backward.enabled,
             _attn.backward.rtn_grad_packs,
             _attn.backward.save_packs,
             _attn.backward.dkdv_scratch_bf16,
             _attn.backward.compile_custom_op,
+        )
+        # These remain Qwen3.5/MoE-only (gated q fast-path / DeltaNet hybrid / MLP).
+        qwen3_5_only_flags = (
             _attn.fuse_vproj,
             _attn.fp4_projections,
             self.nvfp4_training.fla_causal_conv_compile_boundary,
@@ -1775,28 +1780,38 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
             self.nvfp4_training.mlp,
         )
         model_config_type = getattr(self, "model_config_type", None)
+        _attn_ok = ("qwen3_5", "qwen3_5_moe", "qwen3_vl")
         if (
             model_config_type is not None
-            and any(qwen3_5_native_flags)
-            and model_config_type
-            not in (
-                "qwen3_5",
-                "qwen3_5_moe",
-            )
+            and any(attn_native_flags)
+            and model_config_type not in _attn_ok
         ):
             raise ValueError(
-                "nvfp4_training Qwen3.5 native switches require "
-                "model_config_type: qwen3_5 or qwen3_5_moe."
+                "nvfp4_training.attention requires model_config_type: qwen3_5, "
+                "qwen3_5_moe, or qwen3_vl."
+            )
+        if (
+            model_config_type is not None
+            and any(qwen3_5_only_flags)
+            and model_config_type not in ("qwen3_5", "qwen3_5_moe")
+        ):
+            raise ValueError(
+                "nvfp4_training.attention.fuse_vproj/fp4_projections and "
+                "linear_attn/mlp/fla_causal_conv_compile_boundary are Qwen3.5/MoE-"
+                "only; not supported on model_config_type "
+                f"{model_config_type!r}."
             )
         # model_config_type may resolve after the model config loads, so don't
         # hard-error when it is still None here — but these switches silently
-        # no-op on non-qwen3_5 (the patch step returns early), so warn.
-        if model_config_type is None and any(qwen3_5_native_flags):
+        # no-op on unsupported architectures (the patch step returns early), warn.
+        if model_config_type is None and (
+            any(attn_native_flags) or any(qwen3_5_only_flags)
+        ):
             LOG.warning(
-                "nvfp4_training Qwen3.5 native switches (attention.*, linear_attn, "
-                "mlp, fla_causal_conv_compile_boundary) require model_config_type "
-                "qwen3_5 or qwen3_5_moe; model_config_type is unresolved during "
-                "validation and these flags will be ignored on any other architecture."
+                "nvfp4_training native switches require a supported model "
+                "(attention: qwen3_5/qwen3_5_moe/qwen3_vl; linear_attn/mlp/"
+                "fuse_vproj/fp4_projections: qwen3_5/qwen3_5_moe). model_config_type "
+                "is unresolved during validation; unsupported flags will be ignored."
             )
 
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
