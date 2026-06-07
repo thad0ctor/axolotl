@@ -136,7 +136,12 @@ def _gather_per_rank_peak_bytes(
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+    # Use a CUDA tensor whenever CUDA is available: the GPU collective (NCCL) has
+    # no CPU backend, and under FSDP2 / device-mesh PGs dist.get_backend() returns
+    # a composite string (e.g. "cuda:nccl,cpu:gloo"), not bare "nccl" — relying on
+    # that string sent the gather tensor to CPU and crashed ("No backend type
+    # associated with device type cpu"). Fall back to CPU only when there's no CUDA.
+    if torch.cuda.is_available():
         device = torch.device("cuda", torch.cuda.current_device())
     else:
         device = torch.device("cpu")
