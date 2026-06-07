@@ -1821,6 +1821,20 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "produces silently wrong results. Use nvfp4_training.base_mode: "
                 "storage under FSDP, or run compute-base with DDP."
             )
+        # FSDP cpu_ram_efficient_loading broadcasts rank-0 params at init via
+        # c10d.broadcast_, which the packed FP4 base tensor (FSDPNVFP4Tensor) does
+        # not implement -> "attempting to run unimplemented operator c10d.broadcast_".
+        # Storage+FSDP works with all-ranks loading instead.
+        if (
+            self.fsdp_config is not None
+            and getattr(self.fsdp_config, "cpu_ram_efficient_loading", None)
+        ):
+            raise ValueError(
+                "nvfp4_training under FSDP requires fsdp_config.cpu_ram_efficient_"
+                "loading: false — the packed NVFP4 base tensor cannot be NCCL-"
+                "broadcast from rank 0 at init. Set it to false so every rank loads "
+                "the base weights locally."
+            )
 
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
         # modules (detected via is_nvfp4_base in kernels/lora.py), so the native
