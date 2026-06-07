@@ -1799,30 +1799,6 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "validation and these flags will be ignored on any other architecture."
             )
 
-        # compute-base + FSDP shards via the all-gather hooks (all-ranks loading).
-        # rank-0 broadcast loading (cpu_ram_efficient_loading) of the transposed
-        # compute FP4 layouts is unstable (segfault), so require it off for
-        # compute+FSDP. storage+FSDP supports it via the FP4 broadcast handler.
-        if (
-            self.adapter
-            and self.fsdp_config is not None
-            and getattr(self.fsdp_config, "cpu_ram_efficient_loading", None)
-        ):
-            _bm = self.nvfp4_training.base_mode
-            if _bm is None:
-                _bm = (
-                    "storage"
-                    if (self.nvfp4_training.quantize_base or self.adapter == "qlora")
-                    else "compute"
-                )
-            if _bm == "compute":
-                raise ValueError(
-                    "nvfp4_training base_mode=compute under FSDP requires "
-                    "fsdp_config.cpu_ram_efficient_loading: false (the transposed "
-                    "compute FP4 layouts can't be safely rank-0 broadcast). Set it "
-                    "false, or use nvfp4_training.base_mode: storage."
-                )
-
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
         # modules (detected via is_nvfp4_base in kernels/lora.py), so the native
         # backend is allowed with the kernels. The te backend still bypasses them:

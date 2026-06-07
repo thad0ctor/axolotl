@@ -604,11 +604,9 @@ def _fsdp_nvfp4_class():
                     for inner in comps:
                         if inner is None:
                             continue
-                        # Inner components are contiguous for the storage layout.
-                        # (compute's transposed layouts are not broadcast-loaded —
-                        # the validator requires cpu_ram_efficient_loading:false for
-                        # compute+FSDP, since broadcasting the sharded transposed
-                        # FP4 views is unstable.)
+                        # Inner qdata/scale are contiguous for both base modes
+                        # (storage and compute store non-transposed NVFP4Tensors),
+                        # so the broadcast is a plain contiguous collective.
                         _out, last_work = torch.ops.c10d.broadcast_.default(
                             [inner], *rest
                         )
@@ -892,8 +890,12 @@ class NVFP4ComputeBaseFunction(torch.autograd.Function):
         orig_shape = x.shape
         x2d = x.reshape(-1, orig_shape[-1])
         x2d_p, m = _pad_to_block(x2d, 0)
+        # w_fprop is stored CONTIGUOUS ([N,K], blocked along K); .t() gives the
+        # [K,N] b-operand (addmm wants b.qdata.t() contiguous). Transposing at
+        # GEMM time (not at store) keeps the buffer's inner qdata/scale contiguous
+        # so FSDP2 rank-0 broadcast (cpu_ram_efficient_loading) can broadcast them.
         out = _addmm_nvfp4_dispatch(
-            _quantize(x2d_p, QuantPolicy()), w_fprop, torch.ops.aten.mm.default
+            _quantize(x2d_p, QuantPolicy()), w_fprop.t(), torch.ops.aten.mm.default
         )[:m]
         # FSDP2 frees the all-gathered weight after forward and does not re-gather
         # the FROZEN base for backward, so a saved reference would read freed
@@ -906,7 +908,7 @@ class NVFP4ComputeBaseFunction(torch.autograd.Function):
         )
         ctx.recipe = recipe
         ctx.x_shape = orig_shape
-        ctx.out_features = w_fprop.shape[1]
+        ctx.out_features = w_fprop.shape[0]
         return out.reshape(*orig_shape[:-1], ctx.out_features)
 
     @staticmethod
@@ -919,9 +921,11 @@ class NVFP4ComputeBaseFunction(torch.autograd.Function):
             g_p, m = _pad_to_block(g, 0)
             # dgrad: gx[M,K] = g[M,N] @ W[N,K]; W pre-quantized along N (contraction)
             g_q = _quantize(g_p, QuantPolicy(stochastic=ctx.recipe.stochastic_rounding))
-            grad_x = _addmm_nvfp4_dispatch(g_q, ctx.w_dgrad, torch.ops.aten.mm.default)[
-                :m
-            ]
+            # w_dgrad is stored CONTIGUOUS ([K,N], blocked along N); .t() gives the
+            # [N,K] b-operand (W blocked along N, the dgrad contraction axis).
+            grad_x = _addmm_nvfp4_dispatch(
+                g_q, ctx.w_dgrad.t(), torch.ops.aten.mm.default
+            )[:m]
             grad_x = grad_x.reshape(ctx.x_shape)
         return grad_x, None, None, None
 
@@ -938,12 +942,16 @@ class NVFP4ComputeBaseLinear(nn.Module):
 
     def __init__(self, w_fprop, w_dgrad, bias, recipe: NVFP4Recipe):
         super().__init__()
+        # Both buffers are stored CONTIGUOUS (non-transposed) NVFP4Tensors:
+        # w_fprop is [N,K] (blocked along K), w_dgrad is [K,N] (blocked along N).
+        # The forward/backward apply .t() at GEMM time. Contiguous inner storage
+        # is what lets FSDP2 rank-0 broadcast (cpu_ram_efficient_loading) work.
         self.register_buffer("w_fprop", w_fprop)
         self.register_buffer("w_dgrad", w_dgrad)
         self.bias = bias
         self.recipe = recipe
-        self.in_features = w_fprop.shape[0]
-        self.out_features = w_fprop.shape[1]
+        self.in_features = w_fprop.shape[1]
+        self.out_features = w_fprop.shape[0]
 
     def forward(self, x):
         out = NVFP4ComputeBaseFunction.apply(x, self.w_fprop, self.w_dgrad, self.recipe)
@@ -952,22 +960,27 @@ class NVFP4ComputeBaseLinear(nn.Module):
     @property
     def weight(self) -> torch.Tensor:
         # Read-only dequantized [N,K] for PEFT; writes don't persist (see
-        # NVFP4FrozenBaseLinear.weight). w_fprop is _quantize(W).t() ([K,N]),
-        # so .t().dequantize() recovers [N,K].
-        return self.w_fprop.t().dequantize(torch.bfloat16)
+        # NVFP4FrozenBaseLinear.weight). w_fprop is the contiguous _quantize(W)
+        # ([N,K]), so dequantize() directly recovers [N,K].
+        return self.w_fprop.dequantize(torch.bfloat16)
 
     @classmethod
     def from_linear(
         cls, linear: nn.Linear, recipe: NVFP4Recipe, *, fsdp: bool = False
     ) -> "NVFP4ComputeBaseLinear":
         w = linear.weight.detach()  # [N, K]
-        # fprop b-operand represents W.T ([K,N]): quantize W then transpose.
-        w_fprop = _quantize(w, QuantPolicy()).t()
-        # dgrad b-operand represents W ([N,K]) blocked along N: quantize W.T then transpose.
-        w_dgrad = _quantize(w.t().contiguous(), QuantPolicy()).t()
+        # Store CONTIGUOUS (non-transposed) NVFP4 layouts; forward/backward apply
+        # .t() at GEMM time. This keeps each buffer's inner qdata/scale contiguous
+        # (vs the old .t() views), which is required for FSDP2 rank-0 broadcast
+        # (cpu_ram_efficient_loading). The logical b-operands at the GEMM are
+        # bit-identical to the old stored .t() views.
+        # fprop: stored W ([N,K]) blocked along K; GEMM uses w_fprop.t() ([K,N]).
+        w_fprop = _quantize(w, QuantPolicy())
+        # dgrad: stored W.T ([K,N]) blocked along N; GEMM uses w_dgrad.t() ([N,K]).
+        w_dgrad = _quantize(w.t().contiguous(), QuantPolicy())
         # FSDP2 shards each FP4 layout by row; the all-gather hooks live on the
         # FSDP subclass. Wrap both buffers independently (they shard on different
-        # axes — fprop along K, dgrad along N — but each reassembles on its own).
+        # axes — fprop rows are N, dgrad rows are K — but each reassembles on its own).
         if fsdp:
             w_fprop = _to_fsdp_nvfp4(w_fprop)
             w_dgrad = _to_fsdp_nvfp4(w_dgrad)
