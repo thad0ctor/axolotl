@@ -151,7 +151,7 @@ transformer-engine = [
 # SageAttention fork; install it Triton-only (editable/local) — see
 # docs/nvfp4_training.qmd.
 nvfp4-attn = [
-    "sageattention @ git+https://github.com/thad0ctor/SageAttention.git@nvfp4-attention",
+    "sageattention @ git+https://github.com/thad0ctor/SageAttention.git@main",
 ]
 opentelemetry = [
     "opentelemetry-api",

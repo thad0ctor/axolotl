@@ -32,7 +32,7 @@
 #                            the git copy (for hacking the kernel). Default: the
 #                            fork is pulled from the nvfp4-attn extra's git dep only.
 #     --sage-repo URL        fork remote for --editable-sage (default: thad0ctor)
-#     --sage-ref REF         fork branch/tag for --editable-sage (default: nvfp4-attention)
+#     --sage-ref REF         fork branch/tag for --editable-sage (default: main)
 #     --sage-dir PATH        clone dir for --editable-sage (default: ../SageAttention-NVFP4)
 #     --no-axolotl           skip installing this Axolotl checkout (deps only)
 #     -h|--help              show this help
@@ -47,7 +47,7 @@ MSLK_PRE="--pre"
 BUILD_MSLK=0
 MSLK_REPO="https://github.com/pytorch/MSLK.git"
 SAGE_REPO="https://github.com/thad0ctor/SageAttention.git"
-SAGE_REF="nvfp4-attention"
+SAGE_REF="main"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SAGE_DIR="$(dirname "$REPO_ROOT")/SageAttention-NVFP4"
 INSTALL_AXOLOTL=1
@@ -118,7 +118,7 @@ fi
 
 # --- 4. Axolotl + the nvfp4-attn extra (pulls the SageAttention fork from git) -
 # The nvfp4-attn extra carries the fork as a git dependency
-# (sageattention @ git+.../SageAttention.git@nvfp4-attention), so the kernel is
+# (sageattention @ git+.../SageAttention.git@main), so the kernel is
 # installed here automatically — no separate clone for a normal install.
 # SAGEATTN_SKIP_CUDA_BUILD: the nvfp4 submodule is pure Triton; don't compile the
 # legacy SageAttention CUDA kernels just to import it.
