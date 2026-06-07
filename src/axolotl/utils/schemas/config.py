@@ -1788,6 +1788,39 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "nvfp4_training Qwen3.5 native switches require "
                 "model_config_type: qwen3_5 or qwen3_5_moe."
             )
+        # model_config_type may resolve after the model config loads, so don't
+        # hard-error when it is still None here — but these switches silently
+        # no-op on non-qwen3_5 (the patch step returns early), so warn.
+        if model_config_type is None and any(qwen3_5_native_flags):
+            LOG.warning(
+                "nvfp4_training Qwen3.5 native switches (attention.*, linear_attn, "
+                "mlp, fla_causal_conv_compile_boundary) require model_config_type "
+                "qwen3_5 or qwen3_5_moe; model_config_type is unresolved during "
+                "validation and these flags will be ignored on any other architecture."
+            )
+
+        # Resolve base_mode the same way patch_manager does (explicit wins; else
+        # qlora/quantize_base => storage, else compute). FSDP all-gather hooks are
+        # only wired for the storage path (NVFP4FrozenBaseLinear); compute-base FP4
+        # buffers would be sharded with no reassembly -> silent wrong results.
+        _resolved_base_mode = self.nvfp4_training.base_mode
+        if _resolved_base_mode is None:
+            _resolved_base_mode = (
+                "storage"
+                if (self.nvfp4_training.quantize_base or self.adapter == "qlora")
+                else "compute"
+            )
+        if (
+            self.adapter
+            and _resolved_base_mode == "compute"
+            and self.fsdp_config is not None
+        ):
+            raise ValueError(
+                "nvfp4_training base_mode=compute is not supported under FSDP: the "
+                "compute-base FP4 buffers have no FSDP all-gather hooks, so sharding "
+                "produces silently wrong results. Use nvfp4_training.base_mode: "
+                "storage under FSDP, or run compute-base with DDP."
+            )
 
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
         # modules (detected via is_nvfp4_base in kernels/lora.py), so the native

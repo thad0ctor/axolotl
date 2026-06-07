@@ -428,6 +428,22 @@ class PatchManager:
                 )
             compute_base = base_mode == "compute"
             quantized_storage = base_mode == "storage"
+            # The torchao compute-base path (no MSLK) runs quant+GEMM with no
+            # custom-op/is_compiling boundary, so torch.compile traces into it and
+            # can hit the decompose pass / heavy recompiles; the MSLK fast path
+            # wraps quant in registered custom ops and is compile-safe. Warn (eager
+            # is still correct) and never warn on the MSLK fast path.
+            if compute_base and self.cfg.torch_compile:
+                from axolotl.utils.nvfp4_training import _mslk_available
+
+                if not _mslk_available():
+                    LOG.warning(
+                        "nvfp4_training compute-base under torch_compile without MSLK: "
+                        "the torchao quant+GEMM has no compile boundary and may "
+                        "graph-break/recompile heavily. Install MSLK for the "
+                        "compile-safe compute-base path, or set torch_compile: false, "
+                        "or nvfp4_training.base_mode: hp."
+                    )
             # FP4-stored base needs the NVFP4 all-gather hooks to shard under FSDP2.
             use_fsdp = quantized_storage and bool(self.cfg.fsdp_config)
             count = convert_lora_base_to_nvfp4(
