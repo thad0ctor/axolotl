@@ -3,12 +3,14 @@
 Qwen3-VL uses STANDARD (non-gated) softmax attention with multimodal mRoPE,
 unlike Qwen3.5's gated DeltaNet-hybrid attention — so it needs its own forward
 rather than the Qwen3.5 patch (which assumes q_proj -> head_dim*2 + sigmoid gate
-and Qwen3.5's plain RoPE). This patches ``Qwen3VLTextAttention``'s grad-enabled
-dense-prefill path to the differentiable native-NVFP4 attention op (rope-agnostic
-— fed VL's already-roped Q/K via the model's own ``apply_rotary_pos_emb``), and
-falls back to the model's configured attention (flash_attention_2) for masks /
-cache states it doesn't support. head_dim 128 is supported by the kernel
-(d in {128, 256}). Vision attention (Qwen3VLVisionBlock) is left untouched.
+and Qwen3.5's plain RoPE). This patches ``Qwen3VLTextAttention`` to run native
+NVFP4 attention on the dense causal/full, cache-free PREFILL path in both grad
+(training) and no-grad (eval / first generation token) modes — fed VL's
+already-roped Q/K via the model's own ``apply_rotary_pos_emb`` (rope-agnostic op).
+It falls back to the model's configured attention (flash_attention_2) for KV-cache
+decode, non-dense / per-key-padded masks, and ``output_attentions``. head_dim 128
+is supported by the kernel (d in {128, 256}). Vision attention
+(Qwen3VLVisionBlock) is left untouched.
 
 Opt-in via ``nvfp4_training.attention`` on a qwen3_vl model; default OFF.
 """
@@ -31,9 +33,16 @@ LOG = get_logger(__name__)
 def make_nvfp4_vl_forward(orig_forward):
     """Build a patched ``Qwen3VLTextAttention.forward`` using NVFP4 attention.
 
-    Only the grad-enabled, cache-free, dense causal/full path routes through
-    NVFP4 (the training path); everything else (eval/generation, KV-cache decode,
-    per-key-padded or output_attentions batches) falls back to ``orig_forward``.
+    Runs NVFP4 on the dense causal/full, cache-free PREFILL path in BOTH grad
+    (training) and no-grad (eval / first generation token) modes — mirroring the
+    Qwen3.5 patch, so the two passes are numerically consistent (matters under
+    gradient checkpointing). On the no-grad path it writes the roped K/V to the
+    cache so subsequent decode steps see prefill context. Falls back to
+    ``orig_forward`` (flash_attention_2) for: KV-cache decode (prior cached
+    context — a dedicated FP4 decode kernel is a proven loser), per-key-padded /
+    non-dense masks, ``output_attentions``, and grad mode without a trained
+    backward. The Qwen3.5-only inference fast paths (fuse_vproj / fp4_projections)
+    are intentionally omitted here.
     """
 
     def forward(
@@ -44,14 +53,7 @@ def make_nvfp4_vl_forward(orig_forward):
         past_key_values=None,
         **kwargs,
     ):
-        # Only the differentiable training path is NVFP4; eval/generation, the KV
-        # cache, and output_attentions go to the model's configured attention.
-        if (
-            kwargs.get("output_attentions")
-            or past_key_values is not None
-            or not torch.is_grad_enabled()
-            or not getattr(self, "_nvfp4_train_backward", False)
-        ):
+        if kwargs.get("output_attentions"):
             return orig_forward(
                 self,
                 hidden_states,
@@ -61,13 +63,35 @@ def make_nvfp4_vl_forward(orig_forward):
                 **kwargs,
             )
 
+        grad_enabled = torch.is_grad_enabled()
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         q_len = input_shape[-1]
 
-        kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
+        # NVFP4 fast path is PREFILL only (no prior cached context) on a dense
+        # causal/full mask. Cached decode reuses prior roped K/V and FP4 decode is
+        # a proven loser, so it goes to stock attention.
+        has_cache_context = (
+            past_key_values is not None
+            and past_key_values.get_seq_length(self.layer_idx) > 0
+        )
+        kind = None
+        if not has_cache_context:
+            kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
         if kind is None:
-            # per-key padding / mask we can't densely represent -> stock forward
+            return orig_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                **kwargs,
+            )
+        # Grad mode needs the trained backward; a cache during grad is unexpected.
+        if grad_enabled and (
+            not getattr(self, "_nvfp4_train_backward", False)
+            or past_key_values is not None
+        ):
             return orig_forward(
                 self,
                 hidden_states,
@@ -93,16 +117,21 @@ def make_nvfp4_vl_forward(orig_forward):
         cos, sin = position_embeddings
         query_roped, key_roped = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # No-grad prefill: stash roped K/V so later decode steps see this context.
+        if not grad_enabled and past_key_values is not None:
+            past_key_values.update(key_roped, value_states, self.layer_idx)
+
         ng = query_states.shape[1] // key_states.shape[1]
         sr = getattr(self, "_nvfp4_stochastic_rounding", True)
         grad_sr = sr and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
         save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
         dkdv_bf16 = getattr(self, "_nvfp4_dkdv_scratch_bf16", False)
 
+        # Same NVFP4 op for grad and no-grad (consistent under checkpointing). The
+        # backward SR knobs are inert in no-grad. Under compile the opaque custom op
+        # keeps Inductor from tracing tl.dot_scaled (decompose crash); the graph
+        # breaks give it the eager boundary.
         if _custom_op_enabled(self):
-            # Opaque differentiable custom op: Inductor compiles AROUND the whole
-            # NVFP4 attention (fwd + registered NVFP4 bwd). The graph breaks give
-            # it the eager boundary the eager-fallback baseline already gets.
             from axolotl.kernels.attn_nvfp4_custom_op import (
                 nvfp4_flash_attn_train_custom_op,
             )
