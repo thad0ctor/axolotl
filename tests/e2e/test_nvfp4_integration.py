@@ -179,9 +179,6 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
                 "backward": {
                     "enabled": True,
                     "rtn_grad_packs": True,
-                    "p_dv_stochastic_rounding": False,
-                    "dot_dv_stochastic_rounding": True,
-                    "ds_dq_stochastic_rounding": False,
                     "save_packs": True,
                     "dkdv_scratch_bf16": True,
                 },
@@ -194,9 +191,6 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
     a = cfg.nvfp4_training.attention
     assert a.enabled is True and a.fuse_vproj is True and a.fp4_projections is True
     assert a.backward.enabled is True and a.backward.rtn_grad_packs is True
-    assert a.backward.p_dv_stochastic_rounding is False
-    assert a.backward.dot_dv_stochastic_rounding is True
-    assert a.backward.ds_dq_stochastic_rounding is False
     assert a.backward.save_packs is True and a.backward.dkdv_scratch_bf16 is True
     assert cfg.nvfp4_training.linear_attn is True and cfg.nvfp4_training.mlp is True
     assert cfg.nvfp4_training.fla_causal_conv_compile_boundary is True
@@ -372,30 +366,6 @@ def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
         )
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "p_dv_stochastic_rounding",
-        "dot_dv_stochastic_rounding",
-        "ds_dq_stochastic_rounding",
-    ],
-)
-def test_gate_refuses_qwen3_5_backward_sr_override_without_backward(
-    monkeypatch, field
-):
-    _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
-        AxolotlConfigWCapabilities(
-            **BASE,
-            **CAPS,
-            model_config_type="qwen3_5",
-            nvfp4_training={
-                "enabled": True,
-                "attention": {"enabled": True, "backward": {field: False}},
-            },
-        )
-
-
 def test_qwen3_5_compile_custom_op_allowed_with_backward(monkeypatch):
     # The compile custom op is now a differentiable, training-compatible op
     # (register_autograd), so it is ALLOWED together with native_attention_backward
@@ -539,9 +509,6 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
                     "enabled": True,
                     "backward": {
                         "enabled": True,
-                        "p_dv_stochastic_rounding": False,
-                        "dot_dv_stochastic_rounding": True,
-                        "ds_dq_stochastic_rounding": False,
                         "save_packs": True,
                         "dkdv_scratch_bf16": True,
                     },
@@ -554,33 +521,7 @@ def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
 
     assert captured["save_backward_packs"] is True
     assert captured["dkdv_scratch_bf16"] is True
-    assert captured["backward_p_dv_stochastic_rounding"] is False
-    assert captured["backward_dot_dv_stochastic_rounding"] is True
-    assert captured["backward_ds_dq_stochastic_rounding"] is False
     assert captured["train_backward"] is True
-
-
-def test_qwen3_5_backward_sr_policy_resolution():
-    from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
-        _resolve_backward_sr_policy,
-    )
-
-    class Module:
-        _nvfp4_backward_rtn_grad_packs = False
-        _nvfp4_backward_p_dv_stochastic_rounding = None
-        _nvfp4_backward_dot_dv_stochastic_rounding = None
-        _nvfp4_backward_ds_dq_stochastic_rounding = None
-
-    module = Module()
-    assert _resolve_backward_sr_policy(module, True) == (True, True, True)
-    assert _resolve_backward_sr_policy(module, False) == (False, False, False)
-
-    module._nvfp4_backward_rtn_grad_packs = True
-    assert _resolve_backward_sr_policy(module, True) == (False, False, False)
-
-    module._nvfp4_backward_p_dv_stochastic_rounding = True
-    module._nvfp4_backward_ds_dq_stochastic_rounding = False
-    assert _resolve_backward_sr_policy(module, True) == (True, False, False)
 
 
 def test_qwen3_5_packing_patch_forwards_fla_compile_boundary(monkeypatch):

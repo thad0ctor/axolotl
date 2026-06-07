@@ -63,23 +63,6 @@ def _custom_op_enabled(module: nn.Module) -> bool:
     return bool(requested) and torch.compiler.is_compiling()
 
 
-def _resolve_backward_sr_policy(
-    module: object,
-    stochastic_rounding: bool,
-) -> tuple[bool, bool, bool]:
-    grad_sr = stochastic_rounding and not getattr(
-        module, "_nvfp4_backward_rtn_grad_packs", False
-    )
-    sr_p_dv = getattr(module, "_nvfp4_backward_p_dv_stochastic_rounding", None)
-    sr_dot_dv = getattr(module, "_nvfp4_backward_dot_dv_stochastic_rounding", None)
-    sr_ds_dq = getattr(module, "_nvfp4_backward_ds_dq_stochastic_rounding", None)
-    return (
-        grad_sr if sr_p_dv is None else sr_p_dv,
-        grad_sr if sr_dot_dv is None else sr_dot_dv,
-        grad_sr if sr_ds_dq is None else sr_ds_dq,
-    )
-
-
 _DENSE_KIND_ATTR = "_nvfp4_dense_kind"
 _TRIL_CACHE: dict[tuple, torch.Tensor] = {}
 
@@ -416,9 +399,8 @@ def make_nvfp4_forward(orig_forward):
                     query_states, key_states, cos, sin
                 )
                 sr = getattr(self, "_nvfp4_stochastic_rounding", True)
-                sr_p_dv, sr_dot_dv, sr_ds_dq = _resolve_backward_sr_policy(
-                    self,
-                    sr,
+                grad_sr = sr and not getattr(
+                    self, "_nvfp4_backward_rtn_grad_packs", False
                 )
                 ng = query_states.shape[1] // key_states.shape[1]
                 if _custom_op_enabled(self):
@@ -438,9 +420,9 @@ def make_nvfp4_forward(orig_forward):
                         causal=(kind == "causal"),
                         num_key_value_groups=ng,
                         stochastic_rounding=sr,
-                        backward_p_dv_stochastic_rounding=sr_p_dv,
-                        backward_dot_dv_stochastic_rounding=sr_dot_dv,
-                        backward_ds_dq_stochastic_rounding=sr_ds_dq,
+                        backward_p_dv_stochastic_rounding=grad_sr,
+                        backward_dot_dv_stochastic_rounding=grad_sr,
+                        backward_ds_dq_stochastic_rounding=grad_sr,
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
@@ -460,9 +442,9 @@ def make_nvfp4_forward(orig_forward):
                         causal=(kind == "causal"),
                         num_key_value_groups=ng,
                         stochastic_rounding=sr,
-                        backward_p_dv_stochastic_rounding=sr_p_dv,
-                        backward_dot_dv_stochastic_rounding=sr_dot_dv,
-                        backward_ds_dq_stochastic_rounding=sr_ds_dq,
+                        backward_p_dv_stochastic_rounding=grad_sr,
+                        backward_dot_dv_stochastic_rounding=grad_sr,
+                        backward_ds_dq_stochastic_rounding=grad_sr,
                         save_backward_packs=getattr(
                             self, "_nvfp4_save_backward_packs", False
                         ),
@@ -522,9 +504,6 @@ def patch_qwen3_5_nvfp4_attention(
     fuse_attn_proj: bool = False,
     train_backward: bool = False,
     backward_rtn_grad_packs: bool = False,
-    backward_p_dv_stochastic_rounding: bool | None = None,
-    backward_dot_dv_stochastic_rounding: bool | None = None,
-    backward_ds_dq_stochastic_rounding: bool | None = None,
     save_backward_packs: bool = False,
     dkdv_scratch_bf16: bool = False,
     compile_custom_op: bool = False,
@@ -550,15 +529,6 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_fuse_vproj = fuse_vproj
                 module._nvfp4_train_backward = train_backward
                 module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
-                module._nvfp4_backward_p_dv_stochastic_rounding = (
-                    backward_p_dv_stochastic_rounding
-                )
-                module._nvfp4_backward_dot_dv_stochastic_rounding = (
-                    backward_dot_dv_stochastic_rounding
-                )
-                module._nvfp4_backward_ds_dq_stochastic_rounding = (
-                    backward_ds_dq_stochastic_rounding
-                )
                 module._nvfp4_save_backward_packs = save_backward_packs
                 module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
                 module._nvfp4_compile_custom_op = compile_custom_op
@@ -576,15 +546,6 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_fuse_vproj = fuse_vproj
             module._nvfp4_train_backward = train_backward
             module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
-            module._nvfp4_backward_p_dv_stochastic_rounding = (
-                backward_p_dv_stochastic_rounding
-            )
-            module._nvfp4_backward_dot_dv_stochastic_rounding = (
-                backward_dot_dv_stochastic_rounding
-            )
-            module._nvfp4_backward_ds_dq_stochastic_rounding = (
-                backward_ds_dq_stochastic_rounding
-            )
             module._nvfp4_save_backward_packs = save_backward_packs
             module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
             module._nvfp4_compile_custom_op = compile_custom_op
@@ -597,15 +558,11 @@ def patch_qwen3_5_nvfp4_attention(
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
-        "backward_p_dv_sr=%s, backward_dot_dv_sr=%s, backward_ds_dq_sr=%s, "
         "save_backward_packs=%s, dkdv_scratch_bf16=%s, compile_custom_op=%s)",
         patched,
         fuse_vproj,
         train_backward,
         backward_rtn_grad_packs,
-        backward_p_dv_stochastic_rounding,
-        backward_dot_dv_stochastic_rounding,
-        backward_ds_dq_stochastic_rounding,
         save_backward_packs,
         dkdv_scratch_bf16,
         compile_custom_op,
