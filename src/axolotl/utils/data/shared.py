@@ -117,6 +117,23 @@ def load_dataset_with_config(
     if Path(dataset_config.path).exists():
         return _load_from_local_path(dataset_config, load_dataset_kwargs)
 
+    # `path` is a HF packaged-builder name (json/parquet/csv/arrow/text) plus
+    # explicit `data_files`: load via the builder so LOCAL data_files are read
+    # from disk. Without this, the non-streaming path falls through to
+    # `_load_from_data_files`, which treats `path` as a Hub repo_id and tries to
+    # `hf_hub_download` the data_files — a 401 for a local absolute path. This
+    # mirrors the streaming / `pretraining_dataset` loader, which already accepts
+    # the `path: json` + `data_files: <local file>` shape. A builder name is
+    # never a Hub repo, so this can't shadow the `path: <org/repo>` +
+    # `data_files: <file-in-repo>` case (that path is not a builder name).
+    builder_names = set(EXTENSIONS_TO_DATASET_TYPES.values()) | {"json"}
+    if dataset_config.data_files and dataset_config.path in builder_names:
+        return load_dataset(
+            dataset_config.path,
+            data_files=dataset_config.data_files,
+            **load_dataset_kwargs,
+        )
+
     # Check if it's a HuggingFace dataset
     is_hub_dataset = _check_if_hub_dataset(dataset_config, use_auth_token)
 
