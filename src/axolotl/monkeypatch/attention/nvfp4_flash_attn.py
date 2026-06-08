@@ -521,10 +521,23 @@ def patch_qwen3_5_nvfp4_attention(
     """
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
+    # qwen3_5_moe uses its own full-attention class (Qwen3_5MoeAttention) for the
+    # full_attention layers; its GatedDeltaNet/Vision attention are separate classes
+    # and stay untouched. Same head_dim-256 gated softmax forward, so the wrapper fits.
+    attn_classes: tuple = (Qwen3_5Attention,)
+    try:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeAttention,
+        )
+
+        attn_classes = attn_classes + (Qwen3_5MoeAttention,)
+    except ImportError:
+        pass
+
     patched = 0
     seen_forward = None
     for module in model.modules():
-        if isinstance(module, Qwen3_5Attention):
+        if isinstance(module, attn_classes):
             if getattr(module, "_nvfp4_patched", False):
                 module._nvfp4_fuse_vproj = fuse_vproj
                 module._nvfp4_train_backward = train_backward
