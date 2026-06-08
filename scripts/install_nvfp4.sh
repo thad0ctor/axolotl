@@ -25,8 +25,11 @@
 #     --create-venv PATH     create + activate a fresh venv at PATH first
 #     --with-torch           also (re)install torch/vision/audio from --torch-index
 #     --torch-index URL      cu130 torch index (default below)
-#     --mslk-index URL       index for mslk (default: nightly cu130)
-#     --mslk-stable          use the stable cu130 index for mslk (no --pre)
+#     --mslk-index URL       index for mslk (default: stable cu130 — ABI-matches
+#                            the stable cu130 torch this script installs)
+#     --mslk-stable          force the stable cu130 index for mslk (the default)
+#     --mslk-nightly         use the nightly cu130 index for mslk (--pre); pair
+#                            this with a nightly cu130 torch or the ABIs mismatch
 #     --build-mslk           build mslk from source (github.com/pytorch/MSLK) instead
 #     --editable-sage        ALSO clone the fork + install it editable, overriding
 #                            the git copy (for hacking the kernel). Default: the
@@ -42,8 +45,11 @@ TOOL="uv"
 CREATE_VENV=""
 WITH_TORCH=0
 TORCH_INDEX="https://download.pytorch.org/whl/cu130"
-MSLK_INDEX="https://download.pytorch.org/whl/nightly/cu130"
-MSLK_PRE="--pre"
+# Default to the STABLE cu130 index: it ABI-matches the stable cu130 torch this
+# script installs. The nightly mslk wheel races ahead of stable torch and dlopens
+# with an undefined c10:: symbol (ABI break) — only use it with a nightly torch.
+MSLK_INDEX="https://download.pytorch.org/whl/cu130"
+MSLK_PRE=""
 BUILD_MSLK=0
 MSLK_REPO="https://github.com/pytorch/MSLK.git"
 SAGE_REPO="https://github.com/thad0ctor/SageAttention.git"
@@ -61,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --torch-index) TORCH_INDEX="$2"; shift 2;;
     --mslk-index) MSLK_INDEX="$2"; shift 2;;
     --mslk-stable) MSLK_INDEX="https://download.pytorch.org/whl/cu130"; MSLK_PRE=""; shift;;
+    --mslk-nightly) MSLK_INDEX="https://download.pytorch.org/whl/nightly/cu130"; MSLK_PRE="--pre"; shift;;
     --build-mslk) BUILD_MSLK=1; shift;;
     --sage-repo) SAGE_REPO="$2"; shift 2;;
     --sage-ref) SAGE_REF="$2"; shift 2;;
@@ -101,8 +108,10 @@ if [[ "$WITH_TORCH" == "1" ]]; then
 fi
 
 # --- 2. transformers -----------------------------------------------------------
-say "Installing transformers >= 4.57 (Qwen3.5 support)"
-PIP install "transformers>=4.57.0"
+# Pin to the validated set (5.8.x). >=4.57 brings Qwen3.5 (`qwen3_5`) support; the
+# <5.9 cap keeps us on the transformers the NVFP4 stack was validated against.
+say "Installing transformers >= 4.57, < 5.9 (Qwen3.5 support; validated on 5.8.x)"
+PIP install "transformers>=4.57.0,<5.9.0"
 
 # --- 3. mslk (FP4 quant kernels for the linear/MLP path) -----------------------
 if [[ "$BUILD_MSLK" == "1" ]]; then
@@ -123,8 +132,17 @@ fi
 # SAGEATTN_SKIP_CUDA_BUILD: the nvfp4 submodule is pure Triton; don't compile the
 # legacy SageAttention CUDA kernels just to import it.
 if [[ "$INSTALL_AXOLOTL" == "1" ]]; then
-  say "Installing Axolotl + nvfp4-attn extra (SageAttention fork pulled from git)"
-  SAGEATTN_SKIP_CUDA_BUILD=1 PIP install -e "${REPO_ROOT}[nvfp4-attn]" --no-build-isolation
+  say "Installing Axolotl + nvfp4-attn,flash-attn extras (SageAttention fork from git)"
+  # flash-attn extra: the recommended recipe sets attn_implementation: flash_attention_2
+  # (required on Blackwell), and native NVFP4 attention falls back to it for
+  # KV-cache/padded/non-causal batches. flash-attn 2.8.3 has no cu130 wheel — it builds
+  # from source, so wheel/setuptools/ninja must be present (no-build-isolation).
+  PIP install wheel setuptools ninja packaging psutil
+  SAGEATTN_SKIP_CUDA_BUILD=1 MAX_JOBS="${MAX_JOBS:-16}" \
+    PIP install -e "${REPO_ROOT}[nvfp4-attn,flash-attn]" --no-build-isolation
+  # torchao is pinned ==0.17.0; pull the cu130 build (matches the validated env) so the
+  # NVFP4Tensor prototype mx_formats path lines up with the cu130 torch.
+  PIP install --reinstall torchao==0.17.0 --index-url "$TORCH_INDEX"
 else
   say "Installing just the SageAttention fork from git (--no-axolotl)"
   SAGEATTN_SKIP_CUDA_BUILD=1 PIP install "sageattention @ git+${SAGE_REPO}@${SAGE_REF}"

@@ -56,8 +56,12 @@ the standard wheels do not pull in:
 2. **`transformers >= 4.57`** for Qwen3.5 (`qwen3_5`) support.
 3. **`mslk`** — [github.com/pytorch/MSLK](https://github.com/pytorch/MSLK),
    Meta/PyTorch's FP4 quant Triton kernels (`triton_quantize_nvfp4` etc.) used by
-   the NVFP4 linear/MLP path. Published on the PyTorch wheel index:
-   `uv pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu130`.
+   the NVFP4 linear/MLP path. Published on the PyTorch wheel index. Match it to
+   your torch: with a **stable** cu130 torch use the stable index
+   (`uv pip install mslk --index-url https://download.pytorch.org/whl/cu130`); only
+   use the nightly index (`--pre`, `.../nightly/cu130`) alongside a nightly torch —
+   the nightly mslk wheel races ahead of stable torch and dlopens with an undefined
+   `c10::` symbol (ABI break).
 4. **The SageAttention-NVFP4 fork** (`sageattention.nvfp4`) — the native-NVFP4
    flash-attention kernel (forward + FP4 backward). It has **no PyPI package**;
    clone the fork and install it editable. It is pure Triton, so skip the
@@ -77,8 +81,9 @@ bash scripts/install_nvfp4.sh --create-venv .venv-nvfp4 --with-torch
 bash scripts/install_nvfp4.sh --tool pip
 ```
 
-It clones the fork (default `thad0ctor/SageAttention` @ `nvfp4-attention`;
-override with `--sage-repo/--sage-ref`), installs mslk from the PyTorch index
+It pulls the fork from the `nvfp4-attn` extra's git dep (`thad0ctor/SageAttention`
+@ `main`; `--editable-sage` instead clones it editable for kernel hacking,
+overridable with `--sage-repo/--sage-ref`), installs mslk from the PyTorch index
 (or `--build-mslk` from source), installs the `nvfp4-attn` extra, and validates
 that `tl.dot_scaled`, `mslk`, and `sageattention.nvfp4` all import.
 
@@ -102,6 +107,29 @@ pure Triton — install it without building SageAttention's CUDA kernels:
 ```bash
 SAGEATTN_SKIP_CUDA_BUILD=1 pip install -e /path/to/SageAttention-NVFP4
 ```
+:::
+
+::: {.callout-warning}
+## FP4 attention is only for HYBRID models — not full-attention models like Qwen3-VL
+
+Native NVFP4 attention quantizes Q/K/V/P to FP4 (e2m1, 3-bit mantissa) inside the
+flash kernel. Its per-layer output fidelity vs an fp32 SDPA reference is only
+**~0.97–0.985 cosine** (measured at both head_dim 128 and 256, and confirmed
+against an independent NVFP4 emulation — this is **inherent FP4 precision loss, not
+a kernel bug**).
+
+On a **hybrid** model such as Qwen3.5 only the few `full_attention` layers run FP4
+attention (the rest are DeltaNet linear attention the kernel does not touch), so
+the error does not compound and training is unaffected. On a **non-hybrid**
+model — every layer is full softmax attention, e.g. **Qwen3-VL (36 LM layers)** —
+the per-layer error compounds across all layers (`0.97^36 ≈ 0.3`) and **destroys
+the forward**: Qwen3-VL step-1 loss is **~5.3 with FP4 attention vs ~1.4 without**
+it (FP4 base weights + FP4 lm_head alone are fine at ~1.4).
+
+Because of this, `nvfp4_training.attention.enabled: true` is **refused on Qwen3-VL**
+(it logs a warning and disables only the attention path; FP4 base weights/lm_head
+still apply). Override with `nvfp4_training.attention.allow_full_model: true` only
+if you have verified the degradation is acceptable for your use case.
 :::
 
 To use the TE backend, install the extra:
