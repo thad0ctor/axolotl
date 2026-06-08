@@ -94,6 +94,18 @@ class NVFP4AttentionConfig(BaseModel):
         default_factory=NVFP4AttentionBackwardConfig,
         json_schema_extra={"description": "Native-NVFP4 attention training settings."},
     )
+    allow_full_model: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Allow native NVFP4 attention on NON-hybrid models where "
+            "EVERY layer is full softmax attention (e.g. Qwen3-VL). FP4 attention is "
+            "~0.97 cosine per layer; on a hybrid model only a few layers are affected, "
+            "but on a full-attention model the per-layer error compounds over all "
+            "layers (~0.97^N) and destroys the forward (Qwen3-VL: step-1 loss ~5.3 vs "
+            "~1.4). Refused by default for such models. Set True only if you have "
+            "verified it is acceptable for your model."
+        },
+    )
 
     @model_validator(mode="after")
     def _check_requires(self):

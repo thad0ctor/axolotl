@@ -580,7 +580,26 @@ class PatchManager:
         # VL patch (the Qwen3.5 patch assumes gated q + plain RoPE). Only the
         # attention path applies; VL has no DeltaNet linear_attn / Qwen3.5 MLP.
         if self.cfg.model_config_type == "qwen3_vl":
+            if attn.enabled and not attn.allow_full_model:
+                # Qwen3-VL is NON-hybrid: every LM layer is full softmax attention.
+                # FP4 attention is ~0.97 cosine per layer, which compounds over all
+                # ~36 layers (~0.97^36 -> ~0.3) and wrecks the forward (step-1 loss
+                # ~5.3 vs ~1.4 without it). Refuse rather than silently train garbage.
+                LOG.warning(
+                    "nvfp4_training.attention.enabled is set on a non-hybrid Qwen3-VL "
+                    "model, where FP4 attention would touch EVERY layer; the per-layer "
+                    "FP4 error (~0.97 cos) compounds over all layers and destroys the "
+                    "forward (step-1 loss ~5.3 vs ~1.4). Disabling native FP4 attention "
+                    "(FP4 base weights/lm_head still apply). Set "
+                    "nvfp4_training.attention.allow_full_model: true to override."
+                )
+                return
             if attn.enabled:
+                LOG.warning(
+                    "nvfp4_training.attention.allow_full_model is set: enabling native "
+                    "FP4 attention on ALL Qwen3-VL layers. Expect a large forward "
+                    "degradation (step-1 loss ~5.3 vs ~1.4) from compounded FP4 error."
+                )
                 from axolotl.monkeypatch.attention.nvfp4_flash_attn_vl import (
                     patch_qwen3_vl_nvfp4_attention,
                 )

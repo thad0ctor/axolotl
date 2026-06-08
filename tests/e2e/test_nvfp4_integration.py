@@ -617,6 +617,9 @@ def test_apply_qwen3_vl_routes_to_vl_attention_not_qwen3_5(monkeypatch):
                 "stochastic_rounding": True,
                 "attention": {
                     "enabled": True,
+                    # VL native attention is refused by default (degrades non-hybrid
+                    # models); the override is required to exercise the routing.
+                    "allow_full_model": True,
                     "backward": {
                         "enabled": True,
                         "rtn_grad_packs": True,

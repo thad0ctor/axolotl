@@ -96,6 +96,52 @@ def test_nvfp4_vl_forward_parity_nograd(layer_idx):
     assert cos > 0.9, f"layer {layer_idx} nvfp4-vl no-grad cos={cos:.4f} (FP4 lossy)"
 
 
+# Qwen3-VL has this many full-attention LM layers; FP4's per-layer error compounds
+# over ALL of them (the model is non-hybrid), unlike Qwen3.5 where only a few layers
+# are FP4'd. cos^FULL_MODEL_LAYERS is the relevant model-level fidelity.
+FULL_MODEL_LAYERS = 36
+# Per-layer cosine required for the compounded product to stay >= 0.99 across the
+# full model. At ~0.97-0.985 (measured) FP4 attention is WELL below this, which is
+# why patching every layer wrecks the forward (step-1 loss ~5.3 vs ~1.4). The patch
+# manager refuses FP4 attention on non-hybrid models for exactly this reason.
+MODEL_SAFE_PER_LAYER_COS = 0.99 ** (1.0 / FULL_MODEL_LAYERS)
+
+
+def test_nvfp4_vl_per_layer_error_is_not_model_safe():
+    """Document the limitation: D=128 FP4 attention's per-layer cosine vs fp32 SDPA
+    is too low to survive compounding over all 36 Qwen3-VL layers.
+
+    This is NOT a kernel bug (the kernel matches an independent NVFP4 emulation) — it
+    is inherent FP4 precision loss. If a future change makes the per-layer cosine
+    model-safe, flip this assertion (and relax the patch-manager guard).
+    """
+    from axolotl.monkeypatch.attention.nvfp4_flash_attn_vl import (
+        patch_qwen3_vl_nvfp4_attention,
+    )
+
+    # Realistic shape: longer seq, full head count.
+    model = _build_model(seed=7)
+    hs, pos = _inputs(seq=1024, seed=7)
+
+    with torch.no_grad():
+        ref = _run_attention(model, 0, hs, pos)
+    patch_qwen3_vl_nvfp4_attention(model, train_backward=True)
+    with torch.no_grad():
+        got = _run_attention(model, 0, hs, pos)
+
+    cos = F.cosine_similarity(
+        ref.flatten().float(), got.flatten().float(), dim=0
+    ).item()
+    compounded = cos**FULL_MODEL_LAYERS
+    assert cos < MODEL_SAFE_PER_LAYER_COS, (
+        f"per-layer cos={cos:.4f} is now >= model-safe "
+        f"{MODEL_SAFE_PER_LAYER_COS:.4f}; FP4 attention may now be safe on "
+        "non-hybrid models — revisit the patch-manager guard."
+    )
+    # Compounded fidelity over the full model is poor: this is the documented limit.
+    assert compounded < 0.9, f"compounded cos^{FULL_MODEL_LAYERS}={compounded:.4f}"
+
+
 def test_nvfp4_vl_forward_parity_grad():
     """Grad (training) path runs NVFP4 and matches SDPA within FP4 error."""
     from axolotl.monkeypatch.attention.nvfp4_flash_attn_vl import (
