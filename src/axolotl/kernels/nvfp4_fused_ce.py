@@ -50,8 +50,8 @@ def _nvfp4_lm_head_store(module: nn.Module):
     store layout differs per module:
 
     - storage / tied: ``w_q`` is already the ``[V, H]`` NVFP4Tensor.
-    - compute: ``w_fprop`` is ``_quantize(W).t()`` (the [H, V] fprop B operand),
-      so ``.t()`` recovers the ``[V, H]`` store.
+    - compute: ``w_fprop`` is ``_quantize(W)`` ([V, H] blocked along H); the GEMM
+      transposes it on read, but the stored tensor is already the [V, H] store.
 
     MSLK-fast modules keep swizzled e4m3 scales (not safe to row-slice) and a
     high-precision store can't be tiled either — both return None so the caller
@@ -67,7 +67,7 @@ def _nvfp4_lm_head_store(module: nn.Module):
     if isinstance(module, (NVFP4FrozenBaseLinear, NVFP4TiedLMHead)):
         store = module.w_q
     elif isinstance(module, NVFP4ComputeBaseLinear):
-        store = module.w_fprop.t()
+        store = module.w_fprop
     else:
         return None  # MSLK-fast (swizzled), hp (NVFP4Linear), or non-FP4
 
@@ -96,7 +96,7 @@ def _nvfp4_lm_head_fp4_store(module: nn.Module):
     if isinstance(module, (NVFP4FrozenBaseLinear, NVFP4TiedLMHead)):
         return module.w_q
     if isinstance(module, NVFP4ComputeBaseLinear):
-        return module.w_fprop.t()
+        return module.w_fprop
     if isinstance(module, NVFP4FastFrozenBaseLinear):
         return NVFP4Tensor(
             module.wq,

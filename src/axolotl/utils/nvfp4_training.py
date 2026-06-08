@@ -2017,8 +2017,10 @@ def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
         xq, xsc = _mslk_quantize_sl(xp)
         out = _mslk_fprop_mm(xq, xsc, base.wq, base.wsc, base.w_inv, x.dtype)
     elif isinstance(base, NVFP4ComputeBaseLinear):
+        # w_fprop is stored contiguous [N,K]; .t() gives the [K,N] b-operand
+        # whose qdata.t() is contiguous (torchao's _addmm_nvfp4_dispatch invariant).
         out = _addmm_nvfp4_dispatch(
-            _quantize(xp, QuantPolicy()), base.w_fprop, torch.ops.aten.mm.default
+            _quantize(xp, QuantPolicy()), base.w_fprop.t(), torch.ops.aten.mm.default
         )
     elif isinstance(base, NVFP4FrozenBaseLinear):
         out = _addmm_nvfp4_dispatch(
@@ -2088,8 +2090,9 @@ def nvfp4_base_fprop_many(
         a_q = _quantize(xp, QuantPolicy())
         for base in bases:
             if isinstance(base, NVFP4ComputeBaseLinear):
+                # w_fprop stored contiguous [N,K]; .t() is the [K,N] b-operand.
                 out = _addmm_nvfp4_dispatch(
-                    a_q, base.w_fprop, torch.ops.aten.mm.default
+                    a_q, base.w_fprop.t(), torch.ops.aten.mm.default
                 )
                 out_features = base.out_features
             else:
@@ -2115,8 +2118,9 @@ def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
             gq, gsc, g_inv, base.wq_d, base.wsc_d, base.w_inv_d, g.dtype
         )
     elif isinstance(base, NVFP4ComputeBaseLinear):
+        # w_dgrad stored contiguous [K,N]; .t() is the [N,K] b-operand.
         out = _addmm_nvfp4_dispatch(
-            _quantize(gp, sr), base.w_dgrad, torch.ops.aten.mm.default
+            _quantize(gp, sr), base.w_dgrad.t(), torch.ops.aten.mm.default
         )
     elif isinstance(base, NVFP4FastFrozenBaseLinear):
         # single FP4 layout: dequantize the stored weight for the dgrad GEMM.
