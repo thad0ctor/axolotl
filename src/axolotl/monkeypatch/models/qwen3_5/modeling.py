@@ -46,6 +46,18 @@ except Exception:  # pragma: no cover
     _call_fla_causal_conv1d_disabled = _call_fla_causal_conv1d
 
 
+def _call_self_attn(attn_module, **kwargs):
+    return attn_module(**kwargs)
+
+
+try:
+    import torch._dynamo as _dynamo
+
+    _call_self_attn_disabled = _dynamo.disable(_call_self_attn)
+except Exception:  # pragma: no cover
+    _call_self_attn_disabled = _call_self_attn
+
+
 # torch.compile-friendly wrapper for FLA's FusedRMSNormGated. Its fused gated-norm
 # backward (layer_norm_gated_bwd) calls aten.as_strided in a way torch>=2.12 cannot
 # meta-trace ("mismatch in length of strides and shape"). Registering it as a custom
@@ -222,7 +234,15 @@ def _patched_decoder_forward(
             position_ids=position_ids,
         )
     elif self.layer_type == "full_attention":
-        hidden_states, _ = self.self_attn(
+        # Run flash-attention eager under torch.compile. With gradient
+        # checkpointing OFF, Inductor otherwise fuses the FA2 backward with the
+        # gated-output/o_proj dgrad into a region that yields corrupt (~1e5)
+        # input gradients on packed sequences; the gate multiply right after
+        # attention is what makes this region fusable on Qwen3.5 (plain-attention
+        # models such as Qwen3-VL are unaffected). Breaking the graph around the
+        # one attention call avoids the fusion while the rest stays compiled.
+        hidden_states, _ = _call_self_attn_disabled(
+            self.self_attn,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
