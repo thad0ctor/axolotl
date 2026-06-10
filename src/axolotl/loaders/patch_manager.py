@@ -500,8 +500,17 @@ class PatchManager:
         # Fused FP4 lm_head + cross-entropy: skip materializing the [M, vocab]
         # logits (memory win). Opt-in and only when the lm_head became an FP4
         # store above; falls back to the materialized CE path otherwise.
-        if getattr(nvfp4, "fused_fp4_cross_entropy", False) and getattr(
-            nvfp4, "quantize_lm_head", False
+        #
+        # When lm_head_distillation is enabled, its own forward patch already runs
+        # the fused FP4 CE (then adds the KL term) and owns the head computation —
+        # installing the plain fused-CE wrapper on top would shadow the KL term, so
+        # skip it (the distillation forward calls fused_fp4_cross_entropy directly).
+        _distill = getattr(nvfp4, "lm_head_distillation", None)
+        _distill_on = _distill is not None and getattr(_distill, "enabled", False)
+        if (
+            getattr(nvfp4, "fused_fp4_cross_entropy", False)
+            and getattr(nvfp4, "quantize_lm_head", False)
+            and not _distill_on
         ):
             from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
 
@@ -771,7 +780,9 @@ class PatchManager:
         return without_lm_head
 
     @staticmethod
-    def _nvfp4_swap_frozen_lm_head(model, recipe, base_mode: str) -> None:
+    def _nvfp4_swap_frozen_lm_head(
+        model, recipe, base_mode: str, retain_teacher: bool = False
+    ) -> None:
         """Swap a bare frozen lm_head (LoRA, not a target module) to NVFP4.
 
         Locates the output-embedding module by identity in the (possibly
@@ -796,7 +807,9 @@ class PatchManager:
                 "module in the model tree; leaving it in high precision."
             )
             return
-        swap_frozen_linear_to_nvfp4(model, name, recipe, base_mode=base_mode)
+        swap_frozen_linear_to_nvfp4(
+            model, name, recipe, base_mode=base_mode, retain_teacher=retain_teacher
+        )
 
     @staticmethod
     def _model_ties_embeddings(model: PreTrainedModel) -> bool:
@@ -853,6 +866,20 @@ class PatchManager:
         if not (want_lm_head or want_embed):
             return
 
+        # KL-distillation AND the low-rank residual both need the original bf16
+        # head retained: distillation uses it as the teacher, the residual computes
+        # the quant error E = W_bf16 - dequant(Q(W)) from it. Gated to
+        # quantize_lm_head (the validator enforces that upstream).
+        distill_cfg = getattr(nvfp4, "lm_head_distillation", None)
+        residual_cfg = getattr(nvfp4, "lm_head_residual", None)
+        retain_teacher = bool(
+            want_lm_head
+            and (
+                (distill_cfg is not None and getattr(distill_cfg, "enabled", False))
+                or (residual_cfg is not None and getattr(residual_cfg, "enabled", False))
+            )
+        )
+
         tied = self._model_ties_embeddings(model)
 
         if tied and want_lm_head:
@@ -862,8 +889,10 @@ class PatchManager:
             out_name = self._module_name(model, model.get_output_embeddings())
             if in_name and out_name:
                 swap_tied_embedding_and_lm_head_to_nvfp4(
-                    model, in_name, out_name, recipe
+                    model, in_name, out_name, recipe, retain_teacher=retain_teacher
                 )
+            self._nvfp4_attach_residual(model, residual_cfg, retain_teacher)
+            self._nvfp4_attach_distillation(model, distill_cfg, retain_teacher)
             return
 
         if want_lm_head:
@@ -879,9 +908,15 @@ class PatchManager:
                 if isinstance(out_emb, _nn.Linear):
                     name = self._module_name(model, out_emb)
                     if name:
-                        swap_frozen_lm_head_tileable(model, name, recipe)
+                        swap_frozen_lm_head_tileable(
+                            model, name, recipe, retain_teacher=retain_teacher
+                        )
             else:
-                self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
+                self._nvfp4_swap_frozen_lm_head(
+                    model, recipe, base_mode, retain_teacher=retain_teacher
+                )
+            self._nvfp4_attach_residual(model, residual_cfg, retain_teacher)
+            self._nvfp4_attach_distillation(model, distill_cfg, retain_teacher)
 
         if want_embed:
             in_emb = model.get_input_embeddings()
@@ -889,6 +924,158 @@ class PatchManager:
                 in_name = self._module_name(model, in_emb)
                 if in_name:
                     swap_frozen_embedding_to_nvfp4(model, in_name)
+
+    def _nvfp4_attach_residual(self, model, residual_cfg, retain_teacher: bool) -> None:
+        """Compute + attach the low-rank bf16 residual to the FP4 lm_head.
+
+        No-op unless lm_head_residual is enabled and the bf16 teacher weight was
+        retained (used as E = W_bf16 - dequant(Q(W))). For the activation (L2QER)
+        construction, capture calibration hidden states with one short forward over
+        a few real batches; plain SVD needs no calibration.
+        """
+        if not (
+            retain_teacher
+            and residual_cfg is not None
+            and getattr(residual_cfg, "enabled", False)
+        ):
+            return
+        from axolotl.kernels.nvfp4_residual import ResidualConfig, attach_residual
+
+        cfg = ResidualConfig(
+            enabled=True,
+            rank=int(getattr(residual_cfg, "rank", 32)),
+            calibration=str(getattr(residual_cfg, "calibration", "activation")),
+            calib_tokens=int(getattr(residual_cfg, "calib_tokens", 512)),
+        )
+        lm_head = model.get_output_embeddings()
+        teacher_w = getattr(lm_head, "_distill_teacher_w", None)
+        if teacher_w is None:
+            LOG.warning(
+                "lm_head_residual: bf16 teacher weight not retained; cannot build "
+                "the residual. Skipping."
+            )
+            return
+
+        calib_hidden = None
+        if cfg.calibration == "activation":
+            calib_hidden = self._nvfp4_capture_calib_hidden(model, cfg.calib_tokens)
+
+        attach_residual(lm_head, teacher_w, cfg, calib_hidden)
+        LOG.info(
+            "NVFP4 lm_head_residual enabled (rank=%d, calibration=%s)",
+            cfg.rank,
+            cfg.calibration,
+        )
+
+    def _nvfp4_capture_calib_hidden(self, model, n_tokens: int):
+        """Capture ``[N, H]`` final-layer hidden states feeding the lm_head.
+
+        Forwards a short slice of the training dataset (or a synthetic token range
+        if none is reachable) through the model body with a forward hook on the
+        base model, returning the activations the lm_head consumes. Best-effort:
+        returns None on any failure, and the residual falls back to plain SVD.
+        """
+        import torch
+
+        try:
+            base = getattr(model, "model", None) or getattr(
+                getattr(model, "base_model", model), "model", None
+            )
+            if base is None:
+                return None
+            device = next(model.parameters()).device
+            # Build a small input_ids batch: prefer a real train sample, else a
+            # deterministic token range (the second moment per hidden dim is robust
+            # to the exact tokens — it is dominated by the layernorm output scale).
+            ids = self._nvfp4_calib_input_ids(model, n_tokens, device)
+            if ids is None:
+                return None
+
+            captured = {}
+
+            def hook(_m, _inp, out):
+                h = getattr(out, "last_hidden_state", None)
+                if h is None:
+                    h = out[0] if isinstance(out, (tuple, list)) else out
+                captured["h"] = h.detach()
+
+            handle = base.register_forward_hook(hook)
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                base(ids)
+            handle.remove()
+            if was_training:
+                model.train()
+            h = captured.get("h")
+            return None if h is None else h.reshape(-1, h.shape[-1])
+        except Exception as e:  # best-effort calibration
+            LOG.warning("lm_head_residual: calibration capture failed (%s); plain SVD", e)
+            return None
+
+    def _nvfp4_calib_input_ids(self, model, n_tokens: int, device):
+        """A ``[1, n]`` input_ids tensor for residual calibration, or None."""
+        import torch
+
+        ds = getattr(self, "train_dataset", None) or getattr(
+            getattr(self, "cfg", None), "_train_dataset", None
+        )
+        try:
+            if ds is not None and len(ds) > 0:
+                ids = ds[0].get("input_ids")
+                if ids is not None:
+                    t = torch.as_tensor(ids, device=device).reshape(1, -1)[:, :n_tokens]
+                    if t.shape[1] >= 2:
+                        return t
+        except Exception:
+            pass
+        # Fallback: a deterministic in-vocab token range.
+        vocab = getattr(getattr(model, "config", None), "vocab_size", None)
+        if not vocab:
+            return None
+        n = min(n_tokens, 256)
+        return (torch.arange(n, device=device) % vocab).reshape(1, n)
+
+    @staticmethod
+    def _nvfp4_attach_distillation(model, distill_cfg, retain_teacher: bool) -> None:
+        """Attach the KL-distillation state + forward patch to the FP4 head model.
+
+        No-op unless distillation is enabled and the bf16 teacher was retained on
+        the lm_head. The forward patch recomputes the (tiled) teacher logits and
+        adds ``lambda * T^2 * KL(teacher || student)`` to the loss; it is gated on
+        labels being present (training) and the head exposing both a retained
+        teacher and a tile-able FP4 student store.
+        """
+        if not (
+            retain_teacher
+            and distill_cfg is not None
+            and getattr(distill_cfg, "enabled", False)
+        ):
+            return
+        from axolotl.kernels.nvfp4_distill import (
+            DistillState,
+            patch_model_distillation,
+        )
+
+        state = DistillState(
+            enabled=True,
+            lambda_=float(getattr(distill_cfg, "lambda_", 1.0)),
+            temperature=float(getattr(distill_cfg, "temperature", 1.0)),
+            top_k=getattr(distill_cfg, "top_k", None),
+            cadence=int(getattr(distill_cfg, "cadence", 1)),
+            teacher=str(getattr(distill_cfg, "teacher", "live")),
+            vocab_block=int(getattr(distill_cfg, "teacher_vocab_block", 8192)),
+        )
+        patch_model_distillation(model, state)
+        LOG.info(
+            "NVFP4 lm_head_distillation enabled (lambda=%s, T=%s, top_k=%s, "
+            "cadence=%s, teacher=%s)",
+            state.lambda_,
+            state.temperature,
+            state.top_k,
+            state.cadence,
+            state.teacher,
+        )
 
     @staticmethod
     def _module_name(model: PreTrainedModel, target) -> str | None:

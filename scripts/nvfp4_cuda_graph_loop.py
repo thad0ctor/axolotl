@@ -10,15 +10,22 @@ import sys
 import types
 
 
+def _positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0 (got {value})")
+    return ivalue
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Prototype static-batch NVFP4 training loop outside HF Trainer."
     )
     parser.add_argument("config", help="Axolotl YAML config")
     parser.add_argument("--gpu", type=int, default=None, help="physical GPU index")
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--capture-warmup", type=int, default=3)
+    parser.add_argument("--steps", type=_positive_int, default=20)
+    parser.add_argument("--warmup", type=_positive_int, default=5)
+    parser.add_argument("--capture-warmup", type=_positive_int, default=3)
     parser.add_argument("--mode", choices=["eager", "graph", "auto"], default="auto")
     parser.add_argument(
         "--reuse-static-batch",

@@ -1760,6 +1760,33 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "remain a frozen plain nn.Linear. Disable quantize_lm_head/"
                 "fused_fp4_cross_entropy/fp8_lm_head_cross_entropy."
             )
+
+        # lm_head KL-distillation needs a FROZEN FP4 head to be the student and the
+        # retained bf16 head to be the teacher; it is meaningless without
+        # quantize_lm_head (there is no FP4-induced gap to close).
+        distill = getattr(self.nvfp4_training, "lm_head_distillation", None)
+        if distill is not None and distill.enabled:
+            if not self.nvfp4_training.quantize_lm_head:
+                raise ValueError(
+                    "nvfp4_training.lm_head_distillation requires "
+                    "nvfp4_training.quantize_lm_head: true (the KL teacher is the "
+                    "retained bf16 head and the student is the frozen FP4 head). "
+                    "Enable quantize_lm_head or disable lm_head_distillation."
+                )
+
+        # The low-rank head residual corrects the FP4 quant error E = W_bf16 -
+        # dequant(Q(W)); with no FP4 head there is no error to correct, so it is
+        # meaningless without quantize_lm_head (and it reuses the retained bf16
+        # teacher weight to form E).
+        residual = getattr(self.nvfp4_training, "lm_head_residual", None)
+        if residual is not None and residual.enabled:
+            if not self.nvfp4_training.quantize_lm_head:
+                raise ValueError(
+                    "nvfp4_training.lm_head_residual requires "
+                    "nvfp4_training.quantize_lm_head: true (the residual A@B "
+                    "corrects the FP4 quant error of the frozen head). Enable "
+                    "quantize_lm_head or disable lm_head_residual."
+                )
         _attn = self.nvfp4_training.attention
         # The native NVFP4 attention path (attention.enabled + its backward knobs)
         # is supported on Qwen3.5/MoE AND Qwen3-VL (each has its own forward patch).

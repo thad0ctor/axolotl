@@ -36,8 +36,12 @@ Blackwell:
 
 Software requirements:
 
-- `torch >= 2.8`
-- `torchao >= 0.18`
+- A **cu130 `torch`** whose bundled **Triton ≥ 3.7** exposes `tl.dot_scaled` — the
+  native FP4 tensor-core op the base GEMMs emit (validated on torch 2.12.0+cu130 /
+  triton 3.7.0)
+- `torchao` (cu130 build; validated on 0.17.0+cu130)
+- `transformers >= 4.57` for Qwen3.5 (`qwen3_5`) support — validated on **5.9.0** (with **liger-kernel 0.8.0**), the versions pinned in `pyproject.toml`
+- `bf16` (the NVFP4 quantizer requires bf16/fp32 — fp16 is rejected)
 - CUDA available (the capability gate refuses to run on non-Blackwell GPUs with a
   clear error)
 
@@ -56,7 +60,7 @@ the standard wheels do not pull in:
 2. **`transformers >= 4.57`** for Qwen3.5 (`qwen3_5`) support.
 3. **`mslk`** — [github.com/pytorch/MSLK](https://github.com/pytorch/MSLK),
    Meta/PyTorch's FP4 quant Triton kernels (`triton_quantize_nvfp4` etc.) used by
-   the NVFP4 linear/MLP path. Published on the PyTorch wheel index. Match it to
+   the NVFP4 base GEMM path. Published on the PyTorch wheel index. Match it to
    your torch: with a **stable** cu130 torch use the stable index
    (`uv pip install mslk --index-url https://download.pytorch.org/whl/cu130`); only
    use the nightly index (`--pre`, `.../nightly/cu130`) alongside a nightly torch —
@@ -96,8 +100,10 @@ that `tl.dot_scaled`, `mslk`, and `sageattention.nvfp4` all import.
   no extra install. This is the portable default and the only path with a
   working convergence recipe on consumer Blackwell.
 - **`te`**: NVIDIA [Transformer Engine](https://github.com/NVIDIA/TransformerEngine)
-  `NVFP4BlockScaling`. Hand-tuned CUTLASS kernels — faster GEMMs — but an
-  optional, heavier dependency, and **full-fine-tune only**.
+  `NVFP4BlockScaling`. Hand-tuned CUTLASS kernels — faster GEMMs — but an optional,
+  heavier dependency. Supports FFT and LoRA/QLoRA, but on adapter paths it keeps a
+  high-precision base (it ignores `base_mode`/`quantize_base`, so no FP4 storage or
+  compute-pre-quant) and is incompatible with the fused LoRA kernels.
 
 ::: {.callout-note}
 The native NVFP4 **attention** kernel (`nvfp4_training.attention`) lives in a
@@ -163,8 +169,9 @@ the TE backend therefore runs the core FP4 GEMM with the **convergence recipe
 disabled** (Axolotl logs a warning), which the NVFP4 paper shows diverges at
 scale. **On `sm_120`, prefer `backend: native` for real training**; use the TE
 backend on `sm_120` only for throughput experiments, or on `sm_100` (B200) where
-the full recipe runs. Measured (RTX 5090, 7B MLP): TE core ~3.2× vs bf16 (no
-recipe), native ~1.9× vs bf16 (full recipe).
+the full recipe runs. Measured on an **isolated 7B MLP** (RTX 5090; not the
+end-to-end headline): TE core ~3.2× vs bf16 (no recipe), native ~1.9× vs bf16 (full
+recipe).
 
 ## When to use it
 
@@ -179,23 +186,117 @@ and 2048, so:
 
 ### Measured end-to-end throughput
 
-Compiled NVFP4 vs compiled bf16, optimizer step included (measured on RTX 5090,
-`sm_120`, torch 2.11 + torchao 0.18):
+The headline numbers come from the **canonical fully-fused recipe**, where bf16 and
+NVFP4 are compared with the *identical* stack (Liger + fused-attn enabled on both
+sides) so the only difference is precision. Measured on an exclusively-idle RTX PRO
+6000 Blackwell (`sm_120`, 96 GiB), compiled, mbs 4, seq 2048, gradient-checkpointing
+off:
 
-| Model | Hidden size | Compiled NVFP4 vs compiled bf16 |
-|-------|------------:|--------------------------------:|
-| 0.5B  | 896  | **0.08–0.65× (SLOWER)** |
-| ~3B   | 2048 | **1.38×** |
-| 7B    | 3584 | **1.92×** |
-| 8B    | 4096 | **1.97×** (35.9k → 70.3k tok/s) |
+| Model | packing | bf16 tok/s (mem) | NVFP4 tok/s (mem) | ratio |
+|-------|---------|-----------------:|------------------:|------:|
+| Qwen3.5-9B | yes | 3,936 (62.1 GiB) | 5,886 (57.0 GiB) | **1.50×** |
+| Qwen3.5-9B | no  | 1,804 (32.3 GiB) | 1,916 (29.5 GiB) | **1.06×** |
+| Qwen3-VL-8B | yes | 4,372 (55.0 GiB) | 7,302 (48.8 GiB) | **1.67×** |
 
-The isolated-GEMM ceiling is ~2.9–3.6×; about 2× is realized end-to-end at 7–8B.
-**Eager mode is always slower** (0.1–0.25×) — compile is mandatory.
+With the canonical fully-fused recipe NVFP4 LoRA gives **~1.5× (Qwen3.5-9B, packed)**
+and **~1.7× (Qwen3-VL-8B, packed)** throughput at ~8–11% lower peak memory, with
+convergence tracking bf16. The win is **pure FP4-GEMM**: Liger and `fused_attn_kernel`
+are throughput-neutral under `torch.compile` (Inductor already fuses those ops) and
+are applied identically on both sides — the ratios are not a Liger or fused-attn
+artifact.
+
+::: {.callout-warning}
+**FP4 needs packing.** Without `sample_packing` the FP4 win nearly vanishes
+(**1.06×**, no-packing row above): the GEMMs are too small/under-filled for FP4's
+tensor-core advantage to show. Packing (which fills the GEMMs to full sequence
+length) is what makes the headline 1.5× / 1.7× real — so packing is in the
+recommended recipe. Likewise **sub-3B models do not benefit** (see *When to use it*).
+:::
+
+The isolated-GEMM ceiling is higher (~2.9–3.6× on older RTX 5090 / torch 2.11 +
+torchao 0.18 microbenchmarks), but that is an isolated-kernel figure, not the
+end-to-end headline. **Eager mode is always slower** (0.1–0.25×) — compile is
+mandatory.
 
 ### Fastest measured Qwen3.5-9B LoRA path
 
-For Qwen3.5-9B LoRA SFT on RTX PRO 6000 Blackwell, the fastest no-gradient-
-checkpointing path measured so far is:
+The canonical fully-fused recipe for Qwen3.5-9B LoRA SFT on RTX PRO 6000 Blackwell
+(every flag below is enabled identically in the bf16 baseline, so the FP4 win is
+isolated):
+
+```yaml
+adapter: lora
+nvfp4_training:
+  enabled: true
+  backend: native
+  base_mode: compute
+  quantize_lm_head: true
+attn_implementation: flash_attention_2     # REQUIRED on Blackwell (SDPA slow on packed masks)
+torch_compile: true                        # the speedup only materializes compiled
+sample_packing: true                       # fills the GEMMs — the FP4 win needs this
+pad_to_sequence_len: true
+gradient_checkpointing: false              # biggest single throughput lever
+liger_rms_norm: true
+liger_swiglu: true
+liger_rope: true
+liger_cross_entropy: true                  # short context (≤4k); NOT liger_fused_linear_cross_entropy
+fused_attn_kernel: true                    # qwen3-family fused q/k-norm + RoPE; keeps the FP4 base
+optimizer: adamw_torch_fused
+micro_batch_size: 4                        # the FP4 advantage grows with batch
+```
+
+`base_mode: compute` pre-quantizes the frozen base into the two NVFP4 layouts so
+fprop and dgrad run as pure FP4 GEMMs with no per-step base-quant prologue (fastest
+base compute). `fused_attn_kernel: true` enables the qwen3-family fused q/k-norm +
+RoPE kernel; it calls the FP4 projection modules so it **preserves the FP4 base**
+(all base layers are still swapped) and is throughput-neutral under compile, so it is
+in the recipe at no cost.
+
+::: {.callout-note}
+**Qwen3-VL** uses the same recipe with a reduced Liger set — `liger_rms_norm` /
+`liger_rope` / `liger_cross_entropy` (**no `liger_swiglu`**, since `qwen3_vl` has no
+gated SwiGLU). With it, NVFP4 LoRA on Qwen3-VL-8B measured **~1.7×** throughput.
+:::
+
+Hold `dataset_prepared_path` fixed across comparisons (changing it changes packed
+examples and moves marginal timings) and compare configs on the same board — the
+marginal s/step varies ~5% between RTX PRO 6000 boards. Dropping the random Hadamard
+transform (`hadamard: false`) shaves ~1% at unchanged loss for frozen-base LoRA — see
+the convergence-recipe note on why RHT is near-free to drop there.
+
+The shared LoRA base fprop path (`shared_lora_base_fprop`) reuses one NVFP4
+activation pack across fused LoRA QKV/QK base fprops; the isolated QKV
+forward+backward path measured faster, but the end-to-end step delta on this
+8-full-attention-layer hybrid model sat within whole-step noise. Try `true` on
+models with many more full-attention LoRA layers.
+
+Negative checks from the cross-entropy sweep:
+
+- Cut Cross Entropy and Liger fused-linear CE are not valid with this NVFP4
+  training setup today: b5 warmups loss-collapsed to zero after the first step
+  and logged non-finite grad norms. The opt-in `bf16_lm_head_cross_entropy` path
+  (below) avoids that collapse — it never filters gradient mass and keeps the
+  logsumexp and `grad_hidden` accumulation in fp32 — but it is a memory win, not a
+  throughput win (the tile GEMMs are bf16 with the same FLOPs as the materialized
+  lm_head, so it trades ~2.5% speed for ~13 GiB).
+- `fp8_lm_head_cross_entropy` converges but is **dominated** — in apples-to-apples it
+  is the slowest *and* most memory-hungry CE option (8k 31.4 GiB, 32k 71.6 GiB; both
+  worse than `fused_fp4`/`bf16_lm_head` on speed and memory). Not recommended, and not
+  fully deterministic: one run loss-collapsed with `grad_norm: nan`.
+- fp16 is rejected: torchao's NVFP4 quantizer requires bf16/fp32, and diagnostic
+  runs showed fp16 LoRA gradients NaN after AMP unscale at global step 0 even with
+  `max_grad_norm: 1.0`. Use `bf16: true` on Blackwell.
+
+The native Qwen3.5 MLP, linear-attention, and standalone FP8 lm_head patches are
+currently eval/no-grad paths; they do not accelerate this training benchmark.
+
+### Native FP4 attention training (opt-in)
+
+Beyond the FP4 base GEMMs, this branch can also run the softmax attention itself
+in native NVFP4 (`nvfp4_training.attention.*`, forward and backward) on hybrid
+models — see the install note and the hybrid-model-only warning under *Backends*.
+The fastest attention-enabled no-gradient-checkpointing profile measured for
+Qwen3.5-9B LoRA SFT on RTX PRO 6000 Blackwell is:
 
 - `adapter: lora`
 - `nvfp4_training.base_mode: compute`
@@ -215,6 +316,16 @@ work. The BF16 dK/dV scratch flag halves the per-query-head dK/dV scratch dtype
 before GQA reduction; the final dK/dV tensors remain bf16 either way. See
 `examples/nvfp4/qwen35-9b-lora-fastest.yaml`.
 
+The default backward when `save_packs` is off is the **HP-grad-dots** path
+(`attention.backward.bf16_grad_dots`, tri-state, auto-on): it keeps the FP4 S/dP
+recomputes but runs the three grad GEMMs (dV/dK/dQ) as bf16 `tl.dot` with exact
+operands — measured ~1.5–1.7× faster backward, grad cosine vs bf16 SDPA ~0.991
+(vs ~0.94 RTN / ~0.82 SR all-FP4), and ~4× less backward scratch memory. Setting
+`save_packs: true` (as in the profile above) forces the legacy all-FP4 backward
+(`bf16_grad_dots: true` with `save_packs: true` is rejected — the HP path needs
+the saved high-precision q/k/v, not the FP4 packs); when the HP path is active
+the `rtn_grad_packs`/`dkdv_scratch_bf16` knobs are moot.
+
 Keep the no-grad/eval-only Qwen3.5 native MLP, native linear-attention, fused
 `v_proj`, and standalone `fp8_lm_head` switches out of this training-speed
 profile. A same-prepared-dataset lock-down ablation on the beta branch measured
@@ -224,12 +335,6 @@ Prepared sample-packing data must also be held fixed across comparisons; changin
 The existing fused RMSNorm-to-FP4 prequant path is also left off here; it is
 functionally present in this branch but was not part of the measured fastest
 Qwen3.5 training profile.
-
-The shared LoRA base fprop path (`shared_lora_base_fprop`) is also left off for
-this Qwen3.5-9B profile. It reuses one NVFP4 activation pack across fused LoRA
-QKV/QK base fprops; the isolated QKV forward+backward path measured faster, but
-the end-to-end step delta on this 8-full-attention-layer hybrid model sat within
-whole-step noise. Try `true` on models with many more full-attention LoRA layers.
 
 Measured with `scripts/bench_nvfp4.sh` using marginal `train_runtime` delta,
 sequence length 2048, sample packing, no gradient checkpointing:
@@ -284,17 +389,11 @@ of once per attention layer removes the per-layer `bool(...)` device→host sync
 O(Z·S²) `tril`/compare; a same-session A/B on board #1 measured 1.1863 vs 1.1983 s/step
 (~1% faster) at unchanged loss.
 
-Negative checks from the same sweep:
+Additional negative checks from the attention-profile sweep (the cross-entropy
+negative checks above also apply):
 
 - `fused_fp4_cross_entropy` made batch 6 fit but remained slower after saved
   attention packs: 2.0500 s/step (~5,994 tok/s).
-- Cut Cross Entropy and Liger fused-linear CE are not valid with this NVFP4
-  training setup today: b5 warmups loss-collapsed to zero after the first step
-  and logged non-finite grad norms. The opt-in `bf16_lm_head_cross_entropy` path
-  (below) avoids that collapse — it never filters gradient mass and keeps the
-  logsumexp and `grad_hidden` accumulation in fp32 — but it is a memory win, not a
-  throughput win (1.2178 s/step, 56.48 GiB at b4; the tile GEMMs are bf16 with the
-  same FLOPs as the materialized lm_head, so it trades ~2.5% speed for ~13 GiB).
 - `fp8_lm_head_cross_entropy` can reduce memory and run b5/b6, but it did not
   beat the b4 saved-pack path on max throughput in clean validation. It is also
   not fully deterministic yet: one b6 run loss-collapsed with `grad_norm: nan`,
@@ -309,22 +408,24 @@ Negative checks from the same sweep:
   loss 2.533 / grad norm 1.185e6 over 40 steps. The stable full-precision b6
   baseline is `learning_rate: 2e-5`: 2.1550 s/step, final loss 1.054, loss max
   1.231, finite grad norms throughout the 40-step run.
-- fp16 batch 6 with NVFP4 omitted entirely measured 2.6250 s/step and finite loss,
-  but logged `grad_norm: nan` from the first step even with `max_grad_norm: 1.0`
-  explicit. Diagnostic runs showed the LoRA gradients were already NaN after AMP
-  unscale at global step 0; `GradScaler(init_scale=1.0)` did not fix it, and
-  fp16 b4 without `torch_compile` still produced NaN grad norms for the first
-  several steps before scaler backoff recovered. Treat fp16 Qwen3.5 numbers as
-  throughput-only; clipping cannot repair already non-finite gradients, and this
-  was not caused by the NVFP4 path.
-
-The native Qwen3.5 MLP, linear-attention, and standalone FP8 lm_head patches are
-currently eval/no-grad paths; they do not accelerate this training benchmark.
 
 ### Convergence
 
-In an A/B run (same model/data/seed/optimizer; Qwen2.5-0.5B, 120 steps), NVFP4 full
-fine-tune tracked bf16 with no NaN or divergence, with a small upward loss offset:
+With the canonical recipe (FP4 base + FP4 `lm_head` + Liger + fused-attn) on both
+sides, NVFP4 **tracks bf16** on the headline models — final loss within ~0.02–0.09 of
+bf16, finite grad_norm throughout (NVFP4 grad_norm stays ~0.5–4 with the packing
+graph-break fix), no NaN (alpaca-cleaned, seed 42, 300 steps):
+
+| Model | packing | final loss (bf16) | final loss (NVFP4) | verdict |
+|-------|---------|------------------:|-------------------:|---------|
+| Qwen3.5-9B | yes | 0.9042 | 0.932 | **tracks bf16** |
+| Qwen3.5-9B | no  | 0.8443 | 0.8685 | **tracks bf16** |
+| Qwen3-VL-8B | yes | 1.01 | 1.094 | **tracks bf16** |
+| Qwen3.5-9B, 8k (NVFP4 = `fused_fp4_cross_entropy`) | yes | 0.8913 | 0.934 | **tracks bf16** |
+
+An earlier shape-check A/B (Qwen2.5-0.5B, 120 steps, full fine-tune) showed the same
+pattern at small scale — NVFP4 tracked bf16 with a small upward loss offset and no
+divergence:
 
 | | bf16 | NVFP4 full (SR + RHT) | NVFP4 recipe-off |
 |---|--:|--:|--:|
@@ -339,12 +440,12 @@ rates where bf16 can overshoot.
 NVFP4 training modes are selected from the `adapter:` setting plus
 `nvfp4_training.base_mode` (adapter paths) / `quantize_base` (legacy alias):
 
-| Mode | `adapter:` | `base_mode` | What runs in FP4 | Memory savings | Speed (compiled, 7B) |
+| Mode | `adapter:` | `base_mode` | What runs in FP4 | Memory savings | Speed (compiled) |
 |------|-----------|-------------|------------------|----------------|------|
-| Full fine-tune | *(none)* | n/a | all eligible base GEMMs (trainable: fprop+dgrad+wgrad) | none | ~1.9× vs bf16 |
-| LoRA FP4-compute (default) | `lora` | `compute` | frozen base fprop+dgrad, pre-quantized once; adapters bf16 | ~1.75× weight | **~2.0× vs bf16-LoRA** |
-| NVFP4-QLoRA (FP4 storage) | `lora`/`qlora` | `storage` | frozen base GEMMs, base stored packed in FP4 | ~3.5× weight | ~1.6× vs bf16-LoRA |
-| LoRA HP base | `lora` | `hp` | frozen base GEMMs, base kept bf16, re-quantized each step | none | ~1.7× vs bf16-LoRA |
+| Full fine-tune | *(none)* | n/a | all eligible base GEMMs (trainable: fprop+dgrad+wgrad) | none | FP4 GEMM win |
+| LoRA FP4-compute (default) | `lora` | `compute` | frozen base fprop+dgrad, pre-quantized once; adapters bf16 | ~1.75× weight | **~1.5× (9B) / ~1.7× (VL-8B) packed** |
+| NVFP4-QLoRA (FP4 storage) | `lora`/`qlora` | `storage` | frozen base GEMMs, base stored packed in FP4 | ~3.5× weight | slower than `compute` |
+| LoRA HP base | `lora` | `hp` | frozen base GEMMs, base kept bf16, re-quantized each step | none | re-quants each step |
 
 The default LoRA path (`base_mode: compute`) pre-quantizes the frozen base ONCE
 at load into two NVFP4 layouts (fprop blocked along K, dgrad along N), so the
@@ -500,17 +601,71 @@ lm_head weight distribution, see the MixFP4 note in *Limitations*). Off by defau
 
 Two safety guards apply:
 
-- **Tied embeddings are rejected.** When `tie_word_embeddings` is set (or the output
-  and input embedding share the same parameter), `lm_head` shares storage with the
-  input embedding; quantizing it would corrupt `tok_embd`. Axolotl raises a clear
-  error in this case — use an untied model or leave `quantize_lm_head: false`. (Many
-  small models tie; larger Qwen3 variants do not.)
+- **Tied embeddings: a *frozen* tied weight is handled; a *trainable* one is rejected.**
+  When `tie_word_embeddings` is set, `lm_head` shares storage with the input embedding.
+  If that shared weight is **frozen** (the usual case — e.g. under LoRA), Axolotl
+  quantizes it **once** and routes the single FP4 store to both the embedding lookup and
+  the lm_head GEMM (`NVFP4TiedLMHead`), so the two roles stay bit-identical. Only a
+  **trainable** tied weight raises a clear error (an FP4 store has no bf16 master to take
+  the gradient) — untie the model or leave `quantize_lm_head: false`. (Many small models
+  tie; larger Qwen3 variants do not.)
 - **Cut Cross-Entropy is rejected.** `cut_cross_entropy` fuses the output projection
   into the loss and reads the `lm_head` weight directly, bypassing the NVFP4 forward.
   The combination is refused at config validation. Disable one of the two.
 
 If the `lm_head` dimensions are not FP4-eligible (`%32`), it is left in high
 precision with a warning rather than crashing.
+
+### Recovering FP4 lm_head accuracy: distillation and low-rank residual (opt-in)
+
+The frozen FP4 head adds ~9.5% uniform e2m1 mantissa noise (~21% argmax flips,
+all near-ties; ~+0.04 nats CE on an 8B head). The frozen weight cannot move off
+its FP4 grid, but two opt-in recovery levers exist, both gated to
+`quantize_lm_head: true` and both OFF by default:
+
+- **`lm_head_distillation`** — a KL-distillation aux-loss against the ORIGINAL
+  bf16 head (retained as a frozen teacher at swap time):
+  `total = CE + lambda * T^2 * KL(softmax(z_teacher/T) || softmax(z_student/T))`.
+  The trainable body learns to emit hidden states whose FP4 logits match the
+  bf16-head logits. The teacher logits are always computed in vocab tiles (peak
+  memory never the full `[tokens, vocab]`); `top_k` bounds the KL math to k
+  teacher logits plus one aggregated tail bucket, and `cadence: N` applies the
+  KL term only every N optimizer steps, amortizing the (dominant) teacher
+  matmul. `teacher: precomputed` is a Phase-1 design stub (warns and uses the
+  live teacher).
+- **`lm_head_residual`** — a low-rank bf16 correction `A[V,k] @ B[k,H]` of the
+  quant error `E = W_bf16 - dequant(Q(W))`, computed ONCE at load and threaded
+  into every logit path (direct GEMM, fused-CE tiles, distillation student
+  logits). The default `calibration: activation` (L2QER) weights E by the
+  calibration activation second moment (`calib_tokens` real tokens forwarded
+  once at load) before the SVD — the only construction that meaningfully helps:
+  the raw e2m1 error is near full-rank, so plain `calibration: svd` recovers
+  little and is kept as an ablation. Measured on a Qwen3-8B head, rank 16 cut
+  `KL(bf16 || fp4)` by ~57% and closed the CE gap. Unlike the distillation term
+  (train-time only), the residual is a PERMANENT cost (train + inference),
+  nearly rank-independent (~10–15% of the head forward when fused into the CE
+  tile loop) — prefer the smallest rank that captures the gain (16 sufficed on
+  Qwen3 0.6B/8B heads; default 32).
+
+```yaml
+nvfp4_training:
+  enabled: true
+  quantize_lm_head: true
+  lm_head_distillation:
+    enabled: true
+    lambda: 1.0          # weight on the KL term
+    temperature: 1.0     # softmax temperature (grad scaled by T^2)
+    top_k: 128           # distill top-128 teacher logits + a tail bucket
+    cadence: 4           # apply the KL term every 4 steps (amortize the teacher)
+    teacher: live
+  lm_head_residual:
+    enabled: true
+    rank: 16
+    calibration: activation   # L2QER (default); 'svd' is an ablation
+    calib_tokens: 512
+```
+
+See `examples/nvfp4/qwen-nvfp4-lm-head-distill.yaml` for a complete config.
 
 ### FP8 lm_head cross-entropy (opt-in)
 
@@ -522,13 +677,17 @@ scaled matmul against a prepacked dgrad weight layout. It is incompatible with
 `quantize_lm_head`, `fused_fp4_cross_entropy`, and the other CE optimization
 patches.
 
-This is a memory/batch-size unlock, not the current fastest max-throughput path:
-on Qwen3.5-9B LoRA with sequence length 2048 and no gradient checkpointing it made
-batch 5 run at 1.5312 s/step (~6,688 tok/s, 69.60 GiB active) and batch 6 run at
-1.7700 s/step (~6,943 tok/s, 80.32 GiB active), while the fastest b4 saved-pack
-path remained ahead on tokens/sec. Treat batch-6 FP8 CE as experimental: one
-validation run loss-collapsed after the first step with non-finite grad norms,
-while a later short repeat stayed finite.
+Experimental and **not recommended** — it converges but is **dominated**. In an
+apples-to-apples comparison (Qwen3.5-9B, same recipe, varying only the CE) FP8 CE is
+the **slowest and most memory-hungry** of the CE options: it measured **8k 2,620 tok/s
+· 31.4 GiB · 0.958** and **32k 2,656 tok/s · 71.6 GiB · 0.892** (loss tracks
+`bf16_lm_head_cross_entropy`), where at 32k `fused_fp4_cross_entropy` uses 26.9 GiB and
+`bf16_lm_head_cross_entropy` uses 45.1 GiB — both faster *and* lighter at every context.
+It streamed (no fallback to materialized), so the high peak is a current
+kernel-efficiency limitation, not a config issue. (An earlier short-seq batch-scaling
+probe — seq 2048, no gradient checkpointing — ran batch 5/6, but one run loss-collapsed
+after the first step with non-finite grad norms.) Prefer `fused_fp4_cross_entropy`
+(minimum memory, fits 64k) or `bf16_lm_head_cross_entropy` (best speed + convergence).
 
 ### Chunked bf16 lm_head cross-entropy (opt-in)
 
@@ -559,6 +718,79 @@ by the integration layer rather than inside `convert_to_nvfp4_training` directly
 current integration code.
 :::
 
+## Long context
+
+At long context the cross-entropy recipe — not the base GEMMs — dominates memory. A
+standard CE materializes the `[tokens × 248320-vocab]` logit tensor, which is ≈65 GB
+at 64k and OOMs a single card at 32k+. So **the CE must switch with context length**:
+
+- **Short (≤4k):** `liger_cross_entropy` — the logit tensor is small, so it is the
+  fastest option.
+- **Long (≥8k):** `fused_fp4_cross_entropy` (logit-free; requires
+  `quantize_lm_head: true`) — **required at 32k+**, where a logits-materializing CE
+  OOMs.
+
+**64k on one card.** `fused_fp4_cross_entropy` trains a **9B model at 64k context in
+41.6 GiB on a single 96 GiB card** — the only recipe that fits 64k. It also fits a
+**Qwen3.5-27B at 32k** (1,252 tok/s · 64.0 GiB) where bf16 OOMs.
+
+### Fair comparison vs bf16 (apples-to-apples)
+
+The honest baseline is *also logit-free*: bf16 with Liger `fused_linear_cross_entropy`
+(FLCE), which likewise never materializes the logit tensor. With that fair baseline,
+**both** recipes train long context up to 32k — but NVFP4 uses **~⅓–½ of bf16's
+memory** and is **~20–26% faster** at every length. Qwen3.5-9B (mbs 1, gc on, packing,
+compiled; tok/s · peak GiB):
+
+| seq | bf16 + FLCE (logit-free, fair baseline) | NVFP4 + `fused_fp4_cross_entropy` | NVFP4 mem ratio |
+|-----|----------------------------------------:|----------------------------------:|----------------:|
+| 8k  | 2,722 · 31.4 | 3,232 · 15.9 | **0.51×** |
+| 16k | 2,603 · 44.8 | 3,227 · 19.6 | **0.44×** |
+| 32k | 2,663 · 71.6 | 3,352 · 26.9 | **0.38×** |
+| 64k | **OOM** (needs ~140 GiB) | 1,846 · 41.6 | NVFP4 only |
+
+bf16 with logit-free FLCE fits to 32k; it is **not** that "bf16 can't do long
+context." The honest claim is that NVFP4 uses ~⅓ the memory at every length and is the
+**only** recipe that fits 64k (the logit-free bf16 baseline still OOMs there, needing
+~140 GiB).
+
+### Choosing the cross-entropy
+
+Three NVFP4 CE options differ only in the lm_head precision they run the loss against
+(everything else held fixed; tok/s · peak GiB at 64k):
+
+| Option | lm_head | 64k | Trade-off |
+|--------|---------|-----|-----------|
+| `fused_fp4_cross_entropy` | FP4 (needs `quantize_lm_head: true`) | 1,846 · **41.6** | **Minimum memory** (fits 64k); ~15% slower; slight convergence cost. |
+| `bf16_lm_head_cross_entropy` | bf16 (needs `quantize_lm_head: false`) | 2,040 · 76.6 | **Best convergence + faster**, but ~2× the memory (near the 96 GiB limit at 64k). |
+| standard `liger_cross_entropy` | FP4 | OOM | Fastest at short context; **OOMs at 32k+**. |
+
+`fused_fp4_cross_entropy` and `bf16_lm_head_cross_entropy` are mutually exclusive and
+have opposite `quantize_lm_head` requirements (`True` vs `False`).
+
+### What is actually new in `fused_fp4_cross_entropy`
+
+The *fusion technique* — stream the vocabulary in tiles, keep a running online-softmax
+tally, and never materialize the full `[tokens × vocab]` logit tensor — is **not** new.
+It is the established **Cut-Cross-Entropy (CCE) / Liger `fused_linear_cross_entropy`**
+approach (and `bf16_lm_head_cross_entropy` is essentially that technique on a plain
+bf16 head). What is new is making that fusion work **when the lm_head is *stored* in
+4-bit (NVFP4)** — packed 4-bit (e2m1) values plus separate per-group (e4m3) scales. The
+off-the-shelf fused-CE kernels stream tiles out of a dense bf16 weight and an NVFP4 head
+has none, so they would have to rebuild a full dense bf16 copy of the head first, undoing
+the compression (which is exactly why `cut_cross_entropy` and
+`liger_fused_linear_cross_entropy` are rejected under `quantize_lm_head` — and why they
+loss-collapse under NVFP4 SR grads, see the negative checks above).
+`fused_fp4_cross_entropy` instead reads **row-slices of the packed 4-bit head and
+dequantizes each tile to bf16 just-in-time** (bit-identical to dequantizing the whole
+table), then runs the per-tile matmul — so neither the full logits **nor** a dense bf16
+copy of the head ever exists, only one `[tokens × V_BLOCK]` tile at a time. This is a
+**memory** win, not an FP4-tensor-core throughput win: the per-tile matmul runs in
+**bf16** by default (an experimental `fused_fp4_cross_entropy_fp4_matmul` flag routes it
+through FP4 `torch._scaled_mm`, but it is off by default and currently slower). The
+contribution is narrow and engineering-level — a memory technique, not a new CE algorithm
+or an FP4 GEMM.
+
 ## Configuration reference
 
 The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
@@ -568,14 +800,20 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `null` (off) | Enable NVFP4-GEMM training (real FP4 forward/backward GEMMs). Blackwell-only; speedup requires `torch.compile`. |
+| `backend` | `"native" \| "te"` | `"native"` | FP4 compute backend. `native`: the `torch._scaled_mm` module-swap with the full SR+RHT recipe on any FP4 GPU (sm_100/sm_120), no extra build. `te`: NVIDIA Transformer Engine (faster kernels, source build); on consumer sm_120 its RHT/SR kernels don't run (recipe-less, convergence unproven) and adapter paths keep a high-precision base. |
 | `stochastic_rounding` | `bool` | `true` | Stochastic rounding on gradient operands. |
 | `hadamard` | `bool` | `true` | Random Hadamard transform on wgrad inputs. |
 | `quantize_base` | `bool` | `false` | Adapter modes only. `false` = LoRA + FP4 compute (frozen base high-precision, FP4 GEMMs, throughput only). `true` = NVFP4-QLoRA (frozen base stored packed in FP4, ~3.5× weight memory). Implied by `adapter: qlora`. Conflicts with `load_in_4bit`/`load_in_8bit`. |
 | `base_mode` | `"compute" \| "storage" \| "hp"` | `null` | Adapter modes only. `compute` pre-quantizes the frozen base into FP4 layouts for fastest LoRA base fprop/dgrad; `storage` stores the frozen base packed in FP4 for maximum memory savings; `hp` keeps the base high precision and re-quantizes each step. Overrides `quantize_base` when set. |
 | `exclude_modules` | `list[str]` | `[lm_head, embed_tokens]` | Module name fragments kept in high precision (not swapped). |
-| `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). **Incompatible with tied embeddings and `cut_cross_entropy` (both raise).** `embed_tokens` stays excluded. |
-| `fused_fp4_cross_entropy` | `bool` | `false` | Opt-in. Requires `quantize_lm_head`. Computes CE while tiling over the NVFP4 lm_head so logits are not materialized. This is a memory feature, not a tensor-core FP4 lm_head throughput feature. |
-| `fp8_lm_head_cross_entropy` | `bool` | `false` | Opt-in. Requires a frozen bias-free plain `nn.Linear` lm_head. Streams FP8 lm_head vocab tiles into CE without full logits materialization and uses FP8 scaled matmul for `dL/dhidden`; no lm_head weight grad. Memory/batch-size feature; not currently the fastest b4 max-throughput path. |
+| `quantize_lm_head` | `bool` | `false` | Opt-in. Remove `lm_head` from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large tensor, small convergence cost). A **frozen** tied embedding is quantized once and shared with both roles; a **trainable** tied weight raises, as does `cut_cross_entropy`. `embed_tokens` stays excluded. |
+| `quantize_embeddings` | `bool` | `false` | Store the input embedding (`embed_tokens`) packed in FP4, dequantized on lookup (W4A16). **Frozen only** (a trainable embedding is skipped with a warning); hidden dim must be %16. |
+| `quantize_vision_tower` | `bool` | `false` | Multimodal only. Swap the **frozen** `nn.Linear`s under the vision encoder (attn qkv/proj, mlp fc1/fc2) to NVFP4; the merger and patch-embed projection are left untouched. Warns if no vision tower is found. |
+| `fused_fp4_cross_entropy` | `bool` | `false` | Opt-in. Requires `quantize_lm_head`. Tiles CE over the FP4 lm_head with online softmax — each tile is dequantized FP4→bf16 just-in-time (per-tile matmul in **bf16** by default) so neither logits nor a dense head are materialized. A **memory** win, not an FP4-GEMM win. The long-context recipe (fits 9B at 64k in 41.6 GiB). See [Long context](#long-context). |
+| `fused_fp4_cross_entropy_fp4_matmul` | `bool` | `false` | **Experimental.** Route the fused-CE per-tile matmul through FP4 `torch._scaled_mm` (hits FP4 tensor cores) instead of bf16. Faster than the memory-only FP4-CE path but slower than materialized bf16/Liger CE — keep off unless benchmarking the next CE-epilogue design. |
+| `fp8_lm_head_cross_entropy` | `bool` | `false` | Opt-in. Requires a frozen bias-free plain `nn.Linear` lm_head. Streams FP8 lm_head vocab tiles into CE without full logits materialization; FP8 scaled matmul for `dL/dhidden`; no lm_head weight grad. **Converges but dominated** — slowest and highest-memory CE (8k 31.4 GiB, 32k 71.6 GiB; worse than `fused_fp4`/`bf16_lm_head` on both). Not recommended. |
+| `lm_head_distillation.*` | block | off | KL-distillation aux-loss for the frozen FP4 lm_head against the original bf16 head retained at swap time (`enabled`, `lambda`, `temperature`, `top_k`, `cadence`, `teacher`, `teacher_vocab_block`). Teacher logits computed in vocab tiles; `top_k`/`cadence` bound the per-step teacher cost. Requires `quantize_lm_head`. |
+| `lm_head_residual.*` | block | off | Low-rank bf16 residual `A@B` on the frozen FP4 lm_head (`enabled`, `rank`, `calibration: activation\|svd`, `calib_tokens`), computed once at load. Activation-weighted (L2QER) by default; ~57% of the FP4-head KL gap recovered at rank 16 on a Qwen3-8B head. PERMANENT inference cost (~10–15% of the head forward when fused). Requires `quantize_lm_head`. |
 | `shared_lora_base_fprop` | `bool \| null` | `null` (env fallback; off) | Experimental LoRA/QLoRA native-backend option. For fused LoRA QKV/QK projections with pre-quantized NVFP4 frozen bases, pack the shared activation once and reuse it across base fprops. YAML `true`/`false` wins; omitted/null falls back to `AXOLOTL_NVFP4_SHARED_BASE_FPROP`. Leave off unless an end-to-end bench on a many-attention-layer model shows a win. |
 | `skip_first_n_blocks` | `int` | `0` | Keep the first N transformer blocks in high precision (see the ~15% high-precision policy below). |
 | `skip_last_n_blocks` | `int` | `0` | Keep the last N transformer blocks in high precision (the tail blocks matter most). |
@@ -583,14 +821,17 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `attention.enabled` | `bool` | `false` | Patch full softmax-attention layers to the native NVFP4 attention path on dense causal/full batches (model-agnostic; applied where the architecture supports it). Replaces the deprecated flat `qwen3_5_native_attention*` flags. |
 | `attention.fuse_vproj` | `bool \| null` | `null` | Run v_proj as a native NVFP4 GEMM with a key-axis pack epilogue on inference/cache-free prefill. `null`: on for inference, off for training. |
 | `attention.fp4_projections` | `bool` | `false` | Run q/k/o_proj as native NVFP4 GEMMs (q/k share one activation pack) on inference prefill. **Parity-affecting** (not bit-exact); speed-neutral on hybrid models, a per-layer win on dense models. Plain-`nn.Linear` only. |
+| `attention.allow_full_model` | `bool` | `false` | Allow native NVFP4 attention on NON-hybrid models where every layer is full softmax attention (e.g. Qwen3-VL). Refused by default — the ~0.97-cosine per-layer error compounds over all layers and destroys the forward (see the hybrid-model warning above). |
 | `attention.backward.enabled` | `bool` | `false` | Requires `attention.enabled`. Use the native NVFP4 autograd attention path while training. |
 | `attention.backward.rtn_grad_packs` | `bool` | `false` | Deterministic round-to-nearest for the measured-safe gradient packs, leaving the dK and dPt packs governed by `stochastic_rounding`. |
 | `attention.backward.save_packs` | `bool` | `false` | Save the forward Q/K/V FP4 packs (+ transposed backward layouts) and reuse them in backward — trades activation memory for higher throughput. Under the compile custom op, this is applied only on short/mid static sequence lengths where the forward dual-pack cost measured worthwhile. |
+| `attention.backward.bf16_grad_dots` | `bool \| null` | `null` (auto) | HP-grad-dots backward: keep the FP4 S/dP recomputes but run the three grad GEMMs (dV/dK/dQ) as bf16 `tl.dot` with exact operands — ~1.5–1.7× faster backward, grad cosine vs bf16 SDPA ~0.991 (vs ~0.94 RTN / ~0.82 SR all-FP4), ~4× less backward scratch. `null` auto-enables it whenever `save_packs` is off; `true` forces it (rejected with `save_packs: true` — the HP path needs the saved high-precision q/k/v); `false` forces the legacy all-FP4 backward. When active, `rtn_grad_packs` and `dkdv_scratch_bf16` are moot. |
 | `attention.backward.dkdv_scratch_bf16` | `bool` | `false` | Store dQ and per-query-head dK/dV backward scratch in bf16 (accumulate fp32 in-register, downcast once at the store → bit-identical to fp32-then-`.to(bf16)`; a pure memory save on the largest backward scratch planes). |
 | `attention.backward.compile_custom_op` | `bool \| null` | `null` (auto) | Wrap the attention path in an opaque differentiable custom op so Inductor compiles *around* the Triton `tl.dot_scaled` (which otherwise raises an `InductorError` and silently drops the block to eager). `null` auto-enables it when `torch_compile` is on and `attention.enabled`; `true`/`false` force it. The op reuses forward LSE in backward and honors `attention.backward.save_packs` conditionally by carrying deterministic forward FP4 packs across the opaque boundary only for short/mid static sequence lengths. |
 | `bf16_lm_head_cross_entropy` | `bool` | `false` | Opt-in **memory** path. Requires a frozen bias-free plain `nn.Linear` lm_head. Chunked online-softmax CE over bf16 vocab tiles — no `[tokens, vocab]` logits materialization, fp32 logsumexp/`grad_hidden`, no gradient filtering (avoids the CCE/Liger collapse). Trades ~2.5% throughput for ~13 GiB. Mutually exclusive with `quantize_lm_head` / `fused_fp4_cross_entropy` / `fp8_lm_head_cross_entropy`. |
-| `fla_causal_conv_compile_boundary` | `bool` | `false` | Sample-packing only. Runs FLA varlen `causal_conv1d` behind a compile boundary so variable packed `cu_seqlens` lengths do not repeatedly trigger Dynamo/Inductor recompiles. |
-| `linear_attn` / `mlp` / `fp8_lm_head` | `bool` | `false` | Eval/no-grad-only native-NVFP4 module patches (linear-attention projections, dense SwiGLU MLP). Do not accelerate grad-enabled training. Deprecated flat aliases: `qwen3_5_native_linear_attn`, `qwen3_5_native_mlp`. |
+| `fp8_lm_head` | `bool` | `false` | Eval/no-grad-only FP8 scaled-matmul lm_head patch for eval/scoring/logprob throughput. Training forwards stay high-precision. |
+| `fla_causal_conv_compile_boundary` | `bool` | `false` | Qwen3.5/MoE sample-packing only. Runs FLA varlen `causal_conv1d` behind a compile boundary so variable packed `cu_seqlens` lengths do not repeatedly trigger Dynamo/Inductor recompiles. |
+| `linear_attn` / `mlp` | `bool` | `false` | Eval/no-grad-only native-NVFP4 module patches (linear-attention projections, dense SwiGLU MLP). Do not accelerate grad-enabled training. Deprecated flat aliases: `qwen3_5_native_linear_attn`, `qwen3_5_native_mlp`. |
 
 ## FP4-packed save (`save_nvfp4`) {#fp4-packed-save-save_nvfp4}
 
@@ -668,9 +909,28 @@ loads from the checkpoint and the frozen base reconstructs/reloads identically).
   the all-gathered weight after forward and does not re-gather the no-grad base);
   and the slow SR quant path clamps amax (an all-zero dgrad tile otherwise gives a
   zero per-tensor scale and `0*inf=NaN`). Launch via `torchrun --nproc_per_node=N`.
-  Disable the fused LoRA Triton kernels (`lora_*_kernel: false`) — they bypass the
-  FP4 base. DDP remains simpler for models that fit replicated (the FP4 base is
-  3.5x smaller); use FSDP2 when the base must be sharded.
+  For **FP4-stored QLoRA** (`base_mode: storage` / `adapter: qlora`) under FSDP2 the
+  config validator emits a **cautionary warning** to set `lora_*_kernel: false`, on the
+  theory that the fused LoRA kernels' plain FP4 GEMM may not participate in FSDP2's
+  custom all-gather of the packed FP4 weight. In a two-rank smoke this did **not**
+  manifest — kernels-on ran cleanly and converged **identically** to kernels-off (the
+  FP4 storage base stayed active), so it is a caution, not a hard failure; disable the
+  kernels if you observe divergence on a larger / more-sharded setup. The
+  `compute`/FFT base modes keep a bf16 master weight that FSDP2 shards normally and
+  carry no such warning. On single-GPU / DDP the LoRA kernels are NVFP4-aware and stay
+  auto-enabled (`get_lora_parameters` threads the NVFP4 base module through the
+  quant-state slot and runs the base GEMM in FP4, not the dense `base_layer.weight`).
+  DDP remains simpler for models that fit replicated (the FP4 base is 3.5x smaller);
+  use FSDP2 when the base must be sharded.
+- **Tensor parallelism / context parallelism: not validated — use DDP or FSDP2.**
+  `tensor_parallel_size` has no NVFP4-aware sharding (the per-group FP4 scales are
+  not split alongside the weight), and models with **tied embeddings cannot use TP
+  at all** (a transformers limitation — e.g. Qwen3.5-2B). In a short two-rank smoke
+  NVFP4 *tracked* bf16 under TP (near-identical loss), so NVFP4 does not break TP —
+  but TP correctness itself is unverified here, so it is not a supported path.
+  `context_parallel_size` requires `ring_flash_attn`, which is currently incompatible
+  with the validated `transformers` version (it imports a symbol removed upstream),
+  so it could not be exercised — untested.
 - **Checkpoint resume:** the FP4-stored QLoRA base is registered as a buffer, so
   it is saved in `state_dict` and reloads bit-exactly — resume works.
 - **Full fine-tune has the most validation coverage.** The convergence and

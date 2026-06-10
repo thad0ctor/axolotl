@@ -57,7 +57,9 @@ def geglu_forward(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """
     batch, seq_len, hidden_dim = gate.shape
     n_elements = gate.numel()
-    out = torch.empty((batch, seq_len, hidden_dim), dtype=gate.dtype, device=gate.device)
+    out = torch.empty(
+        (batch, seq_len, hidden_dim), dtype=gate.dtype, device=gate.device
+    )
 
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)  # noqa: E731
     _geglu_fwd_kernel[grid](

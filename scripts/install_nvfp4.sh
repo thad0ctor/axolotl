@@ -9,8 +9,8 @@
 #      path the kernels emit. Stable CUDA wheels do not yet ship this; use the
 #      cu130 (or nightly cu130) index.
 #   2. transformers >= 4.57  (Qwen3.5 / `qwen3_5` model support).
-#   3. mslk  —  github.com/pytorch/MSLK, Meta/PyTorch's FP4 quant Triton kernels
-#      (`triton_quantize_nvfp4` etc.), used by the NVFP4 linear/MLP path.
+#   3. mslk  —  github.com/meta-pytorch/MSLK, Meta/PyTorch's FP4 quant Triton kernels
+#      (`triton_quantize_nvfp4` etc.), used by the NVFP4 base GEMM path.
 #      Published on the PyTorch wheel index.
 #   4. The SageAttention-NVFP4 fork (`sageattention.nvfp4`) — the native-NVFP4
 #      flash-attention kernel (forward + FP4 backward). Pure Triton, so it
@@ -30,7 +30,7 @@
 #     --mslk-stable          force the stable cu130 index for mslk (the default)
 #     --mslk-nightly         use the nightly cu130 index for mslk (--pre); pair
 #                            this with a nightly cu130 torch or the ABIs mismatch
-#     --build-mslk           build mslk from source (github.com/pytorch/MSLK) instead
+#     --build-mslk           build mslk from source (github.com/meta-pytorch/MSLK) instead
 #     --editable-sage        ALSO clone the fork + install it editable, overriding
 #                            the git copy (for hacking the kernel). Default: the
 #                            fork is pulled from the nvfp4-attn extra's git dep only.
@@ -51,7 +51,7 @@ TORCH_INDEX="https://download.pytorch.org/whl/cu130"
 MSLK_INDEX="https://download.pytorch.org/whl/cu130"
 MSLK_PRE=""
 BUILD_MSLK=0
-MSLK_REPO="https://github.com/pytorch/MSLK.git"
+MSLK_REPO="https://github.com/meta-pytorch/MSLK.git"
 SAGE_REPO="https://github.com/thad0ctor/SageAttention.git"
 SAGE_REF="main"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -61,7 +61,12 @@ EDITABLE_SAGE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tool) TOOL="$2"; shift 2;;
+    --tool)
+      case "${2:-}" in
+        uv|pip) TOOL="$2";;
+        *) echo "ERROR: --tool must be one of: uv, pip" >&2; exit 2;;
+      esac
+      shift 2;;
     --create-venv) CREATE_VENV="$2"; shift 2;;
     --with-torch) WITH_TORCH=1; shift;;
     --torch-index) TORCH_INDEX="$2"; shift 2;;
@@ -108,12 +113,13 @@ if [[ "$WITH_TORCH" == "1" ]]; then
 fi
 
 # --- 2. transformers -----------------------------------------------------------
-# Pin to the validated set (5.8.x). >=4.57 brings Qwen3.5 (`qwen3_5`) support; the
-# <5.9 cap keeps us on the transformers the NVFP4 stack was validated against.
-say "Installing transformers >= 4.57, < 5.9 (Qwen3.5 support; validated on 5.8.x)"
-PIP install "transformers>=4.57.0,<5.9.0"
+# >=4.57 brings Qwen3.5 (`qwen3_5`) support. The NVFP4 stack is validated on
+# transformers 5.9.0 + liger-kernel 0.8.0 (the versions pinned in pyproject); the
+# `axolotl` install below pins `transformers==5.9.0`, so this just enforces the floor.
+say "Installing transformers >= 4.57 (Qwen3.5 support; validated on 5.9.0)"
+PIP install "transformers>=4.57.0"
 
-# --- 3. mslk (FP4 quant kernels for the linear/MLP path) -----------------------
+# --- 3. mslk (FP4 quant kernels for the base GEMM path) ------------------------
 if [[ "$BUILD_MSLK" == "1" ]]; then
   say "Building mslk from source ($MSLK_REPO)"
   MSLK_DIR="$(dirname "$REPO_ROOT")/MSLK"
@@ -184,7 +190,7 @@ import transformers
 ok(f"transformers {transformers.__version__}")
 
 importlib.import_module("mslk")
-ok("mslk importable (linear/MLP FP4 path)")
+ok("mslk importable (base GEMM FP4 path)")
 
 from sageattention.nvfp4 import nvfp4_flash_attn_func  # noqa: F401
 ok("sageattention.nvfp4 importable (attention kernel)")

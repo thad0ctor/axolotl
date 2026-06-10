@@ -67,6 +67,9 @@
 # 1.5312 s/step; CCE/Liger CE loss-collapse with non-finite grad norms in this
 # NVFP4 training setup.
 #
+# base_mode: compute pre-quantizes the frozen base into the two NVFP4 layouts so
+# fprop and dgrad run as pure FP4 GEMMs with no per-step base-quant prologue.
+#
 # For benchmark comparisons, copy this config to /tmp, set base_model to the
 # local model path, and keep dataset_prepared_path fixed across compared runs.
 base_model: Qwen/Qwen3.5-9B

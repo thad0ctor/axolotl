@@ -37,6 +37,22 @@ LOG = logging.getLogger(__name__)
 _MIN_FP4_CAPABILITIES = ((10, 0), (12, 0))
 
 _BLOCK_SIZE = 16  # NVFP4 is fixed at block_size 16
+
+
+def _apply_lm_head_residual(module, x, out):
+    """Add the low-rank bf16 residual correction to a frozen FP4 head's logits.
+
+    No-op (and zero import/dispatch cost) unless an ``lm_head_residual`` was
+    attached to ``module`` at load (OFF by default). Kept here so all three FP4
+    head forwards (frozen/tied/compute) route the residual through one code path,
+    bit-identical to the fused-CE and distillation residual term.
+    """
+    a = getattr(module, "_lm_head_residual_A", None)
+    if a is None:
+        return out
+    from axolotl.kernels.nvfp4_residual import apply_residual
+
+    return apply_residual(module, x, out)
 # torch._scaled_mm packs 2 FP4/byte and requires the packed contraction dim
 # (= logical/2) to be divisible by 16, so logical contraction must be a
 # multiple of 32. The token dimension (M) is padded to this alignment.
@@ -658,6 +674,14 @@ def _fsdp_nvfp4_class():
                 return type(out)(rewrapped)
             return out
 
+    # The class is built lazily inside this function so the module never imports
+    # torchao's NVFP4Tensor at top level — but a ``<locals>`` class is not
+    # picklable, and FSDP2's FULL_STATE_DICT save pickles the frozen NVFP4 params.
+    # Expose it at module scope with a stable qualname so pickle can round-trip it.
+    FSDPNVFP4Tensor.__module__ = __name__
+    FSDPNVFP4Tensor.__qualname__ = "FSDPNVFP4Tensor"
+    globals()["FSDPNVFP4Tensor"] = FSDPNVFP4Tensor
+
     _FSDP_NVFP4_CLS = FSDPNVFP4Tensor
     return _FSDP_NVFP4_CLS
 
@@ -696,6 +720,7 @@ class NVFP4FrozenBaseLinear(nn.Module):
 
     def forward(self, x):
         out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
+        out = _apply_lm_head_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -865,6 +890,7 @@ class NVFP4TiedLMHead(nn.Module):
 
     def forward(self, x):
         out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
+        out = _apply_lm_head_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -955,6 +981,7 @@ class NVFP4ComputeBaseLinear(nn.Module):
 
     def forward(self, x):
         out = NVFP4ComputeBaseFunction.apply(x, self.w_fprop, self.w_dgrad, self.recipe)
+        out = _apply_lm_head_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -2270,6 +2297,7 @@ def swap_frozen_linear_to_nvfp4(
     recipe: NVFP4Recipe | None = None,
     *,
     base_mode: str = "compute",
+    retain_teacher: bool = False,
 ) -> bool:
     """Swap a single bare frozen ``nn.Linear`` (e.g. an un-targeted lm_head in a
     LoRA run) for the matching NVFP4 base module.
@@ -2310,7 +2338,9 @@ def swap_frozen_linear_to_nvfp4(
         LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
         return True
 
-    new_module = _stream_quantize_swap(model, name, module, build)
+    new_module = _stream_quantize_swap(
+        model, name, module, build, retain_teacher=retain_teacher
+    )
     _dynamo_disable_forward(new_module)
     LOG.info("NVFP4 training: swapped frozen %s (mode=%s)", name, base_mode)
     return True
@@ -2320,6 +2350,8 @@ def swap_frozen_lm_head_tileable(
     model: nn.Module,
     name: str,
     recipe: NVFP4Recipe | None = None,
+    *,
+    retain_teacher: bool = False,
 ) -> bool:
     """Swap a bare frozen lm_head to the row-sliceable torchao FP4 store.
 
@@ -2342,6 +2374,7 @@ def swap_frozen_lm_head_tileable(
         name,
         module,
         lambda src: NVFP4FrozenBaseLinear.from_linear(src, recipe, fsdp=False),
+        retain_teacher=retain_teacher,
     )
     _dynamo_disable_forward(new_module)
     LOG.info("NVFP4 training: swapped frozen %s (tileable storage for fused CE)", name)
@@ -2388,7 +2421,30 @@ def _reclaim_gpu() -> None:
         torch.cuda.empty_cache()
 
 
-def _stream_quantize_swap(model, name, source, build):
+def _retain_teacher_weight(new_module: nn.Module, source: nn.Module) -> None:
+    """Clone the ORIGINAL bf16 weight onto ``new_module`` for KL-distillation.
+
+    Captured BEFORE ``_stream_quantize_swap`` frees the source, so the teacher is
+    the true bf16 head (not the lossy FP4 dequant). Held as a non-persistent,
+    no-grad buffer ``_distill_teacher_w`` ([V, H]); non-persistent so it stays out
+    of the checkpoint (it is reconstructable from the original model and would
+    otherwise ~triple the lm_head save). The clone is independent of the source
+    storage about to be freed.
+    """
+    w = getattr(source, "weight", None)
+    if w is None:
+        return
+    teacher = w.detach().clone()
+    teacher.requires_grad_(False)
+    # register_buffer with persistent=False keeps it off the state_dict.
+    new_module.register_buffer("_distill_teacher_w", teacher, persistent=False)
+    LOG.info(
+        "NVFP4 lm_head_distillation: retained bf16 teacher weight %s on the FP4 head",
+        tuple(teacher.shape),
+    )
+
+
+def _stream_quantize_swap(model, name, source, build, *, retain_teacher: bool = False):
     """Quantize ``source`` to its NVFP4 module keeping the transient peak small.
 
     The lm_head/embed/vision swaps run AFTER the full model is on the GPU, so on a
@@ -2399,9 +2455,14 @@ def _stream_quantize_swap(model, name, source, build):
     carried alongside the FP4 copies — mirroring the LoRA base streaming. Quant
     stays on the GPU (CPU quant is NOT bit-identical: torchao's e2m1 rounding
     diverges between CPU and CUDA).
+
+    ``retain_teacher``: clone the source bf16 weight onto the new module before it
+    is freed, for the lm_head KL-distillation teacher (a bf16 [V, H] buffer).
     """
     new_module = build(source)
     _set_submodule(model, name, new_module)
+    if retain_teacher and isinstance(source, nn.Module):
+        _retain_teacher_weight(new_module, source)
     # Free the now-replaced bf16 source. Sync first: the quant kernels may still
     # read it async, and expandable_segments would otherwise hand the freed block
     # to the next allocation (use-after-free / illegal access).
@@ -2457,6 +2518,8 @@ def swap_tied_embedding_and_lm_head_to_nvfp4(
     embed_name: str,
     lm_head_name: str,
     recipe: NVFP4Recipe | None = None,
+    *,
+    retain_teacher: bool = False,
 ) -> bool:
     """Quantize a tied (shared) FROZEN weight ONCE and route both roles to it.
 
@@ -2485,11 +2548,23 @@ def swap_tied_embedding_and_lm_head_to_nvfp4(
     # at the SAME store. The shared weight is held by BOTH modules, so drop the
     # lm_head's reference too — otherwise streaming the embedding can't reclaim it.
     lm_head_bias = lm_head.bias
+    # Capture the bf16 teacher from the shared weight BEFORE streaming frees it.
+    teacher_w = None
+    if retain_teacher and embed.weight is not None:
+        teacher_w = embed.weight.detach().clone()
+        teacher_w.requires_grad_(False)
     lm_head.weight = None
     new_embed = _stream_quantize_swap(
         model, embed_name, embed, lambda src: NVFP4Embedding.from_embedding(src)
     )
     tied_head = NVFP4TiedLMHead(new_embed, lm_head_bias, recipe)
+    if teacher_w is not None:
+        tied_head.register_buffer("_distill_teacher_w", teacher_w, persistent=False)
+        LOG.info(
+            "NVFP4 lm_head_distillation: retained bf16 teacher weight %s on the "
+            "tied FP4 head",
+            tuple(teacher_w.shape),
+        )
     _set_submodule(model, lm_head_name, tied_head)
     _dynamo_disable_forward(tied_head)
     LOG.info("NVFP4 training: tied embedding/lm_head quantized once (shared FP4 store)")

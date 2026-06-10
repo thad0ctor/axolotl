@@ -165,6 +165,107 @@ def test_gate_refuses_bf16_lm_head_ce_with_quantized_lm_head(monkeypatch):
         )
 
 
+def test_schema_lm_head_distillation_defaults_off(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True})
+    distill = cfg.nvfp4_training.lm_head_distillation
+    assert distill.enabled is False
+    assert distill.cadence == 1
+    assert distill.temperature == 1.0
+    assert distill.teacher == "live"
+
+
+def test_schema_lm_head_distillation_parses_lambda_alias(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        nvfp4_training={
+            "enabled": True,
+            "quantize_lm_head": True,
+            "lm_head_distillation": {
+                "enabled": True,
+                "lambda": 2.0,
+                "temperature": 1.5,
+                "top_k": 128,
+                "cadence": 4,
+                "teacher": "live",
+            },
+        },
+    )
+    distill = cfg.nvfp4_training.lm_head_distillation
+    assert distill.lambda_ == 2.0
+    assert distill.top_k == 128
+    assert distill.cadence == 4
+
+
+def test_gate_refuses_lm_head_distillation_without_quantize_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="lm_head_distillation requires"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            nvfp4_training={
+                "enabled": True,
+                "quantize_lm_head": False,
+                "lm_head_distillation": {"enabled": True},
+            },
+        )
+
+
+def test_gate_allows_lm_head_distillation_with_quantize_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        nvfp4_training={
+            "enabled": True,
+            "quantize_lm_head": True,
+            "fused_fp4_cross_entropy": True,
+            "lm_head_distillation": {"enabled": True, "lambda": 1.0, "top_k": 64},
+        },
+    )
+    assert cfg.nvfp4_training.lm_head_distillation.enabled is True
+
+
+def test_schema_lm_head_residual_defaults_off(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True})
+    res = cfg.nvfp4_training.lm_head_residual
+    assert res.enabled is False
+    assert res.rank == 32
+    assert res.calibration == "activation"
+
+
+def test_gate_refuses_lm_head_residual_without_quantize_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="lm_head_residual requires"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            nvfp4_training={
+                "enabled": True,
+                "quantize_lm_head": False,
+                "lm_head_residual": {"enabled": True},
+            },
+        )
+
+
+def test_gate_allows_lm_head_residual_with_quantize_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        nvfp4_training={
+            "enabled": True,
+            "quantize_lm_head": True,
+            "fused_fp4_cross_entropy": True,
+            "lm_head_residual": {"enabled": True, "rank": 16, "calibration": "activation"},
+        },
+    )
+    assert cfg.nvfp4_training.lm_head_residual.enabled is True
+    assert cfg.nvfp4_training.lm_head_residual.rank == 16
+
+
 def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
     _supported(monkeypatch, True)
     cfg = AxolotlInputConfig(
@@ -969,3 +1070,21 @@ def test_e2e_lora_swap_and_train_step(quantize_base):
     out = model(input_ids=ids, labels=ids)
     out.loss.backward()
     assert torch.isfinite(out.loss).item()
+
+
+def test_fsdp_nvfp4_class_is_picklable():
+    """FSDP2's FULL_STATE_DICT save pickles the frozen NVFP4 params, so the
+    lazily-built FSDP-hooked subclass must live at module scope (not be a
+    ``<locals>`` class) or the checkpoint save crashes with
+    ``Can't get local object '_fsdp_nvfp4_class.<locals>.FSDPNVFP4Tensor'``.
+    Regression guard for that FSDP checkpoint-save bug."""
+    import pickle
+
+    pytest.importorskip("torchao.prototype.mx_formats.nvfp4_tensor")
+    from axolotl.utils.nvfp4_training import _fsdp_nvfp4_class
+
+    cls = _fsdp_nvfp4_class()
+    assert cls.__qualname__ == "FSDPNVFP4Tensor"
+    assert cls.__module__ == "axolotl.utils.nvfp4_training"
+    # the exact operation that failed during the FSDP checkpoint save:
+    assert pickle.loads(pickle.dumps(cls)) is cls

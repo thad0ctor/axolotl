@@ -884,7 +884,7 @@ class TestNVFP4Training:
         for p in m.parameters():
             p.requires_grad_(False)
 
-        name, vt = _find_vision_tower(m)
+        name, _vt = _find_vision_tower(m)
         assert name == "model.visual"
         n = convert_vision_tower_to_nvfp4(m, NVFP4Recipe(), base_mode="storage")
         # qkv + proj per block (fc1/fc2 skipped for %32), 2 blocks => 4
