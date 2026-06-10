@@ -201,8 +201,10 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale):
+    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale, res_A, res_B):
         # hidden: [M, H] (2D, contiguous), labels: [M]
+        # res_A [V,k] / res_B [k,H]: optional low-rank bf16 head residual; logits
+        # get + (hidden @ res_B.t()) @ res_A[lo:hi].t() per tile (None = no residual).
         M, H = hidden.shape
         V = store.shape[0]
         device = hidden.device
@@ -217,11 +219,18 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
 
+        # Precompute hidden @ res_B.t() -> [M, k] ONCE (the only H-contracting
+        # residual matmul); each tile then needs only [M,k] @ res_A[lo:hi].t().
+        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())
+
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
             w_tile = _dequant_vocab_tile(store, lo, hi, dtype)  # [Vb, H]
             # bf16 tile-matmul (the heavy FLOPs), fp32 only for the logsumexp.
-            logits = (hidden @ w_tile.t()).float() * scale  # [M, Vb]
+            logits = hidden @ w_tile.t()  # [M, Vb]
+            if hb is not None:
+                logits = logits + (hb @ res_A[lo:hi].t())
+            logits = logits.float() * scale
 
             tile_max = logits.max(dim=1).values
             new_max = torch.maximum(running_max, tile_max)
@@ -240,7 +249,7 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
 
         loss = per_token.sum() * grad_scale
 
-        ctx.save_for_backward(hidden, lse, safe_labels, valid)
+        ctx.save_for_backward(hidden, lse, safe_labels, valid, res_A, res_B)
         ctx.store = store
         ctx.scale = scale
         ctx.grad_scale = grad_scale
@@ -249,7 +258,7 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss):
-        hidden, lse, safe_labels, valid = ctx.saved_tensors
+        hidden, lse, safe_labels, valid, res_A, res_B = ctx.saved_tensors
         store = ctx.store
         scale = ctx.scale
         V = ctx.V
@@ -262,28 +271,44 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         )  # [M,1]
         rows = torch.arange(M, device=hidden.device)
 
+        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())  # [M,k]
+
         grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
+        # The residual contributes dz @ res_A[lo:hi] -> [M,k] accumulated, then
+        # @ res_B -> dL/dhidden (mirrors the (hidden@B.t())@A.t() forward).
+        grad_proj = None if res_A is None else torch.zeros(
+            M, res_A.shape[1], device=hidden.device, dtype=res_B.dtype
+        )
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
             w_tile = _dequant_vocab_tile(store, lo, hi, dtype)  # [Vb, H]
-            logits = (hidden @ w_tile.t()).float() * scale  # [M, Vb]
+            logits = hidden @ w_tile.t()  # [M, Vb]
+            if hb is not None:
+                logits = logits + (hb @ res_A[lo:hi].t())
+            logits = logits.float() * scale
             sm = torch.exp(logits - lse.unsqueeze(1))  # softmax tile [M, Vb]
 
             in_tile = (safe_labels >= lo) & (safe_labels < hi)
             cols = (safe_labels - lo).clamp(0, hi - lo - 1)
             sm[rows, cols] -= in_tile.float()  # subtract onehot in place
 
+            dz = (sm * coef).to(dtype)  # [M, Vb]
             # bf16 dz @ w_tile (the heavy backward FLOPs); accumulate in bf16.
-            grad_hidden += ((sm * coef).to(dtype)) @ w_tile
+            grad_hidden += dz @ w_tile
+            if grad_proj is not None:
+                grad_proj += dz.to(res_B.dtype) @ res_A[lo:hi]  # [M,k]
 
-        return grad_hidden, None, None, None, None, None
+        if grad_proj is not None:
+            grad_hidden += (grad_proj @ res_B).to(dtype)  # dL/dhidden via residual
+
+        return grad_hidden, None, None, None, None, None, None, None
 
 
 class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
     """Tiled CE whose lm_head logits are produced by FP4 ``torch._scaled_mm``."""
 
     @staticmethod
-    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale):
+    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale, res_A, res_B):
         M, _ = hidden.shape
         V = store.shape[0]
         device = hidden.device
@@ -305,13 +330,17 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
 
+        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())  # [M,k]
+
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
             tile = _slice_vocab_tile(store, lo, hi)
             if tile is None:
                 raise RuntimeError("FP4 lm_head store is not vocab-tile sliceable")
-            logits = _fp4_logits_tile(hidden_qdata, hidden_scale, tile, dtype).float()
-            logits = logits * scale
+            logits = _fp4_logits_tile(hidden_qdata, hidden_scale, tile, dtype)
+            if hb is not None:
+                logits = logits + (hb @ res_A[lo:hi].t()).to(dtype)
+            logits = logits.float() * scale
 
             tile_max = logits.max(dim=1).values
             new_max = torch.maximum(running_max, tile_max)
@@ -329,7 +358,7 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
         per_token = (lse - label_logit) * valid.float()
         loss = per_token.sum() * grad_scale
 
-        ctx.save_for_backward(hidden, lse, safe_labels, valid)
+        ctx.save_for_backward(hidden, lse, safe_labels, valid, res_A, res_B)
         ctx.store = store
         ctx.scale = scale
         ctx.grad_scale = grad_scale
@@ -338,7 +367,7 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss):
-        hidden, lse, safe_labels, valid = ctx.saved_tensors
+        hidden, lse, safe_labels, valid, res_A, res_B = ctx.saved_tensors
         store = ctx.store
         scale = ctx.scale
         V = ctx.V
@@ -349,22 +378,35 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
         coef = (grad_loss * ctx.grad_scale * valid.float() * scale).unsqueeze(1)
         rows = torch.arange(M, device=hidden.device)
 
+        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())  # [M,k]
+        grad_proj = None if res_A is None else torch.zeros(
+            M, res_A.shape[1], device=hidden.device, dtype=res_B.dtype
+        )
+
         grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
             tile = _slice_vocab_tile(store, lo, hi)
-            logits = _fp4_logits_tile(hidden_qdata, hidden_scale, tile, dtype).float()
-            logits = logits * scale
+            logits = _fp4_logits_tile(hidden_qdata, hidden_scale, tile, dtype)
+            if hb is not None:
+                logits = logits + (hb @ res_A[lo:hi].t()).to(dtype)
+            logits = logits.float() * scale
             sm = torch.exp(logits - lse.unsqueeze(1))
 
             in_tile = (safe_labels >= lo) & (safe_labels < hi)
             cols = (safe_labels - lo).clamp(0, hi - lo - 1)
             sm[rows, cols] -= in_tile.float()
 
+            dz = (sm * coef).to(dtype)
             w_tile = tile.dequantize(dtype)
-            grad_hidden += ((sm * coef).to(dtype)) @ w_tile
+            grad_hidden += dz @ w_tile
+            if grad_proj is not None:
+                grad_proj += dz.to(res_B.dtype) @ res_A[lo:hi]
 
-        return grad_hidden, None, None, None, None, None
+        if grad_proj is not None:
+            grad_hidden += (grad_proj @ res_B).to(dtype)
+
+        return grad_hidden, None, None, None, None, None, None, None
 
 
 def fused_fp4_cross_entropy(
@@ -401,12 +443,19 @@ def fused_fp4_cross_entropy(
     else:
         grad_scale = 1.0 / valid.sum().clamp(min=1).float()
 
+    # Optional low-rank bf16 head residual (Phase 2 accuracy recovery): added per
+    # vocab tile inside the CE Function so it composes with the FP4 logits and the
+    # gradient flows back into hidden through both A and B. None when not attached.
+    res_A = getattr(lm_head, "_lm_head_residual_A", None)
+    res_B = getattr(lm_head, "_lm_head_residual_B", None)
+
     if _fp4_scaled_mm_enabled(fp4_matmul):
         fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
         if fp4_store is not None:
             try:
                 return _FusedFP4ScaledMMCrossEntropy.apply(
-                    hidden2d, fp4_store, labels1d, ignore_index, logit_scale, grad_scale
+                    hidden2d, fp4_store, labels1d, ignore_index, logit_scale,
+                    grad_scale, res_A, res_B,
                 )
             except Exception:
                 if fp4_matmul is True:
@@ -418,7 +467,7 @@ def fused_fp4_cross_entropy(
         return None
 
     return _FusedFP4CrossEntropy.apply(
-        hidden2d, store, labels1d, ignore_index, logit_scale, grad_scale
+        hidden2d, store, labels1d, ignore_index, logit_scale, grad_scale, res_A, res_B
     )
 
 

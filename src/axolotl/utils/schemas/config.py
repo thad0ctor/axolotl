@@ -1708,6 +1708,20 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                     "retained bf16 head and the student is the frozen FP4 head). "
                     "Enable quantize_lm_head or disable lm_head_distillation."
                 )
+
+        # The low-rank head residual corrects the FP4 quant error E = W_bf16 -
+        # dequant(Q(W)); with no FP4 head there is no error to correct, so it is
+        # meaningless without quantize_lm_head (and it reuses the retained bf16
+        # teacher weight to form E).
+        residual = getattr(self.nvfp4_training, "lm_head_residual", None)
+        if residual is not None and residual.enabled:
+            if not self.nvfp4_training.quantize_lm_head:
+                raise ValueError(
+                    "nvfp4_training.lm_head_residual requires "
+                    "nvfp4_training.quantize_lm_head: true (the residual A@B "
+                    "corrects the FP4 quant error of the frozen head). Enable "
+                    "quantize_lm_head or disable lm_head_residual."
+                )
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
         # modules (detected via is_nvfp4_base in kernels/lora.py), so the native
         # backend is allowed with the kernels. The te backend still bypasses them:

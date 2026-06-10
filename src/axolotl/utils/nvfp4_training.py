@@ -37,6 +37,22 @@ LOG = logging.getLogger(__name__)
 _MIN_FP4_CAPABILITIES = ((10, 0), (12, 0))
 
 _BLOCK_SIZE = 16  # NVFP4 is fixed at block_size 16
+
+
+def _apply_lm_head_residual(module, x, out):
+    """Add the low-rank bf16 residual correction to a frozen FP4 head's logits.
+
+    No-op (and zero import/dispatch cost) unless an ``lm_head_residual`` was
+    attached to ``module`` at load (OFF by default). Kept here so all three FP4
+    head forwards (frozen/tied/compute) route the residual through one code path,
+    bit-identical to the fused-CE and distillation residual term.
+    """
+    a = getattr(module, "_lm_head_residual_A", None)
+    if a is None:
+        return out
+    from axolotl.kernels.nvfp4_residual import apply_residual
+
+    return apply_residual(module, x, out)
 # torch._scaled_mm packs 2 FP4/byte and requires the packed contraction dim
 # (= logical/2) to be divisible by 16, so logical contraction must be a
 # multiple of 32. The token dimension (M) is padded to this alignment.
@@ -704,6 +720,7 @@ class NVFP4FrozenBaseLinear(nn.Module):
 
     def forward(self, x):
         out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
+        out = _apply_lm_head_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -873,6 +890,7 @@ class NVFP4TiedLMHead(nn.Module):
 
     def forward(self, x):
         out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
+        out = _apply_lm_head_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -963,6 +981,7 @@ class NVFP4ComputeBaseLinear(nn.Module):
 
     def forward(self, x):
         out = NVFP4ComputeBaseFunction.apply(x, self.w_fprop, self.w_dgrad, self.recipe)
+        out = _apply_lm_head_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property

@@ -114,6 +114,77 @@ class LMHeadDistillationConfig(BaseModel):
         return self
 
 
+class LMHeadResidualConfig(BaseModel):
+    """Low-rank bf16 residual correction for the FROZEN FP4 lm_head (Phase 2).
+
+    Stores ``A [V,k]`` / ``B [k,H]`` factors of the quant error
+    ``E = W_bf16 - dequant(Q(W))`` computed ONCE at load (after the FP4 quant), so
+    the head logits become ``Q(W) @ h + A @ (B @ h)``. The factors are threaded
+    into every logit path (direct GEMM, fused CE tiles, distillation student
+    logits), so the residual is applied consistently.
+
+    The quant error is ~9.5% UNIFORM e2m1 rounding noise, so a PLAIN SVD of E is
+    nearly full-rank and recovers almost nothing (measured: top-64 singular
+    directions hold only ~2-10% of E's energy). The ACTIVATION-weighted (L2QER)
+    construction weights E by the calibration activation second moment before the
+    SVD, concentrating the *logit-relevant* error into a low-rank subspace
+    (measured: top-16 directions hold ~56-74% of the weighted energy), and is the
+    construction that actually shrinks the logit/CE gap — on a Qwen3-8B head it
+    cut KL(bf16||fp4) by ~57% at rank 16 and closed the CE gap. Plain SVD is kept
+    only as an ablation/diagnostic. OFF by default; opt-in, gated to
+    quantize_lm_head.
+
+    SPEED: this is a PERMANENT cost (train + inference). The cost is dominated by
+    the [tokens, vocab] projection and is nearly rank-INDEPENDENT, so prefer the
+    smallest rank that captures the gain (16 on these heads). Fused into the CE
+    tile loop it adds ~10-15% to the head forward; as a bolt-on after a
+    materialized GEMM it is ~36%. Not the "<1-2%" a small adapter would cost — the
+    large vocab makes any second projection back to V expensive.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Enable the low-rank bf16 residual correction on the "
+            "frozen FP4 lm_head. OFF by default (opt-in). Requires "
+            "nvfp4_training.quantize_lm_head (the bf16 teacher weight is retained "
+            "at swap to compute the quant error E)."
+        },
+    )
+    rank: int = Field(
+        default=32,
+        ge=1,
+        json_schema_extra={
+            "description": "Rank k of the residual A[V,k]/B[k,H]. The cost is nearly "
+            "rank-independent (the [tokens, vocab] projection dominates), so prefer "
+            "the smallest k that captures the gain — 16 sufficed on Qwen3 0.6B/8B "
+            "heads. Clamped to min(V,H)."
+        },
+    )
+    calibration: Literal["activation", "svd"] = Field(
+        default="activation",
+        json_schema_extra={
+            "description": "'activation' (default, L2QER): weight the quant error by "
+            "the calibration activation second moment before the SVD, so the rank-k "
+            "captures the directions that matter for the LOGITS — the only "
+            "construction that meaningfully helps given the uniform error. 'svd': "
+            "plain truncated SVD of the raw quant error (ablation; recovers little "
+            "because the e2m1 error is near full-rank)."
+        },
+    )
+    calib_tokens: int = Field(
+        default=512,
+        ge=16,
+        json_schema_extra={
+            "description": "Number of real tokens to forward once at load to capture "
+            "the calibration hidden states for the activation weighting (only the "
+            "per-hidden-dim second moment is used). Ignored when calibration='svd'."
+        },
+    )
+
+
 class NVFP4TrainingConfig(BaseModel):
     """NVFP4-GEMM training settings (module-swap on eligible nn.Linear)."""
 
@@ -286,6 +357,17 @@ class NVFP4TrainingConfig(BaseModel):
             "description": "KL-distillation aux-loss against the original bf16 head, "
             "to recover the accuracy the frozen FP4 lm_head loses. Only activates "
             "with quantize_lm_head. OFF by default. See LMHeadDistillationConfig."
+        },
+    )
+    lm_head_residual: LMHeadResidualConfig = Field(
+        default_factory=LMHeadResidualConfig,
+        json_schema_extra={
+            "description": "Low-rank bf16 residual correction A@B on the frozen FP4 "
+            "lm_head (W ~= Q(W) + A B), computed once at load. Activation-weighted "
+            "(L2QER) by default; recovers ~57% of the FP4-head KL gap at rank 16 on "
+            "a Qwen3-8B head. Only activates with quantize_lm_head. OFF by default. "
+            "PERMANENT inference cost (~10-15% of the head forward when fused). See "
+            "LMHeadResidualConfig."
         },
     )
     quantize_embeddings: bool = Field(

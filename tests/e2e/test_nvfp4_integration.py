@@ -227,6 +227,45 @@ def test_gate_allows_lm_head_distillation_with_quantize_lm_head(monkeypatch):
     assert cfg.nvfp4_training.lm_head_distillation.enabled is True
 
 
+def test_schema_lm_head_residual_defaults_off(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True})
+    res = cfg.nvfp4_training.lm_head_residual
+    assert res.enabled is False
+    assert res.rank == 32
+    assert res.calibration == "activation"
+
+
+def test_gate_refuses_lm_head_residual_without_quantize_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match="lm_head_residual requires"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            nvfp4_training={
+                "enabled": True,
+                "quantize_lm_head": False,
+                "lm_head_residual": {"enabled": True},
+            },
+        )
+
+
+def test_gate_allows_lm_head_residual_with_quantize_lm_head(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        nvfp4_training={
+            "enabled": True,
+            "quantize_lm_head": True,
+            "fused_fp4_cross_entropy": True,
+            "lm_head_residual": {"enabled": True, "rank": 16, "calibration": "activation"},
+        },
+    )
+    assert cfg.nvfp4_training.lm_head_residual.enabled is True
+    assert cfg.nvfp4_training.lm_head_residual.rank == 16
+
+
 def test_gate_refuses_unsupported_hardware(monkeypatch):
     _supported(monkeypatch, False, "no Blackwell here")
     with pytest.raises(ValueError, match="no Blackwell here"):

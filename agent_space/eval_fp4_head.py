@@ -138,12 +138,55 @@ def _m_outlier_keep(W: torch.Tensor, hidden: torch.Tensor, ctx: dict):
     raise NotImplementedError("outlier_keep_mixfp4: implement mixed-precision head")
 
 
+def _residual_method(calibration: str, rank: int):
+    """Build a registerable method: FP4(W) + low-rank bf16 residual A@B.
+
+    ``calibration='activation'`` is the L2QER construction (weight the quant error
+    by the calib activation 2nd-moment before the SVD); ``'svd'`` is plain. Reuses
+    the SHIPPED residual builder so the harness scores exactly the training code.
+    """
+
+    def method(W: torch.Tensor, hidden: torch.Tensor, ctx: dict):
+        from axolotl.kernels.nvfp4_residual import _build_residual
+
+        lin = _linear_from_weight(W, ctx["bias"], ctx["device"], ctx["dtype"])
+        Wq = fp4_dequant_weight(lin).float()
+        E = W.float() - Wq
+        g = None
+        if calibration == "activation":
+            h = hidden.reshape(-1, hidden.shape[-1]).float()
+            g = h.pow(2).mean(0).sqrt().clamp_min(1e-8)
+        A, B = _build_residual(E, rank, g)
+        dtype = ctx["dtype"]
+
+        class _ResHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fp4 = make_fp4_head(lin)
+                self.A = A.to(dtype)
+                self.B = B.to(dtype)
+
+            @property
+            def weight(self):
+                return (self.fp4.weight.float() + self.A.float() @ self.B.float()).to(dtype)
+
+            def __call__(self, x):
+                base = self.fp4(x)
+                return base + (x @ self.B.t()) @ self.A.t()
+
+        return _ResHead()
+
+    return method
+
+
 @register_method("low_rank_residual")
 def _m_low_rank_residual(W: torch.Tensor, hidden: torch.Tensor, ctx: dict):
-    """STUB: store FP4(W) + a low-rank bf16 correction U V^T ~= (W - Q(W)). SVD of the
-    quant error, truncated to rank r, applied at logit time. Trades a small bf16 GEMM
-    for accuracy."""
-    raise NotImplementedError("low_rank_residual: implement FP4 + UV^T head")
+    """FP4(W) + activation-weighted (L2QER) low-rank bf16 residual, rank 32.
+
+    The plain-SVD residual barely helps (the e2m1 quant error is near full-rank);
+    the activation weighting concentrates the logit-relevant error into a low-rank
+    subspace. See residual_probe.py for the full plain-vs-L2QER rank sweep."""
+    return _residual_method("activation", 32)(W, hidden, ctx)
 
 
 @register_method("logit_distill")

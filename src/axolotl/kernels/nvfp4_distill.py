@@ -87,17 +87,28 @@ def _fp4_student_store(lm_head: nn.Module):
     return _nvfp4_lm_head_store(lm_head)
 
 
-def _student_logits_tile(store, lo: int, hi: int, hidden: torch.Tensor) -> torch.Tensor:
+def _student_logits_tile(
+    store, lo: int, hi: int, hidden: torch.Tensor, res_A=None, res_B=None
+) -> torch.Tensor:
     """FP4 student logits for vocab rows ``[lo, hi)``: dequant tile then matmul.
 
     Mirrors the fused-CE tiling (``_dequant_vocab_tile``): one ``[Vb, H]`` weight
     tile is dequantized FP4->hidden.dtype on read, never the whole table. The
     matmul carries hidden's grad (the body), the weight does not (frozen).
+
+    When a low-rank head residual is attached (``res_A`` [V,k] / ``res_B`` [k,H]),
+    its contribution ``(hidden @ res_B.t()) @ res_A[lo:hi].t()`` is added so the
+    STUDENT logits the KL sees are the SAME corrected logits the FP4-head forward
+    and fused CE produce (the residual reduces the student error before the KL —
+    they compose, no double-count).
     """
     from axolotl.kernels.nvfp4_fused_ce import _dequant_vocab_tile
 
     w_tile = _dequant_vocab_tile(store, lo, hi, hidden.dtype)  # [Vb, H]
-    return hidden @ w_tile.t()  # [M, Vb]
+    logits = hidden @ w_tile.t()  # [M, Vb]
+    if res_A is not None:
+        logits = logits + (hidden.to(res_B.dtype) @ res_B.t()) @ res_A[lo:hi].t()
+    return logits
 
 
 def _teacher_logits_tile(
@@ -169,6 +180,8 @@ def _kl_topk(
     tk_idx: torch.Tensor,
     temperature: float,
     vocab_block: int,
+    res_A=None,
+    res_B=None,
 ) -> torch.Tensor:
     """KL over the teacher's top-k tokens + one aggregated tail bucket.
 
@@ -205,7 +218,14 @@ def _kl_topk(
     s_rows = _dequant_rows(student_store, tk_idx.reshape(-1), hidden.dtype)
     s_rows = s_rows.reshape(M, k, -1)  # [M, k, H]
     z_s_k = torch.einsum("mh,mkh->mk", hidden, s_rows)  # [M, k]
-    L_s = _scaled_lse(student_store, hidden, T, vocab_block, grad=True)  # [M]
+    if res_A is not None:
+        # residual logit at the k teacher-selected vocab rows: gather A's rows.
+        a_rows = res_A[tk_idx.reshape(-1)].reshape(M, k, -1).to(res_B.dtype)  # [M,k,r]
+        hb = hidden.to(res_B.dtype) @ res_B.t()  # [M, r]
+        z_s_k = z_s_k + torch.einsum("mr,mkr->mk", hb, a_rows).to(z_s_k.dtype)
+    L_s = _scaled_lse(
+        student_store, hidden, T, vocab_block, grad=True, res_A=res_A, res_B=res_B
+    )  # [M]
 
     log_p_s_k = z_s_k / T - L_s.unsqueeze(1)  # [M, k]
     # student tail log-mass: log(1 - sum_k p_s_k), clamped off 0.
@@ -224,12 +244,16 @@ def _scaled_lse(
     T: float,
     vocab_block: int,
     grad: bool,
+    res_A=None,
+    res_B=None,
 ) -> torch.Tensor:
     """fp32 logsumexp of logits/T over the full vocab, tiled.
 
     ``store_or_w`` is either an NVFP4 store (student, dequant per tile) or a dense
     ``[V, H]`` teacher weight. ``grad`` controls whether the student pass tracks
-    autograd (teacher is always no-grad).
+    autograd (teacher is always no-grad). ``res_A``/``res_B`` (student only) add
+    the low-rank head residual per tile so the student lse matches the corrected
+    student logits.
     """
     from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 
@@ -245,6 +269,7 @@ def _scaled_lse(
     device = hidden.device
     running_max = torch.full((M,), float("-inf"), device=device, dtype=torch.float32)
     running_sum = torch.zeros(M, device=device, dtype=torch.float32)
+    hb = None if (res_A is None or not is_store) else (hidden.to(res_B.dtype) @ res_B.t())
 
     ctx = torch.enable_grad() if grad else torch.no_grad()
     with ctx:
@@ -252,7 +277,10 @@ def _scaled_lse(
             hi = min(lo + vocab_block, V)
             if is_store:
                 w_tile = _dequant_vocab_tile(store_or_w, lo, hi, hidden.dtype)
-                z = (hidden @ w_tile.t()).float() / T
+                zt = hidden @ w_tile.t()
+                if hb is not None:
+                    zt = zt + hb @ res_A[lo:hi].t()
+                z = zt.float() / T
             else:
                 z = (hidden @ store_or_w[lo:hi].t()).float() / T
             tile_max = z.max(dim=1).values.detach()
@@ -294,6 +322,8 @@ def _kl_full(
     teacher_lse: torch.Tensor,
     temperature: float,
     vocab_block: int,
+    res_A=None,
+    res_B=None,
 ) -> torch.Tensor:
     """Exact full-vocab KL(P_T || P_S), tiled (no top_k bucketing).
 
@@ -313,7 +343,10 @@ def _kl_full(
         if T == 1.0
         else _scaled_lse(teacher_w, hidden, T, vocab_block, grad=False)
     )
-    s_lse = _scaled_lse(student_store, hidden, T, vocab_block, grad=True)
+    s_lse = _scaled_lse(
+        student_store, hidden, T, vocab_block, grad=True, res_A=res_A, res_B=res_B
+    )
+    hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())  # [M,r]
 
     kl = hidden.new_zeros((M,), dtype=torch.float32)
     for lo in range(0, V, vocab_block):
@@ -323,7 +356,10 @@ def _kl_full(
             log_p_t = z_t - t_lse.unsqueeze(1)
             p_t = torch.exp(log_p_t)
         w_tile = _dequant_vocab_tile(student_store, lo, hi, hidden.dtype)
-        z_s = (hidden @ w_tile.t()).float() / T
+        z_s_lin = hidden @ w_tile.t()
+        if hb is not None:
+            z_s_lin = z_s_lin + hb @ res_A[lo:hi].t()
+        z_s = z_s_lin.float() / T
         log_p_s = z_s - s_lse.unsqueeze(1)
         kl = kl + (p_t * (log_p_t - log_p_s)).sum(dim=1)
     return kl.mean()
@@ -372,17 +408,25 @@ def lm_head_distillation_loss(
     h2d = hidden.reshape(-1, hidden.shape[-1])
     teacher_w = teacher_w.to(device=h2d.device, dtype=h2d.dtype)
 
+    # Low-rank head residual (Phase 2), if attached: thread it into the STUDENT
+    # logits so the KL sees the corrected student (the residual reduces the student
+    # error before the KL — composes with distillation, no double-count).
+    res_A = getattr(lm_head, "_lm_head_residual_A", None)
+    res_B = getattr(lm_head, "_lm_head_residual_B", None)
+
     lse, _, tk_vals, tk_idx = _teacher_pass(
         teacher_w, h2d, state.vocab_block, state.top_k
     )
 
     if state.top_k is not None:
         kl = _kl_topk(
-            store, teacher_w, h2d, lse, tk_idx, state.temperature, state.vocab_block
+            store, teacher_w, h2d, lse, tk_idx, state.temperature, state.vocab_block,
+            res_A=res_A, res_B=res_B,
         )
     else:
         kl = _kl_full(
-            store, teacher_w, h2d, lse, state.temperature, state.vocab_block
+            store, teacher_w, h2d, lse, state.temperature, state.vocab_block,
+            res_A=res_A, res_B=res_B,
         )
 
     state.last_kl = float(kl.detach())
