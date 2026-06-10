@@ -1695,6 +1695,19 @@ class AxolotlConfigWCapabilities(AxolotlInputConfig):
                 "remain a frozen plain nn.Linear. Disable quantize_lm_head/"
                 "fused_fp4_cross_entropy/fp8_lm_head_cross_entropy."
             )
+
+        # lm_head KL-distillation needs a FROZEN FP4 head to be the student and the
+        # retained bf16 head to be the teacher; it is meaningless without
+        # quantize_lm_head (there is no FP4-induced gap to close).
+        distill = getattr(self.nvfp4_training, "lm_head_distillation", None)
+        if distill is not None and distill.enabled:
+            if not self.nvfp4_training.quantize_lm_head:
+                raise ValueError(
+                    "nvfp4_training.lm_head_distillation requires "
+                    "nvfp4_training.quantize_lm_head: true (the KL teacher is the "
+                    "retained bf16 head and the student is the frozen FP4 head). "
+                    "Enable quantize_lm_head or disable lm_head_distillation."
+                )
         # The fused LoRA kernels now route the base GEMM through the native NVFP4
         # modules (detected via is_nvfp4_base in kernels/lora.py), so the native
         # backend is allowed with the kernels. The te backend still bypasses them:

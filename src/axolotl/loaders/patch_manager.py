@@ -446,8 +446,17 @@ class PatchManager:
         # Fused FP4 lm_head + cross-entropy: skip materializing the [M, vocab]
         # logits (memory win). Opt-in and only when the lm_head became an FP4
         # store above; falls back to the materialized CE path otherwise.
-        if getattr(nvfp4, "fused_fp4_cross_entropy", False) and getattr(
-            nvfp4, "quantize_lm_head", False
+        #
+        # When lm_head_distillation is enabled, its own forward patch already runs
+        # the fused FP4 CE (then adds the KL term) and owns the head computation —
+        # installing the plain fused-CE wrapper on top would shadow the KL term, so
+        # skip it (the distillation forward calls fused_fp4_cross_entropy directly).
+        _distill = getattr(nvfp4, "lm_head_distillation", None)
+        _distill_on = _distill is not None and getattr(_distill, "enabled", False)
+        if (
+            getattr(nvfp4, "fused_fp4_cross_entropy", False)
+            and getattr(nvfp4, "quantize_lm_head", False)
+            and not _distill_on
         ):
             from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
 
@@ -634,7 +643,9 @@ class PatchManager:
         return without_lm_head
 
     @staticmethod
-    def _nvfp4_swap_frozen_lm_head(model, recipe, base_mode: str) -> None:
+    def _nvfp4_swap_frozen_lm_head(
+        model, recipe, base_mode: str, retain_teacher: bool = False
+    ) -> None:
         """Swap a bare frozen lm_head (LoRA, not a target module) to NVFP4.
 
         Locates the output-embedding module by identity in the (possibly
@@ -659,7 +670,9 @@ class PatchManager:
                 "module in the model tree; leaving it in high precision."
             )
             return
-        swap_frozen_linear_to_nvfp4(model, name, recipe, base_mode=base_mode)
+        swap_frozen_linear_to_nvfp4(
+            model, name, recipe, base_mode=base_mode, retain_teacher=retain_teacher
+        )
 
     @staticmethod
     def _model_ties_embeddings(model: PreTrainedModel) -> bool:
@@ -716,6 +729,13 @@ class PatchManager:
         if not (want_lm_head or want_embed):
             return
 
+        # KL-distillation needs the original bf16 head retained as the teacher; the
+        # validator already gated it to quantize_lm_head.
+        distill_cfg = getattr(nvfp4, "lm_head_distillation", None)
+        retain_teacher = bool(
+            want_lm_head and distill_cfg is not None and getattr(distill_cfg, "enabled", False)
+        )
+
         tied = self._model_ties_embeddings(model)
 
         if tied and want_lm_head:
@@ -725,8 +745,9 @@ class PatchManager:
             out_name = self._module_name(model, model.get_output_embeddings())
             if in_name and out_name:
                 swap_tied_embedding_and_lm_head_to_nvfp4(
-                    model, in_name, out_name, recipe
+                    model, in_name, out_name, recipe, retain_teacher=retain_teacher
                 )
+            self._nvfp4_attach_distillation(model, distill_cfg, retain_teacher)
             return
 
         if want_lm_head:
@@ -742,9 +763,14 @@ class PatchManager:
                 if isinstance(out_emb, _nn.Linear):
                     name = self._module_name(model, out_emb)
                     if name:
-                        swap_frozen_lm_head_tileable(model, name, recipe)
+                        swap_frozen_lm_head_tileable(
+                            model, name, recipe, retain_teacher=retain_teacher
+                        )
             else:
-                self._nvfp4_swap_frozen_lm_head(model, recipe, base_mode)
+                self._nvfp4_swap_frozen_lm_head(
+                    model, recipe, base_mode, retain_teacher=retain_teacher
+                )
+            self._nvfp4_attach_distillation(model, distill_cfg, retain_teacher)
 
         if want_embed:
             in_emb = model.get_input_embeddings()
@@ -752,6 +778,47 @@ class PatchManager:
                 in_name = self._module_name(model, in_emb)
                 if in_name:
                     swap_frozen_embedding_to_nvfp4(model, in_name)
+
+    @staticmethod
+    def _nvfp4_attach_distillation(model, distill_cfg, retain_teacher: bool) -> None:
+        """Attach the KL-distillation state + forward patch to the FP4 head model.
+
+        No-op unless distillation is enabled and the bf16 teacher was retained on
+        the lm_head. The forward patch recomputes the (tiled) teacher logits and
+        adds ``lambda * T^2 * KL(teacher || student)`` to the loss; it is gated on
+        labels being present (training) and the head exposing both a retained
+        teacher and a tile-able FP4 student store.
+        """
+        if not (
+            retain_teacher
+            and distill_cfg is not None
+            and getattr(distill_cfg, "enabled", False)
+        ):
+            return
+        from axolotl.kernels.nvfp4_distill import (
+            DistillState,
+            patch_model_distillation,
+        )
+
+        state = DistillState(
+            enabled=True,
+            lambda_=float(getattr(distill_cfg, "lambda_", 1.0)),
+            temperature=float(getattr(distill_cfg, "temperature", 1.0)),
+            top_k=getattr(distill_cfg, "top_k", None),
+            cadence=int(getattr(distill_cfg, "cadence", 1)),
+            teacher=str(getattr(distill_cfg, "teacher", "live")),
+            vocab_block=int(getattr(distill_cfg, "teacher_vocab_block", 8192)),
+        )
+        patch_model_distillation(model, state)
+        LOG.info(
+            "NVFP4 lm_head_distillation enabled (lambda=%s, T=%s, top_k=%s, "
+            "cadence=%s, teacher=%s)",
+            state.lambda_,
+            state.temperature,
+            state.top_k,
+            state.cadence,
+            state.teacher,
+        )
 
     @staticmethod
     def _module_name(model: PreTrainedModel, target) -> str | None:

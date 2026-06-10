@@ -6,7 +6,112 @@ from the fake-quant QAT/PTQ `quantization:` block.
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class LMHeadDistillationConfig(BaseModel):
+    """KL-distillation aux-loss for the FROZEN FP4 lm_head (accuracy recovery).
+
+    When ``quantize_lm_head`` freezes the lm_head on its FP4 grid, the head adds
+    ~9.5% uniform e2m1 mantissa noise (~21% argmax flips, all near-ties; +~0.04
+    nats CE on an 8B head). The frozen weight cannot move off its grid, but the
+    trainable body CAN adapt to it: an additive KL term against the ORIGINAL bf16
+    head (retained as a frozen reference) teaches the body to produce hidden
+    states whose FP4 logits match the bf16-head logits.
+
+    Total loss = CE_student + lambda * T^2 * KL(softmax(z_teacher/T) || softmax(z_student/T)),
+    where z_student are the FP4 head's logits and z_teacher = hidden @ W_bf16.T.
+
+    The FP4 head's SPEED is the reason it exists, so every field here is a lever to
+    bound the per-step teacher cost: ``top_k`` bounds the KL math, ``cadence``
+    amortizes the (dominant) teacher matmul, and the teacher logits are always
+    computed in vocab tiles (peak memory never the full [tokens, vocab]).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Enable the bf16-head KL-distillation aux-loss. OFF by "
+            "default (opt-in). Requires nvfp4_training.quantize_lm_head: the teacher "
+            "is the original bf16 head retained at swap time, and the student logits "
+            "are the FP4 head's logits."
+        },
+    )
+    lambda_: float = Field(
+        default=1.0,
+        ge=0.0,
+        alias="lambda",
+        json_schema_extra={
+            "description": "Weight on the KL aux-loss (the `lambda` key in YAML). "
+            "total = CE + lambda * T^2 * KL. 0.0 disables the term (same as "
+            "enabled: false)."
+        },
+    )
+    temperature: float = Field(
+        default=1.0,
+        gt=0.0,
+        json_schema_extra={
+            "description": "Softmax temperature T for both teacher and student in "
+            "the KL term. The gradient is scaled by T^2 (Hinton distillation) so "
+            "lambda stays comparable across T. Default 1.0 (match the argmax "
+            "distribution directly)."
+        },
+    )
+    top_k: int | None = Field(
+        default=None,
+        ge=1,
+        json_schema_extra={
+            "description": "SPEED lever. If set, distill only the top-k teacher "
+            "logits plus a single aggregated tail bucket (the remaining vocab mass "
+            "as one outcome), bounding the KL math to k+1 terms. Null = full-vocab "
+            "KL. Note the teacher matmul itself (over the full vocab) is the dominant "
+            "cost; top_k bounds the softmax/KL work, not the matmul."
+        },
+    )
+    cadence: int = Field(
+        default=1,
+        ge=1,
+        json_schema_extra={
+            "description": "SPEED lever. Apply the distillation loss only every N "
+            "optimizer steps, amortizing the (dominant) teacher forward. 1 = every "
+            "step. On off-steps the loss is the plain FP4 CE (zero teacher cost)."
+        },
+    )
+    teacher: Literal["live", "precomputed"] = Field(
+        default="live",
+        json_schema_extra={
+            "description": "'live' (default): recompute teacher logits each applied "
+            "step as hidden @ W_bf16.T (tiled). 'precomputed': read offline-cached "
+            "top-k teacher logits per token (near-zero per-step teacher cost) — the "
+            "speed-optimal option. The precomputed path is a Phase-1 design stub "
+            "(interface present, raises if selected without a cache)."
+        },
+    )
+    teacher_vocab_block: int = Field(
+        default=8192,
+        ge=256,
+        json_schema_extra={
+            "description": "Vocab tile width for the tiled teacher/student logit "
+            "computation (peak teacher memory is one [tokens, block] tile, never the "
+            "full [tokens, vocab]). Tunable; not load-bearing for correctness."
+        },
+    )
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.enabled and self.teacher == "precomputed":
+            # Surface the stub clearly rather than failing deep in the trainer.
+            import warnings
+
+            warnings.warn(
+                "lm_head_distillation.teacher='precomputed' is a Phase-1 design "
+                "stub (no cache builder yet); the live teacher will be used at "
+                "runtime. Set teacher: live to silence this.",
+                stacklevel=2,
+            )
+        return self
 
 
 class NVFP4TrainingConfig(BaseModel):
@@ -173,6 +278,14 @@ class NVFP4TrainingConfig(BaseModel):
             "show it is faster than the memory-only FP4 CE path but slower than "
             "materialized bf16/Liger CE; keep this off unless benchmarking the "
             "next native CE-epilogue design."
+        },
+    )
+    lm_head_distillation: LMHeadDistillationConfig = Field(
+        default_factory=LMHeadDistillationConfig,
+        json_schema_extra={
+            "description": "KL-distillation aux-loss against the original bf16 head, "
+            "to recover the accuracy the frozen FP4 lm_head loses. Only activates "
+            "with quantize_lm_head. OFF by default. See LMHeadDistillationConfig."
         },
     )
     quantize_embeddings: bool = Field(
