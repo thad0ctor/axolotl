@@ -1088,6 +1088,270 @@ class TestNVFP4Training:
 
 @require_torch_2_8_0
 @requires_sm_ge_100
+class TestNVFP4BaseResidual:
+    """L2QER low-rank residual generalized to ALL frozen FP4 base linears."""
+
+    def _frozen_classes(self):
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4FastComputeBaseLinear,
+            NVFP4FastFrozenBaseLinear,
+            NVFP4FrozenBaseLinear,
+            _mslk_available,
+        )
+
+        classes = [NVFP4FrozenBaseLinear, NVFP4ComputeBaseLinear]
+        if _mslk_available():
+            classes += [NVFP4FastFrozenBaseLinear, NVFP4FastComputeBaseLinear]
+        return classes
+
+    def test_residual_reduces_output_error_anisotropic(self):
+        """On anisotropic activations the rank-16 L2QER residual must cut the
+        output error ||W x - base(x)|| substantially vs the uncorrected FP4 base
+        (the synthetic analogue of the measured real-model KL reduction)."""
+        from axolotl.kernels.nvfp4_residual import (
+            attach_base_residual,
+            has_base_residual,
+        )
+        from axolotl.utils.nvfp4_training import NVFP4Recipe
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        lin = nn.Linear(512, 384, bias=False).cuda().bfloat16()
+        lin.weight.requires_grad_(False)
+        # anisotropic activations: a few input channels dominate (the structure
+        # L2QER exploits; on white noise the residual correctly recovers ~0)
+        scale = torch.ones(512, device="cuda")
+        scale[:16] = 25.0
+        x = (
+            torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+            * scale.bfloat16()
+        )
+        mean_x2 = x.float().pow(2).mean(0)
+        ref = x.float() @ lin.weight.float().t()
+
+        for cls in self._frozen_classes():
+            mod = cls.from_linear(lin, recipe)
+            base_err = (mod(x).float() - ref).norm().item()
+            assert attach_base_residual(mod, lin.weight, 16, mean_x2)
+            assert has_base_residual(mod)
+            corr_err = (mod(x).float() - ref).norm().item()
+            assert corr_err < 0.8 * base_err, (cls.__name__, base_err, corr_err)
+            # buffers are non-persistent: reconstructable at load, never bloat
+            # the checkpoint (mirrors the lm_head residual convention)
+            assert not any("_base_residual" in k for k in mod.state_dict())
+
+    def test_dgrad_includes_exact_residual_term(self):
+        """The corrected layer's input gradient equals the analytic
+        (Q(W) + A B)^T dY: the base FP4 dgrad plus an EXACT (dY @ A) @ B term
+        (plain linear correction — no quant noise of its own, no wgrad)."""
+        from axolotl.kernels.nvfp4_residual import attach_base_residual
+        from axolotl.utils.nvfp4_training import NVFP4Recipe
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        lin = nn.Linear(512, 384, bias=False).cuda().bfloat16()
+        lin.weight.requires_grad_(False)
+        x = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
+        mean_x2 = torch.rand(512, device="cuda") + 0.1
+
+        for cls in self._frozen_classes():
+            mod = cls.from_linear(lin, recipe)
+            attach_base_residual(mod, lin.weight, 16, mean_x2)
+            A = mod._base_residual_A
+            B = mod._base_residual_B
+
+            xg = x.clone().requires_grad_(True)
+            out = mod(xg)
+            dY = torch.randn_like(out)
+            out.backward(dY)
+            g_corr = xg.grad.float()
+
+            # full analytic dgrad of the corrected layer. The FP4 dgrad GEMM
+            # itself carries double-quant noise (storage mode re-quantizes both
+            # dY and the dequantized weight, ~10% rel) — this is a sanity bound;
+            # the residual-term EXACTNESS is the tight assert below.
+            w_eff = mod.weight.float() + A.float() @ B.float()
+            g_ref = dY.float() @ w_eff
+            rel = (g_corr - g_ref).norm() / (g_ref.norm() + 1e-9)
+            assert rel < 2e-1, (cls.__name__, rel.item())
+
+            # the residual TERM itself is exact: corrected minus uncorrected
+            # dgrad equals (dY @ A) @ B up to bf16 grad-accumulation rounding
+            del mod._base_residual_A, mod._base_residual_B
+            xg2 = x.clone().requires_grad_(True)
+            mod(xg2).backward(dY)
+            g_base = xg2.grad.float()
+            analytic = ((dY @ A) @ B).float()
+            term_rel = (g_corr - g_base - analytic).norm() / (g_corr.norm() + 1e-9)
+            assert term_rel < 1e-2, (cls.__name__, term_rel.item())
+
+            # no wgrad: A/B are buffers and never accumulate gradients
+            assert A.grad is None and B.grad is None
+
+    def test_fused_base_helpers_carry_residual(self):
+        """nvfp4_base_fprop / nvfp4_base_dgrad / nvfp4_base_fprop_many (the fused
+        LoRA kernel entry points that bypass module.forward) must include the
+        same residual term as the corrected module forward."""
+        from axolotl.kernels.nvfp4_residual import attach_base_residual
+        from axolotl.utils.nvfp4_training import (
+            NVFP4ComputeBaseLinear,
+            NVFP4Recipe,
+            nvfp4_base_dgrad,
+            nvfp4_base_fprop,
+            nvfp4_base_fprop_many,
+        )
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        mean_x2 = torch.rand(256, device="cuda") + 0.1
+        x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+        g = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+
+        for with_res in (False, True):
+            bases = []
+            for _ in range(2):
+                lin = nn.Linear(256, 512, bias=False).cuda().bfloat16()
+                mod = NVFP4ComputeBaseLinear.from_linear(lin, recipe)
+                if with_res:
+                    attach_base_residual(mod, lin.weight, 16, mean_x2)
+                bases.append(mod)
+            if with_res:
+                for mod in bases:
+                    # forward helper == corrected module forward (bit-exact: the
+                    # torchao compute path shares the same quant + GEMM)
+                    assert torch.equal(nvfp4_base_fprop(x, mod), mod(x))
+                    a, b = mod._base_residual_A, mod._base_residual_B
+                    base_d = nvfp4_base_dgrad(g, mod) - ((g @ a) @ b)
+                    del mod._base_residual_A, mod._base_residual_B
+                    plain_d = nvfp4_base_dgrad(g, mod)
+                    rel = (base_d - plain_d).float().norm() / (
+                        plain_d.float().norm() + 1e-9
+                    )
+                    assert rel < 1e-2, rel.item()
+                    mod.register_buffer("_base_residual_A", a, persistent=False)
+                    mod.register_buffer("_base_residual_B", b, persistent=False)
+            shared = nvfp4_base_fprop_many(x, bases)
+            assert shared is not None
+            for got, mod in zip(shared, bases, strict=False):
+                assert torch.equal(got, nvfp4_base_fprop(x, mod))
+
+    def test_residual_compiles_without_graph_breaks(self):
+        """The residual is plain ops on registered buffers with a setup-time None
+        check: a corrected base must still trace fullgraph with 0 breaks."""
+        import torch._dynamo as dyn
+
+        from axolotl.kernels.nvfp4_residual import attach_base_residual
+        from axolotl.utils.nvfp4_training import NVFP4Recipe
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        lin = nn.Linear(256, 512, bias=False).cuda().bfloat16()
+        mean_x2 = torch.rand(256, device="cuda") + 0.1
+        x = torch.randn(
+            64, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        for cls in self._frozen_classes():
+            mod = cls.from_linear(lin, recipe)
+            attach_base_residual(mod, lin.weight, 16, mean_x2)
+            dyn.reset()
+            explanation = dyn.explain(lambda z: mod(z).sum())(x)  # noqa: B023
+            assert explanation.graph_break_count == 0, cls.__name__
+            compiled = torch.compile(lambda z: mod(z).sum(), fullgraph=True)  # noqa: B023
+            compiled(x).backward()
+            assert torch.isfinite(x.grad).all().item()
+            x.grad = None
+
+    def _peft_qwen(self, targets=("q_proj", "k_proj", "v_proj", "o_proj")):
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            "axolotl-ai-co/tiny-qwen2-129m", device_map="auto", dtype=torch.bfloat16
+        )
+        lc = LoraConfig(
+            r=8, lora_alpha=16, target_modules=list(targets), task_type="CAUSAL_LM"
+        )
+        return get_peft_model(model, lc)
+
+    def test_default_on_attaches_residuals(self):
+        """DEFAULT ON: a plain nvfp4_training LoRA config (no base_residual block
+        at all) calibrates and attaches a residual to EVERY swapped frozen base,
+        and a training step stays finite."""
+        from peft.tuners.lora import Linear as LoraLinear
+
+        from axolotl.kernels.nvfp4_residual import has_base_residual
+        from axolotl.loaders.patch_manager import PatchManager
+        from axolotl.utils.dict import DictDefault
+
+        model = self._peft_qwen()
+        pm = PatchManager.__new__(PatchManager)
+        pm.cfg = DictDefault({"adapter": "lora", "nvfp4_training": {"enabled": True}})
+        pm._apply_nvfp4_training(model)
+
+        bases = [m.base_layer for m in model.modules() if isinstance(m, LoraLinear)]
+        assert bases
+        assert all(has_base_residual(b) for b in bases)
+        # rank default 16; buffers tiny bf16 [out,16]/[16,in]
+        a = bases[0]._base_residual_A
+        b = bases[0]._base_residual_B
+        assert a.shape[1] == 16 and b.shape[0] == 16
+        assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+
+        ids = torch.randint(0, 1000, (2, 48), device=model.device)
+        out = model(input_ids=ids, labels=ids)
+        out.loss.backward()
+        assert torch.isfinite(out.loss).item()
+
+    def test_base_residual_disabled_by_config(self):
+        """base_residual.enabled: false swaps the bases with NO residual."""
+        from peft.tuners.lora import Linear as LoraLinear
+
+        from axolotl.kernels.nvfp4_residual import has_base_residual
+        from axolotl.loaders.patch_manager import PatchManager
+        from axolotl.utils.dict import DictDefault
+        from axolotl.utils.nvfp4_training import is_nvfp4_base
+
+        model = self._peft_qwen(targets=("q_proj", "v_proj"))
+        pm = PatchManager.__new__(PatchManager)
+        pm.cfg = DictDefault(
+            {
+                "adapter": "lora",
+                "nvfp4_training": {
+                    "enabled": True,
+                    "base_residual": {"enabled": False},
+                },
+            }
+        )
+        pm._apply_nvfp4_training(model)
+        bases = [m.base_layer for m in model.modules() if isinstance(m, LoraLinear)]
+        assert bases and all(is_nvfp4_base(b) for b in bases)
+        assert not any(has_base_residual(b) for b in bases)
+
+    def test_hp_base_mode_skips_residual(self):
+        """base_mode=hp keeps a high-precision master (no frozen FP4 store):
+        the residual must not attach (it would correct a non-existent error)."""
+        from peft.tuners.lora import Linear as LoraLinear
+
+        from axolotl.kernels.nvfp4_residual import has_base_residual
+        from axolotl.loaders.patch_manager import PatchManager
+        from axolotl.utils.dict import DictDefault
+
+        model = self._peft_qwen(targets=("q_proj", "v_proj"))
+        pm = PatchManager.__new__(PatchManager)
+        pm.cfg = DictDefault(
+            {
+                "adapter": "lora",
+                "nvfp4_training": {"enabled": True, "base_mode": "hp"},
+            }
+        )
+        pm._apply_nvfp4_training(model)
+        bases = [m.base_layer for m in model.modules() if isinstance(m, LoraLinear)]
+        assert bases and not any(has_base_residual(b) for b in bases)
+
+
+@require_torch_2_8_0
+@requires_sm_ge_100
 class TestNVFP4Adapters:
     """NVFP4 base under LoRA adapters: FP4 compute, and FP4 storage (QLoRA)."""
 

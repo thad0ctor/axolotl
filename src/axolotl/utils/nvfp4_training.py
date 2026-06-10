@@ -22,6 +22,7 @@ transform on wgrad inputs) attach at the ``_quantize`` seam — see
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import torch
@@ -53,6 +54,69 @@ def _apply_lm_head_residual(module, x, out):
     from axolotl.kernels.nvfp4_residual import apply_residual
 
     return apply_residual(module, x, out)
+
+
+def _apply_base_residual(module, x, out):
+    """Add the low-rank L2QER correction ``(x @ B.T) @ A.T`` to a frozen FP4
+    base linear's output.
+
+    The generalization of the lm_head residual to every frozen FP4 base linear
+    (``nvfp4_training.base_residual``, ON by default): ``A [out,k]`` / ``B
+    [k,in]`` are plain bf16 buffers attached at swap time, so the correction is a
+    differentiable bolt-on OUTSIDE the FP4 autograd Functions — autograd supplies
+    the exact dgrad ``dX += (dY @ A) @ B`` and no wgrad (buffers carry no grad).
+    The ``getattr`` None-check specializes once under dynamo (module attribute),
+    so the hot path stays branch-free and compile-traceable. No-op (zero cost)
+    when no residual is attached.
+
+    SPEED: the correction is applied as ONE fused ``torch.addmm`` (read ``out``
+    once, write the corrected result) instead of materializing the ``[M, out]``
+    correction and re-reading both for the add — halving the bolt-on's memory
+    traffic. (True in-place ``addmm_`` is forbidden here: ``out`` is a view
+    returned by a custom autograd Function, and autograd rejects view+inplace
+    on those.) NOTE: the PRODUCTION LoRA path does not even pay this — the
+    fused LoRA kernels fold the residual into the adapter GEMMs (see
+    kernels/lora.py) and call the base helpers with ``apply_residual=False``;
+    this bolt-on remains only for plain module forwards (no adapter) and
+    fallbacks.
+    """
+    a = getattr(module, "_base_residual_A", None)
+    if a is None:
+        return out
+    b = module._base_residual_B
+    h = x.reshape(-1, x.shape[-1])
+    hb = h.to(b.dtype) @ b.t()  # [M, k]
+    if a.dtype == out.dtype:
+        o2 = out.reshape(-1, out.shape[-1])
+        return torch.addmm(o2, hb, a.t()).view(out.shape)
+    corr = hb @ a.t()  # [M, out] (dtype-mismatch fallback only)
+    return out + corr.reshape(out.shape).to(out.dtype)
+
+
+def _apply_base_residual_dgrad(module, g, out):
+    """Residual dgrad term ``(dY @ A) @ B`` for the fused-LoRA backward helpers.
+
+    The module forwards route the residual through autograd (no manual backward
+    needed); only the fused LoRA kernels call :func:`nvfp4_base_dgrad` directly
+    inside their own autograd Functions, so their base dgrad must add the same
+    term explicitly to stay consistent with the corrected forward. Accumulated
+    in place (``addmm_``) — ``out`` is always a freshly allocated FP4 dgrad
+    result inside a no-grad custom backward, so no ``[M, in]`` correction is
+    ever materialized. The fused LoRA backwards normally skip even this
+    (``apply_residual=False``) and concat the residual into the adapter dgrad
+    GEMMs instead.
+    """
+    a = getattr(module, "_base_residual_A", None)
+    if a is None:
+        return out
+    b = module._base_residual_B
+    ga = g.to(a.dtype) @ a  # [M, k]
+    if b.dtype == out.dtype:
+        out.addmm_(ga, b)
+        return out
+    return out + (ga @ b).to(out.dtype)
+
+
 # torch._scaled_mm packs 2 FP4/byte and requires the packed contraction dim
 # (= logical/2) to be divisible by 16, so logical contraction must be a
 # multiple of 32. The token dimension (M) is padded to this alignment.
@@ -721,6 +785,7 @@ class NVFP4FrozenBaseLinear(nn.Module):
     def forward(self, x):
         out = NVFP4FrozenBaseFunction.apply(x, self.w_q, self.recipe)
         out = _apply_lm_head_residual(self, x, out)
+        out = _apply_base_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -982,6 +1047,7 @@ class NVFP4ComputeBaseLinear(nn.Module):
     def forward(self, x):
         out = NVFP4ComputeBaseFunction.apply(x, self.w_fprop, self.w_dgrad, self.recipe)
         out = _apply_lm_head_residual(self, x, out)
+        out = _apply_base_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -1890,6 +1956,7 @@ class NVFP4FastComputeBaseLinear(nn.Module):
             self.out_features,
             self.recipe,
         )
+        out = _apply_base_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -1991,6 +2058,7 @@ class NVFP4FastFrozenBaseLinear(nn.Module):
             self.in_features,
             self.recipe,
         )
+        out = _apply_base_residual(self, x, out)
         return out if self.bias is None else out + self.bias
 
     @property
@@ -2027,12 +2095,18 @@ def is_nvfp4_base(module) -> bool:
     return isinstance(module, _nvfp4_base_classes())
 
 
-def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
+def nvfp4_base_fprop(
+    x: torch.Tensor, base, apply_residual: bool = True
+) -> torch.Tensor:
     """``x @ W.T`` in FP4 for any native NVFP4 base module (2D ``x`` [M, K]).
 
     Mirrors each module's forward GEMM but as a plain (no-autograd) call so the
     fused LoRA autograd Functions can invoke it inside their own forward. Pads M
     to the FP4 alignment and slices it back.
+
+    ``apply_residual=False`` skips the frozen-base L2QER correction so the
+    caller can fold it into its own LoRA adapter GEMMs (the cheap path) — the
+    caller then OWNS the residual term and must apply it on the RAW activation.
     """
     from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
 
@@ -2055,11 +2129,14 @@ def nvfp4_base_fprop(x: torch.Tensor, base) -> torch.Tensor:
         )
     else:  # NVFP4Linear (hp): high-precision master weight, per-step requant
         out = _fp4_mm(xp, base.weight.t(), QuantPolicy(), QuantPolicy())
-    return out[:m]
+    # Keep the fused-LoRA base fprop consistent with the module forward: the
+    # frozen-base residual correction is part of the base GEMM's effective weight.
+    out = out[:m]
+    return _apply_base_residual(base, x, out) if apply_residual else out
 
 
 def nvfp4_base_fprop_many(
-    x: torch.Tensor, bases: list | tuple
+    x: torch.Tensor, bases: list | tuple, apply_residual: bool = True
 ) -> list[torch.Tensor] | None:
     """Run several NVFP4 frozen-base fprops while sharing one activation pack.
 
@@ -2105,7 +2182,10 @@ def nvfp4_base_fprop_many(
                 )
             else:
                 out = _mslk_fprop_mm(xq, xsc, base.wq, base.wsc, base.w_inv, x.dtype)
-            outs.append(out[:m].reshape(*lead, base.out_features))
+            out = out[:m]
+            if apply_residual:
+                out = _apply_base_residual(base, x2d, out)
+            outs.append(out.reshape(*lead, base.out_features))
         return outs
 
     if all(
@@ -2127,14 +2207,23 @@ def nvfp4_base_fprop_many(
                     a_q, base.w_q.t(), torch.ops.aten.mm.default
                 )
                 out_features = base.out_features
-            outs.append(out[:m].reshape(*lead, out_features))
+            out = out[:m]
+            if apply_residual:
+                out = _apply_base_residual(base, x2d, out)
+            outs.append(out.reshape(*lead, out_features))
         return outs
 
     return None
 
 
-def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
-    """``g @ W`` in FP4 (the base contribution to the input gradient), 2D ``g``."""
+def nvfp4_base_dgrad(
+    g: torch.Tensor, base, apply_residual: bool = True
+) -> torch.Tensor:
+    """``g @ W`` in FP4 (the base contribution to the input gradient), 2D ``g``.
+
+    ``apply_residual=False`` skips the residual dgrad term ``(dY @ A) @ B`` so
+    the fused LoRA backwards can fold it into their adapter dgrad GEMMs.
+    """
     from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
 
     gp, m = _pad_to_block(g, 0)
@@ -2163,7 +2252,10 @@ def nvfp4_base_dgrad(g: torch.Tensor, base) -> torch.Tensor:
         out = _fp4_mm(gp, base.w_q.dequantize(g.dtype), sr, QuantPolicy())
     else:  # NVFP4Linear (hp)
         out = _fp4_mm(gp, base.weight, sr, QuantPolicy())
-    return out[:m]
+    # The corrected forward is y = (Q(W) + A B) x, so its exact dgrad carries the
+    # residual term too: dX += (dY @ A) @ B (no wgrad — the base is frozen).
+    out = out[:m]
+    return _apply_base_residual_dgrad(base, g, out) if apply_residual else out
 
 
 def _is_swappable(module: nn.Linear) -> bool:
@@ -2800,6 +2892,51 @@ def convert_lora_base_to_te_nvfp4(
     return swapped
 
 
+@dataclass
+class BaseResidualPlan:
+    """Validated base-residual request handed to the LoRA base converter.
+
+    Built by the integration layer (patch_manager) BEFORE the quantize swap:
+    ``calib`` maps each target ``lora.Linear`` module name to the per-input-
+    channel running mean of x^2 (fp32 ``[in_features]``) captured from one
+    forward of the still-bf16 model. ``calibration='activation'`` (L2QER) needs
+    those stats; ``'svd'`` (plain, ablation only) ignores them.
+    """
+
+    rank: int = 16
+    calibration: str = "activation"
+    calib: dict | None = None  # lora.Linear name -> mean_x2 fp32 [in]
+
+
+def _attach_base_residual_at_swap(name, new_module, w_hp, plan, stats) -> None:
+    """Build + attach the residual for one freshly swapped frozen base linear.
+
+    Runs while BOTH the bf16 master ``w_hp`` and the packed FP4 store are in
+    memory (the caller discards the master right after). Per the measured
+    finding, a missing activation calibration means SKIP (loud), not plain-SVD.
+    """
+    from axolotl.kernels.nvfp4_residual import attach_base_residual
+
+    mean_x2 = None
+    if plan.calibration == "activation":
+        mean_x2 = (plan.calib or {}).get(name)
+        if mean_x2 is None:
+            LOG.warning(
+                "nvfp4 base_residual: no activation calibration captured for %s; "
+                "skipping its residual (plain-SVD fallback is pointless on the "
+                "near-full-rank e2m1 error).",
+                name,
+            )
+            return
+    t0 = time.perf_counter()
+    if attach_base_residual(new_module, w_hp, plan.rank, mean_x2):
+        stats["n"] += 1
+        stats["svd_s"] += time.perf_counter() - t0
+        a = new_module._base_residual_A
+        b = new_module._base_residual_B
+        stats["bytes"] += (a.numel() + b.numel()) * a.element_size()
+
+
 def convert_lora_base_to_nvfp4(
     model: nn.Module,
     recipe: NVFP4Recipe | None = None,
@@ -2808,6 +2945,7 @@ def convert_lora_base_to_nvfp4(
     compute_base: bool = False,
     fsdp: bool = False,
     exclude: tuple[str, ...] = ("lm_head", "embed_tokens"),
+    base_residual: BaseResidualPlan | None = None,
 ) -> int:
     """Swap the FROZEN base_layer inside each PEFT ``lora.Linear`` for an NVFP4
     linear, leaving the trainable adapters in high precision.
@@ -2845,6 +2983,7 @@ def convert_lora_base_to_nvfp4(
         (n, m) for n, m in model.named_modules() if isinstance(m, LoraLinear)
     ]
     streamed = False
+    res_stats = {"n": 0, "svd_s": 0.0, "bytes": 0}
     for name, module in lora_modules:
         if any(frag in name for frag in exclude):
             continue
@@ -2882,7 +3021,20 @@ def convert_lora_base_to_nvfp4(
         else:
             base.weight.requires_grad_(False)
             module.base_layer = NVFP4Linear.from_linear(base, recipe)
+            if base_residual is not None:
+                LOG.debug(
+                    "nvfp4 base_residual: %s uses base_mode=hp (bf16 master kept, "
+                    "re-quantized per step) — no frozen FP4 store to correct; "
+                    "skipping.",
+                    name,
+                )
         swapped += 1
+        # Frozen FP4 base (storage/compute): build the L2QER residual NOW, while
+        # the bf16 master is still alive (it is discarded just below).
+        if base_residual is not None and (compute_base or quantized_storage):
+            _attach_base_residual_at_swap(
+                name, module.base_layer, base.weight.detach(), base_residual, res_stats
+            )
         # Free the now-replaced bf16 base immediately. Otherwise the full bf16
         # model stays resident while the FP4 copies accumulate on top (the swap
         # transiently doubles memory) — which OOMs large models on load even
@@ -2912,6 +3064,21 @@ def convert_lora_base_to_nvfp4(
     else:
         mode = "hp"
     LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
+    if res_stats["n"]:
+        LOG.info(
+            "NVFP4 base_residual: attached rank-%d L2QER residuals to %d frozen "
+            "base linears (SVD total %.1fs, A/B buffers %.2f MiB)",
+            base_residual.rank,
+            res_stats["n"],
+            res_stats["svd_s"],
+            res_stats["bytes"] / (1024 * 1024),
+        )
+    elif base_residual is not None and swapped:
+        LOG.warning(
+            "NVFP4 base_residual was requested but no residual was attached "
+            "(mode=%s; only frozen FP4 storage/compute bases are corrected).",
+            mode,
+        )
     if skipped_offloaded:
         raise RuntimeError(
             f"nvfp4_training: {skipped_offloaded} base weight(s) are on meta with no "

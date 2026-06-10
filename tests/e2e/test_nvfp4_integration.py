@@ -259,7 +259,11 @@ def test_gate_allows_lm_head_residual_with_quantize_lm_head(monkeypatch):
             "enabled": True,
             "quantize_lm_head": True,
             "fused_fp4_cross_entropy": True,
-            "lm_head_residual": {"enabled": True, "rank": 16, "calibration": "activation"},
+            "lm_head_residual": {
+                "enabled": True,
+                "rank": 16,
+                "calibration": "activation",
+            },
         },
     )
     assert cfg.nvfp4_training.lm_head_residual.enabled is True
@@ -398,6 +402,79 @@ def test_gate_refuses_qwen3_5_only_module_flags_on_qwen3_vl(monkeypatch, flag):
             model_config_type="qwen3_vl",
             nvfp4_training={"enabled": True, flag: True},
         )
+def test_schema_base_residual_defaults_on(monkeypatch):
+    """base_residual is the DEFAULT-ON product decision: a bare nvfp4_training
+    block already carries enabled=True, rank 16, activation calibration."""
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(**BASE, nvfp4_training={"enabled": True})
+    res = cfg.nvfp4_training.base_residual
+    assert res.enabled is True
+    assert res.rank == 16
+    assert res.calibration == "activation"
+    assert res.calib_tokens == 512
+
+
+def test_schema_base_residual_accepts_overrides(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        nvfp4_training={
+            "enabled": True,
+            "base_residual": {
+                "enabled": False,
+                "rank": 32,
+                "calibration": "svd",
+                "calib_tokens": 128,
+            },
+        },
+    )
+    res = cfg.nvfp4_training.base_residual
+    assert res.enabled is False
+    assert res.rank == 32
+    assert res.calibration == "svd"
+    assert res.calib_tokens == 128
+
+
+def test_schema_base_residual_rejects_bad_values(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError):
+        AxolotlInputConfig(
+            **BASE,
+            nvfp4_training={"enabled": True, "base_residual": {"rank": 0}},
+        )
+    with pytest.raises(ValueError):
+        AxolotlInputConfig(
+            **BASE,
+            nvfp4_training={
+                "enabled": True,
+                "base_residual": {"calibration": "magic"},
+            },
+        )
+    with pytest.raises(ValueError):  # extra=forbid catches stale keys
+        AxolotlInputConfig(
+            **BASE,
+            nvfp4_training={"enabled": True, "base_residual": {"ranks": 16}},
+        )
+
+
+def test_gate_allows_base_residual_with_lora(monkeypatch):
+    """Default-on must not break the capability gate for adapter runs."""
+    _supported(monkeypatch, True)
+    cfg = AxolotlConfigWCapabilities(
+        **BASE, **CAPS, adapter="lora", nvfp4_training={"enabled": True}
+    )
+    assert cfg.nvfp4_training.base_residual.enabled is True
+    cfg = AxolotlConfigWCapabilities(
+        **BASE,
+        **CAPS,
+        adapter="lora",
+        nvfp4_training={
+            "enabled": True,
+            "base_mode": "storage",
+            "base_residual": {"rank": 8},
+        },
+    )
+    assert cfg.nvfp4_training.base_residual.rank == 8
 
 
 def test_gate_refuses_unsupported_hardware(monkeypatch):

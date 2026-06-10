@@ -345,6 +345,90 @@ class NVFP4AttentionConfig(BaseModel):
     def compile_custom_op_set(self) -> bool:
         return bool(self.backward.compile_custom_op)
 
+class BaseResidualConfig(BaseModel):
+    """Low-rank bf16 L2QER residual on EVERY frozen FP4 base linear (LoRA/QLoRA).
+
+    The generalization of ``lm_head_residual`` from the head to all frozen base
+    linears: at swap time, while the bf16 master ``W`` and the packed ``Q(W)``
+    coexist, the quant error ``E = W - dequant(Q(W))`` is factored
+    activation-weighted (L2QER) into ``A [out,k] @ B [k,in]`` and the corrected
+    base computes ``y = Q(W) x + A (B x)``. The weighting ``g = sqrt(mean_t
+    x_t^2)`` per input channel comes from ONE forward of the still-bf16 model
+    over a short slice of the training data, hooked on every linear about to be
+    swapped — run BEFORE the quantize swap (the QLoRA storage mode discards the
+    master right after packing).
+
+    DEFAULT ON (deliberate product decision): the e2m1 base error is a pure
+    accuracy loss the frozen base can never train away, the correction is exact
+    in dgrad, and the memory cost is negligible (rank-16 A/B add ~(in+out)*k*2
+    bytes per layer). MEASURED accuracy: logit KL(bf16||fp4) -27% at rank 16 on
+    a fully FP4-swapped Qwen3-0.6B body. MEASURED speed: the FLOPs are <1%, but
+    the unfused [tokens, out] correction add is bandwidth-bound — ~+45-50% on a
+    lone base linear's fwd+bwd, +16% (eager) / +22% (compiled) on the 0.6B
+    whole-model fwd+bwd at 1k tokens; roughly the cost of a SECOND rank-16 LoRA
+    adapter pair per layer (the trainable adapters already pay the same shapes).
+    Set ``enabled: false`` for pure-throughput runs where the FP4 base accuracy
+    gap does not matter. It silently applies whenever frozen FP4 base linears
+    exist (LoRA/QLoRA storage/compute modes); full fine-tune (trainable weights
+    — the residual would go stale every optimizer step) and the hp base mode
+    are skipped with a debug log, and the lm_head keeps its own
+    ``lm_head_residual`` block.
+
+    If the activation calibration cannot be captured at load, the residual is
+    DISABLED with a loud warning — it does NOT silently degrade to plain SVD,
+    which is measurably useless (the e2m1 error is near full-rank; see
+    LMHeadResidualConfig / nvfp4_residual.py for the measurements).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "description": "Enable the low-rank L2QER residual on every frozen FP4 "
+            "base linear. ON by default (product decision: it activates "
+            "automatically whenever frozen FP4 base linears exist — LoRA/QLoRA "
+            "with base_mode storage/compute). Measured: KL(bf16||fp4) -27% at "
+            "rank 16 on a Qwen3-0.6B body, for a +16-22% whole-model fwd+bwd "
+            "cost at 0.6B scale (the unfused [tokens,out] correction add is "
+            "bandwidth-bound; FLOPs <1%). Set false for pure-throughput runs. "
+            "Full fine-tune and hp-mode bases are never corrected (trainable/hp "
+            "master — the residual would go stale)."
+        },
+    )
+    rank: int = Field(
+        default=16,
+        ge=1,
+        json_schema_extra={
+            "description": "Rank k of the per-layer residual A[out,k]/B[k,in]. 16 "
+            "captures nearly all of the recoverable (activation-weighted) error on "
+            "real heads/bodies; the per-layer cost is two thin matmuls and "
+            "~(in+out)*k*2 bytes of bf16 buffers. Clamped to min(out,in)."
+        },
+    )
+    calibration: Literal["activation", "svd"] = Field(
+        default="activation",
+        json_schema_extra={
+            "description": "'activation' (default, L2QER): weight the quant error "
+            "by the per-input-channel activation second moment (captured in one "
+            "pre-swap forward over calib_tokens training tokens) before the SVD — "
+            "the only construction that meaningfully helps. If that calibration "
+            "cannot be captured, the residual is DISABLED with a warning (no "
+            "silent plain-SVD fallback). 'svd': plain truncated SVD of the raw "
+            "error (ablation only; recovers little)."
+        },
+    )
+    calib_tokens: int = Field(
+        default=512,
+        ge=16,
+        json_schema_extra={
+            "description": "Number of real tokens forwarded once at load (before "
+            "the quantize swap) to capture per-input-channel activation second "
+            "moments on every to-be-swapped linear. Only the [in_features] running "
+            "mean of x^2 is kept per layer (tiny). Ignored for calibration='svd'."
+        },
+    )
+
 
 class NVFP4TrainingConfig(BaseModel):
     """NVFP4-GEMM training settings (module-swap on eligible nn.Linear)."""
@@ -529,6 +613,20 @@ class NVFP4TrainingConfig(BaseModel):
             "a Qwen3-8B head. Only activates with quantize_lm_head. OFF by default. "
             "PERMANENT inference cost (~10-15% of the head forward when fused). See "
             "LMHeadResidualConfig."
+        },
+    )
+    base_residual: BaseResidualConfig = Field(
+        default_factory=BaseResidualConfig,
+        json_schema_extra={
+            "description": "Low-rank bf16 L2QER residual A@B on EVERY frozen FP4 "
+            "base linear (W ~= Q(W) + A B), built at swap time from the bf16 "
+            "master and a one-shot activation calibration. ON by default "
+            "(measured: KL -27% at rank 16 on a Qwen3-0.6B body for +16-22% "
+            "whole-model fwd+bwd at that scale; exact dgrad, no wgrad); applies "
+            "to LoRA/QLoRA storage/compute base modes only — full-FT/hp bases "
+            "and the lm_head (own lm_head_residual block) are excluded. Disabled "
+            "with a loud warning if the activation calibration cannot be "
+            "captured. See BaseResidualConfig."
         },
     )
     quantize_embeddings: bool = Field(

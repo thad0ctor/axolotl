@@ -53,6 +53,12 @@ LOG = logging.getLogger(__name__)
 _RES_A = "_lm_head_residual_A"  # [V, k] bf16
 _RES_B = "_lm_head_residual_B"  # [k, H] bf16
 
+# Buffer names attached to a frozen FP4 BASE linear (the generalization of the
+# lm_head residual to every frozen base linear under LoRA/QLoRA). Distinct names
+# so the lm_head paths (fused CE tiles, distillation) never double-apply.
+_BASE_RES_A = "_base_residual_A"  # [out, k] bf16
+_BASE_RES_B = "_base_residual_B"  # [k, in] bf16
+
 
 @dataclass
 class ResidualConfig:
@@ -150,6 +156,58 @@ def attach_residual(
         tuple(B.shape),
     )
     return True
+
+
+@torch.no_grad()
+def attach_base_residual(
+    module: nn.Module,
+    w_hp: torch.Tensor,
+    rank: int,
+    mean_x2: torch.Tensor | None,
+) -> bool:
+    """Compute + attach the L2QER residual to a frozen FP4 BASE linear ``module``.
+
+    Called AT SWAP TIME, while ``w_hp`` (the original bf16 master ``[out, in]``)
+    is still in memory (the storage swap discards it right after). ``module`` is
+    the freshly built NVFP4 base module, whose ``.weight`` property dequantizes
+    the packed store, so ``E = w_hp - module.weight`` is the quant error.
+    ``mean_x2`` is the per-INPUT-channel running mean of x^2 (fp32 ``[in]``) from
+    the pre-swap calibration forward; ``g = sqrt(mean_x2)`` selects the L2QER
+    construction in :func:`_build_residual` (``None`` -> plain SVD, ablation
+    only — measured useless on the near-full-rank e2m1 error). Returns True on
+    success.
+
+    Buffers are non-persistent (like the lm_head residual): they reconstruct
+    deterministically at load from the original weights + a short calibration
+    forward, so they stay out of the adapter/model checkpoints.
+    """
+    if rank <= 0:
+        return False
+    w_dq = getattr(module, "weight", None)  # dequantized FP4 [out, in]
+    if w_dq is None:
+        return False
+    E = (
+        w_hp.detach().to(device=w_dq.device, dtype=torch.float32)
+        - w_dq.detach().float()
+    )
+    g = None
+    if mean_x2 is not None:
+        g = mean_x2.to(device=E.device, dtype=torch.float32).clamp_min(0).sqrt()
+    A, B = _build_residual(E, rank, g)
+    dtype = w_hp.dtype
+    module.register_buffer(_BASE_RES_A, A.to(dtype), persistent=False)
+    module.register_buffer(_BASE_RES_B, B.to(dtype), persistent=False)
+    return True
+
+
+def base_residual_buffers(module: nn.Module):
+    """Return ``(A, B)`` base-residual buffers on ``module``, or ``(None, None)``."""
+    return getattr(module, _BASE_RES_A, None), getattr(module, _BASE_RES_B, None)
+
+
+def has_base_residual(module: nn.Module) -> bool:
+    a, b = base_residual_buffers(module)
+    return a is not None and b is not None
 
 
 def apply_residual(module: nn.Module, hidden: torch.Tensor, logits: torch.Tensor):
