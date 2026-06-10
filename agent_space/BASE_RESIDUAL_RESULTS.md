@@ -47,45 +47,90 @@ The SVD total is per-call-overhead dominated (196 small fp32 GPU SVDs); fine as
 a load-time cost, scales linearly with layer count and ~quadratically with
 hidden size (a 9B-scale body is minutes, still load-time-acceptable).
 
-## Step-time overhead (PERMANENT: train + inference) — the honest number
+## Step-time overhead — FUSED into the LoRA path (the shipped implementation)
 
-| measurement (fwd+bwd, median)                         | base    | +residuals | overhead |
-|-------------------------------------------------------|--------:|-----------:|---------:|
-| whole 0.6B model, 1081 tokens, eager                  | 160.9 ms| 186.1 ms   | **+15.7%** |
-| whole 0.6B model, 1081 tokens, torch.compile          | 98.7 ms | 120.8 ms   | **+22.4%** |
-| one linear 1024→3072, M=4096, eager                   | 0.65 ms | 0.98 ms    | +51%     |
-| one linear 4096→12288 (9B-ish), M=8192, eager         | 2.66 ms | 3.97 ms    | +49%     |
+The original bolt-on (`out = out + (x@Bᵀ)@Aᵀ` materializing `[tokens, out]`
+per layer) measured +15.7% eager / +22.4% compiled on the 0.6B whole-model
+fwd+bwd and ~+50% on a lone linear — pure memory bandwidth, not FLOPs. The
+shipped implementation now RIDES THE LoRA PATH instead ("path to cheap" #2
+below, implemented): the residual has exactly the LoRA shape, so on the fused
+LoRA kernels (`lora_qkv/o/mlp_kernel`, the production training path) the
+factors are CONCATENATED into the adapter GEMMs —
 
-**The design brief's ~+1% step-cost assumption did NOT hold.** The residual's
-FLOPs really are <1% of the base GEMM, but the shipped bolt-on implementation
-materializes and adds the `[tokens, out]` correction (and reads `[tokens, out]`
-again in dgrad) — pure memory bandwidth, the exact effect Phase 2 measured as
-the lm_head "bolt-on +36%". It does not amortize with wider layers (the FP4
-base GEMM speeds up too) and default torch.compile does not fuse the add into
-the cuBLAS GEMM epilogue (`torch.addmm` measured no better). A useful framing:
-the residual costs about as much as a SECOND rank-16 LoRA adapter pair per
-layer — the trainable adapters already run the same unfused skinny-matmul
-shapes every step.
+  * forward: `out.addmm_(X @ cat([A_lora, res_B/s]).T → C1ᵀ, cat([B_loraᵀ,
+    res_Aᵀ]) → C2, alpha=s)` — the same two skinny GEMMs LoRA already pays,
+    just k columns wider (residual net scale 1: its first factor is
+    pre-divided by s);
+  * backward: `ext = dY @ C2ᵀ` (whose `[:, :r]` slice is exactly the `dY @ B`
+    the LoRA grads consume — adapter grads UNCHANGED), `dX.addmm_(ext, C1,
+    alpha=s)` carries the exact residual dgrad `(dY@A)@B`;
+  * `(C1, C2)` are version-cached per module (invalidated by the optimizer's
+    `_version` bump, the unsloth/DoRA cache pattern), so in steady state the
+    fold adds ZERO extra kernel launches; under dynamo the cache is bypassed
+    (functional build, no graph breaks — verified cold).
+
+Measured (RTX PRO 6000 Blackwell, torch 2.12, fused-LoRA whole-model harness:
+PEFT r=16 on q/k/v/o/gate/up/down + axolotl LoRA kernels + FP4 bases, 1081
+tokens; arms interleaved 3x, medians):
+
+| measurement (fwd+bwd, median)                          | base    | +residuals | overhead |
+|--------------------------------------------------------|--------:|-----------:|---------:|
+| whole 0.6B, fused-LoRA step, eager (wall)              | 226.0 ms| 225.1 ms   | **−0.4%** (noise) |
+| whole 0.6B, fused-LoRA step, eager (GPU time)          | 38.9 ms | 39.1 ms    | **+0.4%** |
+| whole 0.6B, fused-LoRA step, torch.compile (wall)      | 232.7 ms| 239.0 ms   | **+0.1% / +2.7%** (2 runs) |
+| whole 0.6B, fused-LoRA step, torch.compile (GPU time)  | 45.5 ms | 45.9 ms    | **+0.9%** |
+| one linear 4096→4096 + rank-16 LoRA, M=4096, eager     | 1.21 ms | 1.17–1.24 ms | **−3% to +2%** |
+| one linear 1024→3072 + rank-16 LoRA, M=4096, eager     | 0.90 ms | 0.90–0.92 ms | **−0% to +2%** |
+| (old bolt-on, same one-linear shapes, for reference)   |         |            | +12–18%  |
+
+(The lone-linear bench is CPU-launch-bound — wall jitter ±3%; the fused arm
+sometimes measures *faster* than no-residual because the version cache also
+caches the adapter dtype casts. GPU-side kernel time is the clean signal:
++0.4% whole-model.) Note the whole-model "base" here is the fused-LoRA-kernel
+step (~220 ms), not the adapterless module-forward step the original +16/+22%
+was measured on.
+
+Paths NOT on the fused kernels keep a bolt-on, but a cheaper one: plain module
+forwards (no adapter) apply the correction as a single fused `torch.addmm`
+(half the old memory traffic — true in-place is forbidden on a custom-Function
+output view), and dropout>0 adapters accumulate `out.addmm_(X @ (res_B/s)ᵀ,
+res_Aᵀ, alpha=s)` on the RAW X in place (the residual is part of the effective
+frozen weight and must never see dropout). Re-measured module-forward probe
+(NO LoRA — not the production training path; `base_residual_qwen3_0.6b_fused.json`):
+one-linear 1024→3072 bolt-on +30.8% (was +51%); whole-model module-forward
+step +20.5% eager / +21.2% compiled — essentially unchanged from the original
++16/+22% because at 1081 tokens that path is kernel-launch-bound, not
+bandwidth-bound (and this box now runs a concurrent benchmark on GPU 0, so
+wall numbers carry a few % of CPU-contention noise). The fix for training cost
+is riding the LoRA kernels, which production NVFP4 LoRA configs use.
+
+Numerics (fused vs bolt-on, identical inputs + fixed dY): outputs/dX match to
+bf16 accumulation noise (rel ≤5.5e-3 on QKV/O; ~3e-2 through the MLP where the
+down projection re-quantizes `hidden` to FP4 and amplifies 1-ulp differences);
+the residual TERM itself matches the analytic `(x@Bᵀ)@Aᵀ` / `(dY@A)@B` to
+<1e-2 of the full norm on every path; lora A/B grads are BITWISE identical
+given the same dY; a 6-step SGD loop (optimizer-invalidated cache) tracks the
+bolt-on trajectory to <1e-3.
 
 Per the brief, the feature ships DEFAULT ON (explicit product decision), with
 the measured cost documented in the schema field descriptions and
 `enabled: false` as the pure-throughput opt-out.
 
-### Paths to cheap (not done here)
-1. Fuse the correction add into the FP4 GEMM epilogue (custom kernel or
-   max-autotune Triton matmul templates) — would leave only the thin `[M,k]`
-   matmuls (~1–2%).
-2. Piggyback on the LoRA adapter matmuls (concat `[B; lora_A]`, `[A, lora_B]`
-   shapes) — halves the launch/traffic count but entangles frozen and trainable
-   parameters.
+(KL re-check on this run: fp4 baseline 0.07391, l2qer_k16 0.04986 = **−32.5%**,
+top-1 0.9512 → 0.9492; rank sweep k8 −13.6%, k32 −41.7% — the rank-16 default
+still holds the accuracy headline.)
 
 ## Correctness / wiring (unit-tested)
 
 - Forward: `y = Q(W)x + (x@Bᵀ)@Aᵀ` in all four frozen base classes
   (`NVFP4FrozenBaseLinear`, `NVFP4ComputeBaseLinear`, and both MSLK-fast
   variants) AND in the fused-LoRA kernel entry points (`nvfp4_base_fprop`,
-  `nvfp4_base_fprop_many`, `nvfp4_base_dgrad`), so fused-kernel runs stay
-  consistent with module forwards.
+  `nvfp4_base_fprop_many`, `nvfp4_base_dgrad` — which take
+  `apply_residual=False` when a fused-LoRA caller folds the residual into its
+  adapter GEMMs instead), so fused-kernel runs stay consistent with module
+  forwards. `tests/e2e/test_nvfp4_training.py::TestNVFP4BaseResidual::`
+  `test_fused_lora_path_folds_residual` pins the folded path: exact residual
+  terms in out/dX, adapter grads bitwise unchanged.
 - Backward: the module-forward correction is a plain differentiable bolt-on, so
   autograd supplies the EXACT dgrad `dX += (dY@A)@B` and no wgrad (A/B are
   buffers). Verified: corrected-minus-base grad equals the analytic term to
@@ -102,13 +147,22 @@ the measured cost documented in the schema field descriptions and
 
 ## Files
 - `agent_space/base_residual_probe.py` — the PTQ A/B harness (KL, load
-  overhead, step-time A/B; `--compile-step` for the compiled number).
-- `agent_space/base_residual_qwen3_0.6b.json` — raw probe output.
+  overhead, module-forward step-time A/B; `--compile-step` for the compiled
+  number).
+- `agent_space/base_residual_qwen3_0.6b.json` — raw probe output (bolt-on era).
+- `agent_space/base_residual_qwen3_0.6b_fused.json` — raw probe output after
+  the LoRA-path fusion (KL table + module-forward bolt-on step numbers).
 - shipped: `src/axolotl/kernels/nvfp4_residual.py` (`attach_base_residual`,
   reusing `_build_residual`), `src/axolotl/utils/nvfp4_training.py`
-  (`_apply_base_residual[_dgrad]`, `BaseResidualPlan`, swap-time attach in
-  `convert_lora_base_to_nvfp4`), `src/axolotl/loaders/patch_manager.py`
-  (`_nvfp4_prepare_base_residual` pre-swap calibration), schema
-  `nvfp4_training.base_residual` (default ON), tests in
-  `tests/e2e/test_nvfp4_training.py::TestNVFP4BaseResidual` and
+  (`_apply_base_residual[_dgrad]` fused-addmm bolt-ons with
+  `apply_residual` opt-outs on `nvfp4_base_fprop[_many]`/`nvfp4_base_dgrad`,
+  `BaseResidualPlan`, swap-time attach in `convert_lora_base_to_nvfp4`),
+  `src/axolotl/kernels/lora.py` (the LoRA-path fold: `_build_residual_pair`,
+  `_lora_residual_pair` (version-cached C1/C2), `_bwd_residual_pair`,
+  `_dgrad_grad_B`/`_dx_addmm`, residual-aware `matmul_lora` /
+  `_batched_lora_forward` / `_shared_nvfp4_base_fprop`),
+  `src/axolotl/loaders/patch_manager.py` (`_nvfp4_prepare_base_residual`
+  pre-swap calibration), schema `nvfp4_training.base_residual` (default ON),
+  tests in `tests/e2e/test_nvfp4_training.py::TestNVFP4BaseResidual` (incl.
+  `test_fused_lora_path_folds_residual`) and
   `tests/e2e/test_nvfp4_integration.py`.
