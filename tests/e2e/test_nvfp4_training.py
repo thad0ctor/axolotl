@@ -1236,6 +1236,56 @@ class TestNVFP4BaseResidual:
             for got, mod in zip(shared, bases, strict=False):
                 assert torch.equal(got, nvfp4_base_fprop(x, mod))
 
+    def test_fused_lora_path_folds_residual(self):
+        """The fused LoRA kernels FOLD the residual into the adapter GEMMs
+        (apply_residual=False on the base helpers + concatenated factors):
+        the corrected output and dX must carry the exact residual terms, and
+        the lora A/B grads must be UNCHANGED vs the uncorrected base (the
+        residual is frozen — it must never leak into adapter grads)."""
+        from axolotl.kernels.lora import LoRA_O
+        from axolotl.kernels.nvfp4_residual import attach_base_residual
+        from axolotl.utils.nvfp4_training import NVFP4Recipe
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        lin = nn.Linear(512, 384, bias=False).cuda().bfloat16()
+        lin.weight.requires_grad_(False)
+        mean_x2 = torch.rand(512, device="cuda") + 0.1
+        x = torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16)
+        dy = torch.randn(2, 64, 384, device="cuda", dtype=torch.bfloat16)
+        A0 = torch.randn(16, 512, device="cuda") * 0.02
+        B0 = torch.randn(384, 16, device="cuda") * 0.02
+
+        def run(mod):
+            A = A0.clone().requires_grad_(True)
+            B = B0.clone().requires_grad_(True)
+            X = x.clone().requires_grad_(True)
+            out = LoRA_O.apply(X, None, None, None, mod, A, B, 2.0, None, None)
+            out.backward(dy)
+            return out.detach(), X.grad.detach(), A.grad.detach(), B.grad.detach()
+
+        for cls in self._frozen_classes():
+            mod = cls.from_linear(lin, recipe)
+            o_off, dx_off, dA_off, dB_off = run(mod)
+            attach_base_residual(mod, lin.weight, 16, mean_x2)
+            a, b = mod._base_residual_A, mod._base_residual_B
+            o_on, dx_on, dA_on, dB_on = run(mod)
+
+            # exact residual terms in out and dX (normalized to the full norm
+            # — the term diff itself is bf16-cancellation noise)
+            term_o = ((x.reshape(-1, 512).to(b.dtype) @ b.t()) @ a.t()).reshape(
+                o_on.shape
+            )
+            term_dx = ((dy.reshape(-1, 384) @ a) @ b).reshape(dx_on.shape)
+            rel_o = (o_on - o_off - term_o).float().norm() / o_on.float().norm()
+            rel_dx = (dx_on - dx_off - term_dx).float().norm() / dx_on.float().norm()
+            assert rel_o.item() < 1e-2, (cls.__name__, rel_o.item())
+            assert rel_dx.item() < 1e-2, (cls.__name__, rel_dx.item())
+
+            # adapter grads identical with/without the frozen residual (same dY)
+            assert torch.allclose(dA_on, dA_off, rtol=1e-3, atol=1e-5), cls.__name__
+            assert torch.allclose(dB_on, dB_off, rtol=1e-3, atol=1e-5), cls.__name__
+
     def test_residual_compiles_without_graph_breaks(self):
         """The residual is plain ops on registered buffers with a setup-time None
         check: a corrected base must still trace fullgraph with 0 breaks."""

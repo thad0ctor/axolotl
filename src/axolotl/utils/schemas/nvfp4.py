@@ -362,17 +362,23 @@ class BaseResidualConfig(BaseModel):
     accuracy loss the frozen base can never train away, the correction is exact
     in dgrad, and the memory cost is negligible (rank-16 A/B add ~(in+out)*k*2
     bytes per layer). MEASURED accuracy: logit KL(bf16||fp4) -27% at rank 16 on
-    a fully FP4-swapped Qwen3-0.6B body. MEASURED speed: the FLOPs are <1%, but
-    the unfused [tokens, out] correction add is bandwidth-bound — ~+45-50% on a
-    lone base linear's fwd+bwd, +16% (eager) / +22% (compiled) on the 0.6B
-    whole-model fwd+bwd at 1k tokens; roughly the cost of a SECOND rank-16 LoRA
-    adapter pair per layer (the trainable adapters already pay the same shapes).
-    Set ``enabled: false`` for pure-throughput runs where the FP4 base accuracy
-    gap does not matter. It silently applies whenever frozen FP4 base linears
-    exist (LoRA/QLoRA storage/compute modes); full fine-tune (trainable weights
-    — the residual would go stale every optimizer step) and the hp base mode
-    are skipped with a debug log, and the lm_head keeps its own
-    ``lm_head_residual`` block.
+    a fully FP4-swapped Qwen3-0.6B body. MEASURED speed: on the fused LoRA
+    kernel path (lora_qkv/o/mlp_kernel — the production training path) the
+    residual is FOLDED into the adapter GEMMs (it has exactly the LoRA shape;
+    the concatenated factors are version-cached per module), so the marginal
+    cost is ~0-3% wall / <=1% GPU-side: a lone rank-16-LoRA'd base linear's
+    fwd+bwd lands within noise of no-residual (the old bolt-on was +12-18%),
+    and the 0.6B whole-model LoRA fwd+bwd measures -0.4% eager / +0.1-2.7%
+    compiled wall (GPU time +0.4% / +0.9%) vs the old bolt-on's +16-22%.
+    Plain module forwards (no adapter riding the fused kernels) keep a
+    bolt-on, now a single fused addmm per direction (~half the old bolt-on's
+    memory traffic, though that path stays launch-bound — ~+20% whole-model
+    without any adapters). Set ``enabled: false`` for
+    pure-throughput runs where the FP4 base accuracy gap does not matter. It
+    silently applies whenever frozen FP4 base linears exist (LoRA/QLoRA
+    storage/compute modes); full fine-tune (trainable weights — the residual
+    would go stale every optimizer step) and the hp base mode are skipped with
+    a debug log, and the lm_head keeps its own ``lm_head_residual`` block.
 
     If the activation calibration cannot be captured at load, the residual is
     DISABLED with a loud warning — it does NOT silently degrade to plain SVD,
@@ -389,11 +395,14 @@ class BaseResidualConfig(BaseModel):
             "base linear. ON by default (product decision: it activates "
             "automatically whenever frozen FP4 base linears exist — LoRA/QLoRA "
             "with base_mode storage/compute). Measured: KL(bf16||fp4) -27% at "
-            "rank 16 on a Qwen3-0.6B body, for a +16-22% whole-model fwd+bwd "
-            "cost at 0.6B scale (the unfused [tokens,out] correction add is "
-            "bandwidth-bound; FLOPs <1%). Set false for pure-throughput runs. "
-            "Full fine-tune and hp-mode bases are never corrected (trainable/hp "
-            "master — the residual would go stale)."
+            "rank 16 on a Qwen3-0.6B body, for ~0-3% whole-model fwd+bwd cost "
+            "on the fused LoRA kernel path (the residual factors are "
+            "concatenated into the LoRA adapter GEMMs and version-cached, so "
+            "the marginal cost is just the extra rank; eager and compiled). Plain "
+            "module-forward (no-adapter) paths pay a single fused addmm bolt-on "
+            "instead. Set false for pure-throughput runs. Full fine-tune and "
+            "hp-mode bases are never corrected (trainable/hp master — the "
+            "residual would go stale)."
         },
     )
     rank: int = Field(
