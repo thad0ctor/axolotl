@@ -8,6 +8,7 @@ from axolotl.kernels.attn_nvfp4_flash import (
     _gqa_reduce_cast_dkdv,
     _next_mult,
     _run_bwd,
+    _run_bwd_hp,
     nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
 )
@@ -217,6 +218,7 @@ def _flash_attention_train_op(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
+    bf16_grad_dots: int,
     save_backward_packs: bool,
     out_zshd: bool,
     block_m: int,
@@ -238,7 +240,7 @@ def _flash_attention_train_op(
     torch.Tensor,
 ]:
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
-    del dkdv_scratch_bf16
+    del dkdv_scratch_bf16, bf16_grad_dots
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
     use_saved_packs = _use_saved_train_packs(
         save_backward_packs, query.shape[2], key.shape[2]
@@ -294,6 +296,7 @@ def _(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
+    bf16_grad_dots: int,
     save_backward_packs: bool,
     out_zshd: bool,
     block_m: int,
@@ -303,7 +306,7 @@ def _(
 ):
     del key_pad_bias, scaling, causal, num_key_value_groups
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
-    del dkdv_scratch_bf16, num_warps, num_stages
+    del dkdv_scratch_bf16, bf16_grad_dots, num_warps, num_stages
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
     out = query.new_empty((z, s_q, h, d) if out_zshd else (z, h, s_q, d))
@@ -344,6 +347,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         backward_dot_dv_sr,
         backward_ds_dq_sr,
         dkdv_scratch_bf16,
+        bf16_grad_dots,
         save_backward_packs,
         out_zshd,
         block_m,
@@ -390,6 +394,17 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.backward_dot_dv_sr = backward_dot_dv_sr
     ctx.backward_ds_dq_sr = backward_ds_dq_sr
     ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
+    # HP-grad-dots backward (tri-state code: -1 auto, 0 force-legacy, 1 force-on).
+    # Auto turns it on whenever the saved-packs set is absent; it requires the
+    # saved HP q/k/v (mutually exclusive with packs mode) plus a fork that ships
+    # _run_bwd_hp, so both conditions clamp even a forced-on request.
+    if bf16_grad_dots < 0:
+        hp_grad_dots = not use_saved_packs
+    else:
+        hp_grad_dots = bool(bf16_grad_dots)
+    ctx.bf16_grad_dots = (
+        hp_grad_dots and not use_saved_packs and _run_bwd_hp is not None
+    )
     ctx.save_backward_packs = use_saved_packs
     ctx.out_zshd = bool(out_zshd)
     ctx.tiles = (block_m, block_n, num_warps, num_stages)
@@ -434,6 +449,7 @@ def _flash_attention_train_bwd_op(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
+    bf16_grad_dots: bool,
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -455,6 +471,36 @@ def _flash_attention_train_bwd_op(
         query_bwd = query.reshape(z * h, s_q, d).contiguous()
         key_bwd = key.reshape(z * hk, s_kv, d).contiguous()
         value_bwd = value.reshape(z * hk, s_kv, d).contiguous()
+    if bf16_grad_dots and not save_backward_packs:
+        # HP-grad-dots backward: FP4 S/dP recomputes + bf16 grad GEMMs with exact
+        # operands (the SR knobs and dkdv_scratch_bf16 are moot here). dq/dk/dv
+        # come back FINAL — grad_out dtype and GQA dK/dV already group-reduced
+        # in-kernel — so the reduce/cast epilogue below is skipped.
+        dq, dk, dv = _run_bwd_hp(
+            query_bwd,
+            key_bwd,
+            value_bwd,
+            do,
+            o,
+            bias,
+            z,
+            h,
+            hk,
+            s_q,
+            s_kv,
+            d,
+            scaling,
+            causal,
+            lse.reshape(z * h, s_q).contiguous(),
+            do_zshd=out_zshd,
+            o_zshd=out_zshd,
+            out_dtype=grad_out.dtype,
+        )
+        return (
+            dq.reshape(z, h, s_q, d),
+            dk.reshape(z, hk, s_kv, d),
+            dv.reshape(z, hk, s_kv, d),
+        )
     dq, dk, dv = _run_bwd(
         query_bwd,
         key_bwd,
@@ -537,6 +583,7 @@ def _(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
+    bf16_grad_dots: bool,
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -546,9 +593,11 @@ def _(
     del qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
     del scaling, causal, sr, save_backward_packs, out_zshd
     del backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr, dkdv_scratch_bf16
-    del block_m, block_n, num_warps, num_stages
+    del bf16_grad_dots, block_m, block_n, num_warps, num_stages
     # The real op returns CONTIGUOUS dq/dk/dv (reshape / GQA-reduce empty), even when
     # the q/k/v inputs are non-contiguous roped views — the fake must match strides.
+    # Both backward flavors return these final [Z,(H|Hk),S,D] grads (the HP-grad-dots
+    # path allocates them directly; the legacy path reshapes/reduces to them).
     dq = query.new_empty((z, h, s_q, d))
     dk = key.new_empty((z, hk, s_kv, d))
     dv = value.new_empty((z, hk, s_kv, d))
@@ -625,16 +674,18 @@ def _flash_attention_train_backward(
         ctx.backward_dot_dv_sr,
         ctx.backward_ds_dq_sr,
         ctx.dkdv_scratch_bf16,
+        ctx.bf16_grad_dots,
         block_m,
         block_n,
         num_warps,
         num_stages,
     )
-    # one grad slot per forward input (18 inputs)
+    # one grad slot per forward input (19 inputs)
     return (
         dq,
         dk,
         dv,
+        None,
         None,
         None,
         None,
@@ -674,6 +725,7 @@ def nvfp4_flash_attn_train_custom_op(
     backward_dot_dv_stochastic_rounding: bool | None = None,
     backward_ds_dq_stochastic_rounding: bool | None = None,
     dkdv_scratch_bf16: bool = False,
+    backward_bf16_grad_dots: bool | None = None,
     save_backward_packs: bool = False,
     out_layout: str = "zhsd",
     block_m: int = 64,
@@ -688,6 +740,10 @@ def nvfp4_flash_attn_train_custom_op(
     subgraph). All SR knobs are op arguments (so they survive compile/serialization);
     the bwd reuses the forward LSE and, when requested, the deterministic forward
     FP4 packs across the opaque boundary for short/mid static sequence lengths.
+    ``backward_bf16_grad_dots`` (None = auto: on whenever the saved-packs set is
+    absent) routes the backward through the HP-grad-dots ``_run_bwd_hp`` (bf16
+    grad GEMMs with exact operands — faster and more accurate; mutually exclusive
+    with saved packs, which force the legacy all-FP4 backward).
     ``out_layout="zshd"`` writes the HF attention layout directly.
     """
     if out_layout not in ("zhsd", "zshd"):
@@ -713,6 +769,12 @@ def nvfp4_flash_attn_train_custom_op(
         if backward_ds_dq_stochastic_rounding is None
         else backward_ds_dq_stochastic_rounding
     )
+    # custom-op schemas have no Optional[bool]; encode the tri-state as an int
+    # (-1 auto, 0 force-legacy, 1 force-HP), resolved in setup_context where the
+    # EFFECTIVE saved-packs decision (incl. the seq-length gate) is known.
+    hp_grad_dots_code = (
+        -1 if backward_bf16_grad_dots is None else int(bool(backward_bf16_grad_dots))
+    )
     out, *_aux = torch.ops.axolotl_nvfp4.flash_attention_train(
         query,
         key,
@@ -726,6 +788,7 @@ def nvfp4_flash_attn_train_custom_op(
         dot_dv,
         ds_dq,
         dkdv_scratch_bf16,
+        hp_grad_dots_code,
         save_backward_packs,
         out_layout == "zshd",
         block_m,

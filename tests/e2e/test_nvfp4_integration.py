@@ -429,6 +429,68 @@ def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
         )
 
 
+def test_schema_accepts_bf16_grad_dots(monkeypatch):
+    _supported(monkeypatch, True)
+    cfg = AxolotlInputConfig(
+        **BASE,
+        model_config_type="qwen3_5",
+        nvfp4_training={
+            "enabled": True,
+            "attention": {
+                "enabled": True,
+                "backward": {"enabled": True, "bf16_grad_dots": True},
+            },
+        },
+    )
+    assert cfg.nvfp4_training.attention.backward.bf16_grad_dots is True
+    # Tri-state default is None (auto: HP backward whenever save_packs is off).
+    cfg2 = AxolotlInputConfig(
+        **BASE,
+        model_config_type="qwen3_5",
+        nvfp4_training={
+            "enabled": True,
+            "attention": {"enabled": True, "backward": {"enabled": True}},
+        },
+    )
+    assert cfg2.nvfp4_training.attention.backward.bf16_grad_dots is None
+
+
+def test_schema_refuses_bf16_grad_dots_with_save_packs(monkeypatch):
+    # The HP-grad-dots backward needs the saved HP q/k/v; save_packs forces the
+    # legacy all-FP4 backward, so forcing both is contradictory.
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match=r"bf16_grad_dots.*save_packs"):
+        AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {
+                        "enabled": True,
+                        "save_packs": True,
+                        "bf16_grad_dots": True,
+                    },
+                },
+            },
+        )
+
+
+def test_gate_refuses_bf16_grad_dots_without_backward(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {"enabled": True, "backward": {"bf16_grad_dots": True}},
+            },
+        )
+
+
 def test_qwen3_5_compile_custom_op_allowed_with_backward(monkeypatch):
     # The compile custom op is now a differentiable, training-compatible op
     # (register_autograd), so it is ALLOWED together with native_attention_backward

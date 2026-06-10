@@ -126,6 +126,7 @@ def make_nvfp4_vl_forward(orig_forward):
         grad_sr = sr and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
         save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
         dkdv_bf16 = getattr(self, "_nvfp4_dkdv_scratch_bf16", False)
+        hp_grad_dots = getattr(self, "_nvfp4_bf16_grad_dots", None)
 
         # Same NVFP4 op for grad and no-grad (consistent under checkpointing). The
         # backward SR knobs are inert in no-grad. Under compile the opaque custom op
@@ -149,6 +150,7 @@ def make_nvfp4_vl_forward(orig_forward):
                 backward_dot_dv_stochastic_rounding=grad_sr,
                 backward_ds_dq_stochastic_rounding=grad_sr,
                 dkdv_scratch_bf16=dkdv_bf16,
+                backward_bf16_grad_dots=hp_grad_dots,
                 save_backward_packs=save_packs,
                 out_layout="zshd",
             )  # [Z, S, H, D]
@@ -167,6 +169,7 @@ def make_nvfp4_vl_forward(orig_forward):
                 backward_ds_dq_stochastic_rounding=grad_sr,
                 save_backward_packs=save_packs,
                 dkdv_scratch_bf16=dkdv_bf16,
+                backward_bf16_grad_dots=hp_grad_dots,
             ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -176,11 +179,13 @@ def make_nvfp4_vl_forward(orig_forward):
 
 
 def _set_attrs(module, *, train_backward, backward_rtn_grad_packs, save_backward_packs,
-               dkdv_scratch_bf16, compile_custom_op, stochastic_rounding):
+               dkdv_scratch_bf16, bf16_grad_dots, compile_custom_op,
+               stochastic_rounding):
     module._nvfp4_train_backward = train_backward
     module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
     module._nvfp4_save_backward_packs = save_backward_packs
     module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
+    module._nvfp4_bf16_grad_dots = bf16_grad_dots
     module._nvfp4_compile_custom_op = compile_custom_op
     module._nvfp4_stochastic_rounding = stochastic_rounding
 
@@ -192,6 +197,7 @@ def patch_qwen3_vl_nvfp4_attention(
     backward_rtn_grad_packs: bool = False,
     save_backward_packs: bool = False,
     dkdv_scratch_bf16: bool = False,
+    bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
 ) -> int:
@@ -210,6 +216,7 @@ def patch_qwen3_vl_nvfp4_attention(
                 backward_rtn_grad_packs=backward_rtn_grad_packs,
                 save_backward_packs=save_backward_packs,
                 dkdv_scratch_bf16=dkdv_scratch_bf16,
+                bf16_grad_dots=bf16_grad_dots,
                 compile_custom_op=compile_custom_op,
                 stochastic_rounding=stochastic_rounding,
             )

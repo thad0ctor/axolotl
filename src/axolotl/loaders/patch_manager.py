@@ -610,6 +610,7 @@ class PatchManager:
                     backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
                     save_backward_packs=attn.backward.save_packs,
                     dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
+                    bf16_grad_dots=attn.backward.bf16_grad_dots,
                     compile_custom_op=bool(attn.backward.compile_custom_op),
                     stochastic_rounding=nvfp4.stochastic_rounding,
                 )
@@ -633,6 +634,7 @@ class PatchManager:
                 backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
                 save_backward_packs=attn.backward.save_packs,
                 dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
+                bf16_grad_dots=attn.backward.bf16_grad_dots,
                 compile_custom_op=bool(attn.backward.compile_custom_op),
                 stochastic_rounding=nvfp4.stochastic_rounding,
             )

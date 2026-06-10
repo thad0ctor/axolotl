@@ -426,6 +426,9 @@ def make_nvfp4_forward(orig_forward):
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
+                        backward_bf16_grad_dots=getattr(
+                            self, "_nvfp4_bf16_grad_dots", None
+                        ),
                         save_backward_packs=getattr(
                             self, "_nvfp4_save_backward_packs", False
                         ),
@@ -450,6 +453,9 @@ def make_nvfp4_forward(orig_forward):
                         ),
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
+                        ),
+                        backward_bf16_grad_dots=getattr(
+                            self, "_nvfp4_bf16_grad_dots", None
                         ),
                     ).transpose(1, 2)
             else:
@@ -506,6 +512,7 @@ def patch_qwen3_5_nvfp4_attention(
     backward_rtn_grad_packs: bool = False,
     save_backward_packs: bool = False,
     dkdv_scratch_bf16: bool = False,
+    bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
 ) -> int:
@@ -544,6 +551,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
                 module._nvfp4_save_backward_packs = save_backward_packs
                 module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
+                module._nvfp4_bf16_grad_dots = bf16_grad_dots
                 module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
                 module._nvfp4_fuse_attn_proj = fuse_attn_proj
@@ -561,6 +569,7 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
             module._nvfp4_save_backward_packs = save_backward_packs
             module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
+            module._nvfp4_bf16_grad_dots = bf16_grad_dots
             module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
             module._nvfp4_fuse_attn_proj = fuse_attn_proj
@@ -571,13 +580,15 @@ def patch_qwen3_5_nvfp4_attention(
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
-        "save_backward_packs=%s, dkdv_scratch_bf16=%s, compile_custom_op=%s)",
+        "save_backward_packs=%s, dkdv_scratch_bf16=%s, bf16_grad_dots=%s, "
+        "compile_custom_op=%s)",
         patched,
         fuse_vproj,
         train_backward,
         backward_rtn_grad_packs,
         save_backward_packs,
         dkdv_scratch_bf16,
+        bf16_grad_dots,
         compile_custom_op,
     )
     return patched

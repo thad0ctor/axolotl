@@ -22,3 +22,11 @@ from sageattention.nvfp4 import (  # noqa: F401
     nvfp4_flash_attention_packed,
     nvfp4_flash_attn_func,
 )
+
+try:
+    # HP-grad-dots backward (FP4 S/dP recomputes + bf16 grad GEMMs). Newer forks
+    # only; ``None`` on a legacy fork makes callers fall back to the all-FP4
+    # ``_run_bwd`` instead of breaking every attn_nvfp4 import.
+    from sageattention.nvfp4.flash import _run_bwd_hp  # noqa: F401
+except ImportError:  # pragma: no cover - legacy sageattention fork
+    _run_bwd_hp = None

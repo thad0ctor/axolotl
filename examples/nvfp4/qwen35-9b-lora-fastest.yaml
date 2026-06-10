@@ -1,5 +1,16 @@
 # Fastest measured native NVFP4 training path for Qwen3.5-9B LoRA on Blackwell.
 #
+# UPDATE (HP-grad-dots backward): the sageattention fork now ships an
+# HP-grad-dots attention backward (FP4 S/dP recomputes + bf16 grad GEMMs with
+# exact operands) that is ~1.5-1.7x faster than the legacy all-FP4 backward,
+# much more accurate (grad cosine vs bf16 SDPA ~0.991 vs ~0.94 RTN / ~0.82 SR),
+# and uses ~4x less backward scratch memory. It auto-enables whenever
+# attention.backward.save_packs is OFF. save_packs: true now FORCES the slower
+# legacy all-FP4 backward (the HP path needs the saved high-precision q/k/v),
+# so the recommended fastest setting is now save_packs: false (optionally with
+# an explicit bf16_grad_dots: true). The measured numbers below PREDATE the HP
+# backward and were taken with the legacy saved-pack backward.
+#
 # Target shape: text-only SFT, sequence_len 2048, sample packing, no gradient
 # checkpointing. Measured on RTX PRO 6000 Blackwell 96GB with
 # scripts/bench_nvfp4.sh (20 -> 60 marginal train_runtime):
@@ -29,11 +40,13 @@
 # max_grad_norm: 1.0 explicit, fp16 produced NaN LoRA gradients at the first AMP
 # unscale. bf16 is the natural full-precision Blackwell baseline.
 #
-# The speed knob here is attention.backward.save_packs: it saves
-# forward FP4 attention packs and reuses them in backward, trading ~0.4 GiB of
-# activation memory for less backward pack-prep work. The FLA boundary prevents
+# The historical speed knob here was attention.backward.save_packs (forward FP4
+# pack reuse in backward, ~0.4 GiB activation memory for less pack-prep work);
+# with the HP-grad-dots backward it is now a SLOWDOWN switch — see the UPDATE
+# note above. The FLA boundary prevents
 # variable packed cu_seqlens from burning compile time in causal_conv1d. BF16
-# dK/dV scratch reduces the attention-backward scratch traffic before GQA reduce.
+# dK/dV scratch reduces the legacy attention-backward scratch traffic before GQA
+# reduce (moot on the HP-grad-dots path).
 # The no-grad/eval-only Qwen3.5 native MLP, native linear-attn, fused v_proj,
 # standalone fp8_lm_head, FP8 lm_head CE, CCE, and Liger fused-linear CE
 # switches are intentionally omitted. Same-prepared-data ablations measured:
@@ -109,15 +122,19 @@ nvfp4_training:
   # 8-full-attention-layer hybrid model. Try true on models with more attention layers.
   shared_lora_base_fprop: false
 
-  # Native full-attention training path. save_packs is the measured throughput
-  # win; rtn_grad_packs keeps the safe gradient-side packs deterministic.
+  # Native full-attention training path. With the HP-grad-dots backward,
+  # save_packs: false is the fastest setting (the HP backward auto-enables and
+  # replaces the legacy all-FP4 backward; save_packs: true would force the
+  # slower legacy path). rtn_grad_packs/dkdv_scratch_bf16 only affect the
+  # legacy backward and are inert while the HP path is active.
   attention:
     enabled: true
     backward:
       enabled: true
       rtn_grad_packs: true
-      save_packs: true
+      save_packs: false
       dkdv_scratch_bf16: true
+      # bf16_grad_dots: true  # optional; None/unset = auto-on when save_packs is off
   fla_causal_conv_compile_boundary: true
 
 warmup_steps: 10

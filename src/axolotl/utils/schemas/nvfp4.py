@@ -48,6 +48,22 @@ class NVFP4AttentionBackwardConfig(BaseModel):
             "vs the fp32-then-cast path)."
         },
     )
+    bf16_grad_dots: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "HP-grad-dots attention backward: keep the FP4 S/dP "
+            "recomputes but run the three grad GEMMs (dV/dK/dQ) as bf16 tl.dot "
+            "with exact operands — measured ~1.5-1.7x faster backward, grad "
+            "cosine vs bf16 SDPA ~0.991 (vs ~0.94 RTN / ~0.82 SR all-FP4), and "
+            "~4x less backward scratch memory. Tri-state: None (default) = auto, "
+            "on whenever save_packs is off; True forces it (errors if save_packs "
+            "is also true — the HP path needs the saved high-precision q/k/v, "
+            "not the FP4 packs, so save_packs forces the legacy all-FP4 "
+            "backward); False forces the legacy all-FP4 backward. When active, "
+            "rtn_grad_packs/stochastic-rounding grad knobs and dkdv_scratch_bf16 "
+            "are moot."
+        },
+    )
     compile_custom_op: bool | None = Field(
         default=None,
         json_schema_extra={
@@ -59,6 +75,18 @@ class NVFP4AttentionBackwardConfig(BaseModel):
             "only for short/mid static sequence lengths."
         },
     )
+
+    @model_validator(mode="after")
+    def _check_bf16_grad_dots(self):
+        if self.bf16_grad_dots and self.save_packs:
+            raise ValueError(
+                "nvfp4_training.attention.backward.bf16_grad_dots: true is "
+                "incompatible with save_packs: true (the HP-grad-dots backward "
+                "needs the saved high-precision q/k/v; save_packs forces the "
+                "legacy all-FP4 backward). Set save_packs: false or drop "
+                "bf16_grad_dots."
+            )
+        return self
 
 
 class NVFP4AttentionConfig(BaseModel):
@@ -125,7 +153,12 @@ class NVFP4AttentionConfig(BaseModel):
                     "attention.enabled: true."
                 )
         if not self.backward.enabled:
-            for sub in ("rtn_grad_packs", "save_packs", "dkdv_scratch_bf16"):
+            for sub in (
+                "rtn_grad_packs",
+                "save_packs",
+                "dkdv_scratch_bf16",
+                "bf16_grad_dots",
+            ):
                 if getattr(self.backward, sub):
                     raise ValueError(
                         f"nvfp4_training.attention.backward.{sub} requires "
