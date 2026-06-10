@@ -11,6 +11,19 @@
 # an explicit bf16_grad_dots: true). The measured numbers below PREDATE the HP
 # backward and were taken with the legacy saved-pack backward.
 #
+# Same-day HP-vs-legacy A/B on THIS config (bench_nvfp4.sh, RTX PRO 6000 #2):
+#   s2048 b4: legacy save_packs 1.1367 s/step 61.43 GiB loss 0.986
+#             HP backward       1.1568 s/step 61.79 GiB loss 0.952
+#   s8192 b1 (packs auto-disabled >4096; legacy forced via bf16_grad_dots:false):
+#             legacy 1.1260 s/step loss 1.016 | HP 1.1425 s/step loss 0.974
+# Step time/memory are PARITY within method noise on this hybrid model
+# (attention is 8/32 layers and a small slice of the step at these shapes) —
+# the HP gains here are GRADIENT QUALITY (consistently lower loss at equal
+# steps, grad cos 0.991 vs <=0.94) and stability (one legacy run locked the
+# GPU, Xid 8, at step 125; HP runs were clean). The 1.5-1.7x backward kernel
+# speedup matters for attention-dominated shapes (long context, dense-attn
+# models, large micro-batches).
+#
 # Target shape: text-only SFT, sequence_len 2048, sample packing, no gradient
 # checkpointing. Measured on RTX PRO 6000 Blackwell 96GB with
 # scripts/bench_nvfp4.sh (20 -> 60 marginal train_runtime):
