@@ -173,6 +173,217 @@ def _apply_dropout(
     return dropout(X)
 
 
+def _nvfp4_base_residual(quant) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(res_A [out,k], res_B [k,in])`` L2QER buffers on an NVFP4 base module.
+
+    Returns None for non-NVFP4 quant states / uncorrected bases. The fused LoRA
+    paths use this to FOLD the frozen-base residual into the adapter GEMMs (the
+    residual has exactly the LoRA shape), instead of letting the base helpers
+    bolt it on as a separate bandwidth-bound ``[M, out]`` pass.
+    """
+    a = getattr(quant, "_base_residual_A", None)
+    if a is None:
+        return None
+    return a, quant._base_residual_B
+
+
+def _residual_fold_factors(
+    quant, s: float | None, dtype: torch.dtype, dgrad: bool
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Residual factors pre-scaled for concat under the LoRA ``alpha=s`` GEMM.
+
+    Used by the batched LoRA forward (which builds its own multi-projection
+    concat) and the dropout fallback. Pre-dividing the residual's first factor
+    by ``s`` makes its net scale exactly 1 under the shared ``alpha=s`` (bit-
+    exact for the common power-of-two LoRA scales; otherwise one bf16 rounding
+    on the tiny factor). Returns
+
+      * fprop: ``first = res_B/s [k, in]``, ``second = res_A.T [k, out]``
+      * dgrad: ``first = res_A/s [out, k]``, ``second = res_B [k, in]``
+
+    cached on the module in EAGER mode (the factors are frozen; ``s`` is
+    constant per module), keyed by direction/scale/dtype and validated by
+    buffer identity so re-attached residuals invalidate cleanly. Under dynamo
+    the cache is bypassed entirely (no module mutation inside a traced
+    autograd.Function — inductor fuses the construction anyway).
+    """
+    res = _nvfp4_base_residual(quant)
+    if res is None:
+        return None
+    a, b = res
+    compiling = torch.compiler.is_compiling()
+    key = (dgrad, float(s), dtype)
+    if not compiling:
+        cache = getattr(quant, "_res_fold_cache", None)
+        if cache is not None:
+            hit = cache.get(key)
+            # entries pin the source buffers, so `is` identity is collision-
+            # proof; re-attached residuals (new objects) miss and recompute.
+            if hit is not None and hit[0] is a and hit[1] is b:
+                return hit[2]
+    inv = 1.0 / float(s)
+    if dgrad:
+        first = (a * inv).to(dtype).contiguous()  # [out, k]
+        second = b.to(dtype).contiguous()  # [k, in]
+    else:
+        first = (b * inv).to(dtype).contiguous()  # [k, in]
+        second = a.t().to(dtype).contiguous()  # [k, out]
+    if not compiling:
+        cache = getattr(quant, "_res_fold_cache", None)
+        if cache is None:
+            cache = {}
+            quant._res_fold_cache = cache
+        cache[key] = (a, b, (first, second))
+    return first, second
+
+
+def _build_residual_pair(
+    A: torch.Tensor,
+    B_t: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    s: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(C1 [r+k, in], C2 [r+k, out])`` adapter+residual concat pair.
+
+    ``C1 = cat([A, res_B/s])`` and ``C2 = cat([B.T, res_A.T])`` serve BOTH
+    directions of one corrected base linear under a single ``alpha=s``:
+
+      * fprop:  ``out += s * (X @ C1.T) @ C2``  (residual net scale 1 — its
+        first factor is pre-divided by s)
+      * dgrad:  ``dX  += s * (dY @ C2.T) @ C1`` and the ``[:, :r]`` slice of
+        ``dY @ C2.T`` is exactly ``dY @ B`` for the (unchanged) LoRA grads.
+
+    ``A`` is the adapter A in ``[r, in]``; ``B_t`` the adapter B transposed to
+    ``[r, out]`` (may be a view).
+    """
+    inv = 1.0 / float(s)
+    C1 = torch.cat([A.to(dtype), (b * inv).to(dtype)], dim=0)  # [r+k, in]
+    C2 = torch.cat([B_t.to(dtype), a.t().to(dtype)], dim=0)  # [r+k, out]
+    return C1, C2
+
+
+def _lora_residual_pair(
+    quant, A: torch.Tensor, B: torch.Tensor, s: float, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Forward-path ``(C1, C2)`` for a corrected NVFP4 base, version-cached.
+
+    Built from the live adapter params ``A [r, in]`` / ``B [out, r]`` and the
+    frozen residual buffers; cached on the module and revalidated by param
+    identity + ``_version`` (the unsloth/DoRA caching pattern), so in steady
+    state (within an optimizer step / across grad-accumulation micro-batches)
+    the fold costs ZERO extra kernels — the two LoRA GEMMs just widen by k.
+    Under dynamo the cache is bypassed (functional build; no module mutation).
+    """
+    res = _nvfp4_base_residual(quant)
+    if res is None:
+        return None
+    a, b = res
+    if torch.compiler.is_compiling():
+        return _build_residual_pair(A, B.t(), a, b, s, dtype)
+    ent = getattr(quant, "_res_pair_cache", None)
+    if (
+        ent is not None
+        and ent[0] is A
+        and ent[1] == A._version
+        and ent[2] is B
+        and ent[3] == B._version
+        and ent[4] is a
+        and ent[5] is b
+        and ent[6] == float(s)
+        and ent[7] == dtype
+    ):
+        return ent[8]
+    pair = _build_residual_pair(A, B.t(), a, b, s, dtype)
+    quant._res_pair_cache = (
+        A,
+        A._version,
+        B,
+        B._version,
+        a,
+        b,
+        float(s),
+        dtype,
+        pair,
+    )
+    return pair
+
+
+def _bwd_residual_pair(
+    quant,
+    A_saved: torch.Tensor,
+    B_saved: torch.Tensor,
+    s: float,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Backward-path ``(C1, C2)``: reuse the pair this layer's forward built.
+
+    The optimizer only steps AFTER backward, so the forward-built pair is
+    always fresh here; validate scale/dtype and residual-buffer identity only
+    (the saved adapter copies are new objects each forward, so param identity
+    cannot be rechecked — freshness is structural). On a miss (batched
+    forward, compiled trace, re-attached buffers) rebuild functionally from
+    the SAVED adapter matrices ``A_saved [r, in]`` / ``B_saved [out, r]`` —
+    bitwise the same content the forward concatenated.
+    """
+    res = _nvfp4_base_residual(quant)
+    if res is None:
+        return None
+    a, b = res
+    if not torch.compiler.is_compiling():
+        ent = getattr(quant, "_res_pair_cache", None)
+        if (
+            ent is not None
+            and ent[4] is a
+            and ent[5] is b
+            and ent[6] == float(s)
+            and ent[7] == dtype
+        ):
+            return ent[8]
+    return _build_residual_pair(A_saved, B_saved.t(), a, b, s, dtype)
+
+
+def _dgrad_grad_B(
+    grad: torch.Tensor,
+    B: torch.Tensor,
+    pair: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``grad @ B`` for the LoRA backward, optionally extended with the
+    frozen-base residual columns ``grad @ res_A`` in the SAME GEMM.
+
+    ``pair`` is the layer's ``(C1, C2)`` from :func:`_bwd_residual_pair`.
+    Returns ``(grad_B [T, r], ext [T, r+k] | None)``: ``grad_B`` is what the
+    dA/dB grads consume (a column slice of ``ext`` when folding — the LoRA
+    gradients are unchanged); ``ext`` feeds :func:`_dx_addmm` so the residual
+    dgrad ``(dY @ A) @ B`` rides the LoRA dX accumulation for free.
+    """
+    if pair is None:
+        return grad @ B, None
+    ext = grad @ pair[1].t()  # [T, r+k]
+    return ext[:, : B.shape[1]], ext
+
+
+def _dx_addmm(
+    dX: torch.Tensor,
+    grad_B: torch.Tensor,
+    ext: torch.Tensor | None,
+    A: torch.Tensor,
+    s: float,
+    pair: tuple[torch.Tensor, torch.Tensor] | None,
+) -> None:
+    """``dX += s * grad_B @ A`` (+ the folded residual dgrad when ``ext``).
+
+    One accumulation GEMM in the fused case: ``alpha=s`` scales both blocks,
+    and the residual block of ``C1`` carries a pre-divided ``res_B/s`` (see
+    :func:`_build_residual_pair`) so its net scale is 1.
+    """
+    if ext is not None:
+        dX.addmm_(ext, pair[0], alpha=s)
+    else:
+        dX.addmm_(grad_B, A, alpha=s)
+
+
 _USE_TRITON_DORA: bool | None = None
 
 
@@ -286,6 +497,7 @@ def matmul_lora(
     X_drop: torch.Tensor | None = None,
     lora_bias: torch.Tensor | None = None,
     nvfp4_dgrad: bool = False,
+    defer_residual: bool = False,
 ) -> torch.Tensor:
     """
     Efficient fused matmul + LoRA computation.
@@ -304,9 +516,14 @@ def matmul_lora(
             X @ W.T fprop. The bf16 path expresses dgrad by passing W.t() so its
             base GEMM is unaffected; the FP4 module ignores the passed W, so the
             dgrad direction must be selected explicitly here.
+        defer_residual: NVFP4 base only — skip the frozen-base L2QER residual
+            entirely; the CALLER folds it (used by the batched LoRA forward,
+            which concats the residual factors into its shared adapter GEMM).
 
     Returns:
         Result of X @ W + s * X_drop @ A @ B + b + s * lora_bias
+        (+ the frozen-base residual (X @ res_B.T) @ res_A.T on NVFP4 bases,
+        unless defer_residual)
     """
     dtype = X.dtype
 
@@ -326,13 +543,29 @@ def matmul_lora(
             X_drop = X_drop.view(-1, X_drop.shape[-1])
         reshape = True
 
+    pair = res = None
     if is_nvfp4:
+        # Frozen-base L2QER residual: when a LoRA adapter is present, FOLD it
+        # into the adapter GEMMs below (it has exactly the LoRA shape) instead
+        # of paying the base helper's separate [M, out] accumulation pass.
+        if not defer_residual and A is not None:
+            if X_drop is None:
+                if nvfp4_dgrad:
+                    # dgrad call (LoRA_MLP down backward): the saved matrices
+                    # arrive pre-transposed — map back to param layout.
+                    pair = _bwd_residual_pair(W_quant, B.t(), A.t(), s, dtype)
+                else:
+                    pair = _lora_residual_pair(W_quant, A, B, s, dtype)
+            else:
+                # Dropout fallback keeps the residual on the RAW X below.
+                res = _residual_fold_factors(W_quant, s, dtype, dgrad=False)
         # FP4 base GEMM against the NVFP4 module (W is None); the `out=` buffer
         # cannot be reused since the FP4 GEMM allocates its own output.
+        apply_res = not defer_residual and pair is None and res is None
         out = (
-            nvfp4_base_dgrad(X, W_quant)
+            nvfp4_base_dgrad(X, W_quant, apply_residual=apply_res)
             if nvfp4_dgrad
-            else nvfp4_base_fprop(X, W_quant)
+            else nvfp4_base_fprop(X, W_quant, apply_residual=apply_res)
         )
     else:
         W = dequantize(W.t(), W_quant)
@@ -342,8 +575,26 @@ def matmul_lora(
 
     if A is not None:
         X_lora = X_drop if X_drop is not None else X
+        if pair is not None:
+            # Adapter + residual ride the SAME two skinny GEMMs (C1/C2 are
+            # version-cached on the module — zero extra kernels in steady
+            # state; cost ≈ the extra rank k only).
+            if nvfp4_dgrad:
+                out.addmm_(X @ pair[1].t(), pair[0], alpha=s)
+            else:
+                out.addmm_(X @ pair[0].t(), pair[1], alpha=s)
+            if lora_bias is not None:
+                out += s * lora_bias
+            if b is not None:
+                out += b
+            return out.view(batch, seq_len, -1) if reshape else out
         A, B = A.t().to(dtype), B.t().to(dtype)  # type: ignore[union-attr]
         out.addmm_(X_lora @ A, B, alpha=s)
+        if res is not None:
+            # Dropout: the residual is part of the effective FROZEN weight, so
+            # it must see the RAW X — accumulate it separately in place
+            # (res[0] is res_B/s [k, in]; alpha=s restores net scale 1).
+            out.addmm_(X @ res[0].t(), res[1], alpha=s)
         if lora_bias is not None:
             out += s * lora_bias
 
@@ -357,14 +608,19 @@ def _shared_nvfp4_base_fprop(
     X: torch.Tensor,
     quants: list[QuantState | torch.Tensor | nn.Module | None],
     biases: list[torch.Tensor | None],
+    apply_residual: bool = True,
 ) -> list[torch.Tensor] | None:
-    """Opt-in shared activation-pack fprop for fused LoRA NVFP4 bases."""
+    """Opt-in shared activation-pack fprop for fused LoRA NVFP4 bases.
+
+    ``apply_residual=False`` defers the frozen-base L2QER residual to the
+    caller (the batched LoRA forward folds it into its shared adapter GEMM).
+    """
     if not _NVFP4_SHARED_BASE_FPROP:
         return None
 
     from axolotl.utils.nvfp4_training import nvfp4_base_fprop_many
 
-    outs = nvfp4_base_fprop_many(X, quants)
+    outs = nvfp4_base_fprop_many(X, quants, apply_residual=apply_residual)
     if outs is None:
         return None
     for out, bias in zip(outs, biases, strict=False):
@@ -393,6 +649,7 @@ def _batched_lora_forward(
     As: list[torch.Tensor | None],
     Bs: list[torch.Tensor | None],
     scales: list[float],
+    quants: list | None = None,
 ) -> list[torch.Tensor]:
     """Add LoRA contributions to pre-computed base outputs with a single shared A GEMM.
 
@@ -401,26 +658,65 @@ def _batched_lora_forward(
     [T, sum(rank)]; the result is split and each chunk fed to its own `@ B^T`.
     Returns the bases mutated in place (base_i += s_i * X @ A_i^T @ B_i^T).
 
+    ``quants`` (optional, per projection) lets NVFP4 frozen-base L2QER residual
+    factors ride the same concat: each corrected projection contributes its
+    ``res_B [k, in]`` rows to A_cat (scale 1) and applies ``[chunk_lora*s,
+    chunk_res] @ [B^T; res_A^T]`` as ONE in-place accumulation GEMM. Callers
+    passing quants MUST have computed the bases with the residual skipped
+    (defer_residual / apply_residual=False).
+
     Only valid for the plain LoRA path (no DoRA / dropout / lora_bias). Projections
-    with A is None are passed through unchanged.
+    with A is None and no residual are passed through unchanged.
     """
     dtype = X.dtype
-    idx = [i for i, A in enumerate(As) if A is not None]
+    if quants is None:
+        residuals: list = [None] * len(As)
+    else:
+        # pre-scaled (res_B/s_i, res_A.T) fold factors; raw factors (scale 1)
+        # for adapterless projections that still carry a residual.
+        residuals = [
+            _residual_fold_factors(q, scales[i], dtype, dgrad=False)
+            if As[i] is not None
+            else _residual_fold_factors(q, 1.0, dtype, dgrad=False)
+            for i, q in enumerate(quants)
+        ]
+    idx = [
+        i for i, A in enumerate(As) if A is not None or residuals[i] is not None
+    ]
     if not idx:
         return bases
 
     Xf = X.reshape(-1, X.shape[-1])
-    A_cat = torch.cat([As[i] for i in idx], dim=0).to(dtype)  # [sum_r, in]
-    XA = Xf @ A_cat.t()  # [T, sum_r] — single fused GEMM
+    pieces: list[torch.Tensor] = []
+    meta: list[tuple[int, int, int]] = []  # (proj index, lora rank, residual rank)
+    for i in idx:
+        r = As[i].shape[0] if As[i] is not None else 0
+        k = residuals[i][0].shape[0] if residuals[i] is not None else 0
+        if r:
+            pieces.append(As[i].to(dtype))
+        if k:
+            pieces.append(residuals[i][0])  # [k, in] — already dtype, /s_i
+        meta.append((i, r, k))
+    A_cat = torch.cat(pieces, dim=0)  # [sum_r + sum_k, in]
+    XA = Xf @ A_cat.t()  # [T, sum_r + sum_k] — single fused GEMM
 
-    ranks = [As[i].shape[0] for i in idx]
     offset = 0
-    for j, i in enumerate(idx):
-        r = ranks[j]
-        chunk = XA[:, offset : offset + r]
-        offset += r
-        contrib = scales[i] * (chunk @ Bs[i].t().to(dtype))  # [T, out_i]
-        bases[i].view(-1, bases[i].shape[-1]).add_(contrib)
+    for i, r, k in meta:
+        chunk = XA[:, offset : offset + r + k]
+        offset += r + k
+        if k == 0:
+            # plain LoRA path: keep the historical op sequence bit-for-bit
+            contrib = scales[i] * (chunk @ Bs[i].t().to(dtype))  # [T, out_i]
+            bases[i].view(-1, bases[i].shape[-1]).add_(contrib)
+            continue
+        if r:
+            # alpha scales both blocks; the residual block was pre-divided.
+            second = torch.cat([Bs[i].t().to(dtype), residuals[i][1]], dim=0)
+            alpha = scales[i]
+        else:
+            second = residuals[i][1]
+            alpha = 1.0
+        bases[i].view(-1, bases[i].shape[-1]).addmm_(chunk, second, alpha=alpha)
     return bases
 
 
@@ -544,14 +840,28 @@ class LoRA_MLP(torch.autograd.Function):
             gate_combined = gate_base + gate_lora
             up_combined = up_base + up_lora
         elif can_batch_gu:
-            gate = matmul_lora(X, gate_weight, gate_bias, gate_quant, None, None, None)
-            up = matmul_lora(X, up_weight, up_bias, up_quant, None, None, None)
+            # Base outputs only; the NVFP4 frozen-base residual is deferred and
+            # folded into the batched adapter GEMM below.
+            gate = matmul_lora(
+                X,
+                gate_weight,
+                gate_bias,
+                gate_quant,
+                None,
+                None,
+                None,
+                defer_residual=True,
+            )
+            up = matmul_lora(
+                X, up_weight, up_bias, up_quant, None, None, None, defer_residual=True
+            )
             _batched_lora_forward(
                 X,
                 [gate, up],
                 [gate_A, up_A],
                 [gate_B, up_B],
                 [gate_scale, up_scale],
+                quants=[gate_quant, up_quant],
             )
         else:
             gate = matmul_lora(
@@ -802,6 +1112,13 @@ class LoRA_MLP(torch.autograd.Function):
         # Note: _t suffix means transposed from saved shape (A_t = A.t(), etc.)
         d_down_A = d_down_B = d_up_A = d_up_B = d_gate_A = d_gate_B = None
         grad_B_up = grad_B_gate = None
+        ext_up = ext_gate = None
+        res_up = res_gate = None
+        bdtype = grad_output.dtype
+        # NVFP4 frozen-base residual dgrad rides the LoRA dX GEMMs (no-dropout
+        # only: with dropout the LoRA dX targets dX_drop, so the base helper
+        # applies the residual internally instead).
+        fold = not has_dropout
 
         if down_A_t is not None and down_B_t is not None:
             grad_B_down = grad_output @ down_B_t.t()  # reused in matmul_lora above too
@@ -811,9 +1128,18 @@ class LoRA_MLP(torch.autograd.Function):
             d_down_B.addmm_(down_A_t.t() @ h.t(), grad_output, alpha=down_scale, beta=0)
 
         if up_A_t is not None and up_B_t is not None:
-            grad_B_up = grad_up @ up_B_t.t()  # [T, rank] — reuse for dX
+            if fold:
+                res_up = _bwd_residual_pair(
+                    up_quant, up_A_t.t(), up_B_t.t(), up_scale, bdtype
+                )
+            # [T, rank] — reuse for dX (+ residual columns when folding)
+            grad_B_up, ext_up = _dgrad_grad_B(grad_up, up_B_t.t(), res_up)
         if gate_A_t is not None and gate_B_t is not None:
-            grad_B_gate = grad_gate @ gate_B_t.t()  # [T, rank] — reuse for dX
+            if fold:
+                res_gate = _bwd_residual_pair(
+                    gate_quant, gate_A_t.t(), gate_B_t.t(), gate_scale, bdtype
+                )
+            grad_B_gate, ext_gate = _dgrad_grad_B(grad_gate, gate_B_t.t(), res_gate)
 
         if getattr(ctx, "can_batch_gu", False):
             X_lora_t_gu = X_lora.t()
@@ -857,7 +1183,8 @@ class LoRA_MLP(torch.autograd.Function):
             # in FP4 (the module is carried in the *_quant slot, weight is None).
             if is_nvfp4_base(up_quant):
                 # FP4 dgrad allocates its own output, so no inplace into X.
-                dX = nvfp4_base_dgrad(grad_up, up_quant)
+                # Residual dgrad is folded into the LoRA dX GEMM when ext_up.
+                dX = nvfp4_base_dgrad(grad_up, up_quant, apply_residual=ext_up is None)
             else:
                 up_weight_deq = dequantize(up_weight.t(), up_quant)
                 if ctx.inplace:
@@ -867,7 +1194,9 @@ class LoRA_MLP(torch.autograd.Function):
                 del up_weight_deq
 
             if is_nvfp4_base(gate_quant):
-                dX += nvfp4_base_dgrad(grad_gate, gate_quant)
+                dX += nvfp4_base_dgrad(
+                    grad_gate, gate_quant, apply_residual=ext_gate is None
+                )
             else:
                 gate_weight_deq = dequantize(gate_weight, gate_quant)
                 dX.addmm_(grad_gate, gate_weight_deq)
@@ -883,9 +1212,11 @@ class LoRA_MLP(torch.autograd.Function):
                 dX_drop = dX_drop.view(batch, seq_len, hd)
             else:
                 if grad_B_up is not None:
-                    dX.addmm_(grad_B_up, up_A_t.t(), alpha=up_scale)  # type: ignore[union-attr]
+                    _dx_addmm(dX, grad_B_up, ext_up, up_A_t.t(), up_scale, res_up)
                 if grad_B_gate is not None:
-                    dX.addmm_(grad_B_gate, gate_A_t.t(), alpha=gate_scale)  # type: ignore[union-attr]
+                    _dx_addmm(
+                        dX, grad_B_gate, ext_gate, gate_A_t.t(), gate_scale, res_gate
+                    )
 
             dX = dX.view(batch, seq_len, hd)
 
@@ -1167,14 +1498,25 @@ class LoRA_QKV(torch.autograd.Function):
                 v_lora_bias,
             )
         elif can_batch:
-            # Base outputs only (X @ W), then one fused A-GEMM for all LoRA paths.
+            # Base outputs only (X @ W), then one fused A-GEMM for all LoRA
+            # paths. NVFP4 frozen-base residuals are deferred and folded into
+            # that same batched adapter GEMM.
             shared = _shared_nvfp4_base_fprop(
-                X, [q_quant, k_quant, v_quant], [q_bias, k_bias, v_bias]
+                X,
+                [q_quant, k_quant, v_quant],
+                [q_bias, k_bias, v_bias],
+                apply_residual=False,
             )
             if shared is None:
-                Q = matmul_lora(X, q_weight, q_bias, q_quant, None, None, None)
-                K = matmul_lora(X, k_weight, k_bias, k_quant, None, None, None)
-                V = matmul_lora(X, v_weight, v_bias, v_quant, None, None, None)
+                Q = matmul_lora(
+                    X, q_weight, q_bias, q_quant, None, None, None, defer_residual=True
+                )
+                K = matmul_lora(
+                    X, k_weight, k_bias, k_quant, None, None, None, defer_residual=True
+                )
+                V = matmul_lora(
+                    X, v_weight, v_bias, v_quant, None, None, None, defer_residual=True
+                )
             else:
                 Q, K, V = shared
             _batched_lora_forward(
@@ -1183,6 +1525,7 @@ class LoRA_QKV(torch.autograd.Function):
                 [q_A, k_A, v_A],
                 [q_B, k_B, v_B],
                 [q_scale, k_scale, v_scale],
+                quants=[q_quant, k_quant, v_quant],
             )
 
             dtype = X.dtype
@@ -1387,13 +1730,27 @@ class LoRA_QKV(torch.autograd.Function):
         # Key optimization: compute grad @ B once, reuse for both dA and dX_lora
         # A has shape [rank, in], B has shape [out, rank]
         grad_B_q = grad_B_k = grad_B_v = None
+        ext_q = ext_k = ext_v = None
+        res_q = res_k = res_v = None
+        bdtype = q_grad.dtype
+        # NVFP4 frozen-base residual dgrad rides the LoRA dX GEMMs (no-dropout
+        # only: with dropout the LoRA dX targets grad_X_drop, so the base
+        # helper applies the residual internally instead).
+        fold = not has_dropout
 
         if A_q is not None and B_q is not None:
-            grad_B_q = q_grad @ B_q  # [T, rank] — reused for dA and dX
+            if fold:
+                res_q = _bwd_residual_pair(q_quant, A_q, B_q, q_scale, bdtype)
+            # [T, rank] — reused for dA and dX (+ residual columns when folding)
+            grad_B_q, ext_q = _dgrad_grad_B(q_grad, B_q, res_q)
         if A_k is not None and B_k is not None:
-            grad_B_k = k_grad @ B_k
+            if fold:
+                res_k = _bwd_residual_pair(k_quant, A_k, B_k, k_scale, bdtype)
+            grad_B_k, ext_k = _dgrad_grad_B(k_grad, B_k, res_k)
         if A_v is not None and B_v is not None:
-            grad_B_v = v_grad @ B_v
+            if fold:
+                res_v = _bwd_residual_pair(v_quant, A_v, B_v, v_scale, bdtype)
+            grad_B_v, ext_v = _dgrad_grad_B(v_grad, B_v, res_v)
 
         if getattr(ctx, "can_batch", False):
             # One fused X_lora^T @ grad_B_cat for all three dA.
@@ -1438,23 +1795,28 @@ class LoRA_QKV(torch.autograd.Function):
 
         # NVFP4: dX = grad @ W in FP4 (module carried in *_quant). The FP4 dgrad
         # allocates its own output, so it can't write into out_buffer; accumulate
-        # the q/k/v contributions explicitly.
+        # the q/k/v contributions explicitly. The frozen-base residual dgrad is
+        # folded into the LoRA dX GEMMs below when ext_* was computed.
         if is_nvfp4_base(q_quant):
-            grad_X = nvfp4_base_dgrad(q_grad, q_quant)
+            grad_X = nvfp4_base_dgrad(q_grad, q_quant, apply_residual=ext_q is None)
         else:
             q_weight_t = dequantize(q_weight, q_quant)
             grad_X = torch.mm(q_grad, q_weight_t, out=out_buffer)
             del q_weight_t
 
         if is_nvfp4_base(k_quant):
-            grad_X = grad_X + nvfp4_base_dgrad(k_grad, k_quant)
+            grad_X = grad_X + nvfp4_base_dgrad(
+                k_grad, k_quant, apply_residual=ext_k is None
+            )
         else:
             k_weight_t = dequantize(k_weight, k_quant)
             grad_X.addmm_(k_grad, k_weight_t)
             del k_weight_t
 
         if is_nvfp4_base(v_quant):
-            grad_X = grad_X + nvfp4_base_dgrad(v_grad, v_quant)
+            grad_X = grad_X + nvfp4_base_dgrad(
+                v_grad, v_quant, apply_residual=ext_v is None
+            )
         else:
             v_weight_t = dequantize(v_weight, v_quant)
             grad_X.addmm_(v_grad, v_weight_t)
@@ -1472,11 +1834,11 @@ class LoRA_QKV(torch.autograd.Function):
         else:
             grad_X_drop = None
             if grad_B_q is not None:
-                grad_X.addmm_(grad_B_q, A_q, alpha=q_scale)
+                _dx_addmm(grad_X, grad_B_q, ext_q, A_q, q_scale, res_q)
             if grad_B_k is not None:
-                grad_X.addmm_(grad_B_k, A_k, alpha=k_scale)
+                _dx_addmm(grad_X, grad_B_k, ext_k, A_k, k_scale, res_k)
             if grad_B_v is not None:
-                grad_X.addmm_(grad_B_v, A_v, alpha=v_scale)
+                _dx_addmm(grad_X, grad_B_v, ext_v, A_v, v_scale, res_v)
 
         # Transpose LoRA gradients
         if d_A_q is not None:
@@ -1829,16 +2191,26 @@ class LoRA_QK(torch.autograd.Function):
 
         d_A_q = d_B_q = d_A_k = d_B_k = None
         grad_B_q = grad_B_k = None
+        ext_q = ext_k = None
+        res_q = res_k = None
+        bdtype = q_grad.dtype
+        # NVFP4 frozen-base residual dgrad rides the LoRA dX GEMMs (no-dropout
+        # only — see LoRA_QKV.backward).
+        fold = not has_dropout
 
         if A_q is not None and B_q is not None:
-            grad_B_q = q_grad @ B_q
+            if fold:
+                res_q = _bwd_residual_pair(q_quant, A_q, B_q, q_scale, bdtype)
+            grad_B_q, ext_q = _dgrad_grad_B(q_grad, B_q, res_q)
             d_A_q = torch.empty_like(A_q.t())
             d_B_q = torch.empty_like(B_q.t())
             d_A_q.addmm_(X_lora_t, grad_B_q, alpha=q_scale, beta=0)
             d_B_q.addmm_(A_q @ X_lora_t, q_grad, alpha=q_scale, beta=0)
 
         if A_k is not None and B_k is not None:
-            grad_B_k = k_grad @ B_k
+            if fold:
+                res_k = _bwd_residual_pair(k_quant, A_k, B_k, k_scale, bdtype)
+            grad_B_k, ext_k = _dgrad_grad_B(k_grad, B_k, res_k)
             d_A_k = torch.empty_like(A_k.t())
             d_B_k = torch.empty_like(B_k.t())
             d_A_k.addmm_(X_lora_t, grad_B_k, alpha=k_scale, beta=0)
@@ -1852,14 +2224,16 @@ class LoRA_QK(torch.autograd.Function):
         # NVFP4: dX = grad @ W in FP4 (module in *_quant); FP4 dgrad allocates its
         # own output so it can't reuse out_buffer.
         if is_nvfp4_base(q_quant):
-            grad_X = nvfp4_base_dgrad(q_grad, q_quant)
+            grad_X = nvfp4_base_dgrad(q_grad, q_quant, apply_residual=ext_q is None)
         else:
             q_weight_t = dequantize(q_weight, q_quant)
             grad_X = torch.mm(q_grad, q_weight_t, out=out_buffer)
             del q_weight_t
 
         if is_nvfp4_base(k_quant):
-            grad_X = grad_X + nvfp4_base_dgrad(k_grad, k_quant)
+            grad_X = grad_X + nvfp4_base_dgrad(
+                k_grad, k_quant, apply_residual=ext_k is None
+            )
         else:
             k_weight_t = dequantize(k_weight, k_quant)
             grad_X.addmm_(k_grad, k_weight_t)
@@ -1875,9 +2249,9 @@ class LoRA_QK(torch.autograd.Function):
         else:
             grad_X_drop = None
             if grad_B_q is not None:
-                grad_X.addmm_(grad_B_q, A_q, alpha=q_scale)
+                _dx_addmm(grad_X, grad_B_q, ext_q, A_q, q_scale, res_q)
             if grad_B_k is not None:
-                grad_X.addmm_(grad_B_k, A_k, alpha=k_scale)
+                _dx_addmm(grad_X, grad_B_k, ext_k, A_k, k_scale, res_k)
 
         if d_A_q is not None:
             d_A_q = d_A_q.t()
@@ -2078,9 +2452,15 @@ class LoRA_O(torch.autograd.Function):
         # LoRA parameter gradients (A, B already in compute dtype from forward)
         # Compute dY @ B once, reuse for both dA and dX_lora
         d_A = d_B = None
-        grad_B = None
+        grad_B = ext = res = None
+        bdtype = dY.dtype
         if A is not None:
-            grad_B = dY @ B  # [T, rank] — reused below
+            # NVFP4 frozen-base residual dgrad rides the LoRA dX GEMM
+            # (no-dropout only — see LoRA_QKV.backward).
+            if not has_dropout:
+                res = _bwd_residual_pair(W_quant, A, B, s, bdtype)
+            # [T, rank] — reused below (+ residual columns when folding)
+            grad_B, ext = _dgrad_grad_B(dY, B, res)
             X_lora_t = X_lora.t()
             d_A = torch.empty_like(A.t())
             d_B = torch.empty_like(B.t())
@@ -2092,7 +2472,7 @@ class LoRA_O(torch.autograd.Function):
         from axolotl.utils.nvfp4_training import is_nvfp4_base, nvfp4_base_dgrad
 
         if is_nvfp4_base(W_quant):
-            dX = nvfp4_base_dgrad(dY, W_quant)
+            dX = nvfp4_base_dgrad(dY, W_quant, apply_residual=ext is None)
         else:
             W_deq = dequantize(W.t(), W_quant)
             dX = dY @ W_deq.t()
@@ -2105,7 +2485,7 @@ class LoRA_O(torch.autograd.Function):
         else:
             dX_drop = None
             if grad_B is not None:
-                dX.addmm_(grad_B, A, alpha=s)
+                _dx_addmm(dX, grad_B, ext, A, s, res)
 
         # X, X_drop, W, b, W_quant, A, B, s, lora_bias, magnitude
         return (

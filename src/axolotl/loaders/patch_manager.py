@@ -399,6 +399,12 @@ class PatchManager:
             use_fsdp = (quantized_storage or compute_base) and bool(
                 self.cfg.fsdp_config
             )
+            # Frozen-base L2QER residual (default ON): the activation calibration
+            # MUST run before the swap — the storage mode discards the bf16
+            # master the quant error is computed from.
+            base_residual_plan = self._nvfp4_prepare_base_residual(
+                model, exclude, base_mode
+            )
             count = convert_lora_base_to_nvfp4(
                 model,
                 recipe,
@@ -406,6 +412,7 @@ class PatchManager:
                 compute_base=compute_base,
                 fsdp=use_fsdp,
                 exclude=exclude,
+                base_residual=base_residual_plan,
             )
             empty_msg = (
                 "nvfp4_training enabled but no eligible LoRA base layers were "
@@ -413,6 +420,13 @@ class PatchManager:
             )
         else:
             base_mode = getattr(nvfp4, "base_mode", None) or "compute"
+            # base_residual corrects FROZEN FP4 stores; full fine-tune weights are
+            # trainable (re-quantized every step), so a load-time residual would
+            # go stale immediately — leave full-FT untouched.
+            LOG.debug(
+                "nvfp4 base_residual: full fine-tune keeps trainable bf16 masters "
+                "(no frozen FP4 base store); base_residual does not apply."
+            )
             count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
             empty_msg = (
                 "nvfp4_training enabled but no eligible nn.Linear layers were swapped"
@@ -739,7 +753,9 @@ class PatchManager:
             want_lm_head
             and (
                 (distill_cfg is not None and getattr(distill_cfg, "enabled", False))
-                or (residual_cfg is not None and getattr(residual_cfg, "enabled", False))
+                or (
+                    residual_cfg is not None and getattr(residual_cfg, "enabled", False)
+                )
             )
         )
 
@@ -830,6 +846,156 @@ class PatchManager:
             cfg.calibration,
         )
 
+    def _nvfp4_prepare_base_residual(self, model, exclude, base_mode: str):
+        """Pre-swap activation calibration for the frozen-base L2QER residual.
+
+        ``nvfp4_training.base_residual`` is ON by default: whenever the LoRA/QLoRA
+        swap is about to freeze base linears on the FP4 grid, capture — with
+        forward pre-hooks on every base linear that will be swapped — the
+        per-input-channel running mean of x^2 over ONE short forward of the
+        still-bf16 model (token source shared with the lm_head calibration).
+        Must run BEFORE ``convert_lora_base_to_nvfp4``: the storage mode discards
+        the bf16 master the quant error is computed from.
+
+        Returns a ``BaseResidualPlan`` for the converter, or ``None`` (disabled).
+        Per the measured finding (plain SVD is useless on the near-full-rank e2m1
+        error), an UNAVAILABLE activation calibration disables the residual with
+        a loud warning instead of silently degrading to plain SVD.
+        """
+        import torch.nn as nn
+
+        nvfp4 = self.cfg.nvfp4_training
+        br = getattr(nvfp4, "base_residual", None)
+        # Missing block == schema default == enabled (the explicit product
+        # decision: it should just happen when frozen FP4 base linears exist).
+        enabled = getattr(br, "enabled", None) if br is not None else None
+        if enabled is None:
+            enabled = True
+        if not enabled:
+            LOG.debug("nvfp4 base_residual: disabled by config")
+            return None
+        if base_mode not in ("storage", "compute"):
+            LOG.debug(
+                "nvfp4 base_residual: base_mode=%s keeps a high-precision master "
+                "(no frozen FP4 store to correct); skipping.",
+                base_mode,
+            )
+            return None
+        if not isinstance(model, nn.Module):
+            return None
+
+        from peft.tuners.lora import Linear as LoraLinear
+
+        from axolotl.utils.nvfp4_training import BaseResidualPlan, _is_swappable
+
+        rank = int(getattr(br, "rank", None) or 16) if br is not None else 16
+        calibration = (
+            str(getattr(br, "calibration", None) or "activation")
+            if br is not None
+            else "activation"
+        )
+        calib_tokens = (
+            int(getattr(br, "calib_tokens", None) or 512) if br is not None else 512
+        )
+
+        # The linears the converter will swap: frozen, swappable lora.Linear
+        # bases, minus the exclusions. lm_head is always excluded here — it has
+        # its own lm_head_residual block (and lm_head-sized rows need the
+        # streaming path the head machinery already covers).
+        targets = []
+        for name, module in model.named_modules():
+            if not isinstance(module, LoraLinear):
+                continue
+            if any(frag in name for frag in exclude) or "lm_head" in name:
+                continue
+            base = module.base_layer
+            if not isinstance(base, nn.Linear) or not _is_swappable(base):
+                continue
+            w = base.weight
+            if w is None or w.is_meta or w.requires_grad:
+                continue
+            targets.append((name, base))
+        if not targets:
+            LOG.debug("nvfp4 base_residual: no eligible frozen base linears")
+            return None
+        if calibration != "activation":
+            # Explicit ablation request: plain SVD per module (g=None).
+            LOG.warning(
+                "nvfp4 base_residual: calibration='svd' is an ablation — plain "
+                "SVD recovers almost none of the near-full-rank e2m1 error."
+            )
+            return BaseResidualPlan(rank=rank, calibration=calibration, calib={})
+
+        acc: dict = {}
+
+        def _make_hook(name):
+            def hook(_m, args):
+                x = args[0] if args else None
+                if not torch.is_tensor(x) or x.shape[-1] <= 0:
+                    return
+                h = x.detach().reshape(-1, x.shape[-1]).float()
+                ent = acc.get(name)
+                if ent is None:
+                    acc[name] = [h.pow(2).sum(0), h.shape[0]]
+                else:
+                    ent[0] += h.pow(2).sum(0)
+                    ent[1] += h.shape[0]
+
+            return hook
+
+        handles = [
+            base.register_forward_pre_hook(_make_hook(name)) for name, base in targets
+        ]
+        n_tok = 0
+        try:
+            device = next(model.parameters()).device
+            ids = self._nvfp4_calib_input_ids(model, calib_tokens, device)
+            if ids is None:
+                raise RuntimeError("no calibration input_ids available")
+            n_tok = int(ids.numel())
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                model(ids)
+            if was_training:
+                model.train()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            LOG.warning(
+                "nvfp4 base_residual: activation calibration unavailable (%s); "
+                "DISABLING the base residual (no plain-SVD fallback — it is "
+                "pointless on the near-full-rank e2m1 quant error).",
+                exc,
+            )
+            return None
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        calib = {name: (s / max(count, 1)) for name, (s, count) in acc.items()}
+        if not calib:
+            LOG.warning(
+                "nvfp4 base_residual: calibration forward captured no activations; "
+                "DISABLING the base residual."
+            )
+            return None
+        missing = [name for name, _ in targets if name not in calib]
+        if missing:
+            LOG.warning(
+                "nvfp4 base_residual: %d/%d target linears captured no calibration "
+                "activations (e.g. %s); their residuals will be skipped.",
+                len(missing),
+                len(targets),
+                missing[0],
+            )
+        LOG.info(
+            "nvfp4 base_residual: calibrated %d frozen base linears over %d tokens "
+            "(rank=%d)",
+            len(calib),
+            n_tok,
+            rank,
+        )
+        return BaseResidualPlan(rank=rank, calibration="activation", calib=calib)
+
     def _nvfp4_capture_calib_hidden(self, model, n_tokens: int):
         """Capture ``[N, H]`` final-layer hidden states feeding the lm_head.
 
@@ -873,7 +1039,9 @@ class PatchManager:
             h = captured.get("h")
             return None if h is None else h.reshape(-1, h.shape[-1])
         except Exception as e:  # best-effort calibration
-            LOG.warning("lm_head_residual: calibration capture failed (%s); plain SVD", e)
+            LOG.warning(
+                "lm_head_residual: calibration capture failed (%s); plain SVD", e
+            )
             return None
 
     def _nvfp4_calib_input_ids(self, model, n_tokens: int, device):
