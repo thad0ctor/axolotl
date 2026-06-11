@@ -53,6 +53,45 @@ _VOCAB_BLOCK = int(
 )
 
 
+# Token threshold above which a residual-bearing fused CE refuses dynamo tracing
+# (see the compile gate in fused_fp4_cross_entropy). 8192 = the largest M with
+# measured-good compiled behavior; overridable for experiments.
+_RESID_COMPILE_BREAK_TOKENS = int(
+    os.environ.get("AXOLOTL_NVFP4_FUSED_CE_RESID_COMPILE_BREAK_TOKENS", "8192")
+)
+
+
+@torch.compiler.disable
+def _fused_ce_eager(
+    lm_head, hidden2d, labels1d, ignore_index, logit_scale, grad_scale,
+    res_A, res_B, fp4_matmul,
+):
+    """Eager-island invocation of the tiled CE Functions (dynamo skips inside).
+
+    Identical math to the traced path; used when the residual + long-M compile
+    gate trips so the custom Functions' per-tile recompute is preserved instead
+    of being partitioned into logits-scale saves.
+    """
+    if _fp4_scaled_mm_enabled(fp4_matmul):
+        fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
+        if fp4_store is not None:
+            try:
+                return _FusedFP4ScaledMMCrossEntropy.apply(
+                    hidden2d, fp4_store, labels1d, ignore_index, logit_scale,
+                    grad_scale, res_A, res_B,
+                )
+            except Exception:
+                if fp4_matmul is True:
+                    raise
+    store = _nvfp4_lm_head_store(lm_head)
+    if store is None:
+        return None
+    return _FusedFP4CrossEntropy.apply(
+        hidden2d, store, labels1d, ignore_index, logit_scale, grad_scale,
+        res_A, res_B,
+    )
+
+
 def _resolve_vocab_block(vocab_block: int | None) -> int:
     """Effective vocab tile width: env var (if set) > ``vocab_block`` arg > 4096."""
     env = os.environ.get("AXOLOTL_NVFP4_FUSED_CE_VOCAB_BLOCK")
@@ -473,6 +512,22 @@ def fused_fp4_cross_entropy(
     # gradient flows back into hidden through both A and B. None when not attached.
     res_A = getattr(lm_head, "_lm_head_residual_A", None)
     res_B = getattr(lm_head, "_lm_head_residual_B", None)
+
+    # Compile gate: with the residual operands in the traced CE, AOT's min-cut
+    # partitioner flips from per-tile recompute to SAVING logits-scale products
+    # across the fwd/bwd boundary — measured +19.8 GiB sustained at a 32k-token
+    # batch (64.7 vs 44.9 GiB without residual; eager with residual is 28.3).
+    # The traced CE is a measured win at short M and harmless without the
+    # residual, so break out of the graph only for residual + long M.
+    if (
+        res_A is not None
+        and hidden2d.shape[0] > _RESID_COMPILE_BREAK_TOKENS
+        and torch.compiler.is_compiling()
+    ):
+        return _fused_ce_eager(
+            lm_head, hidden2d, labels1d, ignore_index, logit_scale, grad_scale,
+            res_A, res_B, fp4_matmul,
+        )
 
     if _fp4_scaled_mm_enabled(fp4_matmul):
         fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
