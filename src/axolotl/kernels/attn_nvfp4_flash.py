@@ -30,3 +30,11 @@ try:
     from sageattention.nvfp4.flash import _run_bwd_hp  # noqa: F401
 except ImportError:  # pragma: no cover - legacy sageattention fork
     _run_bwd_hp = None
+
+try:
+    # Varlen (packed-sequence cu_seqlens) seq-array expansion. Newer forks only;
+    # ``None`` disables the packed varlen attention paths (callers fall back to
+    # the model's original forward for packed batches).
+    from sageattention.nvfp4.flash import _varlen_seq_arrays  # noqa: F401
+except ImportError:  # pragma: no cover - legacy sageattention fork
+    _varlen_seq_arrays = None

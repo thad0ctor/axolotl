@@ -32,6 +32,8 @@ import torch
 from torch import nn
 
 from axolotl.kernels.attn_nvfp4_flash import (
+    _varlen_seq_arrays,
+    nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
     nvfp4_flash_attn_func,
 )
@@ -126,6 +128,93 @@ def _mask_is_dense_causal_or_full(
     except (AttributeError, RuntimeError):
         pass  # some tensor subclasses disallow setattr; correctness is unaffected
     return kind
+
+
+# ---------------------------------------------------------------------------
+# Packed-sequence (sample-packing / multipack) detection.
+#
+# Under axolotl multipack the batch arrives FLATTENED to one row (Z=1) with
+# attention_mask=None and the sample boundaries encoded in position_ids (each
+# sample's positions restart at 0). Without this detection the mask classifier
+# returns "causal" and the FP4 kernel dense-attends the whole pack — orders of
+# magnitude more work than varlen AND cross-sample attention contamination. The
+# varlen kernel (cu_seqlens) runs block-diagonal causal attention instead.
+#
+# The cu_seqlens derivation needs host syncs (a .sum() reduction + nonzero), so
+# like the mask classification it is cached ON the position_ids tensor itself
+# (keyed by shape and ``_version``): the decoder layers all receive the SAME
+# position_ids tensor object within one model forward, so this is computed once
+# per step, not once per attention layer.
+# ---------------------------------------------------------------------------
+_PACKED_INFO_ATTR = "_nvfp4_packed_info"
+_PACKED_FALLBACK_LOGGED = False
+_PACKED_FORCED_HP_LOGGED = False
+
+
+def _compute_packed_info(
+    position_ids: torch.Tensor, q_len: int
+) -> tuple[str | None, torch.Tensor | None]:
+    """Classify position_ids: (None, None) -> not packed (plain dense batch);
+    ("packed", cu_seqlens) -> Z=1 flattened pack the varlen kernel can serve;
+    ("fallback", None) -> packed but unsupported (e.g. Z>1) — the caller MUST
+    fall back to the original forward (never dense-attend a packed batch)."""
+    pos = position_ids[0] if position_ids.ndim == 3 else position_ids
+    if pos.ndim == 1:
+        pos = pos.unsqueeze(0)
+    if pos.ndim != 2 or pos.shape[-1] != q_len:
+        return (None, None)
+    b = pos.shape[0]
+    n_starts = int((pos == 0).sum())
+    if n_starts <= b:
+        return (None, None)  # at most one sample per row -> plain dense causal
+    if b != 1 or not bool(pos[0, 0] == 0) or _varlen_seq_arrays is None:
+        # Packed, but not the Z=1 flattened layout the varlen kernel requires
+        # (or the installed sageattention fork predates varlen support).
+        return ("fallback", None)
+    from axolotl.monkeypatch.models.qwen3_5.modeling import get_cu_seqlens
+
+    return ("packed", get_cu_seqlens(position_ids))
+
+
+def _packed_position_ids_info(
+    position_ids: torch.Tensor | None, q_len: int
+) -> tuple[str | None, torch.Tensor | None]:
+    """Cached wrapper around ``_compute_packed_info`` (see block comment above)."""
+    if position_ids is None:
+        return (None, None)
+    ckey = (q_len, tuple(position_ids.shape), position_ids._version)
+    cached = getattr(position_ids, _PACKED_INFO_ATTR, None)
+    if cached is not None and cached[0] == ckey:
+        return cached[1]
+    info = _compute_packed_info(position_ids, q_len)
+    try:
+        setattr(position_ids, _PACKED_INFO_ATTR, (ckey, info))
+    except (AttributeError, RuntimeError):
+        pass  # some tensor subclasses disallow setattr; correctness is unaffected
+    return info
+
+
+def _log_packed_fallback_once() -> None:
+    global _PACKED_FALLBACK_LOGGED
+    if not _PACKED_FALLBACK_LOGGED:
+        _PACKED_FALLBACK_LOGGED = True
+        LOG.warning(
+            "nvfp4 attention: packed batch in an unsupported layout (multi-row "
+            "batch or legacy sageattention fork without varlen); falling back to "
+            "the model's original attention for packed batches"
+        )
+
+
+def _log_packed_forced_hp_once() -> None:
+    global _PACKED_FORCED_HP_LOGGED
+    if not _PACKED_FORCED_HP_LOGGED:
+        _PACKED_FORCED_HP_LOGGED = True
+        LOG.info(
+            "nvfp4 attention: packed (varlen) batches require the HP-grad-dots "
+            "backward; ignoring attention.backward.save_packs / "
+            "bf16_grad_dots=false for packed batches (config still applies to "
+            "dense batches)"
+        )
 
 
 def _get_vproj_packed(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -326,8 +415,23 @@ def make_nvfp4_forward(orig_forward):
             and past_key_values.get_seq_length(self.layer_idx) > 0
         )
         kind = None
+        cu_seqlens = None
         if not has_cache_context:
             kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
+            if kind == "causal" and attention_mask is None:
+                # Sample-packed (multipack) batches arrive mask-less with the
+                # boundaries in position_ids — the decoder layer (stock and the
+                # axolotl packing patch alike) forwards position_ids in kwargs.
+                pkind, cu_seqlens = _packed_position_ids_info(
+                    kwargs.get("position_ids"), q_len
+                )
+                if pkind == "packed":
+                    kind = "packed"
+                elif pkind == "fallback":
+                    # Packed but in a layout varlen can't serve: NEVER dense-
+                    # attend it (cross-sample contamination) — original forward.
+                    _log_packed_fallback_once()
+                    kind = None
 
         # Shared-pack FP4 q/k_proj: no-grad prefill, opt-in, plain-Linear only.
         use_fp4_proj = (
@@ -365,6 +469,99 @@ def make_nvfp4_forward(orig_forward):
             ).transpose(1, 2)
 
         cos, sin = position_embeddings
+
+        if kind == "packed":
+            # Varlen block-diagonal causal attention over the flattened pack:
+            # each sample attends only within itself and per-block kv loops skip
+            # cross-sample tiles (work scales with sum(s_i^2), not S^2). Same
+            # handling for grad and no-grad (cheap, same kernel) so eval/prefill
+            # of packed batches stays consistent with training.
+            if grad_enabled and (
+                not getattr(self, "_nvfp4_train_backward", False)
+                or past_key_values is not None
+            ):
+                return orig_forward(
+                    self,
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
+                    past_key_values,
+                    **kwargs,
+                )
+            from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                apply_rotary_pos_emb,
+            )
+
+            value_states = (
+                self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            )
+            query_roped, key_roped = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
+            if not grad_enabled and past_key_values is not None:
+                past_key_values.update(key_roped, value_states, self.layer_idx)
+            ng = query_roped.shape[1] // key_roped.shape[1]
+            # Varlen REQUIRES the HP (bf16-grad-dots) backward — the legacy
+            # all-FP4 backward (save_backward_packs / bf16_grad_dots=false) is
+            # dense-only. Config wins elsewhere; packed batches force HP.
+            if getattr(self, "_nvfp4_save_backward_packs", False) or (
+                getattr(self, "_nvfp4_bf16_grad_dots", None) is False
+            ):
+                _log_packed_forced_hp_once()
+            sr = getattr(self, "_nvfp4_stochastic_rounding", True)
+            if _custom_op_enabled(self):
+                # Opaque differentiable custom op between graph breaks — same
+                # isolation rationale as the dense train path below.
+                from axolotl.kernels.attn_nvfp4_custom_op import (
+                    nvfp4_flash_attn_train_custom_op,
+                )
+
+                torch._dynamo.graph_break()
+                attn_output = nvfp4_flash_attn_train_custom_op(
+                    query_roped,
+                    key_roped,
+                    value_states,
+                    self.scaling,
+                    causal=True,
+                    num_key_value_groups=ng,
+                    cu_seqlens=cu_seqlens,
+                    stochastic_rounding=sr,
+                    save_backward_packs=False,
+                    backward_bf16_grad_dots=True,
+                    out_layout="zshd",
+                )  # [Z, S, H, D]
+                torch._dynamo.graph_break()
+            elif grad_enabled:
+                attn_output = nvfp4_flash_attn_func(
+                    query_roped,
+                    key_roped,
+                    value_states,
+                    self.scaling,
+                    causal=True,
+                    num_key_value_groups=ng,
+                    cu_seqlens=cu_seqlens,
+                    stochastic_rounding=sr,
+                    save_backward_packs=False,
+                    backward_bf16_grad_dots=True,
+                ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
+            else:
+                # No-grad eval/prefill: same varlen kernel, forward-only entry
+                # (skips the autograd Function's LSE/ctx bookkeeping).
+                attn_output = nvfp4_flash_attention(
+                    query_roped,
+                    key_roped,
+                    value_states,
+                    self.scaling,
+                    causal=True,
+                    num_key_value_groups=ng,
+                    cu_seqlens=cu_seqlens,
+                    out_layout="zshd",
+                )  # [Z, S, H, D]
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn_output * torch.sigmoid(gate)
+            if use_fp4_o:
+                return _nvfp4_o_proj(self, attn_output), None
+            return self.o_proj(attn_output), None
 
         if kind is not None:
             from transformers.models.qwen3_5.modeling_qwen3_5 import (

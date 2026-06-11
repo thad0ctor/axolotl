@@ -143,6 +143,14 @@ nvfp4_training:
   # replaces the legacy all-FP4 backward; save_packs: true would force the
   # slower legacy path). rtn_grad_packs/dkdv_scratch_bf16 only affect the
   # legacy backward and are inert while the HP path is active.
+  # PACKED batches (sample_packing flattens the batch to one row, boundaries in
+  # position_ids) now run VARLEN block-diagonal causal attention (cu_seqlens):
+  # correct packing semantics (no cross-sample attention) and the dense-pack
+  # penalty is gone — work scales with sum(s_i^2) instead of S^2 (measured
+  # 10.9 ms -> 1.43 ms fwd+bwd on an 8192-token pack). Varlen only exists on
+  # the HP backward, so on packed batches save_packs: true (already
+  # discouraged) and bf16_grad_dots: false are INAPPLICABLE and are overridden
+  # with a one-time INFO; they still apply to dense (unpacked) batches.
   attention:
     enabled: true
     backward:

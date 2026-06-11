@@ -9,6 +9,7 @@ from axolotl.kernels.attn_nvfp4_flash import (
     _next_mult,
     _run_bwd,
     _run_bwd_hp,
+    _varlen_seq_arrays,
     nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
 )
@@ -210,6 +211,7 @@ def _flash_attention_train_op(
     key: torch.Tensor,  # [Z, Hk, Skv, D]
     value: torch.Tensor,  # [Z, Hk, Skv, D]
     key_pad_bias: torch.Tensor,  # [Z, Skv] fp32 or empty
+    cu_seqlens: torch.Tensor,  # [nseq+1] int varlen boundaries, or empty (dense)
     scaling: float,
     causal: bool,
     num_key_value_groups: int,
@@ -242,7 +244,10 @@ def _flash_attention_train_op(
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
     del dkdv_scratch_bf16, bf16_grad_dots
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
-    use_saved_packs = _use_saved_train_packs(
+    cu = None if cu_seqlens.numel() == 0 else cu_seqlens
+    # Varlen forces the HP backward, which is mutually exclusive with saved
+    # packs — never produce packs for a varlen forward (mirrors the kernel).
+    use_saved_packs = cu is None and _use_saved_train_packs(
         save_backward_packs, query.shape[2], key.shape[2]
     )
     if use_saved_packs:
@@ -271,6 +276,7 @@ def _flash_attention_train_op(
             causal=causal,
             num_key_value_groups=num_key_value_groups,
             key_pad_bias=bias,
+            cu_seqlens=cu,
             block_m=block_m,
             block_n=block_n,
             num_warps=num_warps,
@@ -288,6 +294,7 @@ def _(
     key,
     value,
     key_pad_bias,
+    cu_seqlens,
     scaling: float,
     causal: bool,
     num_key_value_groups: int,
@@ -311,7 +318,9 @@ def _(
     _, hk, s_kv, _ = key.shape
     out = query.new_empty((z, s_q, h, d) if out_zshd else (z, h, s_q, d))
     lse = query.new_empty((z * h, s_q), dtype=torch.float32)
-    if not _use_saved_train_packs(save_backward_packs, s_q, s_kv):
+    if cu_seqlens.numel() > 0 or not _use_saved_train_packs(
+        save_backward_packs, s_q, s_kv
+    ):
         return (out, lse, *_empty_pack_outputs(query))
 
     bwd_block_m = min(block_m, 64)
@@ -339,6 +348,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         key,
         value,
         key_pad_bias,
+        cu_seqlens,
         scaling,
         causal,
         num_key_value_groups,
@@ -361,6 +371,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(
         lse, qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
     )
+    varlen = cu_seqlens.numel() > 0
     use_saved_packs = save_backward_packs and qnv.numel() > 0
     if use_saved_packs:
         query_save = key_save = value_save = out
@@ -372,6 +383,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         value_save,
         out,
         key_pad_bias,
+        cu_seqlens,
         lse,
         qnv,
         qsc,
@@ -402,6 +414,16 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         hp_grad_dots = not use_saved_packs
     else:
         hp_grad_dots = bool(bf16_grad_dots)
+    if varlen:
+        # Varlen backward exists only on the HP path (the legacy all-FP4
+        # backward is dense-only). The public wrapper rejects the conflicting
+        # knob combinations with clear messages; this is the defensive clamp.
+        if _run_bwd_hp is None:
+            raise RuntimeError(
+                "varlen (cu_seqlens) backward requires a sageattention fork "
+                "with the HP-grad-dots backward (_run_bwd_hp)"
+            )
+        hp_grad_dots = True
     ctx.bf16_grad_dots = (
         hp_grad_dots and not use_saved_packs and _run_bwd_hp is not None
     )
@@ -423,6 +445,7 @@ def _flash_attention_train_bwd_op(
     value: torch.Tensor,  # [Z, Hk, Skv, D]
     out: torch.Tensor,  # [Z, H, Sq, D]
     key_pad_bias: torch.Tensor,  # [Z, Skv] fp32 or empty
+    cu_seqlens: torch.Tensor,  # [nseq+1] int varlen boundaries, or empty (dense)
     lse: torch.Tensor,  # [Z*H, Sq] fp32, forward softmax stats
     qnv: torch.Tensor,
     qsc: torch.Tensor,
@@ -456,6 +479,20 @@ def _flash_attention_train_bwd_op(
     num_stages: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias.to(torch.float32)
+    seq_arrays = None
+    if cu_seqlens.numel() > 0:
+        # The forward ran block-diagonal causal under these boundaries (the LSE
+        # was computed under that mask); expand them again for the backward.
+        # Only the HP backward has varlen plumbing — setup_context forces
+        # bf16_grad_dots=True for varlen, so the legacy branch below is
+        # unreachable; raise loud rather than silently dense-attending.
+        if not bf16_grad_dots or save_backward_packs:
+            raise RuntimeError(
+                "varlen (cu_seqlens) backward is only implemented on the hp "
+                "(bf16-grad-dots) path; the legacy all-FP4 backward has no "
+                "varlen support"
+            )
+        seq_arrays = _varlen_seq_arrays(cu_seqlens, s_q, grad_out.device)
     if out_zshd:
         do = grad_out
         o = out
@@ -495,6 +532,7 @@ def _flash_attention_train_bwd_op(
             do_zshd=out_zshd,
             o_zshd=out_zshd,
             out_dtype=grad_out.dtype,
+            seq_arrays=seq_arrays,
         )
         return (
             dq.reshape(z, h, s_q, d),
@@ -557,6 +595,7 @@ def _(
     value,
     out,
     key_pad_bias,
+    cu_seqlens,
     lse,
     qnv,
     qsc,
@@ -589,7 +628,7 @@ def _(
     num_warps: int,
     num_stages: int,
 ):
-    del grad_out, out, key_pad_bias, lse
+    del grad_out, out, key_pad_bias, cu_seqlens, lse
     del qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
     del scaling, causal, sr, save_backward_packs, out_zshd
     del backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr, dkdv_scratch_bf16
@@ -627,6 +666,7 @@ def _flash_attention_train_backward(
         value,
         out,
         key_pad_bias,
+        cu_seqlens,
         lse,
         qnv,
         qsc,
@@ -648,6 +688,7 @@ def _flash_attention_train_backward(
         value,
         out,
         key_pad_bias,
+        cu_seqlens,
         lse,
         qnv,
         qsc,
@@ -680,11 +721,12 @@ def _flash_attention_train_backward(
         num_warps,
         num_stages,
     )
-    # one grad slot per forward input (19 inputs)
+    # one grad slot per forward input (20 inputs)
     return (
         dq,
         dk,
         dv,
+        None,
         None,
         None,
         None,
@@ -720,6 +762,7 @@ def nvfp4_flash_attn_train_custom_op(
     causal: bool = False,
     num_key_value_groups: int = 1,
     key_pad_bias: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     stochastic_rounding: bool = True,
     backward_p_dv_stochastic_rounding: bool | None = None,
     backward_dot_dv_stochastic_rounding: bool | None = None,
@@ -744,14 +787,41 @@ def nvfp4_flash_attn_train_custom_op(
     absent) routes the backward through the HP-grad-dots ``_run_bwd_hp`` (bf16
     grad GEMMs with exact operands — faster and more accurate; mutually exclusive
     with saved packs, which force the legacy all-FP4 backward).
+    ``cu_seqlens`` (optional int ``[nseq+1]``, FA-varlen convention) runs PACKED
+    sequences flattened into one Z=1 row as block-diagonal causal attention;
+    requires ``causal=True`` and the HP backward (``save_backward_packs`` /
+    ``backward_bf16_grad_dots=False`` are rejected, mirroring the kernel). The
+    op schema has no Optional[Tensor], so an EMPTY tensor is the "no
+    cu_seqlens" sentinel (same convention as ``key_pad_bias``).
     ``out_layout="zshd"`` writes the HF attention layout directly.
     """
     if out_layout not in ("zhsd", "zshd"):
         raise ValueError("out_layout must be 'zhsd' or 'zshd'")
+    if cu_seqlens is not None:
+        if not causal:
+            raise ValueError(
+                "varlen (cu_seqlens) implements block-diagonal CAUSAL attention; "
+                "pass causal=True"
+            )
+        if save_backward_packs:
+            raise ValueError(
+                "varlen (cu_seqlens) is incompatible with save_backward_packs "
+                "(legacy all-FP4 backward); use the default hp backward"
+            )
+        if backward_bf16_grad_dots is False:
+            raise ValueError(
+                "varlen (cu_seqlens) requires the hp (bf16-grad-dots) backward; "
+                "do not pass backward_bf16_grad_dots=False"
+            )
     bias = (
         query.new_empty((0,), dtype=torch.float32)
         if key_pad_bias is None
         else key_pad_bias
+    )
+    cu = (
+        query.new_empty((0,), dtype=torch.int32)
+        if cu_seqlens is None
+        else cu_seqlens
     )
     sr = stochastic_rounding
     p_dv = (
@@ -780,6 +850,7 @@ def nvfp4_flash_attn_train_custom_op(
         key,
         value,
         bias,
+        cu,
         scaling,
         causal,
         num_key_value_groups,

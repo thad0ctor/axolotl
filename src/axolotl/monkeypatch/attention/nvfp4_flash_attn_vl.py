@@ -24,6 +24,7 @@ from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attn_func
 from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
     _custom_op_enabled,
     _mask_is_dense_causal_or_full,
+    _packed_position_ids_info,
 )
 from axolotl.utils.logging import get_logger
 
@@ -78,6 +79,16 @@ def make_nvfp4_vl_forward(orig_forward):
         kind = None
         if not has_cache_context:
             kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
+        if kind == "causal" and attention_mask is None:
+            # Sample-packed (multipack) batch: boundaries live in position_ids.
+            # TODO: wire the varlen (cu_seqlens) NVFP4 path like the Qwen3.5
+            # patch once VL mRoPE packed position_ids semantics (vision tokens
+            # share/repeat temporal positions) are validated against the
+            # position==0 reset detection. Until then NEVER dense-attend a
+            # packed batch — fall back to the original (FA2 varlen) forward.
+            pkind, _ = _packed_position_ids_info(kwargs.get("position_ids"), q_len)
+            if pkind is not None:
+                kind = None
         if kind is None:
             return orig_forward(
                 self,

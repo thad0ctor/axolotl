@@ -326,6 +326,27 @@ operands — measured ~1.5–1.7× faster backward, grad cosine vs bf16 SDPA ~0.
 the saved high-precision q/k/v, not the FP4 packs); when the HP path is active
 the `rtn_grad_packs`/`dkdv_scratch_bf16` knobs are moot.
 
+**Packed batches run varlen block-diagonal attention.** With `sample_packing:
+true` the batch reaches the attention layers flattened to ONE row (Z=1) with
+`attention_mask: None` and the sample boundaries encoded in `position_ids`
+(each sample's positions restart at 0). The patch derives FA-varlen
+`cu_seqlens` from `position_ids` (computed once per model forward — the tensor
+is shared across decoder layers — and cached on it) and runs the kernel's
+varlen path: **block-diagonal causal** attention where each sample attends only
+within itself. This fixes both problems of the previous behavior, which
+classified the mask-less pack as plain "causal" and dense-attended the whole
+pack: cross-sample attention contamination is gone (correct packing semantics,
+matching the FA2-varlen baseline), and so is the dense-pack work penalty —
+per-block kv loops skip cross-sample tiles, so work scales with `sum(s_i^2)`
+instead of `S^2` (measured on an 8192-token pack: 10.9 ms dense → 1.43 ms
+varlen fwd+bwd; parity vs per-sample SDPA cos 0.986 forward / 0.991+ grads).
+The varlen backward exists only on the HP-grad-dots path, so for packed batches
+`attention.backward.save_packs: true` (already discouraged — see above) and
+`bf16_grad_dots: false` are **inapplicable and overridden** (one-time INFO log;
+they still apply to dense, unpacked batches). Packed batches in a layout the
+varlen kernel cannot serve (multi-row packs) fall back to the model's original
+attention — they are never dense-attended by the FP4 path.
+
 Keep the no-grad/eval-only Qwen3.5 native MLP, native linear-attention, fused
 `v_proj`, and standalone `fp8_lm_head` switches out of this training-speed
 profile. A same-prepared-dataset lock-down ablation on the beta branch measured
@@ -824,7 +845,7 @@ The `nvfp4_training:` block (schema: `src/axolotl/utils/schemas/nvfp4.py`,
 | `attention.allow_full_model` | `bool` | `false` | Allow native NVFP4 attention on NON-hybrid models where every layer is full softmax attention (e.g. Qwen3-VL). Refused by default — the ~0.97-cosine per-layer error compounds over all layers and destroys the forward (see the hybrid-model warning above). |
 | `attention.backward.enabled` | `bool` | `false` | Requires `attention.enabled`. Use the native NVFP4 autograd attention path while training. |
 | `attention.backward.rtn_grad_packs` | `bool` | `false` | Deterministic round-to-nearest for the measured-safe gradient packs, leaving the dK and dPt packs governed by `stochastic_rounding`. |
-| `attention.backward.save_packs` | `bool` | `false` | Save the forward Q/K/V FP4 packs (+ transposed backward layouts) and reuse them in backward — trades activation memory for higher throughput. Under the compile custom op, this is applied only on short/mid static sequence lengths where the forward dual-pack cost measured worthwhile. |
+| `attention.backward.save_packs` | `bool` | `false` | Save the forward Q/K/V FP4 packs (+ transposed backward layouts) and reuse them in backward — trades activation memory for higher throughput. Under the compile custom op, this is applied only on short/mid static sequence lengths where the forward dual-pack cost measured worthwhile. Inapplicable to PACKED (sample-packing) batches, which run varlen and require the HP backward — overridden there with a one-time INFO. |
 | `attention.backward.bf16_grad_dots` | `bool \| null` | `null` (auto) | HP-grad-dots backward: keep the FP4 S/dP recomputes but run the three grad GEMMs (dV/dK/dQ) as bf16 `tl.dot` with exact operands — ~1.5–1.7× faster backward, grad cosine vs bf16 SDPA ~0.991 (vs ~0.94 RTN / ~0.82 SR all-FP4), ~4× less backward scratch. `null` auto-enables it whenever `save_packs` is off; `true` forces it (rejected with `save_packs: true` — the HP path needs the saved high-precision q/k/v); `false` forces the legacy all-FP4 backward. When active, `rtn_grad_packs` and `dkdv_scratch_bf16` are moot. |
 | `attention.backward.dkdv_scratch_bf16` | `bool` | `false` | Store dQ and per-query-head dK/dV backward scratch in bf16 (accumulate fp32 in-register, downcast once at the store → bit-identical to fp32-then-`.to(bf16)`; a pure memory save on the largest backward scratch planes). |
 | `attention.backward.compile_custom_op` | `bool \| null` | `null` (auto) | Wrap the attention path in an opaque differentiable custom op so Inductor compiles *around* the Triton `tl.dot_scaled` (which otherwise raises an `InductorError` and silently drops the block to eager). `null` auto-enables it when `torch_compile` is on and `attention.enabled`; `true`/`false` force it. The op reuses forward LSE in backward and honors `attention.backward.save_packs` conditionally by carrying deterministic forward FP4 packs across the opaque boundary only for short/mid static sequence lengths. |
