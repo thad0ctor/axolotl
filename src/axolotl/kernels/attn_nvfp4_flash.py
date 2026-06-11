@@ -38,3 +38,14 @@ try:
     from sageattention.nvfp4.flash import _varlen_seq_arrays  # noqa: F401
 except ImportError:  # pragma: no cover - legacy sageattention fork
     _varlen_seq_arrays = None
+
+try:
+    # backward_grad_dots mode resolver (None=AUTO -> "bf16"/"fp4_rownorm" on the
+    # effective sequence; clamps "bf16" against saved packs / GQA group > 8).
+    # Newer forks only; ``None`` means the fork predates the string grad-dot
+    # modes — callers keep the old hp ("bf16") vs legacy all-FP4 tri-state.
+    from sageattention.nvfp4.flash import (  # noqa: F401
+        _resolve_backward_grad_dots,
+    )
+except ImportError:  # pragma: no cover - legacy sageattention fork
+    _resolve_backward_grad_dots = None

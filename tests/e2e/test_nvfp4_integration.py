@@ -639,7 +639,13 @@ def test_gate_refuses_qwen3_5_dkdv_scratch_bf16_without_backward(monkeypatch):
         )
 
 
-def test_schema_accepts_bf16_grad_dots(monkeypatch):
+@pytest.mark.parametrize(
+    "mode", ["bf16", "fp4_rownorm", "fp8_rownorm", "fp4_legacy", None]
+)
+def test_schema_accepts_grad_dots_modes(monkeypatch, mode):
+    """grad_dots accepts the four kernel modes; None (default) = kernel AUTO
+    ('bf16' below an effective sequence of 4096 — the mean sample length for
+    packed batches — else 'fp4_rownorm')."""
     _supported(monkeypatch, True)
     cfg = AxolotlInputConfig(
         **BASE,
@@ -648,28 +654,98 @@ def test_schema_accepts_bf16_grad_dots(monkeypatch):
             "enabled": True,
             "attention": {
                 "enabled": True,
-                "backward": {"enabled": True, "bf16_grad_dots": True},
+                "backward": (
+                    {"enabled": True, "grad_dots": mode}
+                    if mode is not None
+                    else {"enabled": True}
+                ),
             },
         },
     )
-    assert cfg.nvfp4_training.attention.backward.bf16_grad_dots is True
-    # Tri-state default is None (auto: HP backward whenever save_packs is off).
-    cfg2 = AxolotlInputConfig(
-        **BASE,
-        model_config_type="qwen3_5",
-        nvfp4_training={
-            "enabled": True,
-            "attention": {"enabled": True, "backward": {"enabled": True}},
-        },
-    )
-    assert cfg2.nvfp4_training.attention.backward.bf16_grad_dots is None
+    assert cfg.nvfp4_training.attention.backward.grad_dots == mode
 
 
-def test_schema_refuses_bf16_grad_dots_with_save_packs(monkeypatch):
-    # The HP-grad-dots backward needs the saved HP q/k/v; save_packs forces the
-    # legacy all-FP4 backward, so forcing both is contradictory.
+def test_schema_refuses_unknown_grad_dots_mode(monkeypatch):
     _supported(monkeypatch, True)
-    with pytest.raises(ValueError, match=r"bf16_grad_dots.*save_packs"):
+    with pytest.raises(ValueError, match=r"grad_dots"):
+        AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {"enabled": True, "grad_dots": "fp16"},
+                },
+            },
+        )
+
+
+def test_schema_accepts_bf16_grad_dots_alias(monkeypatch):
+    """The DEPRECATED boolean alias maps onto grad_dots: True -> 'bf16',
+    False -> 'fp4_legacy'."""
+    _supported(monkeypatch, True)
+    with pytest.warns(DeprecationWarning, match=r"bf16_grad_dots"):
+        cfg = AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {"enabled": True, "bf16_grad_dots": True},
+                },
+            },
+        )
+    assert cfg.nvfp4_training.attention.backward.grad_dots == "bf16"
+    with pytest.warns(DeprecationWarning, match=r"bf16_grad_dots"):
+        cfg2 = AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {"enabled": True, "bf16_grad_dots": False},
+                },
+            },
+        )
+    assert cfg2.nvfp4_training.attention.backward.grad_dots == "fp4_legacy"
+
+
+def test_schema_refuses_grad_dots_and_alias_both_set(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match=r"grad_dots.*bf16_grad_dots"):
+        AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {
+                        "enabled": True,
+                        "grad_dots": "bf16",
+                        "bf16_grad_dots": True,
+                    },
+                },
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "backward_extra",
+    [
+        {"grad_dots": "bf16"},  # hp backward needs the saved hp q/k/v
+        {"grad_dots": "fp8_rownorm"},  # MXFP8 Q^T/K^T repack needs hp q/k
+        {"bf16_grad_dots": True},  # alias maps to "bf16" -> same conflict
+    ],
+)
+def test_schema_refuses_grad_dots_with_save_packs(monkeypatch, backward_extra):
+    # 'bf16' needs the saved HP q/k/v and 'fp8_rownorm' repacks Q^T/K^T as
+    # MXFP8; both conflict with the packs-only saved set save_packs keeps.
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match=r"grad_dots.*save_packs"):
         AxolotlInputConfig(
             **BASE,
             model_config_type="qwen3_5",
@@ -680,15 +756,49 @@ def test_schema_refuses_bf16_grad_dots_with_save_packs(monkeypatch):
                     "backward": {
                         "enabled": True,
                         "save_packs": True,
-                        "bf16_grad_dots": True,
+                        **backward_extra,
                     },
                 },
             },
         )
 
 
-def test_gate_refuses_bf16_grad_dots_without_backward(monkeypatch):
+def test_schema_allows_rownorm_and_legacy_grad_dots_with_save_packs(monkeypatch):
+    # fp4_rownorm / fp4_legacy only change the GRADIENT-side packing; they
+    # compose with the saved forward FP4 pack set.
     _supported(monkeypatch, True)
+    for mode in ("fp4_rownorm", "fp4_legacy"):
+        cfg = AxolotlInputConfig(
+            **BASE,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {
+                    "enabled": True,
+                    "backward": {
+                        "enabled": True,
+                        "save_packs": True,
+                        "grad_dots": mode,
+                    },
+                },
+            },
+        )
+        assert cfg.nvfp4_training.attention.backward.grad_dots == mode
+
+
+def test_gate_refuses_grad_dots_without_backward(monkeypatch):
+    _supported(monkeypatch, True)
+    with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
+        AxolotlConfigWCapabilities(
+            **BASE,
+            **CAPS,
+            model_config_type="qwen3_5",
+            nvfp4_training={
+                "enabled": True,
+                "attention": {"enabled": True, "backward": {"grad_dots": "bf16"}},
+            },
+        )
+    # The deprecated alias hits the same gate (it maps onto grad_dots).
     with pytest.raises(ValueError, match=r"requires attention\.backward\.enabled"):
         AxolotlConfigWCapabilities(
             **BASE,

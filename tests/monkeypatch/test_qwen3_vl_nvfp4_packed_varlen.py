@@ -24,7 +24,9 @@ These tests cover the VL patch's packed path:
   * forward/grad parity vs a per-sample reference (the model's original
     attention run sample by sample, each with its own mRoPE cos/sin slice);
   * the packed perf gate (``packed_min_sample_len``), same semantics as the
-    Qwen3.5 patch; and the forced-HP backward override (one-time INFO);
+    Qwen3.5 patch; and the save_packs override for packed batches (one-time
+    INFO; the configured grad_dots mode passes through — every mode composes
+    with varlen);
   * once-per-step caching of the classification.
 
 NOTE: parity/routing tests pass ``packed_min_sample_len=0`` — the test pack's
@@ -367,30 +369,32 @@ def test_vl_packed_gate_threshold_routing(monkeypatch, min_len, expect_fp4):
         assert calls == [], f"min_len={min_len}: expected the original forward"
 
 
-def test_vl_packed_save_packs_config_forced_hp_one_time_log(caplog):
-    """save_packs / forced-legacy config + packed VL batch: runs on the forced
-    HP backward (same override as the Qwen3.5 patch) with a one-time INFO."""
+def test_vl_packed_save_packs_config_ignored_one_time_log(caplog):
+    """save_packs config + packed VL batch: runs with the saved-pack set
+    forced off (same override as the Qwen3.5 patch) and a one-time INFO; the
+    configured grad_dots mode (the legacy all-FP4 backward here — it composes
+    with varlen now) still applies."""
     model, cfg = _build_model(seed=4)
     patch_qwen3_vl_nvfp4_attention(
         model,
         train_backward=True,
         save_backward_packs=True,
-        bf16_grad_dots=False,  # forced-legacy: also inapplicable to packed
+        grad_dots="fp4_legacy",  # composes with varlen; only save_packs forced
         packed_min_sample_len=0,
     )
     hs0, w = _packed_inputs(cfg.hidden_size, seed=4)
     text, mrope = _packed_positions()
 
-    text_patch_mod._PACKED_FORCED_HP_LOGGED = False
-    msg = "packed (varlen) batches require the HP-grad-dots backward"
+    text_patch_mod._PACKED_SAVE_PACKS_LOGGED = False
+    msg = "ignoring attention.backward.save_packs"
     with caplog.at_level(logging.INFO, logger=text_patch_mod.LOG.name):
         out, grad = _run_attn(model, hs0, w, text, mrope)
         assert torch.isfinite(out).all() and torch.isfinite(grad).all()
         first = sum(msg in r.getMessage() for r in caplog.records)
-        assert first == 1, f"expected exactly one forced-HP INFO, got {first}"
+        assert first == 1, f"expected exactly one save_packs INFO, got {first}"
         _run_attn(model, hs0, w, text, mrope)
         total = sum(msg in r.getMessage() for r in caplog.records)
-        assert total == 1, f"forced-HP INFO logged {total} times, expected 1"
+        assert total == 1, f"save_packs INFO logged {total} times, expected 1"
 
 
 def test_vl_packed_classification_cached_once_per_step(monkeypatch):

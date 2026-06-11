@@ -93,6 +93,53 @@ try:
 except (TypeError, ValueError):  # pragma: no cover - exotic callables
     _TRAIN_PREPACKED = False
 
+# Whether the fork's TRAINING entry accepts the string backward_grad_dots mode
+# ("bf16" / "fp4_rownorm" / "fp8_rownorm" / "fp4_legacy" / None=AUTO). Older
+# hp-grad-dots forks only know the boolean backward_bf16_grad_dots alias.
+try:
+    _TRAIN_GRAD_DOTS = (
+        "backward_grad_dots" in _inspect.signature(nvfp4_flash_attn_func).parameters
+    )
+except (TypeError, ValueError):  # pragma: no cover - exotic callables
+    _TRAIN_GRAD_DOTS = False
+
+
+def _grad_dots_kwargs(module) -> dict:
+    """Backward grad-GEMM mode kwarg for the eager training entry.
+
+    None (default) = kernel AUTO ("bf16" below an effective sequence of 4096 —
+    the mean sample length for packed/varlen batches — else "fp4_rownorm"). On
+    a legacy fork without the string modes the configured mode degrades to the
+    boolean hp/legacy alias ("bf16" -> hp backward, rownorm/legacy -> legacy
+    all-FP4 backward, None stays auto)."""
+    mode = getattr(module, "_nvfp4_grad_dots", None)
+    if _TRAIN_GRAD_DOTS:
+        return {"backward_grad_dots": mode}
+    return {"backward_bf16_grad_dots": None if mode is None else mode == "bf16"}
+
+
+_GRAD_DOTS_MODES = ("bf16", "fp4_rownorm", "fp8_rownorm", "fp4_legacy")
+
+
+def _resolve_grad_dots_alias(
+    grad_dots: str | None, bf16_grad_dots: bool | None
+) -> str | None:
+    """Fold the DEPRECATED ``bf16_grad_dots`` boolean alias into ``grad_dots``
+    (True -> "bf16", False -> "fp4_legacy"; both set -> error) and validate."""
+    if bf16_grad_dots is not None:
+        if grad_dots is not None:
+            raise ValueError(
+                "pass either grad_dots or the deprecated bf16_grad_dots alias, "
+                "not both"
+            )
+        grad_dots = "bf16" if bf16_grad_dots else "fp4_legacy"
+    if grad_dots is not None and grad_dots not in _GRAD_DOTS_MODES:
+        raise ValueError(
+            f"grad_dots must be one of {_GRAD_DOTS_MODES} or None (kernel "
+            f"auto), got {grad_dots!r}"
+        )
+    return grad_dots
+
 
 def _custom_op_enabled(module: nn.Module) -> bool:
     requested = getattr(module, "_nvfp4_compile_custom_op", False) or os.environ.get(
@@ -188,7 +235,7 @@ def _mask_is_dense_causal_or_full(
 # ---------------------------------------------------------------------------
 _PACKED_INFO_ATTR = "_nvfp4_packed_info"
 _PACKED_FALLBACK_LOGGED = False
-_PACKED_FORCED_HP_LOGGED = False
+_PACKED_SAVE_PACKS_LOGGED = False
 _PACKED_GATE_LOGGED = False
 
 
@@ -289,15 +336,16 @@ def _log_packed_gate_once(mean_len: float, min_len: int, use_fp4: bool) -> None:
         )
 
 
-def _log_packed_forced_hp_once() -> None:
-    global _PACKED_FORCED_HP_LOGGED
-    if not _PACKED_FORCED_HP_LOGGED:
-        _PACKED_FORCED_HP_LOGGED = True
+def _log_packed_save_packs_ignored_once() -> None:
+    global _PACKED_SAVE_PACKS_LOGGED
+    if not _PACKED_SAVE_PACKS_LOGGED:
+        _PACKED_SAVE_PACKS_LOGGED = True
         LOG.info(
-            "nvfp4 attention: packed (varlen) batches require the HP-grad-dots "
-            "backward; ignoring attention.backward.save_packs / "
-            "bf16_grad_dots=false for packed batches (config still applies to "
-            "dense batches)"
+            "nvfp4 attention: packed (varlen) batches are incompatible with the "
+            "saved forward FP4 pack set; ignoring attention.backward.save_packs "
+            "for packed batches (config still applies to dense batches; the "
+            "configured grad_dots mode applies to packed batches too — every "
+            "mode composes with varlen)"
         )
 
 
@@ -680,13 +728,13 @@ def make_nvfp4_forward(orig_forward):
             if not grad_enabled and past_key_values is not None:
                 past_key_values.update(key_roped, value_states, self.layer_idx)
             ng = query_roped.shape[1] // key_roped.shape[1]
-            # Varlen REQUIRES the HP (bf16-grad-dots) backward — the legacy
-            # all-FP4 backward (save_backward_packs / bf16_grad_dots=false) is
-            # dense-only. Config wins elsewhere; packed batches force HP.
-            if getattr(self, "_nvfp4_save_backward_packs", False) or (
-                getattr(self, "_nvfp4_bf16_grad_dots", None) is False
-            ):
-                _log_packed_forced_hp_once()
+            # Varlen is incompatible with the forward saved-pack set ONLY:
+            # save_backward_packs is forced off for packed batches, while the
+            # configured grad_dots mode passes through unchanged (every mode
+            # composes with varlen; None = kernel AUTO resolves on the pack's
+            # MEAN SAMPLE LENGTH — "bf16" below ~4k, else "fp4_rownorm").
+            if getattr(self, "_nvfp4_save_backward_packs", False):
+                _log_packed_save_packs_ignored_once()
             sr = getattr(self, "_nvfp4_stochastic_rounding", True)
             if _custom_op_enabled(self):
                 # Opaque differentiable custom op between graph breaks — same
@@ -706,7 +754,7 @@ def make_nvfp4_forward(orig_forward):
                     cu_seqlens=cu_seqlens,
                     stochastic_rounding=sr,
                     save_backward_packs=False,
-                    backward_bf16_grad_dots=True,
+                    backward_grad_dots=getattr(self, "_nvfp4_grad_dots", None),
                     out_layout="zshd",
                     q_packs=q_packs,
                     k_packs=k_packs,
@@ -730,7 +778,7 @@ def make_nvfp4_forward(orig_forward):
                     cu_seqlens=cu_seqlens,
                     stochastic_rounding=sr,
                     save_backward_packs=False,
-                    backward_bf16_grad_dots=True,
+                    **_grad_dots_kwargs(self),
                     **prepacked_kwargs,
                 ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
             else:
@@ -813,9 +861,7 @@ def make_nvfp4_forward(orig_forward):
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
-                        backward_bf16_grad_dots=getattr(
-                            self, "_nvfp4_bf16_grad_dots", None
-                        ),
+                        backward_grad_dots=getattr(self, "_nvfp4_grad_dots", None),
                         save_backward_packs=getattr(
                             self, "_nvfp4_save_backward_packs", False
                         ),
@@ -841,9 +887,7 @@ def make_nvfp4_forward(orig_forward):
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
-                        backward_bf16_grad_dots=getattr(
-                            self, "_nvfp4_bf16_grad_dots", None
-                        ),
+                        **_grad_dots_kwargs(self),
                     ).transpose(1, 2)
             else:
                 # Write roped K/V to the cache so subsequent decode steps see prefill
@@ -899,6 +943,7 @@ def patch_qwen3_5_nvfp4_attention(
     backward_rtn_grad_packs: bool = False,
     save_backward_packs: bool = False,
     dkdv_scratch_bf16: bool = False,
+    grad_dots: str | None = None,
     bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
@@ -914,6 +959,13 @@ def patch_qwen3_5_nvfp4_attention(
     small parity cost (v_proj goes FP4); only active on the no-grad cache-free
     prefill path and only for plain ``nn.Linear`` v_proj modules.
 
+    ``grad_dots``: backward grad-GEMM mode ("bf16" / "fp4_rownorm" /
+    "fp8_rownorm" / "fp4_legacy"); None (default) = kernel AUTO — "bf16" below
+    an effective sequence of 4096 (the MEAN SAMPLE LENGTH for packed batches),
+    else "fp4_rownorm" (measured 1.12x hp / 1.13x FA2 backward at s8192 d256
+    with hp-equal convergence). ``bf16_grad_dots`` is the DEPRECATED boolean
+    alias (True -> "bf16", False -> "fp4_legacy"); passing both raises.
+
     ``packed_min_sample_len``: packed-batch perf gate — packs whose MEAN sample
     length is below this keep the model's original (FA2-varlen) forward.
     Default 0 (gate off): with the fused RoPE+quant producers feeding the
@@ -923,6 +975,7 @@ def patch_qwen3_5_nvfp4_attention(
     legacy sageattention forks without the pre-packed training entry); a very
     large value never uses FP4 for packed batches.
     """
+    grad_dots = _resolve_grad_dots_alias(grad_dots, bf16_grad_dots)
     if packed_min_sample_len is None:
         packed_min_sample_len = _PACKED_MIN_SAMPLE_LEN_DEFAULT
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
@@ -950,7 +1003,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
                 module._nvfp4_save_backward_packs = save_backward_packs
                 module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
-                module._nvfp4_bf16_grad_dots = bf16_grad_dots
+                module._nvfp4_grad_dots = grad_dots
                 module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
                 module._nvfp4_packed_min_sample_len = packed_min_sample_len
@@ -969,7 +1022,7 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
             module._nvfp4_save_backward_packs = save_backward_packs
             module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
-            module._nvfp4_bf16_grad_dots = bf16_grad_dots
+            module._nvfp4_grad_dots = grad_dots
             module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
             module._nvfp4_packed_min_sample_len = packed_min_sample_len
@@ -981,7 +1034,7 @@ def patch_qwen3_5_nvfp4_attention(
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
-        "save_backward_packs=%s, dkdv_scratch_bf16=%s, bf16_grad_dots=%s, "
+        "save_backward_packs=%s, dkdv_scratch_bf16=%s, grad_dots=%s, "
         "compile_custom_op=%s, packed_min_sample_len=%s)",
         patched,
         fuse_vproj,
@@ -989,7 +1042,7 @@ def patch_qwen3_5_nvfp4_attention(
         backward_rtn_grad_packs,
         save_backward_packs,
         dkdv_scratch_bf16,
-        bf16_grad_dots,
+        grad_dots,
         compile_custom_op,
         packed_min_sample_len,
     )

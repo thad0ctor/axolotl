@@ -32,10 +32,12 @@ from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
     _PACKED_MIN_SAMPLE_LEN_DEFAULT,
     _compute_packed_info,
     _custom_op_enabled,
-    _log_packed_forced_hp_once,
+    _grad_dots_kwargs,
     _log_packed_gate_once,
+    _log_packed_save_packs_ignored_once,
     _mask_is_dense_causal_or_full,
     _packed_position_ids_info,
+    _resolve_grad_dots_alias,
 )
 
 # VL-specific packed-gate default: the VL packed path does not (yet) feed the
@@ -269,17 +271,18 @@ def make_nvfp4_vl_forward(orig_forward):
         grad_sr = sr and not getattr(self, "_nvfp4_backward_rtn_grad_packs", False)
         save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
         dkdv_bf16 = getattr(self, "_nvfp4_dkdv_scratch_bf16", False)
-        hp_grad_dots = getattr(self, "_nvfp4_bf16_grad_dots", None)
 
         if kind == "packed":
             # Varlen block-diagonal causal attention over the flattened pack
-            # (work ~ sum(s_i^2), no cross-sample attention). Varlen REQUIRES
-            # the HP (bf16-grad-dots) backward — the all-FP4 backward
-            # (save_packs / bf16_grad_dots=false) is dense-only; config still
-            # applies to dense batches. Same forced combination as the Qwen3.5
-            # patch.
-            if save_packs or hp_grad_dots is False:
-                _log_packed_forced_hp_once()
+            # (work ~ sum(s_i^2), no cross-sample attention). Varlen is
+            # incompatible with the forward saved-pack set ONLY: save_packs is
+            # forced off for packed batches (one-time INFO; config still
+            # applies to dense batches), while the configured grad_dots mode
+            # passes through — every mode composes with varlen, and None =
+            # kernel AUTO resolves on the pack's mean sample length. Same
+            # handling as the Qwen3.5 patch.
+            if save_packs:
+                _log_packed_save_packs_ignored_once()
             if _custom_op_enabled(self):
                 from axolotl.kernels.attn_nvfp4_custom_op import (
                     nvfp4_flash_attn_train_custom_op,
@@ -296,7 +299,7 @@ def make_nvfp4_vl_forward(orig_forward):
                     cu_seqlens=cu_seqlens,
                     stochastic_rounding=sr,
                     save_backward_packs=False,
-                    backward_bf16_grad_dots=True,
+                    backward_grad_dots=getattr(self, "_nvfp4_grad_dots", None),
                     out_layout="zshd",
                 )  # [Z, S, H, D]
                 torch._dynamo.graph_break()
@@ -311,7 +314,7 @@ def make_nvfp4_vl_forward(orig_forward):
                     cu_seqlens=cu_seqlens,
                     stochastic_rounding=sr,
                     save_backward_packs=False,
-                    backward_bf16_grad_dots=True,
+                    **_grad_dots_kwargs(self),
                 ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             return self.o_proj(attn_output), None
@@ -338,7 +341,7 @@ def make_nvfp4_vl_forward(orig_forward):
                 backward_dot_dv_stochastic_rounding=grad_sr,
                 backward_ds_dq_stochastic_rounding=grad_sr,
                 dkdv_scratch_bf16=dkdv_bf16,
-                backward_bf16_grad_dots=hp_grad_dots,
+                backward_grad_dots=getattr(self, "_nvfp4_grad_dots", None),
                 save_backward_packs=save_packs,
                 out_layout="zshd",
             )  # [Z, S, H, D]
@@ -357,7 +360,7 @@ def make_nvfp4_vl_forward(orig_forward):
                 backward_ds_dq_stochastic_rounding=grad_sr,
                 save_backward_packs=save_packs,
                 dkdv_scratch_bf16=dkdv_bf16,
-                backward_bf16_grad_dots=hp_grad_dots,
+                **_grad_dots_kwargs(self),
             ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -367,13 +370,13 @@ def make_nvfp4_vl_forward(orig_forward):
 
 
 def _set_attrs(module, *, train_backward, backward_rtn_grad_packs, save_backward_packs,
-               dkdv_scratch_bf16, bf16_grad_dots, compile_custom_op,
+               dkdv_scratch_bf16, grad_dots, compile_custom_op,
                stochastic_rounding, packed_min_sample_len):
     module._nvfp4_train_backward = train_backward
     module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
     module._nvfp4_save_backward_packs = save_backward_packs
     module._nvfp4_dkdv_scratch_bf16 = dkdv_scratch_bf16
-    module._nvfp4_bf16_grad_dots = bf16_grad_dots
+    module._nvfp4_grad_dots = grad_dots
     module._nvfp4_compile_custom_op = compile_custom_op
     module._nvfp4_stochastic_rounding = stochastic_rounding
     module._nvfp4_packed_min_sample_len = packed_min_sample_len
@@ -386,6 +389,7 @@ def patch_qwen3_vl_nvfp4_attention(
     backward_rtn_grad_packs: bool = False,
     save_backward_packs: bool = False,
     dkdv_scratch_bf16: bool = False,
+    grad_dots: str | None = None,
     bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
@@ -394,6 +398,12 @@ def patch_qwen3_vl_nvfp4_attention(
     """Patch every Qwen3-VL LM full-attention layer's forward to use NVFP4.
 
     Leaves vision-encoder attention untouched. Idempotent. Returns patched count.
+
+    ``grad_dots``: backward grad-GEMM mode ("bf16" / "fp4_rownorm" /
+    "fp8_rownorm" / "fp4_legacy"); None (default) = kernel AUTO — "bf16" below
+    an effective sequence of 4096 (the MEAN SAMPLE LENGTH for packed batches),
+    else "fp4_rownorm". ``bf16_grad_dots`` is the DEPRECATED boolean alias
+    (True -> "bf16", False -> "fp4_legacy"); passing both raises.
 
     ``packed_min_sample_len``: packed-batch (multipack) perf gate, identical to
     the Qwen3.5 patch — packs whose MEAN sample length is below this keep the
@@ -407,6 +417,7 @@ def patch_qwen3_vl_nvfp4_attention(
     ``_VL_PACKED_MIN_SAMPLE_LEN_DEFAULT``), unlike the text patch whose auto
     default is 0.
     """
+    grad_dots = _resolve_grad_dots_alias(grad_dots, bf16_grad_dots)
     if packed_min_sample_len is None:
         packed_min_sample_len = _VL_PACKED_MIN_SAMPLE_LEN_DEFAULT
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextAttention
@@ -420,7 +431,7 @@ def patch_qwen3_vl_nvfp4_attention(
                 backward_rtn_grad_packs=backward_rtn_grad_packs,
                 save_backward_packs=save_backward_packs,
                 dkdv_scratch_bf16=dkdv_scratch_bf16,
-                bf16_grad_dots=bf16_grad_dots,
+                grad_dots=grad_dots,
                 compile_custom_op=compile_custom_op,
                 stochastic_rounding=stochastic_rounding,
                 packed_min_sample_len=packed_min_sample_len,

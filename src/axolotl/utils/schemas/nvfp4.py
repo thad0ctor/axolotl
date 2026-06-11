@@ -224,20 +224,42 @@ class NVFP4AttentionBackwardConfig(BaseModel):
             "vs the fp32-then-cast path)."
         },
     )
+    grad_dots: Literal["bf16", "fp4_rownorm", "fp8_rownorm", "fp4_legacy"] | None = (
+        Field(
+            default=None,
+            json_schema_extra={
+                "description": "Attention-backward grad-GEMM mode (the kernel's "
+                "backward_grad_dots). 'bf16': FP4 S/dP recomputes + bf16 grad "
+                "GEMMs with exact P/dS operands — the most accurate mode and the "
+                "fastest below ~4k sequence (grad cosine vs bf16 SDPA ~0.991, "
+                "~4x less backward scratch than legacy); needs the saved "
+                "high-precision q/k/v, so it is incompatible with save_packs. "
+                "'fp4_rownorm': all-FP4 grad GEMMs with per-row RMS-normalized "
+                "gradient packs (underflow-proof e4m3 scales) — matches the "
+                "bf16/hp backward on training quality (memorization 0.233 vs "
+                "0.236, grad cos 0.97-0.98) and overtakes it in speed from ~4k "
+                "sequence up: backward 1.12x hp / 1.13x FA2 at s8192 d256. RTN "
+                "only (the SR grad knobs are no-ops — measured strictly worse "
+                "under rownorm). 'fp8_rownorm': MXFP8 (e4m3 + e8m0 group-32) "
+                "gradient-side GEMM operands; the accuracy-leaning fp4-family "
+                "option (best memorization 0.230, grad cos 0.978-0.992, 1.08x hp "
+                "at s8192 d256); RTN only, incompatible with save_packs. "
+                "'fp4_legacy': the original all-FP4 backward (plain grad packs; "
+                "honors rtn_grad_packs / stochastic-rounding) — kept for "
+                "compatibility, rownorm dominates it on accuracy. null (default) "
+                "= kernel AUTO: 'bf16' below an effective sequence of 4096 (the "
+                "MEAN SAMPLE LENGTH for packed/varlen batches — the fp4 arms "
+                "only beat the hp backward from ~4k up), else 'fp4_rownorm'. "
+                "All modes compose with packed (varlen) batches."
+            },
+        )
+    )
     bf16_grad_dots: bool | None = Field(
         default=None,
         json_schema_extra={
-            "description": "HP-grad-dots attention backward: keep the FP4 S/dP "
-            "recomputes but run the three grad GEMMs (dV/dK/dQ) as bf16 tl.dot "
-            "with exact operands — measured ~1.5-1.7x faster backward, grad "
-            "cosine vs bf16 SDPA ~0.991 (vs ~0.94 RTN / ~0.82 SR all-FP4), and "
-            "~4x less backward scratch memory. Tri-state: None (default) = auto, "
-            "on whenever save_packs is off; True forces it (errors if save_packs "
-            "is also true — the HP path needs the saved high-precision q/k/v, "
-            "not the FP4 packs, so save_packs forces the legacy all-FP4 "
-            "backward); False forces the legacy all-FP4 backward. When active, "
-            "rtn_grad_packs/stochastic-rounding grad knobs and dkdv_scratch_bf16 "
-            "are moot."
+            "description": "DEPRECATED alias for grad_dots: true -> 'bf16', "
+            "false -> 'fp4_legacy'. Setting both grad_dots and bf16_grad_dots "
+            "is an error. Use grad_dots."
         },
     )
     compile_custom_op: bool | None = Field(
@@ -253,14 +275,30 @@ class NVFP4AttentionBackwardConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _check_bf16_grad_dots(self):
-        if self.bf16_grad_dots and self.save_packs:
+    def _check_grad_dots(self):
+        if self.bf16_grad_dots is not None:
+            if self.grad_dots is not None:
+                raise ValueError(
+                    "nvfp4_training.attention.backward: set either grad_dots or "
+                    "the deprecated bf16_grad_dots alias, not both "
+                    f"(got grad_dots={self.grad_dots!r}, "
+                    f"bf16_grad_dots={self.bf16_grad_dots})."
+                )
+            warnings.warn(
+                "nvfp4_training.attention.backward.bf16_grad_dots is deprecated; "
+                "use grad_dots: 'bf16' (true) / 'fp4_legacy' (false) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.grad_dots = "bf16" if self.bf16_grad_dots else "fp4_legacy"
+        if self.grad_dots in ("bf16", "fp8_rownorm") and self.save_packs:
             raise ValueError(
-                "nvfp4_training.attention.backward.bf16_grad_dots: true is "
-                "incompatible with save_packs: true (the HP-grad-dots backward "
-                "needs the saved high-precision q/k/v; save_packs forces the "
-                "legacy all-FP4 backward). Set save_packs: false or drop "
-                "bf16_grad_dots."
+                f"nvfp4_training.attention.backward.grad_dots: '{self.grad_dots}' "
+                "is incompatible with save_packs: true (the 'bf16' backward needs "
+                "the saved high-precision q/k/v and 'fp8_rownorm' repacks Q^T/K^T "
+                "as MXFP8 — both conflict with the saved forward FP4 pack set). "
+                "Set save_packs: false or use grad_dots: 'fp4_rownorm' / "
+                "'fp4_legacy'."
             )
         return self
 
@@ -356,7 +394,7 @@ class NVFP4AttentionConfig(BaseModel):
                 "rtn_grad_packs",
                 "save_packs",
                 "dkdv_scratch_bf16",
-                "bf16_grad_dots",
+                "grad_dots",
             ):
                 if getattr(self.backward, sub):
                     raise ValueError(

@@ -7,12 +7,42 @@ import torch
 from axolotl.kernels.attn_nvfp4_flash import (
     _gqa_reduce_cast_dkdv,
     _next_mult,
+    _resolve_backward_grad_dots,
     _run_bwd,
     _run_bwd_hp,
     _varlen_seq_arrays,
     nvfp4_flash_attention,
     nvfp4_flash_attention_packed,
 )
+
+# Valid backward grad-GEMM modes (see the sage fork's BACKWARD GRAD-DOT MODES
+# docstring). The custom-op schema has no Optional[str], so the empty string is
+# the "None = kernel AUTO" sentinel everywhere a mode crosses the op boundary.
+_GRAD_DOTS_MODES = ("bf16", "fp4_rownorm", "fp8_rownorm", "fp4_legacy")
+
+
+def _resolve_grad_dots(
+    mode_str: str, eff_seq: float, save_backward_packs: bool, ng: int
+) -> str:
+    """Resolve the op-boundary grad-dots string ("" = AUTO) to a concrete mode.
+
+    The KERNEL owns the resolution policy (``_resolve_backward_grad_dots``:
+    AUTO = "bf16" below ~4k effective sequence else "fp4_rownorm"; "bf16"
+    clamped to "fp4_rownorm" against saved packs / GQA group > 8) — this just
+    threads the string through with the same inputs the kernel would see. On a
+    legacy fork (no resolver / no rownorm modes) it degrades to the old
+    tri-state: hp ("bf16") whenever the packs-only saved set is absent, else
+    the legacy all-FP4 backward.
+    """
+    mode = mode_str or None
+    if _resolve_backward_grad_dots is not None:
+        return _resolve_backward_grad_dots(mode, eff_seq, save_backward_packs, ng)
+    if mode is None or mode in ("fp4_rownorm", "fp8_rownorm"):
+        mode = "bf16"  # best legacy-fork stand-in for the rownorm arms
+    if mode == "bf16" and (save_backward_packs or _run_bwd_hp is None):
+        mode = "fp4_legacy"
+    return mode
+
 
 _DTYPE_TO_CODE = {
     torch.float16: 0,
@@ -224,7 +254,7 @@ def _flash_attention_train_op(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
-    bf16_grad_dots: int,
+    grad_dots: str,
     save_backward_packs: bool,
     out_zshd: bool,
     block_m: int,
@@ -246,7 +276,7 @@ def _flash_attention_train_op(
     torch.Tensor,
 ]:
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
-    del dkdv_scratch_bf16, bf16_grad_dots
+    del dkdv_scratch_bf16, grad_dots
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
     cu = None if cu_seqlens.numel() == 0 else cu_seqlens
     # Externally-produced forward q/k packs (fused RoPE+quant producers): empty
@@ -335,7 +365,7 @@ def _(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
-    bf16_grad_dots: int,
+    grad_dots: str,
     save_backward_packs: bool,
     out_zshd: bool,
     block_m: int,
@@ -346,7 +376,7 @@ def _(
     del key_pad_bias, scaling, causal, num_key_value_groups
     del qnv_in, qsc_in, knv_in, ksc_in
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
-    del dkdv_scratch_bf16, bf16_grad_dots, num_warps, num_stages
+    del dkdv_scratch_bf16, grad_dots, num_warps, num_stages
     z, h, s_q, d = query.shape
     _, hk, s_kv, _ = key.shape
     out = query.new_empty((z, s_q, h, d) if out_zshd else (z, h, s_q, d))
@@ -394,7 +424,7 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         backward_dot_dv_sr,
         backward_ds_dq_sr,
         dkdv_scratch_bf16,
-        bf16_grad_dots,
+        grad_dots,
         save_backward_packs,
         out_zshd,
         block_m,
@@ -408,7 +438,6 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.mark_non_differentiable(
         lse, qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
     )
-    varlen = cu_seqlens.numel() > 0
     use_saved_packs = save_backward_packs and qnv.numel() > 0
     if use_saved_packs:
         query_save = key_save = value_save = out
@@ -443,27 +472,12 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
     ctx.backward_dot_dv_sr = backward_dot_dv_sr
     ctx.backward_ds_dq_sr = backward_ds_dq_sr
     ctx.dkdv_scratch_bf16 = dkdv_scratch_bf16
-    # HP-grad-dots backward (tri-state code: -1 auto, 0 force-legacy, 1 force-on).
-    # Auto turns it on whenever the saved-packs set is absent; it requires the
-    # saved HP q/k/v (mutually exclusive with packs mode) plus a fork that ships
-    # _run_bwd_hp, so both conditions clamp even a forced-on request.
-    if bf16_grad_dots < 0:
-        hp_grad_dots = not use_saved_packs
-    else:
-        hp_grad_dots = bool(bf16_grad_dots)
-    if varlen:
-        # Varlen backward exists only on the HP path (the legacy all-FP4
-        # backward is dense-only). The public wrapper rejects the conflicting
-        # knob combinations with clear messages; this is the defensive clamp.
-        if _run_bwd_hp is None:
-            raise RuntimeError(
-                "varlen (cu_seqlens) backward requires a sageattention fork "
-                "with the HP-grad-dots backward (_run_bwd_hp)"
-            )
-        hp_grad_dots = True
-    ctx.bf16_grad_dots = (
-        hp_grad_dots and not use_saved_packs and _run_bwd_hp is not None
-    )
+    # Grad-GEMM mode string ("" = kernel AUTO). Passed through UNRESOLVED: the
+    # backward op resolves it via the kernel's own policy against the EFFECTIVE
+    # saved-packs decision (the seq-length gate above) and the effective
+    # sequence (s_kv, or the mean sample length under varlen) — deterministic
+    # from inputs the bwd op already receives, so fwd/bwd always agree.
+    ctx.grad_dots = grad_dots
     ctx.save_backward_packs = use_saved_packs
     ctx.out_zshd = bool(out_zshd)
     ctx.tiles = (block_m, block_n, num_warps, num_stages)
@@ -509,7 +523,7 @@ def _flash_attention_train_bwd_op(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
-    bf16_grad_dots: bool,
+    grad_dots: str,
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -517,25 +531,56 @@ def _flash_attention_train_bwd_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias.to(torch.float32)
     seq_arrays = None
-    if cu_seqlens.numel() > 0:
+    varlen = cu_seqlens.numel() > 0
+    if varlen:
         # The forward ran block-diagonal causal under these boundaries (the LSE
         # was computed under that mask); expand them again for the backward.
-        # Only the HP backward has varlen plumbing — setup_context forces
-        # bf16_grad_dots=True for varlen, so the legacy branch below is
-        # unreachable; raise loud rather than silently dense-attending.
-        if not bf16_grad_dots or save_backward_packs:
+        # Every grad-dots mode composes with varlen on the new fork; saved
+        # packs never do (the wrapper rejects and the fwd never produces them).
+        if save_backward_packs:
             raise RuntimeError(
-                "varlen (cu_seqlens) backward is only implemented on the hp "
-                "(bf16-grad-dots) path; the legacy all-FP4 backward has no "
-                "varlen support"
+                "varlen (cu_seqlens) backward is incompatible with the saved "
+                "forward FP4 pack set (save_backward_packs)"
+            )
+        if _varlen_seq_arrays is None:
+            raise RuntimeError(
+                "varlen (cu_seqlens) backward requires a sageattention fork "
+                "with varlen support (_varlen_seq_arrays)"
             )
         seq_arrays = _varlen_seq_arrays(cu_seqlens, s_q, grad_out.device)
-    if out_zshd:
+    # Resolve the mode HERE, with the kernel's own policy ("" = AUTO) — the
+    # effective sequence is s_kv, or the MEAN SAMPLE LENGTH under varlen, and
+    # save_backward_packs is the fwd's EFFECTIVE saved-packs decision.
+    eff_seq = s_kv if not varlen else s_q / max(int(cu_seqlens.numel()) - 1, 1)
+    mode = _resolve_grad_dots(grad_dots, eff_seq, save_backward_packs, h // hk)
+    if mode == "fp8_rownorm" and save_backward_packs:
+        # Mirrors the kernel assert (MXFP8 Q^T/K^T repack needs hp q/k, which
+        # the packs-only saved set dropped). The wrapper rejects the REQUESTED
+        # combination up front; this guards the resolved one.
+        raise RuntimeError(
+            "grad_dots='fp8_rownorm' is incompatible with save_backward_packs"
+        )
+    if varlen and mode != "bf16" and _resolve_backward_grad_dots is None:
+        raise RuntimeError(
+            "varlen (cu_seqlens) backward on a legacy sageattention fork is "
+            "only implemented on the hp ('bf16') path"
+        )
+    if out_zshd and mode == "fp4_rownorm":
+        # fp4_rownorm's along-D rownorm dO pack reads the contiguous
+        # [Z*H,Sq,D] layout only (kernel assert); fold the zshd [Z,Sq,H,D]
+        # grad/out up front with one transpose copy and run the
+        # standard-layout backward (bf16 and fp8_rownorm keep native zshd).
+        do = grad_out.permute(0, 2, 1, 3).reshape(z * h, s_q, d).contiguous()
+        o = out.permute(0, 2, 1, 3).reshape(z * h, s_q, d).contiguous()
+        zshd_bwd = False
+    elif out_zshd:
         do = grad_out
         o = out
+        zshd_bwd = True
     else:
         do = grad_out.reshape(z * h, s_q, d).contiguous()
         o = out.reshape(z * h, s_q, d).contiguous()
+        zshd_bwd = False
     if save_backward_packs:
         # HP q/k/v were intentionally not saved. _run_bwd does not dereference them
         # when LSE plus all deterministic forward packs are supplied; it only needs
@@ -545,11 +590,13 @@ def _flash_attention_train_bwd_op(
         query_bwd = query.reshape(z * h, s_q, d).contiguous()
         key_bwd = key.reshape(z * hk, s_kv, d).contiguous()
         value_bwd = value.reshape(z * hk, s_kv, d).contiguous()
-    if bf16_grad_dots and not save_backward_packs:
-        # HP-grad-dots backward: FP4 S/dP recomputes + bf16 grad GEMMs with exact
-        # operands (the SR knobs and dkdv_scratch_bf16 are moot here). dq/dk/dv
-        # come back FINAL — grad_out dtype and GQA dK/dV already group-reduced
-        # in-kernel — so the reduce/cast epilogue below is skipped.
+    if mode == "bf16":
+        # HP-grad-dots backward (the resolver already clamped "bf16" away from
+        # saved packs / GQA group > 8): FP4 S/dP recomputes + bf16 grad GEMMs
+        # with exact operands (the SR knobs and dkdv_scratch_bf16 are moot
+        # here). dq/dk/dv come back FINAL — grad_out dtype and GQA dK/dV
+        # already group-reduced in-kernel — so the reduce/cast epilogue below
+        # is skipped.
         dq, dk, dv = _run_bwd_hp(
             query_bwd,
             key_bwd,
@@ -566,8 +613,8 @@ def _flash_attention_train_bwd_op(
             scaling,
             causal,
             lse.reshape(z * h, s_q).contiguous(),
-            do_zshd=out_zshd,
-            o_zshd=out_zshd,
+            do_zshd=zshd_bwd,
+            o_zshd=zshd_bwd,
             out_dtype=grad_out.dtype,
             seq_arrays=seq_arrays,
         )
@@ -576,6 +623,14 @@ def _flash_attention_train_bwd_op(
             dk.reshape(z, hk, s_kv, d),
             dv.reshape(z, hk, s_kv, d),
         )
+    # FP4/FP8 grad-dot backward. ``grad_dots``/``seq_arrays`` exist only on the
+    # new fork (the resolver's presence implies them); a legacy fork can only
+    # reach here with mode "fp4_legacy" and seq_arrays None (raised above).
+    mode_kwargs = {}
+    if _resolve_backward_grad_dots is not None:
+        mode_kwargs["grad_dots"] = mode
+        if seq_arrays is not None:
+            mode_kwargs["seq_arrays"] = seq_arrays
     dq, dk, dv = _run_bwd(
         query_bwd,
         key_bwd,
@@ -611,8 +666,9 @@ def _flash_attention_train_bwd_op(
         vsc_saved=vdsc if vdsc.numel() else None,
         ktnv_saved=ktnv if ktnv.numel() else None,
         ktsc_saved=ktsc if ktsc.numel() else None,
-        do_zshd=out_zshd,
-        o_zshd=out_zshd,
+        do_zshd=zshd_bwd,
+        o_zshd=zshd_bwd,
+        **mode_kwargs,
     )
     dq = dq.reshape(z, h, s_q, d).to(grad_out.dtype).contiguous()
     ng = h // hk
@@ -659,7 +715,7 @@ def _(
     backward_dot_dv_sr: bool,
     backward_ds_dq_sr: bool,
     dkdv_scratch_bf16: bool,
-    bf16_grad_dots: bool,
+    grad_dots: str,
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -669,7 +725,7 @@ def _(
     del qnv, qsc, qtnv, qtsc, knv, ksc, vdnv, vdsc, ktnv, ktsc
     del scaling, causal, sr, save_backward_packs, out_zshd
     del backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr, dkdv_scratch_bf16
-    del bf16_grad_dots, block_m, block_n, num_warps, num_stages
+    del grad_dots, block_m, block_n, num_warps, num_stages
     # The real op returns CONTIGUOUS dq/dk/dv (reshape / GQA-reduce empty), even when
     # the q/k/v inputs are non-contiguous roped views — the fake must match strides.
     # Both backward flavors return these final [Z,(H|Hk),S,D] grads (the HP-grad-dots
@@ -752,7 +808,7 @@ def _flash_attention_train_backward(
         ctx.backward_dot_dv_sr,
         ctx.backward_ds_dq_sr,
         ctx.dkdv_scratch_bf16,
-        ctx.bf16_grad_dots,
+        ctx.grad_dots,
         block_m,
         block_n,
         num_warps,
@@ -784,6 +840,7 @@ def nvfp4_flash_attn_train_custom_op(
     backward_dot_dv_stochastic_rounding: bool | None = None,
     backward_ds_dq_stochastic_rounding: bool | None = None,
     dkdv_scratch_bf16: bool = False,
+    backward_grad_dots: str | None = None,
     backward_bf16_grad_dots: bool | None = None,
     save_backward_packs: bool = False,
     out_layout: str = "zhsd",
@@ -801,16 +858,25 @@ def nvfp4_flash_attn_train_custom_op(
     subgraph). All SR knobs are op arguments (so they survive compile/serialization);
     the bwd reuses the forward LSE and, when requested, the deterministic forward
     FP4 packs across the opaque boundary for short/mid static sequence lengths.
-    ``backward_bf16_grad_dots`` (None = auto: on whenever the saved-packs set is
-    absent) routes the backward through the HP-grad-dots ``_run_bwd_hp`` (bf16
-    grad GEMMs with exact operands — faster and more accurate; mutually exclusive
-    with saved packs, which force the legacy all-FP4 backward).
+    ``backward_grad_dots`` selects the backward grad-GEMM mode (the kernel's
+    BACKWARD GRAD-DOT MODES): "bf16" (hp grad GEMMs with exact operands; clamped
+    to "fp4_rownorm" against saved packs / GQA group > 8), "fp4_rownorm" (all-FP4
+    with row-RMS-normalized grad packs; hp-equal quality, faster from ~4k seq),
+    "fp8_rownorm" (MXFP8 grad operands; rejected with ``save_backward_packs``),
+    "fp4_legacy" (the original all-FP4 backward; honors the SR knobs), or
+    None = kernel AUTO ("bf16" below an effective sequence of 4096 — the mean
+    sample length under varlen — else "fp4_rownorm"). The op schema has no
+    Optional[str], so the EMPTY STRING is the "None/auto" sentinel across the
+    boundary; resolution happens in the backward op via the kernel's own
+    resolver, against the EFFECTIVE saved-packs decision (seq-length gated).
+    ``backward_bf16_grad_dots`` (bool) is a DEPRECATED alias: True -> "bf16",
+    False -> "fp4_legacy"; passing both raises.
     ``cu_seqlens`` (optional int ``[nseq+1]``, FA-varlen convention) runs PACKED
     sequences flattened into one Z=1 row as block-diagonal causal attention;
-    requires ``causal=True`` and the HP backward (``save_backward_packs`` /
-    ``backward_bf16_grad_dots=False`` are rejected, mirroring the kernel). The
-    op schema has no Optional[Tensor], so an EMPTY tensor is the "no
-    cu_seqlens" sentinel (same convention as ``key_pad_bias``).
+    requires ``causal=True`` and composes with every ``backward_grad_dots`` mode
+    (``save_backward_packs`` is rejected, mirroring the kernel). The op schema
+    has no Optional[Tensor], so an EMPTY tensor is the "no cu_seqlens" sentinel
+    (same convention as ``key_pad_bias``).
     ``out_layout="zshd"`` writes the HF attention layout directly.
     ``q_packs`` / ``k_packs`` (optional ``(packed u8, e4m3 scale)`` pairs in the
     along-D ``_quant_nvfp4`` layout, e.g. from the fused RoPE+quant producers)
@@ -820,6 +886,24 @@ def nvfp4_flash_attn_train_custom_op(
     """
     if out_layout not in ("zhsd", "zshd"):
         raise ValueError("out_layout must be 'zhsd' or 'zshd'")
+    if backward_bf16_grad_dots is not None:
+        if backward_grad_dots is not None:
+            raise ValueError(
+                "pass either backward_grad_dots or the deprecated "
+                "backward_bf16_grad_dots, not both"
+            )
+        backward_grad_dots = "bf16" if backward_bf16_grad_dots else "fp4_legacy"
+    if backward_grad_dots is not None and backward_grad_dots not in _GRAD_DOTS_MODES:
+        raise ValueError(
+            f"backward_grad_dots must be one of {_GRAD_DOTS_MODES} or None "
+            f"(auto), got {backward_grad_dots!r}"
+        )
+    if backward_grad_dots == "fp8_rownorm" and save_backward_packs:
+        raise ValueError(
+            "backward_grad_dots='fp8_rownorm' repacks Q^T/K^T as MXFP8; "
+            "incompatible with the saved forward FP4 transposed packs "
+            "(save_backward_packs)"
+        )
     if (q_packs is not None or k_packs is not None) and save_backward_packs:
         raise ValueError(
             "q_packs/k_packs are incompatible with save_backward_packs "
@@ -834,12 +918,8 @@ def nvfp4_flash_attn_train_custom_op(
         if save_backward_packs:
             raise ValueError(
                 "varlen (cu_seqlens) is incompatible with save_backward_packs "
-                "(legacy all-FP4 backward); use the default hp backward"
-            )
-        if backward_bf16_grad_dots is False:
-            raise ValueError(
-                "varlen (cu_seqlens) requires the hp (bf16-grad-dots) backward; "
-                "do not pass backward_bf16_grad_dots=False"
+                "(the forward saved-pack set is not varlen-aware); every "
+                "backward_grad_dots mode itself composes with varlen"
             )
     bias = (
         query.new_empty((0,), dtype=torch.float32)
@@ -878,12 +958,11 @@ def nvfp4_flash_attn_train_custom_op(
         if backward_ds_dq_stochastic_rounding is None
         else backward_ds_dq_stochastic_rounding
     )
-    # custom-op schemas have no Optional[bool]; encode the tri-state as an int
-    # (-1 auto, 0 force-legacy, 1 force-HP), resolved in setup_context where the
-    # EFFECTIVE saved-packs decision (incl. the seq-length gate) is known.
-    hp_grad_dots_code = (
-        -1 if backward_bf16_grad_dots is None else int(bool(backward_bf16_grad_dots))
-    )
+    # custom-op schemas have no Optional[str]; the EMPTY STRING is the
+    # "None = kernel AUTO" sentinel. Resolution happens in the backward op,
+    # where the EFFECTIVE saved-packs decision (incl. the seq-length gate) and
+    # the effective sequence (varlen mean sample length) are both known.
+    grad_dots_str = backward_grad_dots or ""
     out, *_aux = torch.ops.axolotl_nvfp4.flash_attention_train(
         query,
         key,
@@ -902,7 +981,7 @@ def nvfp4_flash_attn_train_custom_op(
         dot_dv,
         ds_dq,
         dkdv_scratch_bf16,
-        hp_grad_dots_code,
+        grad_dots_str,
         save_backward_packs,
         out_layout == "zshd",
         block_m,

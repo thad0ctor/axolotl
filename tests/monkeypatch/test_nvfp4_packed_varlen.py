@@ -13,8 +13,11 @@ one row (Z=1) with ``attention_mask=None`` and the sample boundaries encoded in
   * dense batches staying on the unchanged dense path;
   * unsupported packed layouts (multi-row batches) falling back to the original
     forward — never silently dense-attended;
-  * ``save_packs`` / forced-legacy configs being overridden (one-time INFO) for
-    packed batches, which require the HP-grad-dots backward;
+  * ``save_packs`` being overridden (one-time INFO) for packed batches (the
+    forward saved-pack set is not varlen-aware), while the configured
+    ``grad_dots`` mode passes through — every grad-GEMM mode composes with
+    varlen, and the default (None) defers to the kernel AUTO, which resolves
+    on the pack's MEAN SAMPLE LENGTH ("bf16" below 4096, else "fp4_rownorm");
   * the packed perf GATE (``packed_min_sample_len``): default 0 (gate off —
     the pre-packed training forward beats FA2-varlen at every measured packed
     mean) routes all packs to FP4 varlen; a positive threshold (legacy-fork
@@ -76,7 +79,7 @@ def _cos(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
-def _build_attn(seed=0):
+def _build_attn(seed=0, max_pos=1024):
     """Tiny Qwen3.5 full-attention layer (no download) + its rotary embedding."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -90,7 +93,7 @@ def _build_attn(seed=0):
         num_attention_heads=HEADS,
         num_key_value_heads=KV,
         head_dim=D,
-        max_position_embeddings=1024,
+        max_position_embeddings=max_pos,
         attention_dropout=0.0,
         attention_bias=False,
     )
@@ -288,30 +291,155 @@ def test_packed_routing_cu_seqlens_reaches_kernel(monkeypatch):
     assert torch.isfinite(out2).all()
 
 
-def test_packed_save_packs_config_forced_hp_one_time_log(caplog):
-    """save_packs / forced-legacy config + packed batch: runs (no crash) on the
-    forced HP backward and logs a one-time INFO."""
+def test_packed_save_packs_config_ignored_one_time_log(caplog):
+    """save_packs config + packed batch: runs (no crash) with the saved-pack
+    set forced off and logs a one-time INFO; the configured grad_dots mode
+    (here the legacy all-FP4 backward, which now composes with varlen) still
+    applies."""
     attn, rot, cfg = _build_attn(seed=4)
     patch_qwen3_5_nvfp4_attention(
         attn,
         train_backward=True,
         save_backward_packs=True,
-        bf16_grad_dots=False,  # forced-legacy: also inapplicable to packed
+        grad_dots="fp4_legacy",  # composes with varlen; only save_packs is forced
         packed_min_sample_len=0,
     )
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=4)
 
-    patch_mod._PACKED_FORCED_HP_LOGGED = False
-    msg = "packed (varlen) batches require the HP-grad-dots backward"
+    patch_mod._PACKED_SAVE_PACKS_LOGGED = False
+    msg = "ignoring attention.backward.save_packs"
     with caplog.at_level(logging.INFO, logger=patch_mod.LOG.name):
         out, grad = _run_patched(attn, rot, hs0, pos, w)
         assert torch.isfinite(out).all() and torch.isfinite(grad).all()
         first = sum(msg in r.getMessage() for r in caplog.records)
-        assert first == 1, f"expected exactly one forced-HP INFO, got {first}"
+        assert first == 1, f"expected exactly one save_packs INFO, got {first}"
         # Second packed step: no duplicate log.
         _run_patched(attn, rot, hs0, pos, w)
         total = sum(msg in r.getMessage() for r in caplog.records)
-        assert total == 1, f"forced-HP INFO logged {total} times, expected 1"
+        assert total == 1, f"save_packs INFO logged {total} times, expected 1"
+
+
+def test_packed_default_auto_short_mean_uses_hp_backward(monkeypatch):
+    """The packed default (grad_dots=None) no longer forces a mode: the patch
+    passes None through and the KERNEL AUTO decides from the pack's mean
+    sample length — ~85 here, far below the 4096 crossover, so the backward
+    must route through the hp ('bf16') ``_run_bwd_hp`` path."""
+    if not patch_mod._TRAIN_GRAD_DOTS:
+        pytest.skip("installed sageattention fork lacks backward_grad_dots")
+    import sageattention.nvfp4.flash as sage_flash
+
+    attn, rot, cfg = _build_attn(seed=11)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=0
+    )
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=11)
+
+    hp_calls = []
+    real_hp = sage_flash._run_bwd_hp
+
+    def spy_hp(*args, **kwargs):
+        hp_calls.append(1)
+        return real_hp(*args, **kwargs)
+
+    monkeypatch.setattr(sage_flash, "_run_bwd_hp", spy_hp)
+
+    seen_modes = []
+    real = patch_mod.nvfp4_flash_attn_func
+
+    def spy(*args, **kwargs):
+        seen_modes.append(kwargs.get("backward_grad_dots", "MISSING"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "nvfp4_flash_attn_func", spy)
+
+    out, grad = _run_patched(attn, rot, hs0, pos, w)
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    assert seen_modes == [None], (
+        "packed branch must pass the CONFIGURED grad_dots (None = kernel "
+        f"AUTO) instead of forcing a mode, got {seen_modes}"
+    )
+    assert hp_calls, "kernel AUTO at mean ~85 must resolve to the hp backward"
+
+
+def test_packed_explicit_grad_dots_mode_passes_through(monkeypatch):
+    """An explicit grad_dots config applies to packed batches too: the mode
+    reaches the kernel entry and the matching grad-GEMM backward runs."""
+    if not patch_mod._TRAIN_GRAD_DOTS:
+        pytest.skip("installed sageattention fork lacks backward_grad_dots")
+    import sageattention.nvfp4.flash as sage_flash
+
+    attn, rot, cfg = _build_attn(seed=12)
+    patch_qwen3_5_nvfp4_attention(
+        attn,
+        train_backward=True,
+        grad_dots="fp4_rownorm",
+        packed_min_sample_len=0,
+    )
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=12)
+
+    bwd_modes = []
+    real_bwd = sage_flash._run_bwd
+
+    def spy_bwd(*args, **kwargs):
+        bwd_modes.append(kwargs.get("grad_dots"))
+        return real_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(sage_flash, "_run_bwd", spy_bwd)
+
+    seen_modes = []
+    real = patch_mod.nvfp4_flash_attn_func
+
+    def spy(*args, **kwargs):
+        seen_modes.append(kwargs.get("backward_grad_dots", "MISSING"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "nvfp4_flash_attn_func", spy)
+
+    out, grad = _run_patched(attn, rot, hs0, pos, w)
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    assert seen_modes == ["fp4_rownorm"]
+    assert bwd_modes == ["fp4_rownorm"], (
+        f"configured fp4_rownorm must reach _run_bwd, got {bwd_modes}"
+    )
+
+
+def test_packed_32k_mean_auto_routes_fp4_rownorm_parity(monkeypatch):
+    """A 32k-mean pack (2 x 32768) with the default grad_dots (None): the
+    kernel AUTO resolves to 'fp4_rownorm' (mean >= the 4096 crossover) and the
+    grads still match the per-sample SDPA reference (cos > 0.95)."""
+    if not patch_mod._TRAIN_GRAD_DOTS:
+        pytest.skip("installed sageattention fork lacks backward_grad_dots")
+    import sageattention.nvfp4.flash as sage_flash
+
+    lens = [32768, 32768]
+    attn, rot, cfg = _build_attn(seed=13, max_pos=65536)
+    orig_forward = type(attn).forward
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=13, lens=lens)
+    ref_out, ref_grad = _per_sample_reference(
+        attn, orig_forward, rot, hs0, w, lens=lens
+    )
+
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=0
+    )
+    bwd_modes = []
+    real_bwd = sage_flash._run_bwd
+
+    def spy_bwd(*args, **kwargs):
+        bwd_modes.append(kwargs.get("grad_dots"))
+        return real_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(sage_flash, "_run_bwd", spy_bwd)
+
+    out, grad = _run_patched(attn, rot, hs0, pos, w)
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    assert bwd_modes == ["fp4_rownorm"], (
+        "kernel AUTO at mean 32768 must resolve to fp4_rownorm, got "
+        f"{bwd_modes}"
+    )
+    cf, cg = _cos(out, ref_out), _cos(grad, ref_grad)
+    assert cf > FWD_COS, f"32k-mean packed fwd cos={cf:.4f} <= {FWD_COS}"
+    assert cg > GRAD_COS, f"32k-mean packed grad cos={cg:.4f} <= {GRAD_COS}"
 
 
 def test_qwen3_vl_packed_falls_back_to_original_forward(monkeypatch):
@@ -608,8 +736,12 @@ def test_packed_grad_uses_prepacked_qk(monkeypatch):
     assert quant_calls[0] == (KV, S, D)  # V [Z*Hk, Skv, D] (key-axis quant)
 
 
-def test_custom_op_wrapper_rejects_varlen_legacy_combos():
-    """The custom-op wrapper mirrors the kernel's varlen knob rejections."""
+def test_custom_op_wrapper_rejects_invalid_combos():
+    """The custom-op wrapper mirrors the kernel's knob rejections. Varlen now
+    composes with EVERY grad_dots mode (the old bf16-only restriction is
+    gone); only save_backward_packs and non-causal remain rejected, plus the
+    grad_dots-level conflicts (fp8_rownorm + saved packs, both knobs set,
+    unknown mode)."""
     from axolotl.kernels.attn_nvfp4_custom_op import nvfp4_flash_attn_train_custom_op
 
     q = torch.randn(1, HEADS, 64, D, device="cuda", dtype=torch.bfloat16)
@@ -621,12 +753,30 @@ def test_custom_op_wrapper_rejects_varlen_legacy_combos():
         nvfp4_flash_attn_train_custom_op(
             q, k, v, D**-0.5, **common, save_backward_packs=True
         )
-    with pytest.raises(ValueError, match="bf16-grad-dots"):
-        nvfp4_flash_attn_train_custom_op(
-            q, k, v, D**-0.5, **common, backward_bf16_grad_dots=False
-        )
     with pytest.raises(ValueError, match="causal"):
         nvfp4_flash_attn_train_custom_op(
             q, k, v, D**-0.5, causal=False,
             num_key_value_groups=HEADS // KV, cu_seqlens=cu,
         )
+    dense = dict(causal=True, num_key_value_groups=HEADS // KV)
+    with pytest.raises(ValueError, match="fp8_rownorm"):
+        nvfp4_flash_attn_train_custom_op(
+            q, k, v, D**-0.5, **dense,
+            backward_grad_dots="fp8_rownorm", save_backward_packs=True,
+        )
+    with pytest.raises(ValueError, match="not both"):
+        nvfp4_flash_attn_train_custom_op(
+            q, k, v, D**-0.5, **dense,
+            backward_grad_dots="bf16", backward_bf16_grad_dots=True,
+        )
+    with pytest.raises(ValueError, match="must be one of"):
+        nvfp4_flash_attn_train_custom_op(
+            q, k, v, D**-0.5, **dense, backward_grad_dots="fp16"
+        )
+    # Varlen + the legacy all-FP4 mode now RUNS (block-diagonal grads finite).
+    ql = q.clone().requires_grad_(True)
+    out = nvfp4_flash_attn_train_custom_op(
+        ql, k, v, D**-0.5, **common, backward_grad_dots="fp4_legacy"
+    )
+    out.float().sum().backward()
+    assert torch.isfinite(ql.grad).all()
