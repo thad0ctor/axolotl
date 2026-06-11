@@ -90,18 +90,27 @@ def _build_residual(
     ``None`` selects the plain SVD. All math in fp32; factors returned in fp32
     (the caller casts to the head dtype).
     """
+    # Randomized svd_lowrank (q = 4k oversampling, niter=4): only the top-k
+    # (k<=64) subspace is consumed, and a FULL svd of a 9B head's error matrix
+    # ([248320, 4096] fp32) transiently allocates ~15 GiB (Ef + U + Vt +
+    # cusolver workspace; measured as a 41-vs-28 GiB load-time spike that
+    # inflated benchmark peaks and can OOM tight long-context loads), while
+    # the randomized projection's transients are ~tens of MiB beyond Ef.
     Ef = E.float()
     k = min(rank, min(Ef.shape))
+    q = min(max(4 * k, 64), min(Ef.shape))
     if g is None:
-        U, S, Vt = torch.linalg.svd(Ef, full_matrices=False)
+        U, S, V = torch.svd_lowrank(Ef, q=q, niter=4)
         A = U[:, :k] * S[:k].unsqueeze(0)
-        B = Vt[:k]
+        B = V[:, :k].t().contiguous()
     else:
         gf = g.float().clamp_min(1e-8)
-        Ew = Ef * gf.unsqueeze(0)
-        Uw, Sw, Vwt = torch.linalg.svd(Ew, full_matrices=False)
+        # in-place: Ef is this function's private fp32 copy and is not needed
+        # unweighted in this branch — saves a second [V, H] fp32 plane
+        Ew = Ef.mul_(gf.unsqueeze(0))
+        Uw, Sw, Vw = torch.svd_lowrank(Ew, q=q, niter=4)
         A = Uw[:, :k] * Sw[:k].unsqueeze(0)
-        B = Vwt[:k] / gf.unsqueeze(0)
+        B = Vw[:, :k].t() / gf.unsqueeze(0)
     return A.contiguous(), B.contiguous()
 
 
