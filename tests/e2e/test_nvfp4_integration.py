@@ -281,6 +281,7 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
                 "enabled": True,
                 "fuse_vproj": True,
                 "fp4_projections": True,
+                "packed_min_sample_len": 256,
                 "backward": {
                     "enabled": True,
                     "rtn_grad_packs": True,
@@ -295,10 +296,38 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
     )
     a = cfg.nvfp4_training.attention
     assert a.enabled is True and a.fuse_vproj is True and a.fp4_projections is True
+    assert a.packed_min_sample_len == 256
     assert a.backward.enabled is True and a.backward.rtn_grad_packs is True
     assert a.backward.save_packs is True and a.backward.dkdv_scratch_bf16 is True
     assert cfg.nvfp4_training.linear_attn is True and cfg.nvfp4_training.mlp is True
     assert cfg.nvfp4_training.fla_causal_conv_compile_boundary is True
+
+
+def test_schema_packed_min_sample_len_default_and_bounds(monkeypatch):
+    """Packed perf gate knob: defaults to 1024, accepts 0 (gate off), rejects
+    negatives."""
+    _supported(monkeypatch, True)
+    base = {**BASE, "model_config_type": "qwen3_5"}
+    cfg = AxolotlInputConfig(
+        **base, nvfp4_training={"enabled": True, "attention": {"enabled": True}}
+    )
+    assert cfg.nvfp4_training.attention.packed_min_sample_len == 1024
+    cfg0 = AxolotlInputConfig(
+        **base,
+        nvfp4_training={
+            "enabled": True,
+            "attention": {"enabled": True, "packed_min_sample_len": 0},
+        },
+    )
+    assert cfg0.nvfp4_training.attention.packed_min_sample_len == 0
+    with pytest.raises(ValueError):
+        AxolotlInputConfig(
+            **base,
+            nvfp4_training={
+                "enabled": True,
+                "attention": {"enabled": True, "packed_min_sample_len": -1},
+            },
+        )
 
 
 def test_schema_migrates_legacy_attention_flags(monkeypatch):

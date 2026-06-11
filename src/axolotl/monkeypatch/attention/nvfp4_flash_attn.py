@@ -57,6 +57,25 @@ _BLOCK_N = 128
 _FUSE_VPROJ = False
 _CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
 
+# Packed-batch auto-gate default (see nvfp4_training.attention.packed_min_sample_len):
+# below this MEAN sample length the FP4 quant prologue (linear in tokens) outweighs
+# the collapsed attention math, so the original FA2-varlen forward is strictly faster.
+_PACKED_MIN_SAMPLE_LEN_DEFAULT = 1024
+
+# Whether the installed sageattention fork's packed-operand forward accepts
+# cu_seqlens (varlen): lets the NO-GRAD packed path reuse the fused producers
+# (RoPE+quant one pass) instead of materializing roped Q/K and re-reading them
+# in the kernel's own pre-quant. Detected once at import.
+try:
+    import inspect as _inspect
+
+    _PACKED_FWD_VARLEN = (
+        "cu_seqlens"
+        in _inspect.signature(nvfp4_flash_attention_packed).parameters
+    )
+except (TypeError, ValueError):  # pragma: no cover - exotic callables
+    _PACKED_FWD_VARLEN = False
+
 
 def _custom_op_enabled(module: nn.Module) -> bool:
     requested = getattr(module, "_nvfp4_compile_custom_op", False) or os.environ.get(
@@ -149,39 +168,46 @@ def _mask_is_dense_causal_or_full(
 _PACKED_INFO_ATTR = "_nvfp4_packed_info"
 _PACKED_FALLBACK_LOGGED = False
 _PACKED_FORCED_HP_LOGGED = False
+_PACKED_GATE_LOGGED = False
 
 
 def _compute_packed_info(
     position_ids: torch.Tensor, q_len: int
-) -> tuple[str | None, torch.Tensor | None]:
-    """Classify position_ids: (None, None) -> not packed (plain dense batch);
-    ("packed", cu_seqlens) -> Z=1 flattened pack the varlen kernel can serve;
-    ("fallback", None) -> packed but unsupported (e.g. Z>1) — the caller MUST
-    fall back to the original forward (never dense-attend a packed batch)."""
+) -> tuple[str | None, torch.Tensor | None, float | None]:
+    """Classify position_ids: (None, None, None) -> not packed (plain dense batch);
+    ("packed", cu_seqlens, mean_sample_len) -> Z=1 flattened pack the varlen
+    kernel can serve (mean_sample_len = q_len / n_samples feeds the perf gate);
+    ("fallback", None, None) -> packed but unsupported (e.g. Z>1) — the caller
+    MUST fall back to the original forward (never dense-attend a packed batch)."""
     pos = position_ids[0] if position_ids.ndim == 3 else position_ids
     if pos.ndim == 1:
         pos = pos.unsqueeze(0)
     if pos.ndim != 2 or pos.shape[-1] != q_len:
-        return (None, None)
+        return (None, None, None)
     b = pos.shape[0]
     n_starts = int((pos == 0).sum())
     if n_starts <= b:
-        return (None, None)  # at most one sample per row -> plain dense causal
+        return (None, None, None)  # at most one sample per row -> dense causal
     if b != 1 or not bool(pos[0, 0] == 0) or _varlen_seq_arrays is None:
         # Packed, but not the Z=1 flattened layout the varlen kernel requires
         # (or the installed sageattention fork predates varlen support).
-        return ("fallback", None)
+        return ("fallback", None, None)
     from axolotl.monkeypatch.models.qwen3_5.modeling import get_cu_seqlens
 
-    return ("packed", get_cu_seqlens(position_ids))
+    cu_seqlens = get_cu_seqlens(position_ids)
+    # Mean sample length of the pack — pure tensor-metadata arithmetic (numel),
+    # no device sync; cached with cu_seqlens so the per-step gate decision costs
+    # nothing per layer.
+    mean_len = q_len / max(int(cu_seqlens.numel()) - 1, 1)
+    return ("packed", cu_seqlens, mean_len)
 
 
 def _packed_position_ids_info(
     position_ids: torch.Tensor | None, q_len: int
-) -> tuple[str | None, torch.Tensor | None]:
+) -> tuple[str | None, torch.Tensor | None, float | None]:
     """Cached wrapper around ``_compute_packed_info`` (see block comment above)."""
     if position_ids is None:
-        return (None, None)
+        return (None, None, None)
     ckey = (q_len, tuple(position_ids.shape), position_ids._version)
     cached = getattr(position_ids, _PACKED_INFO_ATTR, None)
     if cached is not None and cached[0] == ckey:
@@ -202,6 +228,32 @@ def _log_packed_fallback_once() -> None:
             "nvfp4 attention: packed batch in an unsupported layout (multi-row "
             "batch or legacy sageattention fork without varlen); falling back to "
             "the model's original attention for packed batches"
+        )
+
+
+def _log_packed_gate_once(mean_len: float, min_len: int, use_fp4: bool) -> None:
+    """One-time INFO stating which way the packed perf gate resolved."""
+    global _PACKED_GATE_LOGGED
+    if _PACKED_GATE_LOGGED:
+        return
+    _PACKED_GATE_LOGGED = True
+    if use_fp4:
+        LOG.info(
+            "nvfp4 attention: packed-batch gate -> FP4 varlen attention "
+            "(measured mean sample length %.1f >= packed_min_sample_len %d)",
+            mean_len,
+            min_len,
+        )
+    else:
+        LOG.info(
+            "nvfp4 attention: packed-batch gate -> original attention "
+            "(measured mean sample length %.1f < packed_min_sample_len %d; "
+            "at short mean sample lengths the FP4 quant prologue, linear in "
+            "tokens, outweighs the collapsed attention math, so FA2-varlen is "
+            "strictly faster — set "
+            "nvfp4_training.attention.packed_min_sample_len: 0 to force FP4)",
+            mean_len,
+            min_len,
         )
 
 
@@ -422,10 +474,36 @@ def make_nvfp4_forward(orig_forward):
                 # Sample-packed (multipack) batches arrive mask-less with the
                 # boundaries in position_ids — the decoder layer (stock and the
                 # axolotl packing patch alike) forwards position_ids in kwargs.
-                pkind, cu_seqlens = _packed_position_ids_info(
+                pkind, cu_seqlens, mean_len = _packed_position_ids_info(
                     kwargs.get("position_ids"), q_len
                 )
                 if pkind == "packed":
+                    # PERF GATE: with short samples nothing quadratic is left
+                    # for FP4 to win (varlen work ~ sum(s_i^2)) while its quant
+                    # prologue stays linear in tokens, so FA2-varlen is strictly
+                    # faster (measured at packed 8192 / ~250-token samples:
+                    # FP4 fwd 0.53ms vs FA2 0.17ms). Route short-mean packs to
+                    # the original forward. The decision input (mean_len) is
+                    # cached with cu_seqlens on the position_ids tensor: per
+                    # step, not per layer, and it applies identically to the
+                    # grad / no-grad / compiled sub-paths below (the routing
+                    # happens here, before any of them).
+                    min_len = getattr(
+                        self,
+                        "_nvfp4_packed_min_sample_len",
+                        _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+                    )
+                    if min_len > 0 and mean_len < min_len:
+                        _log_packed_gate_once(mean_len, min_len, use_fp4=False)
+                        return orig_forward(
+                            self,
+                            hidden_states,
+                            position_embeddings,
+                            attention_mask,
+                            past_key_values,
+                            **kwargs,
+                        )
+                    _log_packed_gate_once(mean_len, min_len, use_fp4=True)
                     kind = "packed"
                 elif pkind == "fallback":
                     # Packed but in a layout varlen can't serve: NEVER dense-
@@ -488,6 +566,54 @@ def make_nvfp4_forward(orig_forward):
                     past_key_values,
                     **kwargs,
                 )
+            if (
+                not grad_enabled
+                and past_key_values is None
+                and _PACKED_FWD_VARLEN
+                and not _custom_op_enabled(self)
+            ):
+                # No-grad packed prefill/eval, varlen-capable packed-operand
+                # forward available: feed it from the FUSED PRODUCERS — RoPE +
+                # NVFP4 pack of Q/K in one pass (no roped bf16 Q/K HBM
+                # materialization + kernel pre-quant re-read), V key-axis packed
+                # directly. The producers need no varlen awareness (quant is
+                # per-token along D; V's key-axis groups match the in-kernel
+                # quant layout exactly) — only the consumer takes cu_seqlens.
+                # The TRAINING path below keeps standalone quant: the HP
+                # backward needs high-precision roped q/k/v anyway.
+                value_states = (
+                    self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                )
+                qnv, qsc = fused_rope_quant_qk(query_states, cos, sin)
+                knv, ksc = fused_rope_quant_qk(key_states, cos, sin)
+                vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
+                z_p, h_p, _, d_p = query_states.shape
+                attn_output = nvfp4_flash_attention_packed(
+                    qnv,
+                    qsc,
+                    knv,
+                    ksc,
+                    vnv,
+                    vsc,
+                    z=z_p,
+                    h=h_p,
+                    hk=key_states.shape[1],
+                    s_q=q_len,
+                    s_kv=q_len,
+                    d=d_p,
+                    scaling=self.scaling,
+                    out_dtype=query_states.dtype,
+                    causal=True,
+                    cu_seqlens=cu_seqlens,
+                    block_n=_BLOCK_N,
+                    out_layout="zshd",
+                )  # [Z, S, H, D]
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output = attn_output * torch.sigmoid(gate)
+                if use_fp4_o:
+                    return _nvfp4_o_proj(self, attn_output), None
+                return self.o_proj(attn_output), None
+
             from transformers.models.qwen3_5.modeling_qwen3_5 import (
                 apply_rotary_pos_emb,
             )
@@ -545,8 +671,9 @@ def make_nvfp4_forward(orig_forward):
                     backward_bf16_grad_dots=True,
                 ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
             else:
-                # No-grad eval/prefill: same varlen kernel, forward-only entry
-                # (skips the autograd Function's LSE/ctx bookkeeping).
+                # No-grad eval/prefill on a legacy fork (packed-operand forward
+                # without cu_seqlens) or with a cache to fill: same varlen
+                # kernel, forward-only entry with in-kernel quant.
                 attn_output = nvfp4_flash_attention(
                     query_roped,
                     key_roped,
@@ -712,6 +839,7 @@ def patch_qwen3_5_nvfp4_attention(
     bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
+    packed_min_sample_len: int = _PACKED_MIN_SAMPLE_LEN_DEFAULT,
 ) -> int:
     """Patch every Qwen3.5 FULL-attention layer's forward to use NVFP4 attention.
 
@@ -722,6 +850,12 @@ def patch_qwen3_5_nvfp4_attention(
     epilogue (no bf16 V / transpose / standalone quant). Faster V producer at a
     small parity cost (v_proj goes FP4); only active on the no-grad cache-free
     prefill path and only for plain ``nn.Linear`` v_proj modules.
+
+    ``packed_min_sample_len``: packed-batch perf gate — packs whose MEAN sample
+    length is below this keep the model's original (FA2-varlen) forward, which
+    is strictly faster there (the FP4 quant prologue is linear in tokens while
+    varlen attention leaves nothing quadratic to win). 0 disables the gate
+    (packed batches always use FP4 varlen); a very large value never does.
     """
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
@@ -751,6 +885,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_bf16_grad_dots = bf16_grad_dots
                 module._nvfp4_compile_custom_op = compile_custom_op
                 module._nvfp4_stochastic_rounding = stochastic_rounding
+                module._nvfp4_packed_min_sample_len = packed_min_sample_len
                 module._nvfp4_fuse_attn_proj = fuse_attn_proj
                 module._nvfp4_attn_proj_ok = (
                     _attn_proj_ok(module) if fuse_attn_proj else False
@@ -769,6 +904,7 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_bf16_grad_dots = bf16_grad_dots
             module._nvfp4_compile_custom_op = compile_custom_op
             module._nvfp4_stochastic_rounding = stochastic_rounding
+            module._nvfp4_packed_min_sample_len = packed_min_sample_len
             module._nvfp4_fuse_attn_proj = fuse_attn_proj
             module._nvfp4_attn_proj_ok = (
                 _attn_proj_ok(module) if fuse_attn_proj else False
@@ -778,7 +914,7 @@ def patch_qwen3_5_nvfp4_attention(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
         "save_backward_packs=%s, dkdv_scratch_bf16=%s, bf16_grad_dots=%s, "
-        "compile_custom_op=%s)",
+        "compile_custom_op=%s, packed_min_sample_len=%s)",
         patched,
         fuse_vproj,
         train_backward,
@@ -787,5 +923,6 @@ def patch_qwen3_5_nvfp4_attention(
         dkdv_scratch_bf16,
         bf16_grad_dots,
         compile_custom_op,
+        packed_min_sample_len,
     )
     return patched

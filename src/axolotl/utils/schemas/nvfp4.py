@@ -294,6 +294,24 @@ class NVFP4AttentionConfig(BaseModel):
             "default; plain-nn.Linear only."
         },
     )
+    packed_min_sample_len: int = Field(
+        default=1024,
+        ge=0,
+        json_schema_extra={
+            "description": "Packed-batch (multipack) perf gate: packs whose MEAN "
+            "sample length (pack tokens / number of samples) is below this keep "
+            "the model's original FA2-varlen attention; at/above it they use FP4 "
+            "varlen attention. Rationale: varlen attention work scales with "
+            "sum(s_i^2), so short samples leave nothing quadratic for FP4 to "
+            "win, while its quant prologue (3 Q/K/V HBM round-trips + quant ALU) "
+            "stays linear in tokens — measured at packed 8192 with ~250-token "
+            "samples: FP4 varlen forward 0.53ms vs FA2-varlen 0.17ms per call "
+            "(backward at parity, fwd+bwd 1.43ms vs 1.25ms). FP4 attention wins "
+            "at long effective lengths (dense d256: 1.02x at 2k, 1.21x at 4k vs "
+            "SDPA), hence the 1024 default. 0 = always use FP4 varlen for "
+            "packed batches; a very large value = never."
+        },
+    )
     backward: NVFP4AttentionBackwardConfig = Field(
         default_factory=NVFP4AttentionBackwardConfig,
         json_schema_extra={"description": "Native-NVFP4 attention training settings."},

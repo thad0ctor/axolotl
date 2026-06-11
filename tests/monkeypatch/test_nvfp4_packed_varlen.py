@@ -14,7 +14,18 @@ one row (Z=1) with ``attention_mask=None`` and the sample boundaries encoded in
   * unsupported packed layouts (multi-row batches) falling back to the original
     forward — never silently dense-attended;
   * ``save_packs`` / forced-legacy configs being overridden (one-time INFO) for
-    packed batches, which require the HP-grad-dots backward.
+    packed batches, which require the HP-grad-dots backward;
+  * the packed perf GATE (``packed_min_sample_len``): short-mean packs keep the
+    model's original (FA2-varlen) forward — strictly faster there — while long
+    means / gate-off (0) use FP4 varlen; the decision is computed once per step
+    (cached with cu_seqlens on the position_ids tensor) and applies to grad,
+    no-grad and compiled sub-paths alike;
+  * the NO-GRAD packed path feeding the varlen-capable packed-operand forward
+    from the fused producers (RoPE+quant one pass, no roped Q/K round-trip).
+
+NOTE: parity/routing tests pass ``packed_min_sample_len=0`` — the test pack's
+mean sample length (256/3 ~ 85) is far below the 1024 default, which would
+(correctly) gate them onto the original forward instead of FP4 varlen.
 """
 
 import logging
@@ -136,22 +147,28 @@ def _run_patched(attn, rot, hs0, pos, w):
 def test_compute_packed_info_classification():
     """position_ids classification: packed / dense / unsupported layouts."""
     pos_packed = torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2, 3]])
-    kind, cu = _compute_packed_info(pos_packed, 9)
+    kind, cu, mean_len = _compute_packed_info(pos_packed, 9)
     assert kind == "packed"
     assert cu.tolist() == [0, 3, 5, 9]
+    assert mean_len == pytest.approx(3.0)  # 9 tokens / 3 samples
     # MRoPE [axes, B, T] layout classifies identically.
-    kind3, cu3 = _compute_packed_info(pos_packed[None].expand(3, 1, 9), 9)
+    kind3, cu3, mean3 = _compute_packed_info(pos_packed[None].expand(3, 1, 9), 9)
     assert kind3 == "packed" and cu3.tolist() == [0, 3, 5, 9]
+    assert mean3 == pytest.approx(3.0)
     # Single contiguous sample -> not packed.
-    assert _compute_packed_info(torch.arange(9).unsqueeze(0), 9) == (None, None)
+    assert _compute_packed_info(torch.arange(9).unsqueeze(0), 9) == (
+        None,
+        None,
+        None,
+    )
     # Plain B>1 batch (one sample per row) -> not packed.
     pos_b2 = torch.arange(4).unsqueeze(0).repeat(2, 1)
-    assert _compute_packed_info(pos_b2, 4) == (None, None)
+    assert _compute_packed_info(pos_b2, 4) == (None, None, None)
     # Multi-row pack: packed but unsupported by the Z=1 varlen kernel.
     pos_multi = torch.tensor([[0, 1, 2, 0, 1], [0, 1, 2, 3, 4]])
-    assert _compute_packed_info(pos_multi, 5) == ("fallback", None)
+    assert _compute_packed_info(pos_multi, 5) == ("fallback", None, None)
     # seq-length mismatch (e.g. cached decode) -> not classified.
-    assert _compute_packed_info(pos_packed, 5) == (None, None)
+    assert _compute_packed_info(pos_packed, 5) == (None, None, None)
 
 
 def test_packed_parity_eager():
@@ -162,14 +179,20 @@ def test_packed_parity_eager():
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=1)
     ref_out, ref_grad = _per_sample_reference(attn, orig_forward, rot, hs0, w)
 
-    assert patch_qwen3_5_nvfp4_attention(attn, train_backward=True) == 1
+    assert (
+        patch_qwen3_5_nvfp4_attention(
+            attn, train_backward=True, packed_min_sample_len=0
+        )
+        == 1
+    )
     out, grad = _run_patched(attn, rot, hs0, pos, w)
     assert torch.isfinite(out).all() and torch.isfinite(grad).all()
     cf, cg = _cos(out, ref_out), _cos(grad, ref_grad)
     assert cf > FWD_COS, f"packed eager fwd cos={cf:.4f} <= {FWD_COS}"
     assert cg > GRAD_COS, f"packed eager grad cos={cg:.4f} <= {GRAD_COS}"
 
-    # No-grad/eval prefill takes the same varlen kernel (forward-only entry).
+    # No-grad/eval prefill takes the varlen kernel too (fused-producer packed
+    # forward when the fork supports it, else the forward-only entry).
     with torch.no_grad():
         out_ng, _ = attn(
             hidden_states=hs0,
@@ -189,7 +212,9 @@ def test_packed_parity_compiled_custom_op():
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=2)
     ref_out, ref_grad = _per_sample_reference(attn, orig_forward, rot, hs0, w)
 
-    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, compile_custom_op=True)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, compile_custom_op=True, packed_min_sample_len=0
+    )
     torch._dynamo.reset()
 
     def fn(hs):
@@ -215,7 +240,9 @@ def test_packed_routing_cu_seqlens_reaches_kernel(monkeypatch):
     """Packed batch -> kernel gets cu_seqlens; dense batch -> dense path
     unchanged (no cu_seqlens); multi-row pack -> original forward (no kernel)."""
     attn, rot, cfg = _build_attn(seed=3)
-    patch_qwen3_5_nvfp4_attention(attn, train_backward=True)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=0
+    )
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=3)
 
     calls = []
@@ -267,6 +294,7 @@ def test_packed_save_packs_config_forced_hp_one_time_log(caplog):
         train_backward=True,
         save_backward_packs=True,
         bf16_grad_dots=False,  # forced-legacy: also inapplicable to packed
+        packed_min_sample_len=0,
     )
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=4)
 
@@ -346,6 +374,168 @@ def test_qwen3_vl_packed_falls_back_to_original_forward(monkeypatch):
     )
     assert len(calls) == 1
     assert torch.isfinite(out2).all()
+
+
+# ---------------------------------------------------------------------------
+# Packed perf gate (packed_min_sample_len).
+# ---------------------------------------------------------------------------
+def _spy_fp4_entrypoints(monkeypatch):
+    """Spy on every FP4 attention entry the packed branch can take; returns the
+    call list (any entry hit appends its name)."""
+    calls = []
+    for name in (
+        "nvfp4_flash_attn_func",
+        "nvfp4_flash_attention",
+        "nvfp4_flash_attention_packed",
+    ):
+        real = getattr(patch_mod, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            calls.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(patch_mod, name, spy)
+    return calls
+
+
+def test_packed_gate_default_routes_short_packs_to_original(monkeypatch, caplog):
+    """Default gate (1024): the test pack's mean sample length (~85) is short,
+    so grad AND no-grad steps must use the ORIGINAL forward (no FP4 entrypoint)
+    with a one-time INFO stating the resolution and the measured mean."""
+    attn, rot, cfg = _build_attn(seed=6)
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True)  # default gate
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=6)
+    calls = _spy_fp4_entrypoints(monkeypatch)
+
+    patch_mod._PACKED_GATE_LOGGED = False
+    msg = "packed-batch gate -> original attention"
+    with caplog.at_level(logging.INFO, logger=patch_mod.LOG.name):
+        out, grad = _run_patched(attn, rot, hs0, pos, w)  # grad path
+        with torch.no_grad():  # no-grad path
+            out_ng, _ = attn(
+                hidden_states=hs0,
+                position_embeddings=_cos_sin(rot, hs0, pos),
+                attention_mask=None,
+                position_ids=pos,
+            )
+        n_logs = sum(msg in r.getMessage() for r in caplog.records)
+    assert calls == [], f"gated-out pack hit FP4 entrypoints: {calls}"
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    assert torch.isfinite(out_ng).all()
+    assert n_logs == 1, f"expected exactly one gate INFO, got {n_logs}"
+    assert any(
+        msg in r.getMessage() and "85.3" in r.getMessage() for r in caplog.records
+    ), "gate INFO must state the measured mean sample length"
+
+
+@pytest.mark.parametrize(
+    "min_len,expect_fp4",
+    [
+        (0, True),  # 0 disables the gate: always FP4 varlen
+        (64, True),  # mean ~85 >= 64: FP4 varlen
+        (86, False),  # mean ~85 < 86: original forward
+        (10**9, False),  # huge: never FP4 for packed batches
+    ],
+)
+def test_packed_gate_threshold_routing(monkeypatch, min_len, expect_fp4):
+    attn, rot, cfg = _build_attn(seed=7)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=min_len
+    )
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=7)
+    calls = _spy_fp4_entrypoints(monkeypatch)
+    patch_mod._PACKED_GATE_LOGGED = False
+
+    out, grad = _run_patched(attn, rot, hs0, pos, w)
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    if expect_fp4:
+        assert calls, f"min_len={min_len}: expected the FP4 varlen path"
+    else:
+        assert calls == [], f"min_len={min_len}: expected the original forward"
+
+
+def test_packed_gate_decision_cached_once_per_step(monkeypatch):
+    """The packed classification (and so the gate decision input) is computed
+    ONCE per distinct position_ids tensor — repeated layer calls within a step
+    reuse the cache; a new step's tensor recomputes."""
+    attn, rot, cfg = _build_attn(seed=8)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=0
+    )
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=8)
+
+    n = {"compute": 0}
+    real = patch_mod._compute_packed_info
+
+    def counting(*args, **kwargs):
+        n["compute"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "_compute_packed_info", counting)
+
+    with torch.no_grad():
+        for _ in range(3):  # same step: same position_ids tensor (3 "layers")
+            attn(
+                hidden_states=hs0,
+                position_embeddings=_cos_sin(rot, hs0, pos),
+                attention_mask=None,
+                position_ids=pos,
+            )
+    assert n["compute"] == 1, f"expected one classification, got {n['compute']}"
+
+    pos2 = pos.clone()  # next step: new tensor -> one new classification
+    with torch.no_grad():
+        attn(
+            hidden_states=hs0,
+            position_embeddings=_cos_sin(rot, hs0, pos2),
+            attention_mask=None,
+            position_ids=pos2,
+        )
+    assert n["compute"] == 2
+
+
+# ---------------------------------------------------------------------------
+# No-grad packed path through the fused producers + packed-operand varlen fwd.
+# ---------------------------------------------------------------------------
+def test_packed_nograd_uses_fused_packed_forward(monkeypatch):
+    """No-grad packed prefill feeds the varlen-capable packed-operand forward
+    (cu_seqlens) from the fused producers; grad path keeps the autograd entry."""
+    if not patch_mod._PACKED_FWD_VARLEN:
+        pytest.skip("installed sageattention fork: packed fwd lacks cu_seqlens")
+    attn, rot, cfg = _build_attn(seed=9)
+    orig_forward = type(attn).forward
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=9)
+    ref_out, _ = _per_sample_reference(attn, orig_forward, rot, hs0, w)
+
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=0
+    )
+    packed_calls = []
+    real_packed = patch_mod.nvfp4_flash_attention_packed
+
+    def spy_packed(*args, **kwargs):
+        packed_calls.append(kwargs.get("cu_seqlens"))
+        return real_packed(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "nvfp4_flash_attention_packed", spy_packed)
+
+    with torch.no_grad():
+        out_ng, _ = attn(
+            hidden_states=hs0,
+            position_embeddings=_cos_sin(rot, hs0, pos),
+            attention_mask=None,
+            position_ids=pos,
+        )
+    assert len(packed_calls) == 1, "no-grad packed must use the packed fwd"
+    assert packed_calls[0] is not None
+    assert packed_calls[0].tolist() == [0, 96, 160, 256]
+    cng = _cos(out_ng, ref_out)
+    assert cng > FWD_COS, f"fused packed no-grad fwd cos={cng:.4f} <= {FWD_COS}"
+
+    # grad path stays on the autograd entry (HP backward needs hp q/k/v).
+    packed_calls.clear()
+    _run_patched(attn, rot, hs0, pos, w)
+    assert packed_calls == []
 
 
 def test_custom_op_wrapper_rejects_varlen_legacy_combos():

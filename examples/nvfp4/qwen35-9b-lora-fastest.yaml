@@ -1,5 +1,16 @@
 # Fastest measured native NVFP4 training path for Qwen3.5-9B LoRA on Blackwell.
 #
+# FINAL MEASURED TABLE (2026-06-10, RTX PRO 6000, b4 s2048 packed, same
+# data/LR/140-step marginal method; full stack = FP4 linears + base/lm_head
+# L2QER residuals + NVFP4 varlen attention with the HP backward):
+#   bf16 base + flash-attn-2:        1.581 s/step  loss 0.917  65.9 GiB
+#   FP4 linears + flash-attn-2:      1.114 s/step  loss 0.941  60.3 GiB
+#   full FP4 stack (varlen, resid):  1.113 s/step  loss 0.942  61.8 GiB
+# i.e. the complete NVFP4 stack trains 1.42x faster than bf16 at -6% memory
+# with a +0.025 loss gap @140 steps; vs the flash-attention config it is
+# speed/loss parity on short-sample packs (the packed_min_sample_len gate
+# routes those to FA2-varlen) and pulls ahead on long effective contexts.
+#
 # UPDATE (HP-grad-dots backward): the sageattention fork now ships an
 # HP-grad-dots attention backward (FP4 S/dP recomputes + bf16 grad GEMMs with
 # exact operands) that is ~1.5-1.7x faster than the legacy all-FP4 backward,

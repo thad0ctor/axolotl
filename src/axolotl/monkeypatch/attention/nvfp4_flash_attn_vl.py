@@ -86,7 +86,7 @@ def make_nvfp4_vl_forward(orig_forward):
             # share/repeat temporal positions) are validated against the
             # position==0 reset detection. Until then NEVER dense-attend a
             # packed batch — fall back to the original (FA2 varlen) forward.
-            pkind, _ = _packed_position_ids_info(kwargs.get("position_ids"), q_len)
+            pkind = _packed_position_ids_info(kwargs.get("position_ids"), q_len)[0]
             if pkind is not None:
                 kind = None
         if kind is None:

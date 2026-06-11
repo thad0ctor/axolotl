@@ -660,6 +660,7 @@ class PatchManager:
                 bf16_grad_dots=attn.backward.bf16_grad_dots,
                 compile_custom_op=bool(attn.backward.compile_custom_op),
                 stochastic_rounding=nvfp4.stochastic_rounding,
+                packed_min_sample_len=attn.packed_min_sample_len,
             )
 
         if nvfp4.linear_attn:
