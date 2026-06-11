@@ -39,6 +39,7 @@ from axolotl.kernels.attn_nvfp4_flash import (
 )
 from axolotl.kernels.nvfp4_fused_producers import (
     fused_rope_quant_qk,
+    fused_rope_quant_qk_hp,
     fused_vproj_quant_v_keyaxis,
     prepack_vproj_weight,
     quant_v_keyaxis,
@@ -58,9 +59,13 @@ _FUSE_VPROJ = False
 _CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
 
 # Packed-batch auto-gate default (see nvfp4_training.attention.packed_min_sample_len):
-# below this MEAN sample length the FP4 quant prologue (linear in tokens) outweighs
-# the collapsed attention math, so the original FA2-varlen forward is strictly faster.
-_PACKED_MIN_SAMPLE_LEN_DEFAULT = 1024
+# 0 = gate OFF. With the fused RoPE+quant producers feeding the training forward
+# pre-packed q/k (q_packs/k_packs) plus the varlen-tuned forward tiles, FP4 varlen
+# beats FA2-varlen at every packed mean sample length measured (packed 8192, RTX
+# PRO 6000: op-level mean-256 grad fwd 1.22x / fwd+bwd 1.22x at d256 h16/4,
+# 1.51x / 1.32x at d128 h32/8; >=1.0x at means 128-2048), so short packs no
+# longer need re-routing to the original forward.
+_PACKED_MIN_SAMPLE_LEN_DEFAULT = 0
 
 # Whether the installed sageattention fork's packed-operand forward accepts
 # cu_seqlens (varlen): lets the NO-GRAD packed path reuse the fused producers
@@ -75,6 +80,18 @@ try:
     )
 except (TypeError, ValueError):  # pragma: no cover - exotic callables
     _PACKED_FWD_VARLEN = False
+
+# Whether the fork's TRAINING entry (nvfp4_flash_attn_func) accepts externally
+# produced forward q/k packs (q_packs/k_packs): lets the packed-grad path use the
+# fused RoPE+quant producers (one pass emits roped hp q/k for the backward AND
+# the forward packs), eliminating the HF rope round-trip plus the standalone
+# q/k forward pre-quant launches. Detected once at import.
+try:
+    _TRAIN_PREPACKED = (
+        "q_packs" in _inspect.signature(nvfp4_flash_attn_func).parameters
+    )
+except (TypeError, ValueError):  # pragma: no cover - exotic callables
+    _TRAIN_PREPACKED = False
 
 
 def _custom_op_enabled(module: nn.Module) -> bool:
@@ -263,10 +280,10 @@ def _log_packed_gate_once(mean_len: float, min_len: int, use_fp4: bool) -> None:
         LOG.info(
             "nvfp4 attention: packed-batch gate -> original attention "
             "(measured mean sample length %.1f < packed_min_sample_len %d; "
-            "at short mean sample lengths the FP4 quant prologue, linear in "
-            "tokens, outweighs the collapsed attention math, so FA2-varlen is "
-            "strictly faster — set "
-            "nvfp4_training.attention.packed_min_sample_len: 0 to force FP4)",
+            "set nvfp4_training.attention.packed_min_sample_len: 0 to force "
+            "FP4 — with the fused-producer pre-packed training forward, FP4 "
+            "varlen wins at all measured packed means, so a positive gate is "
+            "mainly for legacy sageattention forks)",
             mean_len,
             min_len,
         )
@@ -493,16 +510,18 @@ def make_nvfp4_forward(orig_forward):
                     kwargs.get("position_ids"), q_len
                 )
                 if pkind == "packed":
-                    # PERF GATE: with short samples nothing quadratic is left
-                    # for FP4 to win (varlen work ~ sum(s_i^2)) while its quant
-                    # prologue stays linear in tokens, so FA2-varlen is strictly
-                    # faster (measured at packed 8192 / ~250-token samples:
-                    # FP4 fwd 0.53ms vs FA2 0.17ms). Route short-mean packs to
-                    # the original forward. The decision input (mean_len) is
-                    # cached with cu_seqlens on the position_ids tensor: per
-                    # step, not per layer, and it applies identically to the
-                    # grad / no-grad / compiled sub-paths below (the routing
-                    # happens here, before any of them).
+                    # PERF GATE (default OFF, min_len=0): with the fused
+                    # producers feeding the training forward pre-packed q/k
+                    # and the varlen-tuned tiles, FP4 varlen beats FA2-varlen
+                    # at every measured packed mean (op-level mean-256 grad
+                    # fwd 1.22x / fwd+bwd 1.22x at d256). A positive min_len
+                    # still routes short-mean packs to the original forward
+                    # (legacy-fork escape hatch). The decision input
+                    # (mean_len) is cached with cu_seqlens on the
+                    # position_ids tensor: per step, not per layer, and it
+                    # applies identically to the grad / no-grad / compiled
+                    # sub-paths below (the routing happens here, before any
+                    # of them).
                     min_len = getattr(
                         self,
                         "_nvfp4_packed_min_sample_len",
@@ -636,9 +655,28 @@ def make_nvfp4_forward(orig_forward):
             value_states = (
                 self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
             )
-            query_roped, key_roped = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin
-            )
+            # TRAINING fused producers: when the fork's training entry accepts
+            # pre-packed q/k (q_packs/k_packs), one fused pass emits BOTH the
+            # roped hp q/k (saved for the HP backward, grads flow through the
+            # exact RoPE transpose) AND the forward NVFP4 packs — eliminating
+            # the HF rope kernel round-trip and the standalone q/k forward
+            # pre-quant launches. The packs are quantized from the dtype-rounded
+            # hp values, so out/LSE/grads are bit-identical to feeding the same
+            # roped hp through the no-packs path. grad_enabled here implies no
+            # kv cache (cached grad batches returned to orig above).
+            q_packs = k_packs = None
+            if grad_enabled and _TRAIN_PREPACKED:
+                qnv_t, qsc_t, query_roped = fused_rope_quant_qk_hp(
+                    query_states, cos, sin
+                )
+                knv_t, ksc_t, key_roped = fused_rope_quant_qk_hp(
+                    key_states, cos, sin
+                )
+                q_packs, k_packs = (qnv_t, qsc_t), (knv_t, ksc_t)
+            else:
+                query_roped, key_roped = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin
+                )
             if not grad_enabled and past_key_values is not None:
                 past_key_values.update(key_roped, value_states, self.layer_idx)
             ng = query_roped.shape[1] // key_roped.shape[1]
@@ -670,9 +708,18 @@ def make_nvfp4_forward(orig_forward):
                     save_backward_packs=False,
                     backward_bf16_grad_dots=True,
                     out_layout="zshd",
+                    q_packs=q_packs,
+                    k_packs=k_packs,
                 )  # [Z, S, H, D]
                 torch._dynamo.graph_break()
             elif grad_enabled:
+                # kwargs only when prepacked (a legacy fork's signature lacks
+                # q_packs; q_packs is always None there via _TRAIN_PREPACKED).
+                prepacked_kwargs = (
+                    {"q_packs": q_packs, "k_packs": k_packs}
+                    if q_packs is not None
+                    else {}
+                )
                 attn_output = nvfp4_flash_attn_func(
                     query_roped,
                     key_roped,
@@ -684,6 +731,7 @@ def make_nvfp4_forward(orig_forward):
                     stochastic_rounding=sr,
                     save_backward_packs=False,
                     backward_bf16_grad_dots=True,
+                    **prepacked_kwargs,
                 ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
             else:
                 # No-grad eval/prefill on a legacy fork (packed-operand forward
@@ -867,10 +915,13 @@ def patch_qwen3_5_nvfp4_attention(
     prefill path and only for plain ``nn.Linear`` v_proj modules.
 
     ``packed_min_sample_len``: packed-batch perf gate — packs whose MEAN sample
-    length is below this keep the model's original (FA2-varlen) forward, which
-    is strictly faster there (the FP4 quant prologue is linear in tokens while
-    varlen attention leaves nothing quadratic to win). 0 disables the gate
-    (packed batches always use FP4 varlen); a very large value never does.
+    length is below this keep the model's original (FA2-varlen) forward.
+    Default 0 (gate off): with the fused RoPE+quant producers feeding the
+    training forward pre-packed q/k plus the varlen-tuned tiles, FP4 varlen
+    beats FA2-varlen at every measured packed mean (128-2048). A positive
+    value re-routes short-mean packs to the original forward (useful on
+    legacy sageattention forks without the pre-packed training entry); a very
+    large value never uses FP4 for packed batches.
     """
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 

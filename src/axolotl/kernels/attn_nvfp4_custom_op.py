@@ -212,6 +212,10 @@ def _flash_attention_train_op(
     value: torch.Tensor,  # [Z, Hk, Skv, D]
     key_pad_bias: torch.Tensor,  # [Z, Skv] fp32 or empty
     cu_seqlens: torch.Tensor,  # [nseq+1] int varlen boundaries, or empty (dense)
+    qnv_in: torch.Tensor,  # pre-packed fwd Q [Z*H, Sq, D//2] u8, or empty
+    qsc_in: torch.Tensor,  # its e4m3 scale (as u8) [Z*H, Sq, D//16], or empty
+    knv_in: torch.Tensor,  # pre-packed fwd K [Z*Hk, Skv, D//2] u8, or empty
+    ksc_in: torch.Tensor,  # its e4m3 scale (as u8) [Z*Hk, Skv, D//16], or empty
     scaling: float,
     causal: bool,
     num_key_value_groups: int,
@@ -245,12 +249,30 @@ def _flash_attention_train_op(
     del dkdv_scratch_bf16, bf16_grad_dots
     bias = None if key_pad_bias.numel() == 0 else key_pad_bias
     cu = None if cu_seqlens.numel() == 0 else cu_seqlens
+    # Externally-produced forward q/k packs (fused RoPE+quant producers): empty
+    # tensors are the "absent" sentinel (no Optional[Tensor] in op schemas, same
+    # convention as key_pad_bias / cu_seqlens). They skip the matching forward
+    # pre-quant only; backward still repacks from the saved hp q/k.
+    q_packs = (
+        None
+        if qnv_in.numel() == 0
+        else (qnv_in, qsc_in.view(torch.float8_e4m3fn))
+    )
+    k_packs = (
+        None
+        if knv_in.numel() == 0
+        else (knv_in, ksc_in.view(torch.float8_e4m3fn))
+    )
     # Varlen forces the HP backward, which is mutually exclusive with saved
     # packs — never produce packs for a varlen forward (mirrors the kernel).
     use_saved_packs = cu is None and _use_saved_train_packs(
         save_backward_packs, query.shape[2], key.shape[2]
     )
     if use_saved_packs:
+        assert q_packs is None and k_packs is None, (
+            "q_packs/k_packs are incompatible with save_backward_packs "
+            "(rejected in the public wrapper)"
+        )
         out, lse, packs = nvfp4_flash_attention(
             query,
             key,
@@ -268,6 +290,11 @@ def _flash_attention_train_op(
             out_layout="zshd" if out_zshd else "zhsd",
         )
     else:
+        # kwargs only when prepacked (a legacy fork's nvfp4_flash_attention
+        # lacks q_packs; the packs are always empty there).
+        prepacked_kwargs = {}
+        if q_packs is not None or k_packs is not None:
+            prepacked_kwargs = {"q_packs": q_packs, "k_packs": k_packs}
         out, lse = nvfp4_flash_attention(
             query,
             key,
@@ -283,6 +310,7 @@ def _flash_attention_train_op(
             num_stages=num_stages,
             return_lse=True,
             out_layout="zshd" if out_zshd else "zhsd",
+            **prepacked_kwargs,
         )
         packs = _empty_pack_outputs(query)
     return (out, lse, *packs)
@@ -295,6 +323,10 @@ def _(
     value,
     key_pad_bias,
     cu_seqlens,
+    qnv_in,
+    qsc_in,
+    knv_in,
+    ksc_in,
     scaling: float,
     causal: bool,
     num_key_value_groups: int,
@@ -312,6 +344,7 @@ def _(
     num_stages: int,
 ):
     del key_pad_bias, scaling, causal, num_key_value_groups
+    del qnv_in, qsc_in, knv_in, ksc_in
     del sr, backward_p_dv_sr, backward_dot_dv_sr, backward_ds_dq_sr
     del dkdv_scratch_bf16, bf16_grad_dots, num_warps, num_stages
     z, h, s_q, d = query.shape
@@ -349,6 +382,10 @@ def _flash_attention_train_setup_context(ctx, inputs, output):
         value,
         key_pad_bias,
         cu_seqlens,
+        _qnv_in,  # fwd-only pre-packed operands: the backward repacks from hp
+        _qsc_in,
+        _knv_in,
+        _ksc_in,
         scaling,
         causal,
         num_key_value_groups,
@@ -721,29 +758,8 @@ def _flash_attention_train_backward(
         num_warps,
         num_stages,
     )
-    # one grad slot per forward input (20 inputs)
-    return (
-        dq,
-        dk,
-        dv,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+    # one grad slot per forward input (24 inputs)
+    return (dq, dk, dv) + (None,) * 21
 
 
 torch.library.register_autograd(
@@ -775,6 +791,8 @@ def nvfp4_flash_attn_train_custom_op(
     block_n: int = 128,
     num_warps: int = 8,
     num_stages: int = 3,
+    q_packs: tuple[torch.Tensor, torch.Tensor] | None = None,
+    k_packs: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Differentiable native-NVFP4 attention as an opaque torch.compile custom op.
 
@@ -794,9 +812,19 @@ def nvfp4_flash_attn_train_custom_op(
     op schema has no Optional[Tensor], so an EMPTY tensor is the "no
     cu_seqlens" sentinel (same convention as ``key_pad_bias``).
     ``out_layout="zshd"`` writes the HF attention layout directly.
+    ``q_packs`` / ``k_packs`` (optional ``(packed u8, e4m3 scale)`` pairs in the
+    along-D ``_quant_nvfp4`` layout, e.g. from the fused RoPE+quant producers)
+    skip the matching FORWARD pre-quant launches only; the backward repacks
+    from the saved hp q/k as always. Threaded through the op schema as four
+    tensors with EMPTY sentinels. Incompatible with ``save_backward_packs``.
     """
     if out_layout not in ("zhsd", "zshd"):
         raise ValueError("out_layout must be 'zhsd' or 'zshd'")
+    if (q_packs is not None or k_packs is not None) and save_backward_packs:
+        raise ValueError(
+            "q_packs/k_packs are incompatible with save_backward_packs "
+            "(the saved pack set must come from the same fused HP read)"
+        )
     if cu_seqlens is not None:
         if not causal:
             raise ValueError(
@@ -822,6 +850,17 @@ def nvfp4_flash_attn_train_custom_op(
         query.new_empty((0,), dtype=torch.int32)
         if cu_seqlens is None
         else cu_seqlens
+    )
+    empty_u8 = query.new_empty((0,), dtype=torch.uint8)
+    qnv_in, qsc_in = (
+        (q_packs[0].view(torch.uint8), q_packs[1].view(torch.uint8))
+        if q_packs is not None
+        else (empty_u8, empty_u8)
+    )
+    knv_in, ksc_in = (
+        (k_packs[0].view(torch.uint8), k_packs[1].view(torch.uint8))
+        if k_packs is not None
+        else (empty_u8, empty_u8)
     )
     sr = stochastic_rounding
     p_dv = (
@@ -851,6 +890,10 @@ def nvfp4_flash_attn_train_custom_op(
         value,
         bias,
         cu,
+        qnv_in,
+        qsc_in,
+        knv_in,
+        ksc_in,
         scaling,
         causal,
         num_key_value_groups,

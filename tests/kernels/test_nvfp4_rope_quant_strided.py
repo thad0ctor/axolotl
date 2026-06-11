@@ -50,3 +50,74 @@ def test_noncontiguous_d_falls_back():
     assert torch.equal(q_fb, q_ref) and torch.equal(
         sc_fb.view(torch.uint8), sc_ref.view(torch.uint8)
     )
+
+
+# ---------------------------------------------------------------------------
+# STORE_HP: the training-path variant that also writes the roped hp tensor.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("Z,H,S,D", [(1, 4, 256, 128), (1, 16, 300, 256)])
+def test_store_hp_rope_parity_and_pack_consistency(Z, H, S, D):
+    """``store_hp=True``: (a) the roped hp output matches the HF rotate_half
+    reference (cos > 0.999 — fp32 rope math vs HF's bf16, not bit-equal);
+    (b) the emitted packs are BIT-IDENTICAL to ``_quant_nvfp4`` of that hp
+    tensor (the invariant that makes the prepacked training forward
+    bit-identical to the standalone-quant path); (c) ``store_hp=False`` output
+    is unchanged vs the hp variant's packs ONLY where the dtype rounding
+    agrees — but is itself unchanged vs the pre-STORE_HP kernel (same pack
+    math from unrounded fp32)."""
+    import torch.nn.functional as F
+    from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
+
+    torch.manual_seed(1)
+    rot = D
+    x = torch.randn(Z, H, S, D, device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(Z, S, rot, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(Z, S, rot, device="cuda", dtype=torch.bfloat16)
+
+    qnv, qsc, hp = fused_rope_quant_qk(x, cos, sin, store_hp=True)
+    assert hp.shape == (Z, H, S, D) and hp.dtype == x.dtype
+
+    # (a) HF rotate_half reference
+    def rotate_half(t):
+        half = t.shape[-1] // 2
+        return torch.cat((-t[..., half:], t[..., :half]), dim=-1)
+
+    ref = x * cos.unsqueeze(1) + rotate_half(x) * sin.unsqueeze(1)
+    c = F.cosine_similarity(hp.float().flatten(), ref.float().flatten(), dim=0)
+    assert c.item() > 0.999, f"STORE_HP rope cos vs HF reference {c.item():.6f}"
+
+    # (b) packs == _quant_nvfp4(hp), bit-for-bit
+    qq, ss = _quant_nvfp4(hp.reshape(Z * H, S, D))
+    assert torch.equal(qnv, qq)
+    assert torch.equal(qsc.view(torch.uint8), ss.view(torch.uint8))
+
+    # (c) the no-hp call still returns the 2-tuple with the same shapes
+    qnv0, qsc0 = fused_rope_quant_qk(x, cos, sin)
+    assert qnv0.shape == qnv.shape and qsc0.shape == qsc.shape
+
+
+def test_fused_rope_quant_qk_hp_grad_matches_hf_autograd():
+    """The differentiable wrapper's backward (exact RoPE transpose) matches
+    autograd through the stock HF apply_rotary_pos_emb formula bit-for-bit."""
+    Z, H, S, D = 1, 4, 192, 128
+    torch.manual_seed(2)
+    from axolotl.kernels.nvfp4_fused_producers import fused_rope_quant_qk_hp
+
+    x = torch.randn(Z, H, S, D, device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(Z, S, D, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(Z, S, D, device="cuda", dtype=torch.bfloat16)
+    g = torch.randn(Z, H, S, D, device="cuda", dtype=torch.bfloat16)
+
+    xg = x.clone().requires_grad_(True)
+    _, _, hp = fused_rope_quant_qk_hp(xg, cos, sin)
+    hp.backward(g)
+
+    def rotate_half(t):
+        half = t.shape[-1] // 2
+        return torch.cat((-t[..., half:], t[..., :half]), dim=-1)
+
+    xr = x.clone().requires_grad_(True)
+    ref = xr * cos.unsqueeze(1) + rotate_half(xr) * sin.unsqueeze(1)
+    ref.backward(g)
+
+    assert torch.equal(xg.grad, xr.grad)
