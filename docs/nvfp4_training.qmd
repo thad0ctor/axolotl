@@ -347,6 +347,21 @@ they still apply to dense, unpacked batches). Packed batches in a layout the
 varlen kernel cannot serve (multi-row packs) fall back to the model's original
 attention — they are never dense-attended by the FP4 path.
 
+The same packed varlen routing (with the same `packed_min_sample_len` gate and
+forced-HP backward) applies to the opt-in Qwen3-VL attention patch
+(`allow_full_model: true`). The boundary signal there is the flattened TEXT
+axis of the mRoPE position ids — the only form the HF Qwen3-VL text model
+forwards to its attention layers (multi-axis `[3, B, T]` mRoPE tensors are
+stripped to `None` before the decoder layers and feed only the rotary
+embedding); anything the conservative validity check cannot certify (vision-
+style repeated/gridded positions, multi-axis tensors, multi-row packs) falls
+back to the original forward. Note axolotl multimodal (image) sample packing
+is itself unsupported — packed Qwen3-VL batches arise from text-only datasets.
+Perf caveat: at Qwen3-VL's head_dim 128 the FP4 varlen fwd+bwd measured ~8-27%
+slower than FA2-varlen even at long mean sample lengths (unlike Qwen3.5's
+head_dim 256, where FP4 wins), so the packed FP4 path there is for numerical
+consistency/experimentation; raise the gate to keep FA2 for speed.
+
 Keep the no-grad/eval-only Qwen3.5 native MLP, native linear-attention, fused
 `v_proj`, and standalone `fp8_lm_head` switches out of this training-speed
 profile. A same-prepared-dataset lock-down ablation on the beta branch measured

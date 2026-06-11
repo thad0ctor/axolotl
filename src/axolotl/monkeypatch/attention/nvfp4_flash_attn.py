@@ -105,8 +105,12 @@ def _classify_dense_mask(
     m = attention_mask[..., :kv_len]
     if m.shape[-1] != kv_len:
         return None
-    neg = torch.finfo(m.dtype).min
-    keep = m > neg / 2
+    if m.dtype == torch.bool:
+        # Boolean keep-mask (e.g. SDPA's create_causal_mask output).
+        keep = m
+    else:
+        neg = torch.finfo(m.dtype).min
+        keep = m > neg / 2
     if keep.shape[1] != 1:
         if not bool((keep == keep[:, :1]).all()):
             return None
@@ -203,18 +207,29 @@ def _compute_packed_info(
 
 
 def _packed_position_ids_info(
-    position_ids: torch.Tensor | None, q_len: int
+    position_ids: torch.Tensor | None,
+    q_len: int,
+    compute=None,
+    cache_attr: str = _PACKED_INFO_ATTR,
 ) -> tuple[str | None, torch.Tensor | None, float | None]:
-    """Cached wrapper around ``_compute_packed_info`` (see block comment above)."""
+    """Cached wrapper around ``_compute_packed_info`` (see block comment above).
+
+    ``compute`` / ``cache_attr`` let model-specific patches (the Qwen3-VL one)
+    plug in their own classification while reusing the once-per-step caching
+    (``compute=None`` resolves to ``_compute_packed_info`` at call time so test
+    monkeypatching of the module attribute keeps working).
+    """
     if position_ids is None:
         return (None, None, None)
+    if compute is None:
+        compute = _compute_packed_info
     ckey = (q_len, tuple(position_ids.shape), position_ids._version)
-    cached = getattr(position_ids, _PACKED_INFO_ATTR, None)
+    cached = getattr(position_ids, cache_attr, None)
     if cached is not None and cached[0] == ckey:
         return cached[1]
-    info = _compute_packed_info(position_ids, q_len)
+    info = compute(position_ids, q_len)
     try:
-        setattr(position_ids, _PACKED_INFO_ATTR, (ckey, info))
+        setattr(position_ids, cache_attr, (ckey, info))
     except (AttributeError, RuntimeError):
         pass  # some tensor subclasses disallow setattr; correctness is unaffected
     return info

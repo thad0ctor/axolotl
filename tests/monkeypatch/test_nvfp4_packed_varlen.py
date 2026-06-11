@@ -312,8 +312,11 @@ def test_packed_save_packs_config_forced_hp_one_time_log(caplog):
 
 
 def test_qwen3_vl_packed_falls_back_to_original_forward(monkeypatch):
-    """Qwen3-VL patch: packed batches must bypass the NVFP4 kernel (original
-    FA2-varlen forward) — never silently dense-attended."""
+    """Qwen3-VL patch with the DEFAULT gate (packed_min_sample_len=1024): this
+    short-mean pack (~85) must bypass the NVFP4 kernel (original FA2-varlen
+    forward) — never silently dense-attended. The VL packed FP4-varlen path
+    itself (gate off / long packs) is covered in
+    test_qwen3_vl_nvfp4_packed_varlen.py."""
     pytest.importorskip("transformers.models.qwen3_vl")
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel

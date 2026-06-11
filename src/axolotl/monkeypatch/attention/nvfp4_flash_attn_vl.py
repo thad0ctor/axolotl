@@ -12,6 +12,13 @@ decode, non-dense / per-key-padded masks, and ``output_attentions``. head_dim 12
 is supported by the kernel (d in {128, 256}). Vision attention
 (Qwen3VLVisionBlock) is left untouched.
 
+Sample-packed (multipack) batches route through the varlen (cu_seqlens) NVFP4
+path like the Qwen3.5 patch — boundaries are derived from position-0 resets in
+the flattened text-axis position_ids (the only form the HF Qwen3-VL text model
+forwards to its attention layers; multi-axis mRoPE tensors never reach them),
+validated conservatively, and gated by ``packed_min_sample_len``. Any ambiguous
+boundary signal falls back to the original forward.
+
 Opt-in via ``nvfp4_training.attention`` on a qwen3_vl model; default OFF.
 """
 
@@ -22,13 +29,108 @@ from torch import nn
 
 from axolotl.kernels.attn_nvfp4_flash import nvfp4_flash_attn_func
 from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
+    _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+    _compute_packed_info,
     _custom_op_enabled,
+    _log_packed_forced_hp_once,
+    _log_packed_gate_once,
     _mask_is_dense_causal_or_full,
     _packed_position_ids_info,
 )
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Packed-sequence (sample-packing / multipack) detection for Qwen3-VL.
+#
+# What the attention layer actually receives as ``position_ids`` (transformers
+# 5.8.x, models/qwen3_vl/modeling_qwen3_vl.py, Qwen3VLTextModel.forward):
+#
+#   * user passes 2D ``[B, T]`` (axolotl text-pack collators do exactly this):
+#     it is expanded to ``[4, B, T]`` with ALL axes identical, and the decoder
+#     layers get ``text_position_ids = position_ids[0]`` — i.e. the original
+#     packed ``[B, T]`` whose position-0 resets ARE the sample boundaries;
+#   * user passes/model computes the 3-axis mRoPE ``[3, B, T]``
+#     (``get_rope_index`` output for image/video batches): the text model sets
+#     ``text_position_ids = None`` — the multi-axis tensor feeds ONLY the
+#     rotary embedding, never the attention layers.
+#
+# So the vision-token mRoPE structure (temporal axis constant across an image
+# run, gridded h/w axes — the thing that would fake or hide position-0 resets)
+# can never reach this kwarg through the HF text model. The classification
+# below still defends against non-standard callers handing a multi-axis tensor
+# straight to the attention module, and validates the derived boundaries:
+# anything ambiguous falls back to the model's original forward — a packed
+# batch is NEVER dense-attended on a possibly-wrong block-diagonal mask.
+# ---------------------------------------------------------------------------
+_VL_PACKED_INFO_ATTR = "_nvfp4_vl_packed_info"
+_VL_PACKED_AMBIGUOUS_LOGGED = False
+
+
+def _log_vl_packed_ambiguous_once() -> None:
+    global _VL_PACKED_AMBIGUOUS_LOGGED
+    if not _VL_PACKED_AMBIGUOUS_LOGGED:
+        _VL_PACKED_AMBIGUOUS_LOGGED = True
+        LOG.warning(
+            "nvfp4 attention (qwen3_vl): packed batch with an ambiguous "
+            "boundary signal (multi-axis mRoPE position_ids, vision-style "
+            "repeated/reordered positions, or a multi-row pack); falling back "
+            "to the model's original attention for packed batches"
+        )
+
+
+def _compute_packed_info_vl(
+    position_ids: torch.Tensor, q_len: int
+) -> tuple[str | None, torch.Tensor | None, float | None]:
+    """Qwen3-VL packed classification: like ``_compute_packed_info`` but with a
+    conservative validity check on the derived boundaries.
+
+    Returns ("packed", cu_seqlens, mean_sample_len) only when position_ids is
+    (equivalent to) a flattened text-axis pack — every step is +1 or a reset to
+    0, so each derived segment is EXACTLY arange(len): boundaries strictly
+    increasing, every sample starting at position 0, [0, S) fully covered.
+    Vision-token mRoPE runs (repeated temporal / gridded h-w positions) fail
+    this and return ("fallback", None, None) -> original forward, never a
+    wrong mask.
+    """
+    pos = position_ids
+    if pos.ndim == 3:
+        # The HF text model never forwards a multi-axis mRoPE tensor here (it
+        # strips [3, B, T] to None and [4, B, T] to its text axis). A 3D tensor
+        # means a non-standard caller: accept it only when every axis carries
+        # the SAME positions (text-only degenerate case) — otherwise the
+        # boundary signal is ambiguous.
+        if not bool((pos == pos[:1]).all()):
+            return ("fallback", None, None)
+        pos = pos[0]
+    if pos.ndim == 1:
+        pos = pos.unsqueeze(0)
+    if pos.ndim != 2 or pos.shape[-1] != q_len:
+        return (None, None, None)
+    info = _compute_packed_info(pos, q_len)
+    if info[0] != "packed":
+        return info
+    # Validity: combined with pos[0, 0] == 0 (required by _compute_packed_info)
+    # this forces every segment between 0-resets to be exactly arange(len).
+    p = pos[0]
+    if not bool(((p[1:] == p[:-1] + 1) | (p[1:] == 0)).all()):
+        return ("fallback", None, None)
+    return info
+
+
+def _vl_packed_position_ids_info(
+    position_ids: torch.Tensor | None, q_len: int
+) -> tuple[str | None, torch.Tensor | None, float | None]:
+    """Once-per-step cached VL packed classification (same caching pattern as
+    the Qwen3.5 patch: all decoder layers see the same position_ids tensor)."""
+    return _packed_position_ids_info(
+        position_ids,
+        q_len,
+        compute=_compute_packed_info_vl,
+        cache_attr=_VL_PACKED_INFO_ATTR,
+    )
 
 
 def make_nvfp4_vl_forward(orig_forward):
@@ -41,9 +143,10 @@ def make_nvfp4_vl_forward(orig_forward):
     cache so subsequent decode steps see prefill context. Falls back to
     ``orig_forward`` (flash_attention_2) for: KV-cache decode (prior cached
     context — a dedicated FP4 decode kernel is a proven loser), per-key-padded /
-    non-dense masks, ``output_attentions``, and grad mode without a trained
-    backward. The Qwen3.5-only inference fast paths (fuse_vproj / fp4_projections)
-    are intentionally omitted here.
+    non-dense masks, ``output_attentions``, grad mode without a trained
+    backward, and packed batches that are gated out (packed_min_sample_len) or
+    whose boundary signal is ambiguous. The Qwen3.5-only inference fast paths
+    (fuse_vproj / fp4_projections) are intentionally omitted here.
     """
 
     def forward(
@@ -77,17 +180,38 @@ def make_nvfp4_vl_forward(orig_forward):
             and past_key_values.get_seq_length(self.layer_idx) > 0
         )
         kind = None
+        cu_seqlens = None
         if not has_cache_context:
             kind = _mask_is_dense_causal_or_full(attention_mask, q_len, q_len)
         if kind == "causal" and attention_mask is None:
             # Sample-packed (multipack) batch: boundaries live in position_ids.
-            # TODO: wire the varlen (cu_seqlens) NVFP4 path like the Qwen3.5
-            # patch once VL mRoPE packed position_ids semantics (vision tokens
-            # share/repeat temporal positions) are validated against the
-            # position==0 reset detection. Until then NEVER dense-attend a
-            # packed batch — fall back to the original (FA2 varlen) forward.
-            pkind = _packed_position_ids_info(kwargs.get("position_ids"), q_len)[0]
-            if pkind is not None:
+            # The kwarg here is the TEXT axis (see the module block comment):
+            # axolotl text packs arrive as flattened [1, T] per-sample-arange
+            # positions, so position-0 resets ARE the boundaries. Anything the
+            # validity check can't certify (multi-axis mRoPE, vision-style
+            # repeats, multi-row packs) falls back to the original forward —
+            # a packed batch is NEVER dense-attended.
+            pkind, cu_seqlens, mean_len = _vl_packed_position_ids_info(
+                kwargs.get("position_ids"), q_len
+            )
+            if pkind == "packed":
+                # PERF GATE (same as the Qwen3.5 patch): short-mean packs leave
+                # nothing quadratic for FP4 to win while its quant prologue is
+                # linear in tokens — the original FA2-varlen forward is strictly
+                # faster there.
+                min_len = getattr(
+                    self,
+                    "_nvfp4_packed_min_sample_len",
+                    _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+                )
+                if min_len > 0 and mean_len < min_len:
+                    _log_packed_gate_once(mean_len, min_len, use_fp4=False)
+                    kind = None
+                else:
+                    _log_packed_gate_once(mean_len, min_len, use_fp4=True)
+                    kind = "packed"
+            elif pkind == "fallback":
+                _log_vl_packed_ambiguous_once()
                 kind = None
         if kind is None:
             return orig_forward(
@@ -138,6 +262,51 @@ def make_nvfp4_vl_forward(orig_forward):
         save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
         dkdv_bf16 = getattr(self, "_nvfp4_dkdv_scratch_bf16", False)
         hp_grad_dots = getattr(self, "_nvfp4_bf16_grad_dots", None)
+
+        if kind == "packed":
+            # Varlen block-diagonal causal attention over the flattened pack
+            # (work ~ sum(s_i^2), no cross-sample attention). Varlen REQUIRES
+            # the HP (bf16-grad-dots) backward — the all-FP4 backward
+            # (save_packs / bf16_grad_dots=false) is dense-only; config still
+            # applies to dense batches. Same forced combination as the Qwen3.5
+            # patch.
+            if save_packs or hp_grad_dots is False:
+                _log_packed_forced_hp_once()
+            if _custom_op_enabled(self):
+                from axolotl.kernels.attn_nvfp4_custom_op import (
+                    nvfp4_flash_attn_train_custom_op,
+                )
+
+                torch._dynamo.graph_break()
+                attn_output = nvfp4_flash_attn_train_custom_op(
+                    query_roped,
+                    key_roped,
+                    value_states,
+                    self.scaling,
+                    causal=True,
+                    num_key_value_groups=ng,
+                    cu_seqlens=cu_seqlens,
+                    stochastic_rounding=sr,
+                    save_backward_packs=False,
+                    backward_bf16_grad_dots=True,
+                    out_layout="zshd",
+                )  # [Z, S, H, D]
+                torch._dynamo.graph_break()
+            else:
+                attn_output = nvfp4_flash_attn_func(
+                    query_roped,
+                    key_roped,
+                    value_states,
+                    self.scaling,
+                    causal=True,
+                    num_key_value_groups=ng,
+                    cu_seqlens=cu_seqlens,
+                    stochastic_rounding=sr,
+                    save_backward_packs=False,
+                    backward_bf16_grad_dots=True,
+                ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            return self.o_proj(attn_output), None
 
         # Same NVFP4 op for grad and no-grad (consistent under checkpointing). The
         # backward SR knobs are inert in no-grad. Under compile the opaque custom op
@@ -191,7 +360,7 @@ def make_nvfp4_vl_forward(orig_forward):
 
 def _set_attrs(module, *, train_backward, backward_rtn_grad_packs, save_backward_packs,
                dkdv_scratch_bf16, bf16_grad_dots, compile_custom_op,
-               stochastic_rounding):
+               stochastic_rounding, packed_min_sample_len):
     module._nvfp4_train_backward = train_backward
     module._nvfp4_backward_rtn_grad_packs = backward_rtn_grad_packs
     module._nvfp4_save_backward_packs = save_backward_packs
@@ -199,6 +368,7 @@ def _set_attrs(module, *, train_backward, backward_rtn_grad_packs, save_backward
     module._nvfp4_bf16_grad_dots = bf16_grad_dots
     module._nvfp4_compile_custom_op = compile_custom_op
     module._nvfp4_stochastic_rounding = stochastic_rounding
+    module._nvfp4_packed_min_sample_len = packed_min_sample_len
 
 
 def patch_qwen3_vl_nvfp4_attention(
@@ -211,10 +381,20 @@ def patch_qwen3_vl_nvfp4_attention(
     bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
+    packed_min_sample_len: int = _PACKED_MIN_SAMPLE_LEN_DEFAULT,
 ) -> int:
     """Patch every Qwen3-VL LM full-attention layer's forward to use NVFP4.
 
     Leaves vision-encoder attention untouched. Idempotent. Returns patched count.
+
+    ``packed_min_sample_len``: packed-batch (multipack) perf gate, identical to
+    the Qwen3.5 patch — packs whose MEAN sample length is below this keep the
+    model's original (FA2-varlen) forward; 0 disables the gate. NOTE: at
+    Qwen3-VL's head_dim 128 the FP4 varlen fwd+bwd measured ~8-27% SLOWER than
+    FA2-varlen even at long mean sample lengths (2k-8k; fwd-only is at parity
+    at 2k) — unlike Qwen3.5's head_dim 256, where FP4 wins. The packed FP4 path
+    here is for numerical-consistency / experimentation (this whole patch is
+    already opt-in via allow_full_model); raise the gate to keep FA2 for speed.
     """
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextAttention
 
@@ -230,6 +410,7 @@ def patch_qwen3_vl_nvfp4_attention(
                 bf16_grad_dots=bf16_grad_dots,
                 compile_custom_op=compile_custom_op,
                 stochastic_rounding=stochastic_rounding,
+                packed_min_sample_len=packed_min_sample_len,
             )
             if getattr(module, "_nvfp4_patched", False):
                 _set_attrs(module, **kw)
