@@ -295,21 +295,23 @@ class NVFP4AttentionConfig(BaseModel):
         },
     )
     packed_min_sample_len: int = Field(
-        default=1024,
+        default=0,
         ge=0,
         json_schema_extra={
             "description": "Packed-batch (multipack) perf gate: packs whose MEAN "
             "sample length (pack tokens / number of samples) is below this keep "
             "the model's original FA2-varlen attention; at/above it they use FP4 "
-            "varlen attention. Rationale: varlen attention work scales with "
-            "sum(s_i^2), so short samples leave nothing quadratic for FP4 to "
-            "win, while its quant prologue (3 Q/K/V HBM round-trips + quant ALU) "
-            "stays linear in tokens — measured at packed 8192 with ~250-token "
-            "samples: FP4 varlen forward 0.53ms vs FA2-varlen 0.17ms per call "
-            "(backward at parity, fwd+bwd 1.43ms vs 1.25ms). FP4 attention wins "
-            "at long effective lengths (dense d256: 1.02x at 2k, 1.21x at 4k vs "
-            "SDPA), hence the 1024 default. 0 = always use FP4 varlen for "
-            "packed batches; a very large value = never."
+            "varlen attention. Default 0 (gate OFF — packed batches always use "
+            "FP4 varlen): with the fused RoPE+quant producers feeding the "
+            "training forward pre-packed q/k and the varlen-tuned forward "
+            "tiles, FP4 varlen now beats FA2-varlen at every packed mean "
+            "sample length measured (packed 8192, RTX PRO 6000; op-level "
+            "rope+attn at mean 256: grad fwd 1.22x / fwd+bwd 1.22x at d256 "
+            "h16/4 and 1.51x / 1.32x at d128 h32/8; >=1.0x at means 128-2048; "
+            "layer-level fwd+bwd 1.03-1.05x). Set a positive threshold only to "
+            "re-route short-mean packs to FA2 (e.g. on older sageattention "
+            "forks without the pre-packed training forward); a very large "
+            "value = never use FP4 for packed batches."
         },
     )
     backward: NVFP4AttentionBackwardConfig = Field(

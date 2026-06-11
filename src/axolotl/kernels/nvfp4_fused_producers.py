@@ -47,6 +47,7 @@ def _rope_quant_kernel(
     sin_ptr,  # [Z, S, ROT]  (ROT = rotary_dim)
     q_ptr,
     s_ptr,  # [Z*H, S, D//2] uint8, [Z*H, S, D//16] e4m3
+    hp_ptr,  # [Z*H, S, D] roped high-precision out (STORE_HP only; dummy else)
     Z,
     H,
     S,
@@ -59,9 +60,12 @@ def _rope_quant_kernel(
     s_qr,  # q packed: per-(z*h) stride, per-row stride
     s_sn,
     s_sr,  # scale: per-(z*h) stride, per-row stride
+    s_hn,
+    s_hr,  # hp out: per-(z*h) stride, per-row stride
     D: tl.constexpr,
     ROT: tl.constexpr,
     HALF: tl.constexpr,
+    STORE_HP: tl.constexpr,
     BLOCK_R: tl.constexpr,
     DP2: tl.constexpr,
     DP16: tl.constexpr,
@@ -111,6 +115,21 @@ def _rope_quant_kernel(
 
     x_rot = tl.where(is_rot[None, :], x * cos + rot * sin, x)
 
+    if STORE_HP:
+        # One extra store per element: the roped high-precision tile rides along
+        # for the training path (the HP backward needs roped q/k saved).
+        hp = x_rot.to(hp_ptr.dtype.element_ty)
+        tl.store(
+            hp_ptr + pid_n * s_hn + offs_r[:, None] * s_hr + offs_d[None, :],
+            hp,
+            mask=rmask[:, None],
+        )
+        # Pack from the SAME (dtype-rounded) values the backward will repack:
+        # this makes the emitted packs bit-identical to ``_quant_nvfp4(hp)``,
+        # so forward out/LSE/grads exactly match the standalone-quant path fed
+        # the same hp tensor.
+        x_rot = hp.to(tl.float32)
+
     # NVFP4 pack along D, group-16, single-level scale.
     xb = x_rot.reshape(BLOCK_R, NG, 16)
     amax = tl.max(tl.abs(xb), axis=2)
@@ -134,17 +153,26 @@ def _rope_quant_kernel(
 
 
 def fused_rope_quant_qk(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    store_hp: bool = False,
+):
     """Apply Qwen3.5 partial RoPE to ``x`` and emit it NVFP4-packed (along D).
 
     Args:
         x: ``[Z, H, S, D]`` high precision (already q_norm/k_norm'd), D in {128,256}.
         cos, sin: ``[Z, S, rotary_dim]`` (mrope-resolved); rotary_dim <= D, even.
+        store_hp: ALSO write the roped high-precision tensor (one extra store per
+            element, same pass) — the training packed path needs roped hp q/k
+            saved for the HP backward. The packs are then quantized from the
+            dtype-rounded hp values, so they are bit-identical to
+            ``_quant_nvfp4`` of the returned hp tensor.
 
     Returns:
-        (packed uint8 ``[Z*H, S, D//2]``, scale float8_e4m3fn ``[Z*H, S, D//16]``)
-        in the row-major tl.dot_scaled layout.
+        ``(packed uint8 [Z*H, S, D//2], scale float8_e4m3fn [Z*H, S, D//16])``
+        in the row-major tl.dot_scaled layout, plus the roped hp tensor
+        ``[Z, H, S, D]`` (x.dtype, contiguous) when ``store_hp``.
     """
     z, h, s, d = x.shape
     rot = cos.shape[-1]
@@ -160,6 +188,7 @@ def fused_rope_quant_qk(
 
     q = x.new_empty(z * h, s, d // 2, dtype=torch.uint8)
     sc = x.new_empty(z * h, s, d // 16, dtype=torch.uint8)
+    hp = x.new_empty(z * h, s, d) if store_hp else q  # dummy ptr when not stored
 
     BLOCK_R = 64
     grid = (z * h, triton.cdiv(s, BLOCK_R))
@@ -169,6 +198,7 @@ def fused_rope_quant_qk(
         sin,
         q,
         sc,
+        hp,
         z,
         h,
         s,
@@ -181,15 +211,68 @@ def fused_rope_quant_qk(
         q.stride(1),
         sc.stride(0),
         sc.stride(1),
+        hp.stride(0) if store_hp else 0,
+        hp.stride(1) if store_hp else 0,
         D=d,
         ROT=rot,
         HALF=rot // 2,
+        STORE_HP=store_hp,
         BLOCK_R=BLOCK_R,
         DP2=d // 2,
         DP16=d // 16,
         NG=d // 16,
     )
+    if store_hp:
+        return q, sc.view(torch.float8_e4m3fn), hp.view(z, h, s, d)
     return q, sc.view(torch.float8_e4m3fn)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+class _FusedRopeQuantQK(torch.autograd.Function):
+    """Differentiable fused RoPE+NVFP4-pack producer for the TRAINING path.
+
+    Forward runs the one-pass fused kernel with ``store_hp=True`` (roped hp out
+    + packs). Backward applies the exact RoPE transpose to the hp gradient
+    (``dx = dy*cos - rotate_half(dy*sin)`` on the rotary dims, identity on the
+    pass-through tail) — the same math autograd derives for the stock HF
+    ``apply_rotary_pos_emb``. The packs are non-differentiable (uint8); the
+    attention function returns its q/k grads w.r.t. the roped hp tensors.
+    """
+
+    @staticmethod
+    def forward(ctx, x, cos, sin):
+        qnv, qsc, hp = fused_rope_quant_qk(x, cos, sin, store_hp=True)
+        ctx.save_for_backward(cos, sin)
+        ctx.mark_non_differentiable(qnv, qsc)
+        return qnv, qsc, hp
+
+    @staticmethod
+    def backward(ctx, _g_qnv, _g_qsc, g_hp):
+        cos, sin = ctx.saved_tensors
+        rot = cos.shape[-1]
+        c = cos.unsqueeze(1)  # [Z, 1, S, ROT] broadcast over heads
+        s = sin.unsqueeze(1)
+        g_rot = g_hp[..., :rot]
+        dx_rot = g_rot * c - _rotate_half(g_rot * s)
+        if rot == g_hp.shape[-1]:
+            return dx_rot, None, None
+        return torch.cat((dx_rot, g_hp[..., rot:]), dim=-1), None, None
+
+
+def fused_rope_quant_qk_hp(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable ``fused_rope_quant_qk(..., store_hp=True)``.
+
+    Returns ``(qnv, qsc, hp_roped)``; gradients flow from ``hp_roped`` back to
+    ``x`` through the exact RoPE transpose (see ``_FusedRopeQuantQK``).
+    """
+    qnv, qsc, hp = _FusedRopeQuantQK.apply(x, cos, sin)
+    return qnv, qsc.view(torch.float8_e4m3fn), hp
 
 
 def quant_v_keyaxis(

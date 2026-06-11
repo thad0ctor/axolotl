@@ -15,17 +15,20 @@ one row (Z=1) with ``attention_mask=None`` and the sample boundaries encoded in
     forward — never silently dense-attended;
   * ``save_packs`` / forced-legacy configs being overridden (one-time INFO) for
     packed batches, which require the HP-grad-dots backward;
-  * the packed perf GATE (``packed_min_sample_len``): short-mean packs keep the
-    model's original (FA2-varlen) forward — strictly faster there — while long
-    means / gate-off (0) use FP4 varlen; the decision is computed once per step
-    (cached with cu_seqlens on the position_ids tensor) and applies to grad,
-    no-grad and compiled sub-paths alike;
+  * the packed perf GATE (``packed_min_sample_len``): default 0 (gate off —
+    the pre-packed training forward beats FA2-varlen at every measured packed
+    mean) routes all packs to FP4 varlen; a positive threshold (legacy-fork
+    escape hatch) keeps short-mean packs on the model's original (FA2-varlen)
+    forward; the decision is computed once per step (cached with cu_seqlens on
+    the position_ids tensor) and applies to grad, no-grad and compiled
+    sub-paths alike;
   * the NO-GRAD packed path feeding the varlen-capable packed-operand forward
-    from the fused producers (RoPE+quant one pass, no roped Q/K round-trip).
+    from the fused producers (RoPE+quant one pass, no roped Q/K round-trip);
+  * the GRAD packed path feeding PRE-PACKED q/k (fused RoPE+quant with the
+    roped hp stored for the HP backward) into the training entry.
 
-NOTE: parity/routing tests pass ``packed_min_sample_len=0`` — the test pack's
-mean sample length (256/3 ~ 85) is far below the 1024 default, which would
-(correctly) gate them onto the original forward instead of FP4 varlen.
+NOTE: parity/routing tests pass ``packed_min_sample_len=0`` explicitly so
+they stay valid regardless of the default.
 """
 
 import logging
@@ -398,12 +401,29 @@ def _spy_fp4_entrypoints(monkeypatch):
     return calls
 
 
-def test_packed_gate_default_routes_short_packs_to_original(monkeypatch, caplog):
-    """Default gate (1024): the test pack's mean sample length (~85) is short,
-    so grad AND no-grad steps must use the ORIGINAL forward (no FP4 entrypoint)
-    with a one-time INFO stating the resolution and the measured mean."""
+def test_packed_gate_default_is_off_fp4_everywhere(monkeypatch):
+    """The DEFAULT gate is now 0 (off): with the pre-packed training forward
+    FP4 varlen wins at every measured packed mean, so even short-mean packs
+    (the test pack's mean is ~85) go to FP4 under the default patch config."""
     attn, rot, cfg = _build_attn(seed=6)
-    patch_qwen3_5_nvfp4_attention(attn, train_backward=True)  # default gate
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True)  # default gate (0)
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=6)
+    calls = _spy_fp4_entrypoints(monkeypatch)
+    patch_mod._PACKED_GATE_LOGGED = False
+    out, grad = _run_patched(attn, rot, hs0, pos, w)
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    assert calls, "default gate (0) must route packed batches to FP4 varlen"
+
+
+def test_packed_gate_positive_routes_short_packs_to_original(monkeypatch, caplog):
+    """An explicit positive gate (1024, the legacy-fork escape hatch): the test
+    pack's mean sample length (~85) is short, so grad AND no-grad steps must
+    use the ORIGINAL forward (no FP4 entrypoint) with a one-time INFO stating
+    the resolution and the measured mean."""
+    attn, rot, cfg = _build_attn(seed=6)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=1024
+    )
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=6)
     calls = _spy_fp4_entrypoints(monkeypatch)
 
@@ -536,6 +556,53 @@ def test_packed_nograd_uses_fused_packed_forward(monkeypatch):
     packed_calls.clear()
     _run_patched(attn, rot, hs0, pos, w)
     assert packed_calls == []
+
+
+def test_packed_grad_uses_prepacked_qk(monkeypatch):
+    """The packed-GRAD branch feeds PRE-PACKED q/k from the fused RoPE+quant
+    producers: the training call carries q_packs/k_packs, and the sage forward
+    quantizes ONLY V (one _quant_nvfp4 call — q/k arrive packed; the backward
+    repacks from the saved hp with its own kernels, not _quant_nvfp4)."""
+    if not patch_mod._TRAIN_PREPACKED:
+        pytest.skip("installed sageattention fork: training entry lacks q_packs")
+    import sageattention.nvfp4.flash as sage_flash
+
+    attn, rot, cfg = _build_attn(seed=10)
+    patch_qwen3_5_nvfp4_attention(
+        attn, train_backward=True, packed_min_sample_len=0
+    )
+    hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=10)
+
+    seen = []
+    real = patch_mod.nvfp4_flash_attn_func
+
+    def spy(*args, **kwargs):
+        seen.append((kwargs.get("q_packs"), kwargs.get("k_packs")))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(patch_mod, "nvfp4_flash_attn_func", spy)
+
+    quant_calls = []
+    real_quant = sage_flash._quant_nvfp4
+
+    def quant_spy(x, *args, **kwargs):
+        quant_calls.append(tuple(x.shape))
+        return real_quant(x, *args, **kwargs)
+
+    monkeypatch.setattr(sage_flash, "_quant_nvfp4", quant_spy)
+
+    out, grad = _run_patched(attn, rot, hs0, pos, w)
+    assert torch.isfinite(out).all() and torch.isfinite(grad).all()
+    assert len(seen) == 1
+    qp, kp = seen[0]
+    assert qp is not None and kp is not None, "expected pre-packed q/k"
+    assert qp[0].dtype == torch.uint8 and qp[0].shape == (HEADS, S, D // 2)
+    assert kp[0].shape == (KV, S, D // 2)
+    assert len(quant_calls) == 1, (
+        f"forward should quantize ONLY V (q/k pre-packed), got _quant_nvfp4 "
+        f"calls for shapes {quant_calls}"
+    )
+    assert quant_calls[0] == (KV, S, D)  # V [Z*Hk, Skv, D] (key-axis quant)
 
 
 def test_custom_op_wrapper_rejects_varlen_legacy_combos():
