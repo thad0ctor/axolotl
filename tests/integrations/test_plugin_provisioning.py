@@ -439,6 +439,44 @@ def test_git_update_fast_forwards_default_branch(
     assert (clone / "marker.txt").read_text().strip() == "v2"
 
 
+def test_cached_clone_interrupted_before_checkout_heals(
+    tmp_path, monkeypatch, cleanup_syspath
+):
+    # A provisioning run killed between `git clone` and `git checkout ref` leaves a
+    # cached clone on the default branch; the next run must check out the ref rather
+    # than reuse the wrong commit forever.
+    from axolotl.integrations.provisioning import _clone_target
+
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "marker.txt").write_text("v1\n")
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "v1"], cwd=work)
+    _git(["tag", "rel1"], cwd=work)
+    (work / "marker.txt").write_text("v2\n")
+    _git(["commit", "-q", "-am", "v2"], cwd=work)
+
+    bare = tmp_path / "repo.git"
+    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+
+    monkeypatch.chdir(tmp_path)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    # Simulate the interrupted run: clone exists at the ref-keyed target, but the
+    # `git checkout rel1` never happened (HEAD is the default branch at v2).
+    clone = _clone_target(cache, str(bare), "rel1")
+    _git(["clone", "-q", str(bare), str(clone)], cwd=tmp_path)
+    assert (clone / "marker.txt").read_text().strip() == "v2"
+
+    cfg = {
+        "plugin_cache_dir": str(cache),
+        "plugins": [{"cls": "marker.X", "source": str(bare), "ref": "rel1"}],
+    }
+    provision_plugins(cfg)
+    assert (clone / "marker.txt").read_text().strip() == "v1"
+
+
 def test_git_update_with_tag_ref_stays_pinned(tmp_path, monkeypatch, cleanup_syspath):
     # update: true with an immutable tag ref leaves HEAD detached; provisioning
     # must not error and must stay pinned even as the branch advances past it.

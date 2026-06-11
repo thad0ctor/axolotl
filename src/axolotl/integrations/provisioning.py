@@ -90,16 +90,17 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> None:
 
 
 def _clone_or_update(source: str, ref: str | None, target: Path, update: bool) -> Path:
-    if target.exists() and not update:
-        LOG.info("Reusing cached plugin source at %s", target)
-        return target
     if not target.exists():
         LOG.info("Cloning plugin source %s -> %s", source, target)
         _run(["git", "clone", source, str(target)])
     elif update:
         LOG.info("Updating plugin source at %s", target)
         _run(["git", "fetch", "--all", "--tags", "--prune"], cwd=target)
+    else:
+        LOG.info("Reusing cached plugin source at %s", target)
     if ref:
+        # Also on cache reuse: heals a clone interrupted before the checkout, which
+        # would otherwise stay pinned to the default branch.
         _run(["git", "checkout", ref], cwd=target)
     if update and _on_branch(target):
         # `git checkout` alone does not advance an already-checked-out branch, so
