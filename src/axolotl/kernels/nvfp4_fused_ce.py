@@ -53,45 +53,6 @@ _VOCAB_BLOCK = int(
 )
 
 
-# Token threshold above which a residual-bearing fused CE refuses dynamo tracing
-# (see the compile gate in fused_fp4_cross_entropy). 8192 = the largest M with
-# measured-good compiled behavior; overridable for experiments.
-_RESID_COMPILE_BREAK_TOKENS = int(
-    os.environ.get("AXOLOTL_NVFP4_FUSED_CE_RESID_COMPILE_BREAK_TOKENS", "8192")
-)
-
-
-@torch.compiler.disable
-def _fused_ce_eager(
-    lm_head, hidden2d, labels1d, ignore_index, logit_scale, grad_scale,
-    res_A, res_B, fp4_matmul,
-):
-    """Eager-island invocation of the tiled CE Functions (dynamo skips inside).
-
-    Identical math to the traced path; used when the residual + long-M compile
-    gate trips so the custom Functions' per-tile recompute is preserved instead
-    of being partitioned into logits-scale saves.
-    """
-    if _fp4_scaled_mm_enabled(fp4_matmul):
-        fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
-        if fp4_store is not None:
-            try:
-                return _FusedFP4ScaledMMCrossEntropy.apply(
-                    hidden2d, fp4_store, labels1d, ignore_index, logit_scale,
-                    grad_scale, res_A, res_B,
-                )
-            except Exception:
-                if fp4_matmul is True:
-                    raise
-    store = _nvfp4_lm_head_store(lm_head)
-    if store is None:
-        return None
-    return _FusedFP4CrossEntropy.apply(
-        hidden2d, store, labels1d, ignore_index, logit_scale, grad_scale,
-        res_A, res_B,
-    )
-
-
 def _resolve_vocab_block(vocab_block: int | None) -> int:
     """Effective vocab tile width: env var (if set) > ``vocab_block`` arg > 4096."""
     env = os.environ.get("AXOLOTL_NVFP4_FUSED_CE_VOCAB_BLOCK")
@@ -283,17 +244,23 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
 
-        # Precompute hidden @ res_B.t() -> [M, k] ONCE (the only H-contracting
-        # residual matmul); each tile then needs only [M,k] @ res_A[lo:hi].t().
-        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())
 
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
             w_tile = _dequant_vocab_tile(store, lo, hi, dtype)  # [Vb, H]
+            if res_A is not None:
+                # WEIGHT-SIDE residual fold: corr [Vb,H] = A[lo:hi] @ B is a
+                # k*H*Vb GEMM (~8x cheaper than the activation-side [M,k]@[k,Vb]
+                # route at long M) and keeps the activation graph IDENTICAL to
+                # the residual-less case — which is what lets AOT's min-cut
+                # keep the per-tile recompute partition under torch.compile
+                # (activation-side residual operands flipped it into saving
+                # logits-scale products: measured +19.8 GiB at 32k tokens).
+                # The gradient also collapses to the residual-less form:
+                # dz @ w_tile' carries the residual term, no grad_hb plumbing.
+                w_tile = w_tile + (res_A[lo:hi] @ res_B).to(dtype)
             # bf16 tile-matmul (the heavy FLOPs), fp32 only for the logsumexp.
             logits = hidden @ w_tile.t()  # [M, Vb]
-            if hb is not None:
-                logits = logits + (hb @ res_A[lo:hi].t())
             logits = logits.float() * scale
 
             tile_max = logits.max(dim=1).values
@@ -335,20 +302,14 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         )  # [M,1]
         rows = torch.arange(M, device=hidden.device)
 
-        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())  # [M,k]
-
         grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
-        # The residual contributes dz @ res_A[lo:hi] -> [M,k] accumulated, then
-        # @ res_B -> dL/dhidden (mirrors the (hidden@B.t())@A.t() forward).
-        grad_proj = None if res_A is None else torch.zeros(
-            M, res_A.shape[1], device=hidden.device, dtype=res_B.dtype
-        )
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
             w_tile = _dequant_vocab_tile(store, lo, hi, dtype)  # [Vb, H]
+            if res_A is not None:
+                # weight-side residual fold (see forward)
+                w_tile = w_tile + (res_A[lo:hi] @ res_B).to(dtype)
             logits = hidden @ w_tile.t()  # [M, Vb]
-            if hb is not None:
-                logits = logits + (hb @ res_A[lo:hi].t())
             logits = logits.float() * scale
             sm = torch.exp(logits - lse.unsqueeze(1))  # softmax tile [M, Vb]
 
@@ -358,12 +319,8 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
 
             dz = (sm * coef).to(dtype)  # [M, Vb]
             # bf16 dz @ w_tile (the heavy backward FLOPs); accumulate in bf16.
+            # the folded w_tile carries the residual term: no grad_hb plumbing
             grad_hidden += dz @ w_tile
-            if grad_proj is not None:
-                grad_proj += dz.to(res_B.dtype) @ res_A[lo:hi]  # [M,k]
-
-        if grad_proj is not None:
-            grad_hidden += (grad_proj @ res_B).to(dtype)  # dL/dhidden via residual
 
         return grad_hidden, None, None, None, None, None, None, None
 
@@ -442,10 +399,6 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
         coef = (grad_loss * ctx.grad_scale * valid.float() * scale).unsqueeze(1)
         rows = torch.arange(M, device=hidden.device)
 
-        hb = None if res_A is None else (hidden.to(res_B.dtype) @ res_B.t())  # [M,k]
-        grad_proj = None if res_A is None else torch.zeros(
-            M, res_A.shape[1], device=hidden.device, dtype=res_B.dtype
-        )
 
         grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
         for lo in range(0, V, _VOCAB_BLOCK):
@@ -513,21 +466,6 @@ def fused_fp4_cross_entropy(
     res_A = getattr(lm_head, "_lm_head_residual_A", None)
     res_B = getattr(lm_head, "_lm_head_residual_B", None)
 
-    # Compile gate: with the residual operands in the traced CE, AOT's min-cut
-    # partitioner flips from per-tile recompute to SAVING logits-scale products
-    # across the fwd/bwd boundary — measured +19.8 GiB sustained at a 32k-token
-    # batch (64.7 vs 44.9 GiB without residual; eager with residual is 28.3).
-    # The traced CE is a measured win at short M and harmless without the
-    # residual, so break out of the graph only for residual + long M.
-    if (
-        res_A is not None
-        and hidden2d.shape[0] > _RESID_COMPILE_BREAK_TOKENS
-        and torch.compiler.is_compiling()
-    ):
-        return _fused_ce_eager(
-            lm_head, hidden2d, labels1d, ignore_index, logit_scale, grad_scale,
-            res_A, res_B, fp4_matmul,
-        )
 
     if _fp4_scaled_mm_enabled(fp4_matmul):
         fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
