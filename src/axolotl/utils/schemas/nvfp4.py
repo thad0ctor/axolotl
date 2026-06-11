@@ -294,24 +294,27 @@ class NVFP4AttentionConfig(BaseModel):
             "default; plain-nn.Linear only."
         },
     )
-    packed_min_sample_len: int = Field(
-        default=0,
+    packed_min_sample_len: int | None = Field(
+        default=None,
         ge=0,
         json_schema_extra={
             "description": "Packed-batch (multipack) perf gate: packs whose MEAN "
             "sample length (pack tokens / number of samples) is below this keep "
             "the model's original FA2-varlen attention; at/above it they use FP4 "
-            "varlen attention. Default 0 (gate OFF — packed batches always use "
-            "FP4 varlen): with the fused RoPE+quant producers feeding the "
-            "training forward pre-packed q/k and the varlen-tuned forward "
-            "tiles, FP4 varlen now beats FA2-varlen at every packed mean "
+            "varlen attention. Default None = AUTO per patch: 0 (gate OFF) for "
+            "the Qwen3.5 text patch — with the fused RoPE+quant producers "
+            "feeding the training forward pre-packed q/k and the varlen-tuned "
+            "forward tiles, FP4 varlen beats FA2-varlen at every packed mean "
             "sample length measured (packed 8192, RTX PRO 6000; op-level "
             "rope+attn at mean 256: grad fwd 1.22x / fwd+bwd 1.22x at d256 "
-            "h16/4 and 1.51x / 1.32x at d128 h32/8; >=1.0x at means 128-2048; "
-            "layer-level fwd+bwd 1.03-1.05x). Set a positive threshold only to "
-            "re-route short-mean packs to FA2 (e.g. on older sageattention "
-            "forks without the pre-packed training forward); a very large "
-            "value = never use FP4 for packed batches."
+            "h16/4 and 1.51x / 1.32x at d128 h32/8; >=1.0x at means 128-2048) — "
+            "and 1024 for the Qwen3-VL patch, whose packed path does not yet "
+            "use the pre-packed producers and measured 8-27% slower than "
+            "FA2-varlen at head_dim 128 (its value there is numerical "
+            "consistency with the FP4 forward, not speed). Set 0 to force FP4 "
+            "varlen everywhere, a positive threshold to re-route short-mean "
+            "packs to FA2, a very large value to never use FP4 for packed "
+            "batches."
         },
     )
     backward: NVFP4AttentionBackwardConfig = Field(

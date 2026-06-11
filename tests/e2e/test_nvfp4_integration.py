@@ -304,15 +304,17 @@ def test_schema_accepts_qwen3_5_native_switches(monkeypatch):
 
 
 def test_schema_packed_min_sample_len_default_and_bounds(monkeypatch):
-    """Packed perf gate knob: defaults to 0 (gate off — the pre-packed training
-    forward beats FA2-varlen at every measured packed mean), accepts a positive
-    threshold (legacy-fork escape hatch), rejects negatives."""
+    """Packed perf gate knob: defaults to None = AUTO per patch (0/gate-off for
+    the Qwen3.5 text patch, where the pre-packed training forward beats
+    FA2-varlen at every measured packed mean; 1024 for the VL patch, whose
+    packed path lacks the pre-packed producers and measured slower at d128),
+    accepts a positive threshold, rejects negatives."""
     _supported(monkeypatch, True)
     base = {**BASE, "model_config_type": "qwen3_5"}
     cfg = AxolotlInputConfig(
         **base, nvfp4_training={"enabled": True, "attention": {"enabled": True}}
     )
-    assert cfg.nvfp4_training.attention.packed_min_sample_len == 0
+    assert cfg.nvfp4_training.attention.packed_min_sample_len is None
     cfg0 = AxolotlInputConfig(
         **base,
         nvfp4_training={

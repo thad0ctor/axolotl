@@ -37,6 +37,14 @@ from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
     _mask_is_dense_causal_or_full,
     _packed_position_ids_info,
 )
+
+# VL-specific packed-gate default: the VL packed path does not (yet) feed the
+# pre-packed fused-producer q/k, and at Qwen3-VL's head_dim 128 FP4 varlen
+# measured 8-27% SLOWER fwd+bwd than FA2-varlen even at long means — its value
+# is numerical consistency with the FP4 forward, not speed. So unlike the text
+# patch (default 0 = always FP4), VL keeps short/medium packs on FA2 unless the
+# user sets packed_min_sample_len explicitly.
+_VL_PACKED_MIN_SAMPLE_LEN_DEFAULT = 1024
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -202,7 +210,7 @@ def make_nvfp4_vl_forward(orig_forward):
                 min_len = getattr(
                     self,
                     "_nvfp4_packed_min_sample_len",
-                    _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+                    _VL_PACKED_MIN_SAMPLE_LEN_DEFAULT,
                 )
                 if min_len > 0 and mean_len < min_len:
                     _log_packed_gate_once(mean_len, min_len, use_fp4=False)
@@ -381,7 +389,7 @@ def patch_qwen3_vl_nvfp4_attention(
     bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
-    packed_min_sample_len: int = _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+    packed_min_sample_len: int | None = None,
 ) -> int:
     """Patch every Qwen3-VL LM full-attention layer's forward to use NVFP4.
 
@@ -395,7 +403,12 @@ def patch_qwen3_vl_nvfp4_attention(
     at 2k) — unlike Qwen3.5's head_dim 256, where FP4 wins. The packed FP4 path
     here is for numerical-consistency / experimentation (this whole patch is
     already opt-in via allow_full_model); raise the gate to keep FA2 for speed.
+    ``None`` resolves to the VL-specific default (1024 — see
+    ``_VL_PACKED_MIN_SAMPLE_LEN_DEFAULT``), unlike the text patch whose auto
+    default is 0.
     """
+    if packed_min_sample_len is None:
+        packed_min_sample_len = _VL_PACKED_MIN_SAMPLE_LEN_DEFAULT
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextAttention
 
     patched = 0

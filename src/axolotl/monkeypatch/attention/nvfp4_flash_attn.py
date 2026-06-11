@@ -902,7 +902,7 @@ def patch_qwen3_5_nvfp4_attention(
     bf16_grad_dots: bool | None = None,
     compile_custom_op: bool = False,
     stochastic_rounding: bool = True,
-    packed_min_sample_len: int = _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+    packed_min_sample_len: int | None = None,
 ) -> int:
     """Patch every Qwen3.5 FULL-attention layer's forward to use NVFP4 attention.
 
@@ -923,6 +923,8 @@ def patch_qwen3_5_nvfp4_attention(
     legacy sageattention forks without the pre-packed training entry); a very
     large value never uses FP4 for packed batches.
     """
+    if packed_min_sample_len is None:
+        packed_min_sample_len = _PACKED_MIN_SAMPLE_LEN_DEFAULT
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
     # qwen3_5_moe uses its own full-attention class (Qwen3_5MoeAttention) for the
