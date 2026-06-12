@@ -1450,7 +1450,8 @@ class PatchManager:
                         nvfp4
                         and nvfp4.enabled
                         and nvfp4.fla_causal_conv_compile_boundary
-                    )
+                    ),
+                    torch_compile=bool(self.cfg.torch_compile),
                 )
 
             if self.cfg.model_config_type == "qwen3_5_moe" and self.cfg.sample_packing:
@@ -1464,7 +1465,8 @@ class PatchManager:
                         nvfp4
                         and nvfp4.enabled
                         and nvfp4.fla_causal_conv_compile_boundary
-                    )
+                    ),
+                    torch_compile=bool(self.cfg.torch_compile),
                 )
 
             if (
