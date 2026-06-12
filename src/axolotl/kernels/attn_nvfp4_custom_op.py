@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from axolotl.kernels.attn_nvfp4_flash import (
+    _BWD_RN_DO_ZSHD,
     _gqa_reduce_cast_dkdv,
     _next_mult,
     _resolve_backward_grad_dots,
@@ -565,11 +566,11 @@ def _flash_attention_train_bwd_op(
             "varlen (cu_seqlens) backward on a legacy sageattention fork is "
             "only implemented on the hp ('bf16') path"
         )
-    if out_zshd and mode == "fp4_rownorm":
-        # fp4_rownorm's along-D rownorm dO pack reads the contiguous
-        # [Z*H,Sq,D] layout only (kernel assert); fold the zshd [Z,Sq,H,D]
-        # grad/out up front with one transpose copy and run the
-        # standard-layout backward (bf16 and fp8_rownorm keep native zshd).
+    if out_zshd and mode == "fp4_rownorm" and not _BWD_RN_DO_ZSHD:
+        # LEGACY-FORK fold only: old fp4_rownorm asserts a contiguous
+        # [Z*H,Sq,D] dO, so fold the zshd [Z,Sq,H,D] grad/out with one
+        # transpose copy. Current forks (_BWD_RN_DO_ZSHD) take zshd directly
+        # in every mode — two ~[Z*Sq*H*D] copies saved per backward.
         do = grad_out.permute(0, 2, 1, 3).reshape(z * h, s_q, d).contiguous()
         o = out.permute(0, 2, 1, 3).reshape(z * h, s_q, d).contiguous()
         zshd_bwd = False

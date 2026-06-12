@@ -103,6 +103,89 @@ try:
 except (TypeError, ValueError):  # pragma: no cover - exotic callables
     _TRAIN_GRAD_DOTS = False
 
+# Whether the fork's TRAINING entry can write the HF attn_output layout
+# directly (out_layout="zshd") and take the zshd gradient back without a
+# transpose-fold copy. Eliminates one [Z,S,H*D]-sized copy in every
+# checkpoint-replay forward AND one in every backward at long context.
+try:
+    _TRAIN_OUT_LAYOUT = (
+        "out_layout" in _inspect.signature(nvfp4_flash_attn_func).parameters
+    )
+except (TypeError, ValueError):  # pragma: no cover - exotic callables
+    _TRAIN_OUT_LAYOUT = False
+
+# Fused RMSNorm+RoPE (the same compile-safe triton_op the fused_attn_kernel
+# baseline uses for Qwen3.5). The patch previously re-EAGERIZED q_norm/k_norm
+# (HF RMSNorm: fp32 cast + pow + mean + rsqrt + muls per call) on every
+# checkpointed pass — measured as the dominant share of the patch's step
+# overhead vs the fused-attention baseline at 32k (the attention KERNELS beat
+# FA2 while the patch glue burned the win). With the fused op, norm+partial
+# RoPE is one kernel per operand and the forward NVFP4 packs are produced from
+# its output by the standalone strided quant (one extra read of roped Q/K, no
+# eager norm chain).
+try:
+    from axolotl.kernels.gemma4_fused_rope import fused_rms_norm_rope
+
+    _FUSED_NORM_ROPE = True
+except ImportError:  # pragma: no cover - missing optional kernel dep
+    _FUSED_NORM_ROPE = False
+
+
+def _norm_eps(norm) -> float:
+    eps = getattr(norm, "eps", None)
+    if eps is None:
+        eps = norm.variance_epsilon
+    return eps
+
+
+def _fused_norm_rope_ok(module: nn.Module) -> bool:
+    """Once-per-module capability check for the fused RMSNorm+RoPE path."""
+    cached = getattr(module, "_nvfp4_fnr_ok", None)
+    if cached is not None:
+        return cached
+    ok = _FUSED_NORM_ROPE
+    if ok:
+        from axolotl.monkeypatch.models.qwen3_5.fused_attn import (
+            _resolve_norm_module,
+        )
+
+        for norm in (module.q_norm, module.k_norm):
+            n = _resolve_norm_module(norm)
+            if getattr(n, "weight", None) is None:
+                ok = False
+                break
+            try:
+                _norm_eps(n)
+            except AttributeError:
+                ok = False
+                break
+    module._nvfp4_fnr_ok = ok
+    return ok
+
+
+def _fused_norm_rope(norm, x, cos, sin):
+    """RMSNorm (unit-offset, Qwen3.5) + partial RoPE on ``x`` [Z, S, H, D]."""
+    from axolotl.monkeypatch.models.qwen3_5.fused_attn import _resolve_norm_module
+
+    n = _resolve_norm_module(norm)
+    w = n.weight
+    if w.device != x.device:  # accelerate CPU-staged params
+        w = w.to(x.device, non_blocking=True)
+    return fused_rms_norm_rope(x, w, cos, sin, eps=_norm_eps(n), unit_offset=True)
+
+
+def _quant_packs_along_d(x: torch.Tensor):
+    """NVFP4-pack ``x`` [Z, H, S, D] along D (the kernel q_packs/k_packs layout).
+
+    The strided quant reads head-major views (e.g. ``transpose(1, 2)`` of a
+    zshd fused-norm-rope output) without a fold copy when Z == 1 (reshape is a
+    view); reshape handles the copy itself otherwise.
+    """
+    from axolotl.kernels.attn_nvfp4_flash import _quant_nvfp4
+
+    z, h, s, d = x.shape
+    return _quant_nvfp4(x.reshape(z * h, s, d))
+
 
 def _grad_dots_kwargs(module) -> dict:
     """Backward grad-GEMM mode kwarg for the eager training entry.
@@ -369,22 +452,32 @@ def _can_fuse_vproj(module: nn.Module) -> bool:
 
 def _nvfp4_attention(
     module: nn.Module,
-    query_states: torch.Tensor,  # [Z, H, S, D]  post q_norm, PRE-RoPE
-    key_states: torch.Tensor,  # [Z, Hk, S, D] post k_norm, PRE-RoPE
+    query_states: torch.Tensor,  # [Z, H, S, D]  post q_norm (PRE-RoPE, or
+    key_states: torch.Tensor,  # [Z, Hk, S, D]   already roped when roped=True)
     value_states: torch.Tensor,  # [Z, Hk, Skv, D]
     cos: torch.Tensor,  # [Z, S, rotary_dim]
     sin: torch.Tensor,
     scaling: float,
     causal: bool,
     hidden_states: torch.Tensor | None = None,  # [Z, S, hidden], for fused v_proj
+    roped: bool = False,
 ) -> torch.Tensor:
-    """Fused-producer NVFP4 attention. Returns ``[Z, S, H, D]`` (HF attn_output)."""
+    """Fused-producer NVFP4 attention. Returns ``[Z, S, H, D]`` (HF attn_output).
+
+    ``roped=True``: q/k arrive already normed+roped (fused norm+rope path) and
+    are packed by the standalone strided quant; otherwise the fused RoPE+quant
+    producers rope them here.
+    """
     z, h, s_q, d = query_states.shape
     hk = key_states.shape[1]
     s_kv = key_states.shape[2]
 
-    qnv, qsc = fused_rope_quant_qk(query_states, cos, sin)
-    knv, ksc = fused_rope_quant_qk(key_states, cos, sin)
+    if roped:
+        qnv, qsc = _quant_packs_along_d(query_states)
+        knv, ksc = _quant_packs_along_d(key_states)
+    else:
+        qnv, qsc = fused_rope_quant_qk(query_states, cos, sin)
+        knv, ksc = fused_rope_quant_qk(key_states, cos, sin)
     if hidden_states is not None:
         # fuse the V quant into a native-NVFP4 v_proj GEMM epilogue (no bf16 V)
         wnv, wsc = _get_vproj_packed(module)
@@ -620,15 +713,27 @@ def make_nvfp4_forward(orig_forward):
             )
         gate = gate.reshape(*input_shape, -1)
 
-        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        if use_fp4_qk:
-            key_states = self.k_norm(k_full.view(hidden_shape)).transpose(1, 2)
-        else:
-            key_states = self.k_norm(
-                self.k_proj(hidden_states).view(hidden_shape)
-            ).transpose(1, 2)
-
         cos, sin = position_embeddings
+        key_pre = (
+            k_full if use_fp4_qk else self.k_proj(hidden_states)
+        ).view(hidden_shape)
+        # Fused RMSNorm + partial RoPE (one triton_op per operand — the same
+        # kernel the fused_attn_kernel baseline uses). ``roped=True`` means
+        # query_states/key_states below are ALREADY roped [Z, H, S, D] views;
+        # the legacy path keeps eager norms + the rope(-quant) producers.
+        roped = kind is not None and _fused_norm_rope_ok(self)
+        if roped:
+            query_states = _fused_norm_rope(
+                self.q_norm, query_states.view(hidden_shape), cos, sin
+            ).transpose(1, 2)
+            key_states = _fused_norm_rope(self.k_norm, key_pre, cos, sin).transpose(
+                1, 2
+            )
+        else:
+            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(
+                1, 2
+            )
+            key_states = self.k_norm(key_pre).transpose(1, 2)
 
         if kind == "packed":
             # Varlen block-diagonal causal attention over the flattened pack:
@@ -666,8 +771,14 @@ def make_nvfp4_forward(orig_forward):
                 value_states = (
                     self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                 )
-                qnv, qsc = fused_rope_quant_qk(query_states, cos, sin)
-                knv, ksc = fused_rope_quant_qk(key_states, cos, sin)
+                if roped:
+                    # q/k already roped by the fused norm+rope op; pack with
+                    # the standalone strided quant (no eager rope round-trip).
+                    qnv, qsc = _quant_packs_along_d(query_states)
+                    knv, ksc = _quant_packs_along_d(key_states)
+                else:
+                    qnv, qsc = fused_rope_quant_qk(query_states, cos, sin)
+                    knv, ksc = fused_rope_quant_qk(key_states, cos, sin)
                 vnv, vsc, _ = quant_v_keyaxis(value_states, block_n=_BLOCK_N)
                 z_p, h_p, _, d_p = query_states.shape
                 attn_output = nvfp4_flash_attention_packed(
@@ -713,7 +824,15 @@ def make_nvfp4_forward(orig_forward):
             # roped hp through the no-packs path. grad_enabled here implies no
             # kv cache (cached grad batches returned to orig above).
             q_packs = k_packs = None
-            if grad_enabled and _TRAIN_PREPACKED:
+            if roped:
+                # fused norm+rope already produced roped hp q/k (grads flow
+                # through its registered backward); just pack the forward
+                # operands when the fork takes pre-packed q/k.
+                query_roped, key_roped = query_states, key_states
+                if grad_enabled and _TRAIN_PREPACKED:
+                    q_packs = _quant_packs_along_d(query_roped)
+                    k_packs = _quant_packs_along_d(key_roped)
+            elif grad_enabled and _TRAIN_PREPACKED:
                 qnv_t, qsc_t, query_roped = fused_rope_quant_qk_hp(
                     query_states, cos, sin
                 )
@@ -768,6 +887,11 @@ def make_nvfp4_forward(orig_forward):
                     if q_packs is not None
                     else {}
                 )
+                if _TRAIN_OUT_LAYOUT:
+                    # the kernel writes [Z, S, H, D] directly and the backward
+                    # consumes the zshd gradient via strided reads — no
+                    # transpose-fold copy in either direction.
+                    prepacked_kwargs["out_layout"] = "zshd"
                 attn_output = nvfp4_flash_attn_func(
                     query_roped,
                     key_roped,
@@ -778,9 +902,14 @@ def make_nvfp4_forward(orig_forward):
                     cu_seqlens=cu_seqlens,
                     stochastic_rounding=sr,
                     save_backward_packs=False,
+                    dkdv_scratch_bf16=getattr(
+                        self, "_nvfp4_dkdv_scratch_bf16", False
+                    ),
                     **_grad_dots_kwargs(self),
                     **prepacked_kwargs,
-                ).transpose(1, 2)  # [Z, H, S, D] -> [Z, S, H, D]
+                )  # [Z, S, H, D] (zshd) or [Z, H, S, D] (legacy fork)
+                if not _TRAIN_OUT_LAYOUT:
+                    attn_output = attn_output.transpose(1, 2)  # -> [Z, S, H, D]
             else:
                 # No-grad eval/prefill on a legacy fork (packed-operand forward
                 # without cu_seqlens) or with a cache to fill: same varlen
@@ -830,9 +959,20 @@ def make_nvfp4_forward(orig_forward):
                 value_states = (
                     self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                 )
-                query_roped, key_roped = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin
-                )
+                save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
+                q_packs = k_packs = None
+                if roped:
+                    query_roped, key_roped = query_states, key_states
+                    # pre-packed forward q/k (skips the kernel's own pre-quant
+                    # launches); incompatible with the saved-pack set, which
+                    # must derive from one fused HP read.
+                    if _TRAIN_PREPACKED and not save_packs:
+                        q_packs = _quant_packs_along_d(query_roped)
+                        k_packs = _quant_packs_along_d(key_roped)
+                else:
+                    query_roped, key_roped = apply_rotary_pos_emb(
+                        query_states, key_states, cos, sin
+                    )
                 sr = getattr(self, "_nvfp4_stochastic_rounding", True)
                 grad_sr = sr and not getattr(
                     self, "_nvfp4_backward_rtn_grad_packs", False
@@ -862,14 +1002,21 @@ def make_nvfp4_forward(orig_forward):
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
                         backward_grad_dots=getattr(self, "_nvfp4_grad_dots", None),
-                        save_backward_packs=getattr(
-                            self, "_nvfp4_save_backward_packs", False
-                        ),
+                        save_backward_packs=save_packs,
                         out_layout="zshd",
+                        q_packs=q_packs,
+                        k_packs=k_packs,
                     )
                     # trailing half of the isolating break (see the leading one above)
                     torch._dynamo.graph_break()
                 else:
+                    prepacked_kwargs = (
+                        {"q_packs": q_packs, "k_packs": k_packs}
+                        if q_packs is not None
+                        else {}
+                    )
+                    if _TRAIN_OUT_LAYOUT:
+                        prepacked_kwargs["out_layout"] = "zshd"
                     attn_output = nvfp4_flash_attn_func(
                         query_roped,
                         key_roped,
@@ -881,14 +1028,15 @@ def make_nvfp4_forward(orig_forward):
                         backward_p_dv_stochastic_rounding=grad_sr,
                         backward_dot_dv_stochastic_rounding=grad_sr,
                         backward_ds_dq_stochastic_rounding=grad_sr,
-                        save_backward_packs=getattr(
-                            self, "_nvfp4_save_backward_packs", False
-                        ),
+                        save_backward_packs=save_packs,
                         dkdv_scratch_bf16=getattr(
                             self, "_nvfp4_dkdv_scratch_bf16", False
                         ),
                         **_grad_dots_kwargs(self),
-                    ).transpose(1, 2)
+                        **prepacked_kwargs,
+                    )  # [Z, S, H, D] (zshd) or [Z, H, S, D] (legacy fork)
+                    if not _TRAIN_OUT_LAYOUT:
+                        attn_output = attn_output.transpose(1, 2)
             else:
                 # Write roped K/V to the cache so subsequent decode steps see prefill
                 # context, then run NVFP4 on the same roped K/V.
@@ -903,7 +1051,12 @@ def make_nvfp4_forward(orig_forward):
                         self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                     )
                 if past_key_values is not None:
-                    k_roped, _ = apply_rotary_pos_emb(key_states, key_states, cos, sin)
+                    if roped:
+                        k_roped = key_states
+                    else:
+                        k_roped, _ = apply_rotary_pos_emb(
+                            key_states, key_states, cos, sin
+                        )
                     past_key_values.update(k_roped, value_states, self.layer_idx)
 
                 attn_output = _nvfp4_attention(
@@ -916,6 +1069,7 @@ def make_nvfp4_forward(orig_forward):
                     self.scaling,
                     causal=(kind == "causal"),
                     hidden_states=hidden_states if fuse_v else None,
+                    roped=roped,
                 )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = attn_output * torch.sigmoid(gate)

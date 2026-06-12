@@ -49,3 +49,12 @@ try:
     )
 except ImportError:  # pragma: no cover - legacy sageattention fork
     _resolve_backward_grad_dots = None
+
+# Whether the fork's rownorm backward modes take zshd ([Z, Sq, H, D]) dO/out
+# directly (stride-aware packprep + layout-aware dotrms). False on forks whose
+# fp4_rownorm asserts a contiguous [Z*H, Sq, D] dO — callers must fold with a
+# transpose copy there.
+try:
+    from sageattention.nvfp4.flash import _BWD_RN_DO_ZSHD  # noqa: F401
+except ImportError:  # pragma: no cover - legacy sageattention fork
+    _BWD_RN_DO_ZSHD = False
