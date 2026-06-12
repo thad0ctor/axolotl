@@ -13,6 +13,7 @@ from transformers import AutoConfig
 
 from axolotl.kernels.lora import (
     apply_lora_embedding,
+    apply_lora_linear,
     apply_lora_mlp_geglu,
     apply_lora_mlp_swiglu,
     apply_lora_o,
@@ -317,6 +318,34 @@ def find_self_attn_in_layer(
             yield layer.self_attn
 
 
+# Linear-attention (GatedDeltaNet-style) projections that take the layer's
+# [B, S, hidden]-sized activations. Routed through the fused LoRA kernel when
+# LoRA-wrapped so peft's _cast_input_dtype doesn't round-trip the activation
+# bf16 -> fp32 (adapter dtype) -> bf16 (autocast) on every call.
+LINEAR_ATTN_PROJS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")
+_LINEAR_ATTN_PATCH_LOGGED: list[bool] = []
+
+
+def find_linear_attn_in_layer(layer: nn.Module) -> Generator[nn.Module, None, None]:
+    # Qwen3.5 / Qwen3.5-MoE hybrid layers (GatedDeltaNet)
+    if hasattr(layer, "linear_attn"):
+        linear_attn = layer.linear_attn
+        if hasattr(linear_attn, "out_proj") and any(
+            hasattr(linear_attn, proj) for proj in LINEAR_ATTN_PROJS[:-1]
+        ):
+            yield linear_attn
+
+
+def _make_apply_lora_linear(proj_name: str):
+    """Bound-method factory: fused LoRA forward for ``self.<proj_name>``."""
+
+    def apply_linear(self, X: torch.Tensor) -> torch.Tensor:
+        return apply_lora_linear(getattr(self, proj_name), X)
+
+    apply_linear.__name__ = f"apply_{proj_name}"
+    return apply_linear
+
+
 def find_mlp_in_layer(
     layer: nn.Module,
 ) -> Generator[Tuple[nn.Module, nn.Module, nn.Module, nn.Module], None, None]:
@@ -501,6 +530,35 @@ def apply_lora_kernel_patches(
                     LOG.warning_once(
                         "Cannot patch some attention output projection - requires LoRA adapters"
                     )
+        if cfg.lora_qkv_kernel or cfg.lora_o_kernel:
+            # Linear-attention projections (Qwen3.5 GatedDeltaNet): attach a
+            # fused per-projection helper (apply_in_proj_qkv, ..., apply_out_proj)
+            # for every LoRA-wrapped projection. The patched modeling forward
+            # routes through these when present (exact peft fallback otherwise),
+            # keeping the [B, S, hidden] activation in its compute dtype instead
+            # of peft's bf16 -> fp32 -> bf16 cast round-trip per call.
+            for linear_attn in find_linear_attn_in_layer(layer):
+                patched_projs = []
+                for proj_name in LINEAR_ATTN_PROJS:
+                    proj = getattr(linear_attn, proj_name, None)
+                    if proj is None or not hasattr(proj, "lora_A"):
+                        continue
+                    setattr(
+                        linear_attn,
+                        f"apply_{proj_name}",
+                        types.MethodType(
+                            _make_apply_lora_linear(proj_name), linear_attn
+                        ),
+                    )
+                    patched_projs.append(proj_name)
+                if patched_projs:
+                    linear_attn._lora_batch_kernel = bool(cfg.lora_batch_kernel)
+                    if not _LINEAR_ATTN_PATCH_LOGGED:
+                        _LINEAR_ATTN_PATCH_LOGGED.append(True)
+                        LOG.info(
+                            "Patched linear-attention LoRA projections with "
+                            f"fused kernels: {patched_projs}"
+                        )
         for gate_proj, up_proj, down_proj, mlp in find_mlp_in_layer(layer):
             if cfg.lora_mlp_kernel:
                 # Check is inside lora_mlp_kernel guard so models with an

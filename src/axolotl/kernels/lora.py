@@ -2515,6 +2515,26 @@ def apply_lora_o(self, X: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def apply_lora_linear(proj: nn.Module, X: torch.Tensor) -> torch.Tensor:
+    """Fused LoRA forward for a single (peft-wrapped) Linear projection.
+
+    Generic counterpart of ``apply_lora_o`` for projections that are not part
+    of an attention/MLP bundle (e.g. the Qwen3.5 linear-attention
+    in_proj_qkv/in_proj_z/out_proj). Runs the base GEMM + adapter GEMMs through
+    the ``LoRA_O`` autograd function: the input stays in its compute dtype and
+    only the skinny adapter weights are cast, instead of peft's
+    ``_cast_input_dtype`` round-tripping the whole [B, S, in] activation
+    bf16 -> fp32 (adapter dtype) -> bf16 (autocast). NVFP4 frozen bases are
+    threaded through the ``W_quant`` slot exactly as in the other fused paths.
+
+    Note: ``LoRA_O``'s backward assumes a 3-D ``[batch, seq, in]`` input.
+    Supports bias, dropout, and DoRA.
+    """
+    W, b, W_quant, A, B, s, lora_bias, dropout, magnitude = get_lora_parameters(proj)
+    X_drop = _apply_dropout(dropout, X, proj.training)
+    return LoRA_O.apply(X, X_drop, W, b, W_quant, A, B, s, lora_bias, magnitude)
+
+
 # ============================================================
 # Embedding LoRA kernel
 # ============================================================
