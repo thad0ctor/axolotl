@@ -28,6 +28,23 @@ def set_fla_causal_conv_compile_boundary(enabled: bool) -> None:
     _FLA_CAUSAL_CONV_COMPILE_BOUNDARY = bool(enabled)
 
 
+# Set once at patch time (see _apply_packing_patches): True when the opaque
+# custom-op wrappers for the FLA training kernels registered (see fla_ops.py).
+# These keep the linear-attention layer free of graph breaks — required for
+# dynamo to compile the transformers decoder LOOP at all (a break anywhere in
+# the loop body makes dynamo skip the whole ``Qwen3_5TextModel.forward``
+# frame: "graph break in a for/while loop").
+_FLA_COMPILED_OPS = False
+
+
+def _init_fla_compiled_ops() -> bool:
+    global _FLA_COMPILED_OPS
+    from axolotl.monkeypatch.models.qwen3_5 import fla_ops
+
+    _FLA_COMPILED_OPS = fla_ops.fla_ops_available()
+    return _FLA_COMPILED_OPS
+
+
 def _call_fla_causal_conv1d(*, x, weight, bias, activation, cu_seqlens):
     return fla_causal_conv1d(
         x=x,
@@ -234,23 +251,40 @@ def _patched_decoder_forward(
             position_ids=position_ids,
         )
     elif self.layer_type == "full_attention":
-        # Run flash-attention eager under torch.compile. With gradient
-        # checkpointing OFF, Inductor otherwise fuses the FA2 backward with the
-        # gated-output/o_proj dgrad into a region that yields corrupt (~1e5)
-        # input gradients on packed sequences; the gate multiply right after
-        # attention is what makes this region fusable on Qwen3.5 (plain-attention
-        # models such as Qwen3-VL are unaffected). Breaking the graph around the
-        # one attention call avoids the fusion while the rest stays compiled.
-        hidden_states, _ = _call_self_attn_disabled(
-            self.self_attn,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        if getattr(self, "gradient_checkpointing", False) and self.training:
+            # Traced path. The Inductor fusion hazard documented below was
+            # only ever observed with gradient checkpointing OFF; under
+            # activation checkpointing the attention call stays in-graph so
+            # the decoder LOOP can compile (any graph break — including a
+            # dynamo.disable boundary — inside the loop body makes dynamo
+            # skip the whole Qwen3_5TextModel.forward frame).
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        else:
+            # Run flash-attention eager under torch.compile. With gradient
+            # checkpointing OFF, Inductor otherwise fuses the FA2 backward with the
+            # gated-output/o_proj dgrad into a region that yields corrupt (~1e5)
+            # input gradients on packed sequences; the gate multiply right after
+            # attention is what makes this region fusable on Qwen3.5 (plain-attention
+            # models such as Qwen3-VL are unaffected). Breaking the graph around the
+            # one attention call avoids the fusion while the rest stays compiled.
+            hidden_states, _ = _call_self_attn_disabled(
+                self.self_attn,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
 
     hidden_states = residual + hidden_states
 
@@ -286,9 +320,21 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
             and cache_position is not None
         )
 
+        # Compiled-ops path (training, no cache): the FLA kernels run behind
+        # opaque custom ops that take position_ids and derive cu_seqlens
+        # EAGERLY inside (fla_ops.py) — aten.nonzero in the traced region
+        # would graph-break, and one break inside the transformers decoder
+        # loop makes dynamo skip the whole loop frame.
+        use_compiled_ops = (
+            _FLA_COMPILED_OPS and cache_params is None and not use_precomputed_states
+        )
         cu_seqlens = None
+        pos_for_varlen = None
         if not use_precomputed_states and position_ids is not None:
-            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
+            if use_compiled_ops:
+                pos_for_varlen = position_ids
+            else:
+                cu_seqlens = get_cu_seqlens(position_ids=position_ids)
 
         if cache_params is not None:
             conv_state = cache_params.conv_states[self.layer_idx]
@@ -319,7 +365,20 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
                     (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0),
                 )
 
-            if fla_causal_conv1d is not None and cu_seqlens is not None:
+            if fla_causal_conv1d is not None and pos_for_varlen is not None:
+                # Opaque custom op (same FLA varlen kernels): traceable, so
+                # the decoder loop can compile — the raw FLA entry points
+                # graph-break (data-dependent `.item()` in
+                # prepare_chunk_indices, or the legacy dynamo.disable
+                # boundary below).
+                mixed_qkv = torch.ops.axolotl_qwen3_5.gdn_conv(
+                    mixed_qkv,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    self.activation,
+                    pos_for_varlen,
+                )
+            elif fla_causal_conv1d is not None and cu_seqlens is not None:
                 # FLA varlen kernel for packed sequences; input must be contiguous [B, T, D]
                 conv_fn = (
                     _call_fla_causal_conv1d_disabled
@@ -359,18 +418,35 @@ def _make_qwen3_5_gated_delta_forward(apply_mask_fn):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g.to(dtype=query.dtype),
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-                # torch_chunk_gated_delta_rule fallback does not accept cu_seqlens
-                **({"cu_seqlens": cu_seqlens} if cu_seqlens is not None else {}),
-            )
+            if use_compiled_ops:
+                # Opaque custom op mirroring ChunkGatedDeltaRuleFunction
+                # (identical kernels and saved tensors; the g -> query.dtype
+                # cast happens inside the op). FLA's public entry is
+                # @torch.compiler.disable, which would graph-break the
+                # decoder loop. pos_for_varlen None = dense (non-packed).
+                core_attn_out = torch.ops.axolotl_qwen3_5.gdn_chunk(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    key.shape[-1] ** -0.5,  # FLA's default scale
+                    pos_for_varlen,
+                )[0]
+                last_recurrent_state = None
+            else:
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g.to(dtype=query.dtype),
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                    # torch_chunk_gated_delta_rule fallback does not accept cu_seqlens
+                    **({"cu_seqlens": cu_seqlens} if cu_seqlens is not None else {}),
+                )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
@@ -402,6 +478,7 @@ def _apply_packing_patches(
     forward_factory,
     *,
     fla_causal_conv_compile_boundary: bool = False,
+    torch_compile: bool = False,
 ) -> None:
     module_name = f"transformers.models.{model_type}.modeling_{model_type}"
 
@@ -412,7 +489,14 @@ def _apply_packing_patches(
         return
 
     set_fla_causal_conv_compile_boundary(fla_causal_conv_compile_boundary)
-    _inject_fla_kernels(module, compile_boundary=fla_causal_conv_compile_boundary)
+    # Under torch_compile, FusedRMSNormGated must also go through its custom-op
+    # wrapper: its eager entry hits untraceable code (cuda_utils
+    # get_device_properties / un-meta-able as_strided backward), and ANY graph
+    # break inside the decoder loop makes dynamo skip the whole loop frame.
+    _inject_fla_kernels(
+        module, compile_boundary=fla_causal_conv_compile_boundary or torch_compile
+    )
+    compiled_ops = _init_fla_compiled_ops()
     getattr(module, f"{cls_prefix}DecoderLayer").forward = _patched_decoder_forward
     gated_cls = getattr(module, f"{cls_prefix}GatedDeltaNet")
     gated_cls.forward = forward_factory(module.apply_mask_to_padding_states)
@@ -420,27 +504,33 @@ def _apply_packing_patches(
     LOG.info(
         f"Applied {cls_prefix} packing patch "
         f"(fla_causal_conv1d={'available' if fla_causal_conv1d else 'unavailable'}, "
-        f"compile_boundary={fla_causal_conv_compile_boundary})"
+        f"compile_boundary={fla_causal_conv_compile_boundary}, "
+        f"torch_compile={torch_compile}, "
+        f"compiled_loop_fla_ops={compiled_ops})"
     )
 
 
-def patch_qwen3_5_modeling_packing(*, fla_causal_conv_compile_boundary: bool = False):
+def patch_qwen3_5_modeling_packing(
+    *, fla_causal_conv_compile_boundary: bool = False, torch_compile: bool = False
+):
     _apply_packing_patches(
         "qwen3_5",
         "Qwen3_5",
         _make_qwen3_5_gated_delta_forward,
         fla_causal_conv_compile_boundary=fla_causal_conv_compile_boundary,
+        torch_compile=torch_compile,
     )
 
 
 def patch_qwen3_5_moe_modeling_packing(
-    *, fla_causal_conv_compile_boundary: bool = False
+    *, fla_causal_conv_compile_boundary: bool = False, torch_compile: bool = False
 ):
     _apply_packing_patches(
         "qwen3_5_moe",
         "Qwen3_5Moe",
         _make_qwen3_5_gated_delta_forward,
         fla_causal_conv_compile_boundary=fla_causal_conv_compile_boundary,
+        torch_compile=torch_compile,
     )
 
 

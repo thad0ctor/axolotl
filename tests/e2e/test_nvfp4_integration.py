@@ -1084,8 +1084,24 @@ def test_qwen3_5_packing_patch_forwards_fla_compile_boundary(monkeypatch):
 
     pm._apply_model_specific_patches()
 
+    pm = _patch_manager(
+        {
+            "model_config_type": "qwen3_5",
+            "sample_packing": True,
+            "torch_compile": True,
+            "bf16": True,
+        }
+    )
+
+    pm._apply_model_specific_patches()
+
     assert captured[0]["fla_causal_conv_compile_boundary"] is False
     assert captured[1]["fla_causal_conv_compile_boundary"] is True
+    # torch_compile must be forwarded: it switches FusedRMSNormGated to its
+    # custom-op wrapper so the decoder LOOP can compile break-free.
+    assert captured[0]["torch_compile"] is False
+    assert captured[1]["torch_compile"] is False
+    assert captured[2]["torch_compile"] is True
 
 
 def test_apply_selects_lora_compute_mode(monkeypatch):
