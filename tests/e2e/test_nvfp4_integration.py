@@ -933,6 +933,225 @@ def _patch_manager(cfg_dict):
     return PatchManager(DictDefault(cfg_dict), model_config=DictDefault({}))
 
 
+# --- Residual calibration plumbing (regression: the standard `axolotl train`
+# path must thread the prepared train dataset to the PatchManager so the NVFP4
+# residual calibration resolves REAL input_ids at swap time; previously neither
+# `PatchManager.train_dataset` nor `cfg._train_dataset` was ever populated and
+# the base residual silently DISABLED / the lm_head residual fell back to
+# plain SVD). ---
+
+
+def test_calib_input_ids_resolve_from_threaded_train_dataset():
+    """PatchManager built with a prepared dataset must calibrate from its first
+    sample, not the deterministic arange fallback."""
+    import torch
+    from datasets import Dataset
+    from axolotl.loaders.patch_manager import PatchManager
+    from axolotl.utils.dict import DictDefault
+
+    sample = list(range(1000, 1064))
+    ds = Dataset.from_dict({"input_ids": [sample, list(range(7))]})
+    pm = PatchManager(
+        DictDefault({}), model_config=DictDefault({}), train_dataset=ds
+    )
+
+    class _Model:
+        # Tiny vocab: the arange fallback would emit ids < 8, so any value from
+        # `sample` (>= 1000) proves the real dataset path was taken.
+        config = DictDefault({"vocab_size": 8})
+
+    ids = pm._nvfp4_calib_input_ids(_Model(), 32, torch.device("cpu"))
+    assert ids is not None
+    assert ids.shape == (1, 32)
+    assert ids[0].tolist() == sample[:32]
+
+
+def test_calib_input_ids_fallback_without_dataset():
+    """No dataset threaded -> the deterministic in-vocab range stays the last
+    resort (never None for a model with a vocab)."""
+    import torch
+    from axolotl.utils.dict import DictDefault
+
+    pm = _patch_manager({})
+
+    class _Model:
+        config = DictDefault({"vocab_size": 8})
+
+    ids = pm._nvfp4_calib_input_ids(_Model(), 16, torch.device("cpu"))
+    assert ids is not None
+    assert ids.max().item() < 8  # in-vocab arange, not garbage
+
+
+def test_model_loader_threads_train_dataset_to_patch_manager(monkeypatch):
+    """ModelLoader(train_dataset=...) must hand the dataset to its PatchManager."""
+    from datasets import Dataset
+
+    import axolotl.loaders.model as model_mod
+    from axolotl.utils.dict import DictDefault
+
+    monkeypatch.setattr(
+        model_mod, "load_model_config", lambda cfg: DictDefault({})
+    )
+    ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4]]})
+    loader = model_mod.ModelLoader(
+        DictDefault({"base_model": "dummy"}), tokenizer=None, train_dataset=ds
+    )
+    assert loader.patch_manager.train_dataset is ds
+
+
+def test_setup_model_and_trainer_threads_prepared_dataset(monkeypatch):
+    """The trainer-like flow: setup_model_and_trainer must pass
+    dataset_meta.train_dataset into setup_model_and_tokenizer (the prepared
+    dataset exists BEFORE the model load / NVFP4 swap in the standard path)."""
+    from datasets import Dataset
+
+    import axolotl.train as train_mod
+    from axolotl.common.datasets import TrainDatasetMeta
+    from axolotl.utils.dict import DictDefault
+
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_setup(cfg, train_dataset=None):
+        captured["train_dataset"] = train_dataset
+        raise _Stop
+
+    monkeypatch.setattr(train_mod, "setup_model_and_tokenizer", fake_setup)
+    ds = Dataset.from_dict({"input_ids": [[5, 6, 7]]})
+    meta = TrainDatasetMeta(train_dataset=ds)
+    with pytest.raises(_Stop):
+        train_mod.setup_model_and_trainer(DictDefault({}), meta)
+    assert captured["train_dataset"] is ds
+
+
+def test_plain_lora_module_forwards_masks_and_restores_fused_routing():
+    """The calibration contextmanager must reroute every fused-LoRA helper
+    through plain module calls (so the residual-calibration nn.Module hooks
+    fire) and restore the fused routing verbatim on exit."""
+    import types
+
+    import torch
+    import torch.nn as nn
+
+    from axolotl.kernels.lora import apply_lora_mlp_swiglu
+    from axolotl.monkeypatch.lora_kernels import plain_lora_module_forwards
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4, bias=False)
+            self.k_proj = nn.Linear(4, 4, bias=False)
+            self.v_proj = nn.Linear(4, 4, bias=False)
+            self.o_proj = nn.Linear(4, 4, bias=False)
+
+    class GDN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj_qkv = nn.Linear(4, 4, bias=False)
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(4, 4, bias=False)
+            self.up_proj = nn.Linear(4, 4, bias=False)
+            self.down_proj = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.down_proj(self.gate_proj(x) * self.up_proj(x))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+            self.gdn = GDN()
+            self.mlp = MLP()
+
+    model = Model()
+
+    def fused_marker(self, x):  # stands in for the Triton-kernel helpers
+        return "FUSED"
+
+    model.attn.apply_qkv = types.MethodType(fused_marker, model.attn)
+    model.attn.apply_o = types.MethodType(fused_marker, model.attn)
+    model.attn._lora_batch_kernel = True
+    model.gdn.apply_in_proj_qkv = types.MethodType(fused_marker, model.gdn)
+    model.mlp.forward = types.MethodType(apply_lora_mlp_swiglu, model.mlp)
+
+    fired = []
+    handles = [
+        m.register_forward_pre_hook(lambda *_a, _n=n: fired.append(_n))
+        for n, m in model.named_modules()
+        if isinstance(m, nn.Linear)
+    ]
+    x = torch.randn(2, 4)
+    with plain_lora_module_forwards(model):
+        assert not hasattr(model.attn, "_lora_batch_kernel")
+        assert not hasattr(model.gdn, "apply_in_proj_qkv")
+        assert "forward" not in model.mlp.__dict__
+        # apply_qkv/apply_o stay CALLABLE (the source-rewritten attention
+        # forward calls them unconditionally) but route via the modules.
+        model.attn.apply_qkv(x)
+        model.attn.apply_o(x)
+        model.mlp(x)
+        model.gdn.in_proj_qkv(x)  # what _la_proj_fwd falls back to
+
+    for handle in handles:
+        handle.remove()
+    assert set(fired) >= {
+        "attn.q_proj",
+        "attn.k_proj",
+        "attn.v_proj",
+        "attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+        "gdn.in_proj_qkv",
+    }
+    # Fused routing restored verbatim.
+    assert model.attn.apply_qkv(x) == "FUSED"
+    assert model.attn.apply_o(x) == "FUSED"
+    assert model.attn._lora_batch_kernel is True
+    assert model.gdn.apply_in_proj_qkv(x) == "FUSED"
+    assert model.mlp.__dict__["forward"].__func__ is apply_lora_mlp_swiglu
+
+
+def test_capture_calib_hidden_uses_lm_head_pre_hook():
+    """lm_head calibration capture must take the head's INPUT via a forward
+    pre-hook — robust to model-output wrappers without ``last_hidden_state``
+    (regression: Qwen3_5CausalLMOutputWithPast broke the output spelunking)."""
+    import torch.nn as nn
+
+    from axolotl.utils.dict import DictDefault
+
+    class Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = DictDefault({"vocab_size": 16})
+            self.emb = nn.Embedding(16, 4)
+            self.lm_head = nn.Linear(4, 16, bias=False)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, input_ids):
+            h = self.emb(input_ids)
+            logits = self.lm_head(h)
+
+            class _WrapperOutput:  # no last_hidden_state, not a tuple/list
+                pass
+
+            out = _WrapperOutput()
+            out.logits = logits
+            return out
+
+    pm = _patch_manager({})
+    h = pm._nvfp4_capture_calib_hidden(Wrapped(), 8)
+    assert h is not None
+    assert h.shape == (8, 4)
+
+
 def test_apply_qwen3_5_native_attention_forwards_saved_pack_flag(monkeypatch):
     _supported(monkeypatch, True)
     from axolotl.monkeypatch.attention import nvfp4_flash_attn

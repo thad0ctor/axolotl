@@ -53,6 +53,7 @@ PLUGIN_MANAGER = PluginManager.get_instance()
 
 def setup_model_and_tokenizer(
     cfg: DictDefault,
+    train_dataset: Dataset | None = None,
 ) -> tuple[
     PreTrainedModel, PreTrainedTokenizer, PeftConfig | None, ProcessorMixin | None
 ]:
@@ -61,6 +62,10 @@ def setup_model_and_tokenizer(
 
     Args:
         cfg: Dictionary mapping `axolotl` config keys to values.
+        train_dataset: Optional prepared training dataset. In the standard train
+            path it is already tokenized before the model loads; threading it
+            here lets load-time calibration (e.g. the NVFP4 L2QER residuals)
+            forward a real sample instead of a synthetic token range.
 
     Returns:
         Tuple containing model, tokenizer, `peft_config` (if LoRA / QLoRA, else
@@ -80,7 +85,9 @@ def setup_model_and_tokenizer(
     # Load the model
     LOG.debug("Loading model")
 
-    model_loader = ModelLoader(cfg, tokenizer, processor=processor)
+    model_loader = ModelLoader(
+        cfg, tokenizer, processor=processor, train_dataset=train_dataset
+    )
     model, peft_config = model_loader.load()
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.do_sample = True
@@ -578,8 +585,13 @@ def setup_model_and_trainer(
             - PEFT config
             - Processor
     """
-    # Load tokenizer, processor and model
-    model, tokenizer, peft_config, processor = setup_model_and_tokenizer(cfg)
+    # Load tokenizer, processor and model. The prepared train dataset is threaded
+    # through so load-time calibration (NVFP4 base/lm_head residuals) can forward
+    # a real sample — at this point the dataset is already tokenized, but the
+    # trainer (which normally owns it) does not exist yet.
+    model, tokenizer, peft_config, processor = setup_model_and_tokenizer(
+        cfg, train_dataset=dataset_meta.train_dataset
+    )
 
     # Set up reference model for RL if needed
     model_ref = setup_reference_model(cfg, tokenizer)

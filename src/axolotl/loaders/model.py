@@ -107,6 +107,7 @@ class ModelLoader:
         *,
         inference: bool = False,
         reference_model: bool = False,
+        train_dataset=None,
         **kwargs,
     ):
         """Initializes the ModelLoader.
@@ -119,12 +120,15 @@ class ModelLoader:
                 to False.
             reference_model: Whether this is a reference model (used in setups like DPO
                 training). Defaults to False.
+            train_dataset: Optional prepared (tokenized) training dataset, used by
+                load-time activation calibration (NVFP4 residuals). Defaults to None.
             **kwargs: Additional keyword arguments (ignored).
         """
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.inference: bool = inference
         self.reference_model: bool = reference_model
+        self.train_dataset = train_dataset
 
         # Init model kwargs
         self.model_kwargs: dict[str, Any] = {}
@@ -146,6 +150,7 @@ class ModelLoader:
             cfg=cfg,
             model_config=self.model_config,
             inference=inference,
+            train_dataset=train_dataset,
         )
 
     @cached_property

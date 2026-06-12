@@ -76,6 +76,7 @@ class PatchManager:
         cfg: DictDefault,
         model_config: PretrainedConfig | addict.Dict,
         inference: bool = False,
+        train_dataset=None,
     ):
         """Initialize the `PatchManager`.
 
@@ -83,10 +84,15 @@ class PatchManager:
             cfg: Configuration dictionary with model and training settings.
             model_config: Configuration object for the model.
             inference: Whether the model is being loaded for inference mode.
+            train_dataset: Optional prepared (tokenized) training dataset. In the
+                standard train path datasets are prepared before the model loads;
+                threading the dataset here lets the NVFP4 residual calibration
+                (`_nvfp4_calib_input_ids`) forward a real sample at swap time.
         """
         self.cfg = cfg
         self.model_config = model_config
         self.inference = inference
+        self.train_dataset = train_dataset
 
     @cached_property
     def has_flash_attn(self) -> bool:
@@ -1087,15 +1093,39 @@ class PatchManager:
             base.register_forward_pre_hook(_make_hook(name)) for name, base in targets
         ]
         n_tok = 0
+        moved_from_cpu = False
         try:
             device = next(model.parameters()).device
-            ids = self._nvfp4_calib_input_ids(model, calib_tokens, device)
+            run_device = device
+            if device.type == "cpu" and torch.cuda.is_available():
+                # The NVFP4 LoRA loader keeps the bf16 model on CPU (the swap
+                # streams it to the GPU layer by layer), but the calibration
+                # forward has to run on the GPU: flash-attention / Triton
+                # linear-attention kernels have no CPU path. Hop the model over
+                # for the ONE short no-grad forward and hop back, so the
+                # streaming swap still starts from CPU. The bf16 weights fit on
+                # the GPU long before a training step would (no optimizer/grad/
+                # activation state); if they don't, the OOM lands in the except
+                # below and the residual loudly disables as before.
+                run_device = torch.device("cuda")
+                model.to(run_device)
+                moved_from_cpu = True
+            ids = self._nvfp4_calib_input_ids(model, calib_tokens, run_device)
             if ids is None:
                 raise RuntimeError("no calibration input_ids available")
             n_tok = int(ids.numel())
             was_training = model.training
             model.eval()
-            with torch.no_grad():
+            # The fused-LoRA kernel patches (apply_qkv/apply_o, the
+            # GatedDeltaNet apply_<proj> helpers, the fused MLP instance
+            # forward) call the Triton kernels with raw weights — the hooked
+            # base nn.Linear modules never run under them, so the pre-hooks
+            # above would capture nothing. Reroute through the plain module
+            # forwards for this ONE short no-grad pass (numerics-equivalent;
+            # perf is irrelevant here).
+            from axolotl.monkeypatch.lora_kernels import plain_lora_module_forwards
+
+            with torch.no_grad(), plain_lora_module_forwards(model):
                 model(ids)
             if was_training:
                 model.train()
@@ -1110,6 +1140,9 @@ class PatchManager:
         finally:
             for handle in handles:
                 handle.remove()
+            if moved_from_cpu:
+                model.to(torch.device("cpu"))
+                torch.cuda.empty_cache()
 
         calib = {name: (s / max(count, 1)) for name, (s, count) in acc.items()}
         if not calib:
@@ -1140,18 +1173,18 @@ class PatchManager:
         """Capture ``[N, H]`` final-layer hidden states feeding the lm_head.
 
         Forwards a short slice of the training dataset (or a synthetic token range
-        if none is reachable) through the model body with a forward hook on the
-        base model, returning the activations the lm_head consumes. Best-effort:
-        returns None on any failure, and the residual falls back to plain SVD.
+        if none is reachable) through the model with a forward PRE-hook on the
+        lm_head module itself, capturing exactly the activations it consumes —
+        immune to how the wrapper packages model outputs (``ModelOutput``
+        subclasses without ``last_hidden_state``, e.g. the Qwen3.5 conditional
+        generation output, broke the old output-spelunking path). Falls back to
+        a forward hook on the model body when no output embedding module is
+        exposed. Best-effort: returns None on any failure, and the residual
+        falls back to plain SVD.
         """
         import torch
 
         try:
-            base = getattr(model, "model", None) or getattr(
-                getattr(model, "base_model", model), "model", None
-            )
-            if base is None:
-                return None
             device = next(model.parameters()).device
             # Build a small input_ids batch: prefer a real train sample, else a
             # deterministic token range (the second moment per hidden dim is robust
@@ -1161,21 +1194,46 @@ class PatchManager:
                 return None
 
             captured = {}
+            get_out = getattr(model, "get_output_embeddings", None)
+            lm_head = get_out() if callable(get_out) else None
+            if lm_head is not None:
+                # Pre-hook on the head: args[0] is the hidden-state input,
+                # whatever the model's output wrapper looks like.
+                def pre_hook(_m, args):
+                    x = args[0] if args else None
+                    if torch.is_tensor(x):
+                        captured["h"] = x.detach()
 
-            def hook(_m, _inp, out):
-                h = getattr(out, "last_hidden_state", None)
-                if h is None:
-                    h = out[0] if isinstance(out, (tuple, list)) else out
-                captured["h"] = h.detach()
+                handle = lm_head.register_forward_pre_hook(pre_hook)
+                fwd_target = model
+            else:
+                # Fallback: hook the model body output (legacy path for models
+                # without an exposed output embedding module).
+                base = getattr(model, "model", None) or getattr(
+                    getattr(model, "base_model", model), "model", None
+                )
+                if base is None:
+                    return None
 
-            handle = base.register_forward_hook(hook)
+                def hook(_m, _inp, out):
+                    h = getattr(out, "last_hidden_state", None)
+                    if h is None:
+                        h = out[0] if isinstance(out, (tuple, list)) else out
+                    if torch.is_tensor(h):
+                        captured["h"] = h.detach()
+
+                handle = base.register_forward_hook(hook)
+                fwd_target = base
+
             was_training = model.training
             model.eval()
-            with torch.no_grad():
-                base(ids)
-            handle.remove()
-            if was_training:
-                model.train()
+            try:
+                with torch.no_grad():
+                    fwd_target(ids)
+            finally:
+                handle.remove()
+                if was_training:
+                    model.train()
             h = captured.get("h")
             return None if h is None else h.reshape(-1, h.shape[-1])
         except Exception as e:  # best-effort calibration
