@@ -600,6 +600,22 @@ def _nvfp4_o_proj(module, attn_output):
     return out
 
 
+def _o_proj_fwd(module, attn_output):
+    """o_proj through the fused LoRA kernel when attached (``apply_o``).
+
+    The plain peft LoRA module forward round-trips the [Z, S, hidden] input
+    bf16 -> fp32 (adapter dtype, ``_cast_input_dtype``) -> bf16 (autocast inside
+    ``F.linear``) — two hidden-sized copies per call plus their ToCopyBackward0
+    twins. ``apply_o`` (axolotl's LoRA kernel patch, same route the
+    fused_attn_kernel baseline takes) keeps the input bf16 and casts only the
+    skinny adapter weights. Falls back to the peft forward when unpatched.
+    """
+    apply_o = getattr(module, "apply_o", None)
+    if apply_o is not None:
+        return apply_o(attn_output)
+    return module.o_proj(attn_output)
+
+
 def make_nvfp4_forward(orig_forward):
     """Build a patched ``Qwen3_5Attention.forward`` that uses NVFP4 attention.
 
@@ -698,25 +714,37 @@ def make_nvfp4_forward(orig_forward):
         # near-lossless subset). Both default ON when the main flag is on.
         use_fp4_qk = use_fp4_proj and getattr(self, "_nvfp4_fp4_qk", True)
         use_fp4_o = use_fp4_proj and getattr(self, "_nvfp4_fp4_o", True)
+        v_full = None
         if use_fp4_qk:
             q_full, k_full = _nvfp4_qk_proj(self, hidden_states)
-            query_states, gate = torch.chunk(
-                q_full.view(*input_shape, -1, self.head_dim * 2),
-                2,
-                dim=-1,
-            )
+        elif hasattr(self, "_lora_batch_kernel"):
+            # Fused LoRA QKV (``apply_qkv`` — the same route the
+            # fused_attn_kernel baseline takes; ``_lora_batch_kernel`` is the
+            # sentinel apply_lora_kernel_patches sets iff the FUSED kernel was
+            # installed, not the plain fallback). The peft module forwards
+            # instead round-trip the [Z, S, hidden] input bf16 -> fp32 (adapter
+            # dtype) -> bf16 (autocast) per projection — with their backward
+            # ToCopyBackward0 twins that is ~24 hidden-sized copies per
+            # attention layer per checkpointed training step at 32k. matmul_lora
+            # runs the SAME NVFP4 base GEMM (module threaded through the
+            # W_quant slot) and the adapter GEMMs in the input dtype.
+            q_full, k_full, v_full = self.apply_qkv(hidden_states)
         else:
-            query_states, gate = torch.chunk(
-                self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
-                2,
-                dim=-1,
-            )
+            q_full = self.q_proj(hidden_states)
+            k_full = self.k_proj(hidden_states)
+        query_states, gate = torch.chunk(
+            q_full.view(*input_shape, -1, self.head_dim * 2),
+            2,
+            dim=-1,
+        )
         gate = gate.reshape(*input_shape, -1)
 
+        def _v_states():
+            v = v_full if v_full is not None else self.v_proj(hidden_states)
+            return v.view(hidden_shape).transpose(1, 2)
+
         cos, sin = position_embeddings
-        key_pre = (
-            k_full if use_fp4_qk else self.k_proj(hidden_states)
-        ).view(hidden_shape)
+        key_pre = k_full.view(hidden_shape)
         # Fused RMSNorm + partial RoPE (one triton_op per operand — the same
         # kernel the fused_attn_kernel baseline uses). ``roped=True`` means
         # query_states/key_states below are ALREADY roped [Z, H, S, D] views;
@@ -768,9 +796,7 @@ def make_nvfp4_forward(orig_forward):
                 # quant layout exactly) — only the consumer takes cu_seqlens.
                 # The TRAINING path below keeps standalone quant: the HP
                 # backward needs high-precision roped q/k/v anyway.
-                value_states = (
-                    self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                )
+                value_states = _v_states()
                 if roped:
                     # q/k already roped by the fused norm+rope op; pack with
                     # the standalone strided quant (no eager rope round-trip).
@@ -805,15 +831,13 @@ def make_nvfp4_forward(orig_forward):
                 attn_output = attn_output * torch.sigmoid(gate)
                 if use_fp4_o:
                     return _nvfp4_o_proj(self, attn_output), None
-                return self.o_proj(attn_output), None
+                return _o_proj_fwd(self, attn_output), None
 
             from transformers.models.qwen3_5.modeling_qwen3_5 import (
                 apply_rotary_pos_emb,
             )
 
-            value_states = (
-                self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            )
+            value_states = _v_states()
             # TRAINING fused producers: when the fork's training entry accepts
             # pre-packed q/k (q_packs/k_packs), one fused pass emits BOTH the
             # roped hp q/k (saved for the HP backward, grads flow through the
@@ -928,7 +952,7 @@ def make_nvfp4_forward(orig_forward):
             attn_output = attn_output * torch.sigmoid(gate)
             if use_fp4_o:
                 return _nvfp4_o_proj(self, attn_output), None
-            return self.o_proj(attn_output), None
+            return _o_proj_fwd(self, attn_output), None
 
         if kind is not None:
             from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -956,9 +980,7 @@ def make_nvfp4_forward(orig_forward):
                 # eager-fallback baseline already gets. Rest of the model still compiles.
                 if _custom_op_enabled(self):
                     torch._dynamo.graph_break()
-                value_states = (
-                    self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                )
+                value_states = _v_states()
                 save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
                 q_packs = k_packs = None
                 if roped:
@@ -1047,9 +1069,7 @@ def make_nvfp4_forward(orig_forward):
                 )
                 value_states = None
                 if not fuse_v:
-                    value_states = (
-                        self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    )
+                    value_states = _v_states()
                 if past_key_values is not None:
                     if roped:
                         k_roped = key_states
@@ -1075,7 +1095,7 @@ def make_nvfp4_forward(orig_forward):
             attn_output = attn_output * torch.sigmoid(gate)
             if use_fp4_o:
                 return _nvfp4_o_proj(self, attn_output), None
-            return self.o_proj(attn_output), None
+            return _o_proj_fwd(self, attn_output), None
 
         return orig_forward(
             self,
