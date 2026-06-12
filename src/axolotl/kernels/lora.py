@@ -237,77 +237,36 @@ def _residual_fold_factors(
     return first, second
 
 
-def _build_residual_pair(
-    A: torch.Tensor,
-    B_t: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    s: float,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(C1 [r+k, in], C2 [r+k, out])`` adapter+residual concat pair.
-
-    ``C1 = cat([A, res_B/s])`` and ``C2 = cat([B.T, res_A.T])`` serve BOTH
-    directions of one corrected base linear under a single ``alpha=s``:
+def _lora_residual_pair(
+    quant, A: torch.Tensor, B: torch.Tensor, s: float, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(C1 [r+k, in], C2 [r+k, out])`` adapter+residual concat pair, built
+    FUNCTIONALLY from the live adapter ``A [r, in]`` / ``B [out, r]`` and the
+    cached frozen residual halves. The pair serves BOTH directions of one
+    corrected base linear under a single ``alpha=s``:
 
       * fprop:  ``out += s * (X @ C1.T) @ C2``  (residual net scale 1 — its
         first factor is pre-divided by s)
       * dgrad:  ``dX  += s * (dY @ C2.T) @ C1`` and the ``[:, :r]`` slice of
         ``dY @ C2.T`` is exactly ``dY @ B`` for the (unchanged) LoRA grads.
 
-    ``A`` is the adapter A in ``[r, in]``; ``B_t`` the adapter B transposed to
-    ``[r, out]`` (may be a view).
+    The pair is rebuilt from the live adapters on EVERY call (two skinny
+    ``torch.cat`` copies); only the FROZEN residual halves are cached
+    (:func:`_residual_fold_factors` — identity-validated buffers whose content
+    cannot change). The pair itself must NOT be cached across steps keyed on
+    ``param._version``: fused optimizers (``adamw_torch_fused`` →
+    ``_fused_adamw_``) mutate params WITHOUT bumping the version counter, so a
+    version-validated pair silently freezes the fprop fold at stale adapter
+    content while backward uses the live values — a fprop/dgrad mismatch that
+    grows with adapter drift and diverges training (measured: grad_norm
+    1 → 8+ within 25 steps on the 9B run).
     """
-    inv = 1.0 / float(s)
-    C1 = torch.cat([A.to(dtype), (b * inv).to(dtype)], dim=0)  # [r+k, in]
-    C2 = torch.cat([B_t.to(dtype), a.t().to(dtype)], dim=0)  # [r+k, out]
-    return C1, C2
-
-
-def _lora_residual_pair(
-    quant, A: torch.Tensor, B: torch.Tensor, s: float, dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Forward-path ``(C1, C2)`` for a corrected NVFP4 base, version-cached.
-
-    Built from the live adapter params ``A [r, in]`` / ``B [out, r]`` and the
-    frozen residual buffers; cached on the module and revalidated by param
-    identity + ``_version`` (the unsloth/DoRA caching pattern), so in steady
-    state (within an optimizer step / across grad-accumulation micro-batches)
-    the fold costs ZERO extra kernels — the two LoRA GEMMs just widen by k.
-    Under dynamo the cache is bypassed (functional build; no module mutation).
-    """
-    res = _nvfp4_base_residual(quant)
+    res = _residual_fold_factors(quant, s, dtype, dgrad=False)
     if res is None:
         return None
-    a, b = res
-    if torch.compiler.is_compiling():
-        return _build_residual_pair(A, B.t(), a, b, s, dtype)
-    ent = getattr(quant, "_res_pair_cache", None)
-    if (
-        ent is not None
-        and ent[0] is A
-        and ent[1] == A._version
-        and ent[2] is B
-        and ent[3] == B._version
-        and ent[4] is a
-        and ent[5] is b
-        and ent[6] == float(s)
-        and ent[7] == dtype
-    ):
-        return ent[8]
-    pair = _build_residual_pair(A, B.t(), a, b, s, dtype)
-    quant._res_pair_cache = (
-        A,
-        A._version,
-        B,
-        B._version,
-        a,
-        b,
-        float(s),
-        dtype,
-        pair,
-    )
-    return pair
+    C1 = torch.cat([A.to(dtype), res[0]], dim=0)  # [r+k, in]
+    C2 = torch.cat([B.t().to(dtype), res[1]], dim=0)  # [r+k, out]
+    return C1, C2
 
 
 def _bwd_residual_pair(
@@ -317,31 +276,11 @@ def _bwd_residual_pair(
     s: float,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Backward-path ``(C1, C2)``: reuse the pair this layer's forward built.
-
-    The optimizer only steps AFTER backward, so the forward-built pair is
-    always fresh here; validate scale/dtype and residual-buffer identity only
-    (the saved adapter copies are new objects each forward, so param identity
-    cannot be rechecked — freshness is structural). On a miss (batched
-    forward, compiled trace, re-attached buffers) rebuild functionally from
-    the SAVED adapter matrices ``A_saved [r, in]`` / ``B_saved [out, r]`` —
-    bitwise the same content the forward concatenated.
-    """
-    res = _nvfp4_base_residual(quant)
-    if res is None:
-        return None
-    a, b = res
-    if not torch.compiler.is_compiling():
-        ent = getattr(quant, "_res_pair_cache", None)
-        if (
-            ent is not None
-            and ent[4] is a
-            and ent[5] is b
-            and ent[6] == float(s)
-            and ent[7] == dtype
-        ):
-            return ent[8]
-    return _build_residual_pair(A_saved, B_saved.t(), a, b, s, dtype)
+    """Backward-path ``(C1, C2)``: rebuilt from the SAVED adapter matrices
+    ``A_saved [r, in]`` / ``B_saved [out, r]`` — bitwise the same content the
+    forward concatenated, so fprop/dgrad consistency is structural (the
+    backward can never see adapter content from a different step)."""
+    return _lora_residual_pair(quant, A_saved, B_saved, s, dtype)
 
 
 def _dgrad_grad_B(
@@ -376,7 +315,7 @@ def _dx_addmm(
 
     One accumulation GEMM in the fused case: ``alpha=s`` scales both blocks,
     and the residual block of ``C1`` carries a pre-divided ``res_B/s`` (see
-    :func:`_build_residual_pair`) so its net scale is 1.
+    :func:`_lora_residual_pair`) so its net scale is 1.
     """
     if ext is not None:
         dX.addmm_(ext, pair[0], alpha=s)
@@ -577,8 +516,8 @@ def matmul_lora(
         X_lora = X_drop if X_drop is not None else X
         if pair is not None:
             # Adapter + residual ride the SAME two skinny GEMMs (C1/C2 are
-            # version-cached on the module — zero extra kernels in steady
-            # state; cost ≈ the extra rank k only).
+            # rebuilt from the LIVE adapters each call — two skinny cats; the
+            # frozen residual halves are cached — cost ≈ the extra rank k).
             if nvfp4_dgrad:
                 out.addmm_(X @ pair[1].t(), pair[0], alpha=s)
             else:

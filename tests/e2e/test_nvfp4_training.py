@@ -1286,6 +1286,246 @@ class TestNVFP4BaseResidual:
             assert torch.allclose(dA_on, dA_off, rtol=1e-3, atol=1e-5), cls.__name__
             assert torch.allclose(dB_on, dB_off, rtol=1e-3, atol=1e-5), cls.__name__
 
+    def test_residual_fold_consistent_after_fused_optimizer_step(self):
+        """REGRESSION (9B divergence root cause): ``adamw_torch_fused``
+        (``_fused_adamw_``) mutates params WITHOUT bumping ``_version``, so any
+        version-validated cache of the adapter+residual fold pair silently
+        froze the fprop fold at stale adapter content while backward used the
+        live values — a growing fprop/dgrad mismatch (grad_norm 1 -> 8+ within
+        25 steps). The fold must reflect the LIVE adapters on every step:
+        after fused optimizer steps, the real path must match a from-scratch
+        (cache-cleared) recompute bitwise, through both the LoRA_O and the
+        LoRA_MLP (gate/up fold + down dgrad fold) routes."""
+        from axolotl.kernels.lora import LoRA_MLP, LoRA_O
+        from axolotl.kernels.nvfp4_residual import attach_base_residual
+        from axolotl.kernels.swiglu import swiglu_backward, swiglu_forward
+        from axolotl.utils.nvfp4_training import NVFP4Recipe
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        mean_x2 = torch.rand(256, device="cuda") + 0.1
+        mean_h2 = torch.rand(512, device="cuda") + 0.1
+        X = torch.randn(2, 32, 256, device="cuda", dtype=torch.bfloat16)
+
+        def corrected(in_f, out_f, mx2):
+            lin = nn.Linear(in_f, out_f, bias=False).cuda().bfloat16()
+            mod = self._frozen_classes()[1].from_linear(lin, recipe)
+            assert attach_base_residual(mod, lin.weight, 16, mx2)
+            return mod
+
+        gate_m, up_m = corrected(256, 512, mean_x2), corrected(256, 512, mean_x2)
+        down_m, o_m = corrected(512, 256, mean_h2), corrected(256, 256, mean_x2)
+        # fp32 adapters, B zero-init — exactly the real peft training state
+        params = []
+
+        def adapter(r, in_f, out_f):
+            A = (torch.randn(r, in_f, device="cuda") * 0.02).requires_grad_(True)
+            B = torch.zeros(out_f, r, device="cuda", requires_grad=True)
+            params.extend([A, B])
+            return A, B
+
+        gA, gB = adapter(16, 256, 512)
+        uA, uB = adapter(16, 256, 512)
+        dA, dB = adapter(16, 512, 256)
+        oA, oB = adapter(16, 256, 256)
+        opt = torch.optim.AdamW(params, lr=5e-3, fused=True)
+
+        def clear_caches():
+            for m in (gate_m, up_m, down_m, o_m):
+                for attr in ("_res_pair_cache", "_res_fold_cache"):
+                    if hasattr(m, attr):
+                        delattr(m, attr)
+
+        def fwd_bwd():
+            for p in params:
+                p.grad = None
+            Xc = X.clone().requires_grad_(True)
+            with torch.autocast("cuda", torch.bfloat16):
+                h = LoRA_MLP.apply(
+                    Xc, None,
+                    None, None, gate_m, gA, gB, 2.0, None, None,
+                    None, None, up_m, uA, uB, 2.0, None, None,
+                    None, None, down_m, dA, dB, 2.0, None, None,
+                    swiglu_forward, swiglu_backward, True, False,
+                )
+                out = LoRA_O.apply(h, None, None, None, o_m, oA, oB, 2.0, None, None)
+            (out.float().square().mean() * 100).backward()
+            return (
+                out.detach().float(),
+                Xc.grad.detach().float(),
+                [p.grad.detach().clone().float() for p in params],
+            )
+
+        for step in range(3):
+            out1, dx1, g1 = fwd_bwd()  # real path, whatever state it carries
+            clear_caches()
+            out2, dx2, g2 = fwd_bwd()  # from-scratch reference
+            assert torch.equal(out1, out2), f"step {step}: stale fprop fold"
+            assert torch.equal(dx1, dx2), f"step {step}: stale dgrad fold"
+            for ga, gb in zip(g1, g2):
+                assert torch.equal(ga, gb), f"step {step}: stale adapter grads"
+            opt.step()
+
+    def test_fused_lora_residual_fwd_bwd_term_consistency(self):
+        """Gradient-consistency harness (condensed): through the REAL fused
+        paths (LoRA_QKV batched+standard, LoRA_MLP per-projection with a
+        linear activation that exposes exact closed forms), the residual term
+        must appear EXACTLY ONCE in fprop and EXACTLY ONCE in dX, and adapter
+        grads must be invariant to the frozen residual."""
+        from axolotl.kernels.lora import LoRA_MLP, LoRA_QKV
+        from axolotl.utils.nvfp4_training import NVFP4Recipe
+
+        torch.manual_seed(0)
+        recipe = NVFP4Recipe(stochastic_rounding=False, hadamard=False)
+        cls = self._frozen_classes()[1]
+        X = torch.randn(2, 32, 256, device="cuda", dtype=torch.bfloat16)
+        x2 = X.reshape(-1, 256).float()
+
+        def base(in_f, out_f, seed):
+            g = torch.Generator().manual_seed(seed)
+            lin = nn.Linear(in_f, out_f, bias=False)
+            with torch.no_grad():
+                lin.weight.copy_(torch.randn(out_f, in_f, generator=g) * 0.03)
+            return cls.from_linear(lin.cuda().bfloat16(), recipe)
+
+        def synth_res(mod, out_f, in_f, probe, seed):
+            g = torch.Generator().manual_seed(seed)
+            a = (torch.randn(out_f, 16, generator=g) * 0.05).cuda().bfloat16()
+            b = (torch.randn(16, in_f, generator=g) * 0.05).cuda().bfloat16()
+            term = (probe.float() @ b.t().float()) @ a.t().float()
+            ref = (probe.float() @ mod.weight.float().t()).norm()
+            a = (a.float() * (0.25 * ref / term.norm().clamp_min(1e-12))).bfloat16()
+            mod.register_buffer("_base_residual_A", a, persistent=False)
+            mod.register_buffer("_base_residual_B", b, persistent=False)
+            return a, b
+
+        def detach_res(mod):
+            for attr in (
+                "_base_residual_A",
+                "_base_residual_B",
+                "_res_fold_cache",
+            ):
+                if hasattr(mod, attr):
+                    delattr(mod, attr)
+
+        def rel(delta, term):
+            return ((delta.float() - term).norm() / term.norm()).item()
+
+        # ---- LoRA_QKV: batched and standard ----
+        for batched in (True, False):
+            mods = [base(256, o, 10 + i) for i, o in enumerate((256, 128, 128))]
+            adapters = [
+                (
+                    (torch.randn(16, 256, device="cuda") * 0.02).bfloat16(),
+                    (torch.randn(o, 16, device="cuda") * 0.02).bfloat16(),
+                )
+                for o in (256, 128, 128)
+            ]
+            dYs = [
+                torch.randn(2, 32, o, device="cuda", dtype=torch.bfloat16)
+                for o in (256, 128, 128)
+            ]
+
+            def run_qkv():
+                As = [A.clone().requires_grad_(True) for A, _ in adapters]
+                Bs = [B.clone().requires_grad_(True) for _, B in adapters]
+                Xc = X.clone().requires_grad_(True)
+                Q, K, V = LoRA_QKV.apply(
+                    Xc, None,
+                    None, None, mods[0], As[0], Bs[0], 2.0, None, None,
+                    None, None, mods[1], As[1], Bs[1], 2.0, None, None,
+                    None, None, mods[2], As[2], Bs[2], 2.0, None, None,
+                    True, batched,  # noqa: B023
+                )
+                torch.autograd.backward([Q, K, V], dYs)
+                return (
+                    [t.detach().reshape(-1, t.shape[-1]) for t in (Q, K, V)],
+                    Xc.grad.detach(),
+                    [t.grad.detach().clone() for t in As + Bs],
+                )
+
+            off = run_qkv()
+            res = [
+                synth_res(m, o, 256, x2.bfloat16(), 20 + i)
+                for i, (m, o) in enumerate(zip(mods, (256, 128, 128)))
+            ]
+            on = run_qkv()
+            for m in mods:
+                detach_res(m)
+            term_dx = sum(
+                (dY.reshape(-1, dY.shape[-1]).float() @ a.float()) @ b.float()
+                for (a, b), dY in zip(res, dYs)
+            )
+            for i, (a, b) in enumerate(res):
+                term_o = (x2 @ b.t().float()) @ a.t().float()
+                assert rel(on[0][i] - off[0][i], term_o) < 0.1, (batched, i)
+            assert rel((on[1] - off[1]).reshape(term_dx.shape), term_dx) < 0.1
+            for g_on, g_off in zip(on[2], off[2]):
+                assert torch.allclose(g_on, g_off, rtol=1e-2, atol=1e-5)
+
+        # ---- LoRA_MLP: per-projection exact (linear act exposes terms) ----
+        cap = {}
+
+        def act_fwd(gate, up):
+            cap["hidden"] = (gate + up).detach()
+            return gate + up
+
+        def act_bwd(grad_down, gate, up):
+            cap["grad_down"] = grad_down.detach()
+            return gate + up, grad_down.clone(), grad_down.clone()
+
+        mods = [base(256, 512, 30), base(256, 512, 31), base(512, 256, 32)]
+        adapters = [
+            (
+                (torch.randn(16, i_f, device="cuda") * 0.02).bfloat16(),
+                (torch.randn(o_f, 16, device="cuda") * 0.02).bfloat16(),
+            )
+            for i_f, o_f in ((256, 512), (256, 512), (512, 256))
+        ]
+        dY = torch.randn(2, 32, 256, device="cuda", dtype=torch.bfloat16)
+
+        def run_mlp():
+            As = [A.clone().requires_grad_(True) for A, _ in adapters]
+            Bs = [B.clone().requires_grad_(True) for _, B in adapters]
+            Xc = X.clone().requires_grad_(True)
+            out = LoRA_MLP.apply(
+                Xc, None,
+                None, None, mods[0], As[0], Bs[0], 2.0, None, None,
+                None, None, mods[1], As[1], Bs[1], 2.0, None, None,
+                None, None, mods[2], As[2], Bs[2], 2.0, None, None,
+                act_fwd, act_bwd, True, False,
+            )
+            out.backward(dY)
+            return {
+                "out": out.detach().reshape(-1, 256),
+                "dX": Xc.grad.detach().reshape(-1, 256),
+                "hidden": cap["hidden"].reshape(-1, 512),
+                "grad_down": cap["grad_down"].reshape(-1, 512),
+            }
+
+        h_probe = run_mlp()["hidden"].float()
+        for which in (0, 1, 2):
+            off = run_mlp()
+            if which < 2:
+                a, b = synth_res(mods[which], 512, 256, x2.bfloat16(), 40 + which)
+            else:
+                a, b = synth_res(mods[2], 256, 512, h_probe.bfloat16(), 42)
+            on = run_mlp()
+            detach_res(mods[which])
+            if which < 2:
+                # grad_down invariant; dX delta == (grad_down @ a) @ b
+                assert torch.equal(on["grad_down"], off["grad_down"])
+                term_dx = (off["grad_down"].float() @ a.float()) @ b.float()
+                assert rel(on["dX"] - off["dX"], term_dx) < 0.1, which
+            else:
+                # hidden invariant; out delta == term(h); grad_down delta
+                # == (dY @ a) @ b (the down dgrad fold inside matmul_lora)
+                assert torch.equal(on["hidden"], off["hidden"])
+                term_o = (off["hidden"].float() @ b.t().float()) @ a.t().float()
+                assert rel(on["out"] - off["out"], term_o) < 0.1
+                term_gd = (dY.reshape(-1, 256).float() @ a.float()) @ b.float()
+                assert rel(on["grad_down"] - off["grad_down"], term_gd) < 0.1
+
     def test_residual_compiles_without_graph_breaks(self):
         """The residual is plain ops on registered buffers with a setup-time None
         check: a corrected base must still trace fullgraph with 0 breaks."""
