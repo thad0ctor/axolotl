@@ -58,6 +58,20 @@ _BLOCK_N = 128
 _FUSE_VPROJ = False
 _CUSTOM_OP_ENV = "AXOLOTL_NVFP4_QWEN35_ATTENTION_CUSTOM_OP"
 
+# NOTE (graph-break isolation REMOVED): the compiled training custom-op paths
+# below used to be bracketed by torch._dynamo.graph_break() pairs — an old
+# guard against an Inductor miscompile (param grads ~1e5 -> NaN) observed on
+# an earlier torch/patch state, before the attention became an opaque
+# differentiable custom op. A break anywhere inside the decoder-layer body
+# makes dynamo skip the whole ``Qwen3_5TextModel.forward`` loop frame, so the
+# decoder loop could never compile with the breaks in. The guard was verified
+# STALE on torch 2.12/triton 3.7: (1) tiny-hybrid probes are BITWISE identical
+# eager-vs-compiled under backend="aot_eager" and under Inductor with
+# triton.codegen_upcast_to_fp32 disabled (the only compiled-vs-eager delta is
+# Inductor keeping fused bf16 chains in fp32 — a precision difference, not a
+# miscompile; FP4 quantizer bin flips amplify it on degenerate toy losses);
+# (2) an 8-step 9B real-config A/B (32k long-doc packed LoRA) shows identical
+# per-step losses and grad_norms within ~10% with and without the breaks.
 # Packed-batch auto-gate default (see nvfp4_training.attention.packed_min_sample_len):
 # 0 = gate OFF. With the fused RoPE+quant producers feeding the training forward
 # pre-packed q/k (q_packs/k_packs) plus the varlen-tuned forward tiles, FP4 varlen
@@ -432,6 +446,111 @@ def _log_packed_save_packs_ignored_once() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Compile-safe packed-info hoist.
+#
+# ``_compute_packed_info`` needs data-dependent host reads (a ``.sum()`` device
+# sync, ``aten.nonzero``) which graph-break under dynamo — and a single break
+# inside the transformers decoder LOOP makes dynamo skip the whole
+# ``Qwen3_5TextModel.forward`` frame (every layer runs eagerly). The
+# classification only depends on position_ids CONTENT once per batch, so it is
+# hoisted OUT of the per-layer forward: a dynamo-disabled pre-forward hook on
+# the patched model resolves the routing ONCE per step (eagerly, before/around
+# the compiled region) and threads the result to the attention layers as plain
+# module attributes — a host string constant dynamo guards on plus a cu_seqlens
+# tensor it lifts as a graph input. Inside the compiled loop there is no
+# nonzero/item left; the custom op consumes cu_seqlens as a normal tensor.
+#
+# The hook resolves the FULL routing (packed/dense classification, the
+# unsupported-layout fallback AND the packed_min_sample_len perf gate) so the
+# compiled forward never touches ``mean_len`` (a per-batch float would
+# recompile on every distinct value). Eager forwards keep the original
+# in-forward classification (same math, same per-tensor cache the hook warms),
+# so eager behavior is bit-identical with or without the hook.
+# ---------------------------------------------------------------------------
+_STEP_KIND_ATTR = "_nvfp4_step_kind"
+_STEP_CU_ATTR = "_nvfp4_step_cu"
+_STEP_MODULES_ATTR = "_nvfp4_attn_step_modules"
+
+
+def _resolve_step_info(
+    position_ids: torch.Tensor | None, q_len: int | None, min_len: int
+) -> tuple[str, torch.Tensor | None]:
+    """Once-per-step packed routing decision (host-side, eager).
+
+    Returns ``("packed", cu_seqlens)`` (serve the FP4 varlen kernel),
+    ``("dense", None)`` (plain dense causal/full routing) or ``("orig", None)``
+    (the model's ORIGINAL forward must serve this batch: unsupported packed
+    layout, or a positive perf gate routed the short-mean pack away).
+    """
+    if position_ids is None or q_len is None:
+        return ("dense", None)
+    pkind, cu_seqlens, mean_len = _packed_position_ids_info(position_ids, q_len)
+    if pkind == "packed":
+        if min_len > 0 and mean_len < min_len:
+            _log_packed_gate_once(mean_len, min_len, use_fp4=False)
+            return ("orig", None)
+        _log_packed_gate_once(mean_len, min_len, use_fp4=True)
+        return ("packed", cu_seqlens)
+    if pkind == "fallback":
+        _log_packed_fallback_once()
+        return ("orig", None)
+    return ("dense", None)
+
+
+def _hook_q_len(args: tuple, kwargs: dict) -> int | None:
+    """Best-effort sequence length of the incoming batch at the hook level."""
+    for key in ("input_ids", "inputs_embeds", "hidden_states"):
+        t = kwargs.get(key)
+        if isinstance(t, torch.Tensor) and t.ndim >= 2:
+            return t.shape[1]
+    for a in args:
+        if isinstance(a, torch.Tensor) and a.ndim >= 2:
+            return a.shape[1]
+    return None
+
+
+def _step_info_pre_hook(model: nn.Module, args: tuple, kwargs: dict) -> None:
+    modules = getattr(model, _STEP_MODULES_ATTR, ())
+    if not modules:
+        return
+    position_ids = kwargs.get("position_ids")
+    q_len = _hook_q_len(args, kwargs)
+    if q_len is None and position_ids is not None:
+        q_len = position_ids.shape[-1]
+    min_len = getattr(
+        modules[0], "_nvfp4_packed_min_sample_len", _PACKED_MIN_SAMPLE_LEN_DEFAULT
+    )
+    kind, cu_seqlens = _resolve_step_info(position_ids, q_len, min_len)
+    for module in modules:
+        setattr(module, _STEP_KIND_ATTR, kind)
+        setattr(module, _STEP_CU_ATTR, cu_seqlens)
+
+
+try:
+    import torch._dynamo as _attn_dynamo
+
+    # The hook body is data-dependent BY DESIGN (it is the hoist target); keep
+    # dynamo out of it. When the patched model is compiled, the disabled call
+    # splits the outer ``__call__`` frame once — the decoder LOOP frame below
+    # it traces with zero breaks.
+    _step_info_pre_hook_disabled = _attn_dynamo.disable(_step_info_pre_hook)
+except Exception:  # pragma: no cover - dynamo always available with torch>=2
+    _step_info_pre_hook_disabled = _step_info_pre_hook
+
+
+def _install_step_info_hook(model: nn.Module) -> None:
+    """Register the once-per-step packed-info hook on the patched model root."""
+    modules = [m for m in model.modules() if getattr(m, "_nvfp4_patched", False)]
+    if not modules:
+        return
+    setattr(model, _STEP_MODULES_ATTR, modules)
+    if getattr(model, "_nvfp4_step_info_hooked", False):
+        return
+    model.register_forward_pre_hook(_step_info_pre_hook_disabled, with_kwargs=True)
+    model._nvfp4_step_info_hooked = True
+
+
 def _get_vproj_packed(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
     """Lazily prepack v_proj and refresh if an optimizer updated the weight."""
     if type(module.v_proj) is not nn.Linear:
@@ -663,44 +782,65 @@ def make_nvfp4_forward(orig_forward):
                 # Sample-packed (multipack) batches arrive mask-less with the
                 # boundaries in position_ids — the decoder layer (stock and the
                 # axolotl packing patch alike) forwards position_ids in kwargs.
-                pkind, cu_seqlens, mean_len = _packed_position_ids_info(
-                    kwargs.get("position_ids"), q_len
+                #
+                # COMPILED path: the packed/dense/fallback routing (incl. the
+                # perf gate) was hoisted to the model-level pre-forward hook
+                # (once per step, eager — see _install_step_info_hook). The
+                # data-dependent classification never runs inside the traced
+                # decoder loop: ``step_kind`` is a host string dynamo guards
+                # on and cu_seqlens a plain tensor input.
+                step_kind = (
+                    getattr(self, _STEP_KIND_ATTR, None)
+                    if torch.compiler.is_compiling()
+                    else None
                 )
-                if pkind == "packed":
-                    # PERF GATE (default OFF, min_len=0): with the fused
-                    # producers feeding the training forward pre-packed q/k
-                    # and the varlen-tuned tiles, FP4 varlen beats FA2-varlen
-                    # at every measured packed mean (op-level mean-256 grad
-                    # fwd 1.22x / fwd+bwd 1.22x at d256). A positive min_len
-                    # still routes short-mean packs to the original forward
-                    # (legacy-fork escape hatch). The decision input
-                    # (mean_len) is cached with cu_seqlens on the
-                    # position_ids tensor: per step, not per layer, and it
-                    # applies identically to the grad / no-grad / compiled
-                    # sub-paths below (the routing happens here, before any
-                    # of them).
-                    min_len = getattr(
-                        self,
-                        "_nvfp4_packed_min_sample_len",
-                        _PACKED_MIN_SAMPLE_LEN_DEFAULT,
+                if step_kind == "packed":
+                    cu_seqlens = getattr(self, _STEP_CU_ATTR, None)
+                    # defensive: never dense-attend a packed batch
+                    kind = "packed" if cu_seqlens is not None else None
+                elif step_kind == "orig":
+                    kind = None  # fall to the original forward at the bottom
+                elif step_kind is None:  # eager: in-forward classification
+                    pkind, cu_seqlens, mean_len = _packed_position_ids_info(
+                        kwargs.get("position_ids"), q_len
                     )
-                    if min_len > 0 and mean_len < min_len:
-                        _log_packed_gate_once(mean_len, min_len, use_fp4=False)
-                        return orig_forward(
+                    if pkind == "packed":
+                        # PERF GATE (default OFF, min_len=0): with the fused
+                        # producers feeding the training forward pre-packed q/k
+                        # and the varlen-tuned tiles, FP4 varlen beats
+                        # FA2-varlen at every measured packed mean (op-level
+                        # mean-256 grad fwd 1.22x / fwd+bwd 1.22x at d256). A
+                        # positive min_len still routes short-mean packs to the
+                        # original forward (legacy-fork escape hatch). The
+                        # decision input (mean_len) is cached with cu_seqlens
+                        # on the position_ids tensor: per step, not per layer,
+                        # and it applies identically to the grad / no-grad /
+                        # compiled sub-paths below (the routing happens here,
+                        # before any of them).
+                        min_len = getattr(
                             self,
-                            hidden_states,
-                            position_embeddings,
-                            attention_mask,
-                            past_key_values,
-                            **kwargs,
+                            "_nvfp4_packed_min_sample_len",
+                            _PACKED_MIN_SAMPLE_LEN_DEFAULT,
                         )
-                    _log_packed_gate_once(mean_len, min_len, use_fp4=True)
-                    kind = "packed"
-                elif pkind == "fallback":
-                    # Packed but in a layout varlen can't serve: NEVER dense-
-                    # attend it (cross-sample contamination) — original forward.
-                    _log_packed_fallback_once()
-                    kind = None
+                        if min_len > 0 and mean_len < min_len:
+                            _log_packed_gate_once(mean_len, min_len, use_fp4=False)
+                            return orig_forward(
+                                self,
+                                hidden_states,
+                                position_embeddings,
+                                attention_mask,
+                                past_key_values,
+                                **kwargs,
+                            )
+                        _log_packed_gate_once(mean_len, min_len, use_fp4=True)
+                        kind = "packed"
+                    elif pkind == "fallback":
+                        # Packed but in a layout varlen can't serve: NEVER
+                        # dense-attend it (cross-sample contamination) —
+                        # original forward.
+                        _log_packed_fallback_once()
+                        kind = None
+                # step_kind == "dense": keep kind == "causal"
 
         # Shared-pack FP4 q/k_proj: no-grad prefill, opt-in, plain-Linear only.
         use_fp4_proj = (
@@ -847,16 +987,23 @@ def make_nvfp4_forward(orig_forward):
             # hp values, so out/LSE/grads are bit-identical to feeding the same
             # roped hp through the no-packs path. grad_enabled here implies no
             # kv cache (cached grad batches returned to orig above).
+            #
+            # COMPILED (custom-op) path: the producers are raw Triton wrappers
+            # dynamo cannot trace, so the pre-pack is skipped and the opaque op
+            # runs its own internal pre-quant from the SAME dtype-rounded roped
+            # hp — bit-identical out/grads, no graph break in the decoder loop.
+            use_custom_op = _custom_op_enabled(self)
+            prepack = grad_enabled and _TRAIN_PREPACKED and not use_custom_op
             q_packs = k_packs = None
             if roped:
                 # fused norm+rope already produced roped hp q/k (grads flow
                 # through its registered backward); just pack the forward
                 # operands when the fork takes pre-packed q/k.
                 query_roped, key_roped = query_states, key_states
-                if grad_enabled and _TRAIN_PREPACKED:
+                if prepack:
                     q_packs = _quant_packs_along_d(query_roped)
                     k_packs = _quant_packs_along_d(key_roped)
-            elif grad_enabled and _TRAIN_PREPACKED:
+            elif prepack:
                 qnv_t, qsc_t, query_roped = fused_rope_quant_qk_hp(
                     query_states, cos, sin
                 )
@@ -879,14 +1026,16 @@ def make_nvfp4_forward(orig_forward):
             if getattr(self, "_nvfp4_save_backward_packs", False):
                 _log_packed_save_packs_ignored_once()
             sr = getattr(self, "_nvfp4_stochastic_rounding", True)
-            if _custom_op_enabled(self):
-                # Opaque differentiable custom op between graph breaks — same
-                # isolation rationale as the dense train path below.
+            if use_custom_op:
+                # Opaque differentiable custom op: Inductor compiles AROUND
+                # the whole native-NVFP4 attention with no graph break, so the
+                # decoder loop can compile as one graph (the legacy isolation
+                # break pair was removed as a verified-stale guard — see the
+                # NOTE next to _CUSTOM_OP_ENV).
                 from axolotl.kernels.attn_nvfp4_custom_op import (
                     nvfp4_flash_attn_train_custom_op,
                 )
 
-                torch._dynamo.graph_break()
                 attn_output = nvfp4_flash_attn_train_custom_op(
                     query_roped,
                     key_roped,
@@ -902,7 +1051,6 @@ def make_nvfp4_forward(orig_forward):
                     q_packs=q_packs,
                     k_packs=k_packs,
                 )  # [Z, S, H, D]
-                torch._dynamo.graph_break()
             elif grad_enabled:
                 # kwargs only when prepacked (a legacy fork's signature lacks
                 # q_packs; q_packs is always None there via _TRAIN_PREPACKED).
@@ -972,14 +1120,12 @@ def make_nvfp4_forward(orig_forward):
                         past_key_values,
                         **kwargs,
                     )
-                # Break the Inductor graph on BOTH sides of the FP4 attention block.
-                # Fused with the FP4 plugin's quantized q/k/v/o_proj autograd, the
-                # surrounding compiled backward miscompiles (param grads spike ~1e5
-                # -> NaN). The op stays opaque (no InductorError, no bwd eager
-                # fallback); the breaks just give it the eager boundary the
-                # eager-fallback baseline already gets. Rest of the model still compiles.
-                if _custom_op_enabled(self):
-                    torch._dynamo.graph_break()
+                # The graph breaks that used to bracket the FP4 attention
+                # block here (an Inductor-miscompile guard from an earlier
+                # torch/patch state) were verified STALE and removed so the
+                # decoder loop can compile — see the NOTE next to
+                # _CUSTOM_OP_ENV for the A/B evidence.
+                use_custom_op = _custom_op_enabled(self)
                 value_states = _v_states()
                 save_packs = getattr(self, "_nvfp4_save_backward_packs", False)
                 q_packs = k_packs = None
@@ -987,8 +1133,11 @@ def make_nvfp4_forward(orig_forward):
                     query_roped, key_roped = query_states, key_states
                     # pre-packed forward q/k (skips the kernel's own pre-quant
                     # launches); incompatible with the saved-pack set, which
-                    # must derive from one fused HP read.
-                    if _TRAIN_PREPACKED and not save_packs:
+                    # must derive from one fused HP read — and skipped on the
+                    # COMPILED custom-op path (raw-Triton producers are not
+                    # traceable; the opaque op pre-quants internally from the
+                    # same dtype-rounded hp with bit-identical out/grads).
+                    if _TRAIN_PREPACKED and not save_packs and not use_custom_op:
                         q_packs = _quant_packs_along_d(query_roped)
                         k_packs = _quant_packs_along_d(key_roped)
                 else:
@@ -1000,7 +1149,7 @@ def make_nvfp4_forward(orig_forward):
                     self, "_nvfp4_backward_rtn_grad_packs", False
                 )
                 ng = query_states.shape[1] // key_states.shape[1]
-                if _custom_op_enabled(self):
+                if use_custom_op:
                     # Differentiable opaque custom op: Inductor compiles AROUND the
                     # whole native-NVFP4 attention (fwd + registered native-NVFP4
                     # bwd) instead of tracing tl.dot_scaled and silently falling the
@@ -1029,8 +1178,6 @@ def make_nvfp4_forward(orig_forward):
                         q_packs=q_packs,
                         k_packs=k_packs,
                     )
-                    # trailing half of the isolating break (see the leading one above)
-                    torch._dynamo.graph_break()
                 else:
                     prepacked_kwargs = (
                         {"q_packs": q_packs, "k_packs": k_packs}
@@ -1185,6 +1332,7 @@ def patch_qwen3_5_nvfp4_attention(
                 module._nvfp4_attn_proj_ok = (
                     _attn_proj_ok(module) if fuse_attn_proj else False
                 )
+                _fused_norm_rope_ok(module)
                 continue
             orig = type(module).forward
             if seen_forward is None:
@@ -1204,7 +1352,14 @@ def patch_qwen3_5_nvfp4_attention(
             module._nvfp4_attn_proj_ok = (
                 _attn_proj_ok(module) if fuse_attn_proj else False
             )
+            # warm the fused norm+rope capability cache at patch time so the
+            # lazy first-call setattr never happens inside a dynamo trace
+            _fused_norm_rope_ok(module)
             patched += 1
+    # Hoist the data-dependent packed-batch classification out of the compiled
+    # decoder loop: resolved once per step in this (dynamo-disabled) model
+    # pre-forward hook, threaded to the layers as module attributes.
+    _install_step_info_hook(model)
     LOG.info(
         "nvfp4 attention: patched %d Qwen3.5 full-attention layers "
         "(fuse_vproj=%s, train_backward=%s, backward_rtn_grad_packs=%s, "
