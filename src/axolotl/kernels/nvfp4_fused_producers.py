@@ -27,6 +27,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+import os
 from sageattention.nvfp4 import convert_fp32_to_fp4_packed
 
 _E4M3_EPS = tl.constexpr(1.5258789e-05)
@@ -191,7 +192,23 @@ def fused_rope_quant_qk(
     hp = x.new_empty(z * h, s, d) if store_hp else q  # dummy ptr when not stored
 
     BLOCK_R = 64
+    # Triton's default launch heuristic badly under-warps the d256 rope+quant
+    # kernel (the big head_dim doubles every tile plane): on the 5090 (sm_120)
+    # num_warps=8/num_stages=3 is ~1.7-1.8x over the default for both store_hp
+    # paths. d128 is already near-optimal on the default heuristic.
+    _nw = 8 if d >= 256 else None
+    _ns = 3 if d >= 256 else None
+    if os.environ.get("NVFP4_PROD_OVERRIDE"):  # sweep instrumentation
+        _e = os.environ
+        BLOCK_R = int(_e.get("NVFP4_PROD_BR", BLOCK_R))
+        _nw = int(_e.get("NVFP4_PROD_W", 0)) or _nw
+        _ns = int(_e.get("NVFP4_PROD_S", 0)) or _ns
     grid = (z * h, triton.cdiv(s, BLOCK_R))
+    _extra = {}
+    if _nw:
+        _extra["num_warps"] = _nw
+    if _ns:
+        _extra["num_stages"] = _ns
     _rope_quant_kernel[grid](
         x,
         cos,
@@ -221,6 +238,7 @@ def fused_rope_quant_qk(
         DP2=d // 2,
         DP16=d // 16,
         NG=d // 16,
+        **_extra,
     )
     if store_hp:
         return q, sc.view(torch.float8_e4m3fn), hp.view(z, h, s, d)
