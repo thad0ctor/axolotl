@@ -199,10 +199,21 @@ def fused_rope_quant_qk(
     _nw = 8 if d >= 256 else None
     _ns = 3 if d >= 256 else None
     if os.environ.get("NVFP4_PROD_OVERRIDE"):  # sweep instrumentation
-        _e = os.environ
-        BLOCK_R = int(_e.get("NVFP4_PROD_BR", BLOCK_R))
-        _nw = int(_e.get("NVFP4_PROD_W", 0)) or _nw
-        _ns = int(_e.get("NVFP4_PROD_S", 0)) or _ns
+
+        def _env_pos_int(key, default):
+            # parse a positive int from env; ignore missing/malformed/non-positive
+            raw = os.environ.get(key)
+            if raw is None:
+                return default
+            try:
+                val = int(raw)
+            except ValueError:
+                return default
+            return val if val > 0 else default
+
+        BLOCK_R = _env_pos_int("NVFP4_PROD_BR", BLOCK_R)
+        _nw = _env_pos_int("NVFP4_PROD_W", _nw)
+        _ns = _env_pos_int("NVFP4_PROD_S", _ns)
     grid = (z * h, triton.cdiv(s, BLOCK_R))
     _extra = {}
     if _nw:
