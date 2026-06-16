@@ -24,10 +24,11 @@ what the flash kernel's own pre-quant uses, so parity is apples-to-apples.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
-import os
 from sageattention.nvfp4 import convert_fp32_to_fp4_packed
 
 _E4M3_EPS = tl.constexpr(1.5258789e-05)
