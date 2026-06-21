@@ -1,4 +1,4 @@
-"""Hybrid attention mask fix for Gemma 4.
+"""Hybrid attention mask fix for Gemma 4 (standard and unified).
 
 Gemma 4's full-attention (global) layers have ``head_dim=512`` which
 exceeds FA2's supported size, so ``patch_manager._apply_gemma_hybrid_attention``
@@ -13,9 +13,16 @@ that the SDPA layers then crash on with::
 
 ...whenever a batch has padding (mbs>1) or seq len exceeds ~7k.
 
-We rebind the mask-builder symbols in ``modeling_gemma4``'s namespace
-(NOT the originals in ``masking_utils``) to force SDPA on a shallow
-config copy, so the ``full_attention`` mask comes out 4D.
+We fix the symptom by wrapping the mask-builder symbols in the model's
+*module namespace* (NOT the originals in ``masking_utils``). Each wrapper
+forces ``_attn_implementation="sdpa"`` on a shallow-copied config before
+calling through, so the ``full_attention`` mask comes out 4D/SDPA-compatible.
+``create_sliding_window_causal_mask`` is left alone, so sliding-window
+layers keep receiving FA2-format masks.
+
+``gemma4_unified`` reproduces the same mixed sliding/global architecture
+(``global_head_dim=512``) in its own ``modeling_gemma4_unified`` namespace,
+so both namespaces are patched when present.
 
 Two forward paths exist, both must be covered:
 
@@ -33,13 +40,14 @@ Idempotent. Install once per process before any Gemma 4 forward pass.
 from __future__ import annotations
 
 import copy
+import importlib
 from typing import Any, Callable
 
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 
-_PATCH_STATE: dict[str, Callable] = {}
+_PATCH_APPLIED = False
 
 # MagicMock auto-spawns attributes, so ``hasattr(fn, "_axolotl_original")``
 # alone would falsely identify mocks as wrappers. Marker fixes that.
@@ -106,84 +114,99 @@ _WRAPPED_SYMBOLS: dict[str, Callable[[Callable], Callable]] = {
     "create_masks_for_generate": _build_create_masks_for_generate_wrapper,
 }
 
+# Each Gemma 4 variant fully redefines ``create_causal_mask`` in its own module
+# namespace (gemma4_unified does NOT modular-import from gemma4), so both must be
+# patched independently.
+_TARGET_MODULES = (
+    "transformers.models.gemma4.modeling_gemma4",
+    "transformers.models.gemma4_unified.modeling_gemma4_unified",
+)
 
-def patch_gemma4_hybrid_mask() -> bool:
-    """Install the Gemma 4 hybrid-attention mask fix.
 
-    Returns True on install (or no-op if already installed), False if the
-    target module is missing.
+def _patch_module(module: Any) -> tuple[list[str], list[str]]:
+    """Wrap every known mask-builder symbol present in one module namespace.
+
+    Returns ``(installed, covered)`` where ``installed`` is the symbols newly
+    wrapped this call and ``covered`` is every symbol left in a wrapped state
+    (newly wrapped *or* already our wrapper from a prior call). A symbol that is
+    already our wrapper is left untouched — this keeps re-entry idempotent even
+    if ``_PATCH_APPLIED`` was reset externally, without re-wrapping a wrapper.
+    Missing symbols (older transformers) are skipped.
     """
-    if _PATCH_STATE:
-        return True
-
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        LOG.debug(
-            "gemma4_hybrid_mask: transformers.models.gemma4 not importable, "
-            "skipping. This is fine for non-Gemma4 training."
-        )
-        return False
-
     installed: list[str] = []
-    skipped: list[str] = []
+    covered: list[str] = []
     for symbol_name, build_wrapper in _WRAPPED_SYMBOLS.items():
-        current = getattr(modeling_gemma4, symbol_name, None)
+        current = getattr(module, symbol_name, None)
         if current is None:
-            skipped.append(symbol_name)
             continue
         if _is_axolotl_wrapper(current):
-            # Wrapper bound but state empty — fixture cleared state without
-            # restoring bindings. Recover original via marker and warn.
-            LOG.warning(
-                "gemma4_hybrid_mask: %s is already wrapped but _PATCH_STATE "
-                "was empty. Recovering original via wrapper marker.",
-                symbol_name,
-            )
-            _PATCH_STATE[symbol_name] = current._axolotl_original  # type: ignore[attr-defined]
+            covered.append(symbol_name)
             continue
-        wrapper = build_wrapper(current)
-        setattr(modeling_gemma4, symbol_name, wrapper)
-        _PATCH_STATE[symbol_name] = current
+        setattr(module, symbol_name, build_wrapper(current))
         installed.append(symbol_name)
+        covered.append(symbol_name)
+    return installed, covered
 
-    if not _PATCH_STATE:
+
+def patch_gemma4_hybrid_mask() -> bool:
+    """Install the Gemma 4 hybrid-attention mask fix across all variants.
+
+    Returns ``True`` if at least one namespace was patched, ``False`` if none
+    of the target modules could be imported (e.g. transformers version predates
+    Gemma 4) — in which case nothing is done and the caller can continue
+    unaffected.
+    """
+    global _PATCH_APPLIED
+    if _PATCH_APPLIED:
+        return True
+
+    patched_any = False
+    for module_path in _TARGET_MODULES:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            LOG.debug(
+                "gemma4_hybrid_mask: %s not importable, skipping. This is fine "
+                "for non-Gemma4 training.",
+                module_path,
+            )
+            continue
+        installed, covered = _patch_module(module)
+        if covered:
+            patched_any = True
+        if installed:
+            LOG.info(
+                "gemma4_hybrid_mask: patched %s symbols [%s] to force "
+                "SDPA-format masks for full-attention layers",
+                module_path,
+                ", ".join(installed),
+            )
+
+    if patched_any:
+        _PATCH_APPLIED = True
+    else:
         LOG.warning(
-            "gemma4_hybrid_mask: no expected mask-builder symbols found on "
-            "modeling_gemma4 (looked for: %s). Transformers API may have "
-            "changed; the hybrid attention bug fix is not active.",
+            "gemma4_hybrid_mask: no expected mask-builder symbols found on any "
+            "target module (looked for: %s). Transformers API may have changed; "
+            "the hybrid attention bug fix is not active.",
             ", ".join(_WRAPPED_SYMBOLS),
         )
-        return False
-
-    if installed:
-        LOG.info(
-            "gemma4_hybrid_mask: patched modeling_gemma4 symbols [%s] to "
-            "force SDPA-format masks for full-attention layers",
-            ", ".join(installed),
-        )
-    if skipped:
-        LOG.debug(
-            "gemma4_hybrid_mask: skipped symbols missing on this "
-            "transformers version: %s",
-            ", ".join(skipped),
-        )
-    return True
+    return patched_any
 
 
 def unpatch_gemma4_hybrid_mask() -> None:
-    """Restore the original mask-builder symbols. Useful for tests."""
-    if not _PATCH_STATE:
+    """Restore the original mask-builder symbols in every namespace. Tests."""
+    global _PATCH_APPLIED
+    if not _PATCH_APPLIED:
         return
-    try:
-        from transformers.models.gemma4 import modeling_gemma4
-    except ImportError:
-        _PATCH_STATE.clear()
-        return
-
-    for symbol_name, original in list(_PATCH_STATE.items()):
-        current = getattr(modeling_gemma4, symbol_name, None)
-        # Only restore if a downstream patch hasn't replaced our wrapper.
-        if _is_axolotl_wrapper(current):
-            setattr(modeling_gemma4, symbol_name, original)
-    _PATCH_STATE.clear()
+    for module_path in _TARGET_MODULES:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        for symbol_name in _WRAPPED_SYMBOLS:
+            current = getattr(module, symbol_name, None)
+            # Only restore if a downstream patch hasn't replaced our wrapper.
+            if _is_axolotl_wrapper(current):
+                setattr(module, symbol_name, current._axolotl_original)
+    _PATCH_APPLIED = False

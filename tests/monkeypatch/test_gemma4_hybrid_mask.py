@@ -23,24 +23,33 @@ pytest.importorskip(
 
 @pytest.fixture
 def restore_gemma4_module():
-    """Snapshot patch-target symbols and restore after each test."""
+    """Snapshot patch-target symbols across all variants and restore after each test."""
+    import importlib
+
     from transformers.models.gemma4 import modeling_gemma4
 
     from axolotl.monkeypatch import gemma4_hybrid_mask
 
     _MISSING = object()
-    snapshots = {
-        name: getattr(modeling_gemma4, name, _MISSING)
-        for name in gemma4_hybrid_mask._WRAPPED_SYMBOLS
-    }
+    snapshots: dict = {}
+    for module_path in gemma4_hybrid_mask._TARGET_MODULES:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        snapshots[module] = {
+            name: getattr(module, name, _MISSING)
+            for name in gemma4_hybrid_mask._WRAPPED_SYMBOLS
+        }
     yield modeling_gemma4
-    for name, original in snapshots.items():
-        if original is _MISSING:
-            if hasattr(modeling_gemma4, name):
-                delattr(modeling_gemma4, name)
-        else:
-            setattr(modeling_gemma4, name, original)
-    gemma4_hybrid_mask._PATCH_STATE.clear()
+    for module, names in snapshots.items():
+        for name, original in names.items():
+            if original is _MISSING:
+                if hasattr(module, name):
+                    delattr(module, name)
+            else:
+                setattr(module, name, original)
+    gemma4_hybrid_mask._PATCH_APPLIED = False
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +381,7 @@ def test_patch_skips_symbols_missing_on_older_transformers(restore_gemma4_module
         delattr(modeling_gemma4, "create_masks_for_generate")
 
     assert patch_gemma4_hybrid_mask() is True
-    assert "create_causal_mask" in gemma4_hybrid_mask._PATCH_STATE
-    assert "create_masks_for_generate" not in gemma4_hybrid_mask._PATCH_STATE
+    assert gemma4_hybrid_mask._is_axolotl_wrapper(modeling_gemma4.create_causal_mask)
     assert not hasattr(modeling_gemma4, "create_masks_for_generate")
 
 
@@ -389,32 +397,26 @@ def test_patch_returns_false_when_no_symbols_present(restore_gemma4_module):
     assert patch_gemma4_hybrid_mask() is False
 
 
-def test_patch_recovers_when_state_lost_but_wrapper_already_bound(
-    restore_gemma4_module, caplog
+def test_patch_is_idempotent_when_flag_lost_but_wrapper_already_bound(
+    restore_gemma4_module,
 ):
-    """State cleared but wrappers still bound → recover original via marker, warn."""
-    import logging
-
+    """Flag reset but wrappers still bound → re-patch reports success and must
+    not re-wrap an existing wrapper (no double-wrapping)."""
     from axolotl.monkeypatch import gemma4_hybrid_mask
     from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
 
+    modeling_gemma4 = restore_gemma4_module
     patch_gemma4_hybrid_mask()
-    state_before = dict(gemma4_hybrid_mask._PATCH_STATE)
-    assert state_before, "expected install to populate _PATCH_STATE"
+    wrapped = modeling_gemma4.create_causal_mask
+    assert gemma4_hybrid_mask._is_axolotl_wrapper(wrapped)
 
-    gemma4_hybrid_mask._PATCH_STATE.clear()
+    # Simulate a fixture clearing the flag without restoring bindings.
+    gemma4_hybrid_mask._PATCH_APPLIED = False
+    assert patch_gemma4_hybrid_mask() is True
 
-    with caplog.at_level(
-        logging.WARNING, logger="axolotl.monkeypatch.gemma4_hybrid_mask"
-    ):
-        assert patch_gemma4_hybrid_mask() is True
-
-    for name, orig in state_before.items():
-        assert gemma4_hybrid_mask._PATCH_STATE.get(name) is orig
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any(
-        "already wrapped but _PATCH_STATE was empty" in r.message for r in warnings
-    ), "expected a warning about state recovery"
+    rewrapped = modeling_gemma4.create_causal_mask
+    assert rewrapped is wrapped, "re-patch must not wrap an existing wrapper"
+    assert rewrapped._axolotl_original is wrapped._axolotl_original
 
 
 def test_unpatch_leaves_third_party_rebindings_alone(restore_gemma4_module):
@@ -834,3 +836,40 @@ def test_tiny_gemma4_multimodal_forward_unpatched_baseline_works(
 
     assert out.last_hidden_state.shape == (B, S, cfg.text_config.hidden_size)
     assert torch.isfinite(out.last_hidden_state).all()
+
+
+@pytest.fixture
+def restore_gemma4_hybrid_mask_both():
+    """Snapshot ``create_causal_mask`` in BOTH the gemma4 and gemma4_unified
+    namespaces (``patch_gemma4_hybrid_mask`` wraps each independently) and reset
+    the module flag so the patch re-installs cleanly."""
+    modeling_unified = pytest.importorskip(
+        "transformers.models.gemma4_unified.modeling_gemma4_unified",
+        reason="unified namespace coverage requires gemma4_unified",
+    )
+    from transformers.models.gemma4 import modeling_gemma4
+
+    from axolotl.monkeypatch import gemma4_hybrid_mask
+
+    saved_gemma4 = modeling_gemma4.create_causal_mask
+    saved_unified = modeling_unified.create_causal_mask
+    gemma4_hybrid_mask._PATCH_APPLIED = False
+    try:
+        yield modeling_unified
+    finally:
+        modeling_gemma4.create_causal_mask = saved_gemma4
+        modeling_unified.create_causal_mask = saved_unified
+        gemma4_hybrid_mask._PATCH_APPLIED = False
+
+
+def test_patch_covers_unified_namespace(restore_gemma4_hybrid_mask_both):
+    """The unified backbone redefines ``create_causal_mask`` in its own module,
+    so the patch must wrap it too — not just ``modeling_gemma4``."""
+    modeling_unified = restore_gemma4_hybrid_mask_both
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    original = modeling_unified.create_causal_mask
+    assert patch_gemma4_hybrid_mask() is True
+
+    assert modeling_unified.create_causal_mask is not original
+    assert modeling_unified.create_causal_mask._axolotl_original is original
