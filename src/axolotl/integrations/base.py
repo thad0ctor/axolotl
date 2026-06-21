@@ -213,6 +213,14 @@ class BasePlugin:
             class: The class for the collator.
         """
 
+    def get_mm_image_transform(self, cfg: DictDefault):
+        """Return a multimodal image transform (e.g. tiling) for this cfg, or None.
+
+        The returned object must satisfy
+        ``axolotl.utils.data.mm_image_transform.MMImageTransform`` — it is applied
+        identically in the length-estimation paths and the runtime collator.
+        """
+
     def create_optimizer(self, cfg: DictDefault, trainer: Trainer) -> Optimizer | None:
         """Creates and returns an optimizer for training.
 
@@ -619,6 +627,14 @@ class PluginManager:
             if collator is not None:
                 collator_cls, collator_kwargs = collator
                 return collator_cls, collator_kwargs
+        return None
+
+    def get_mm_image_transform(self, cfg):
+        """Return the first non-None multimodal image transform across plugins."""
+        for plugin in self.plugins.values():
+            transform = plugin.get_mm_image_transform(cfg)
+            if transform is not None:
+                return transform
         return None
 
     def post_trainer_create(self, cfg: DictDefault, trainer: Trainer):

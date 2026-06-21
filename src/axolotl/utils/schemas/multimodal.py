@@ -77,6 +77,24 @@ class MultiModalConfig(BaseModel):
             "description": "The resampling algorithm to use for image resizing. Default is bilinear. Please refer to PIL.Image.Resampling for more details."
         },
     )
+    image_resize_buckets: list[tuple[int, int]] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Optional fixed image canvas buckets as (width, height). Images preserve aspect ratio and pad to the chosen bucket."
+        },
+    )
+    image_resize_no_upscale: bool | None = Field(
+        default=False,
+        json_schema_extra={
+            "description": "When using padded square or bucketed resizing, do not enlarge images that are already smaller than the target canvas."
+        },
+    )
+    image_resize_pad_color: int | tuple[int, int, int] | str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Padding color for padded square or bucketed resizing. Defaults to black; OCR/document datasets often prefer 'white'."
+        },
+    )
     role_boundaries: list[RoleBoundarySpec] | None = Field(
         default=None,
         json_schema_extra={
@@ -108,3 +126,33 @@ class MultiModalConfig(BaseModel):
                     f"Invalid image resize algorithm: {image_resize_algorithm}"
                 )
         return image_resize_algorithm
+
+    @field_validator("image_resize_buckets", mode="before")
+    @classmethod
+    def convert_image_resize_buckets(cls, image_resize_buckets):
+        """
+        Convert image resize buckets to width/height tuples.
+        """
+        if image_resize_buckets is None:
+            return None
+        converted = []
+        for bucket in image_resize_buckets:
+            if not isinstance(bucket, (list, tuple)) or len(bucket) != 2:
+                raise ValueError(
+                    "image_resize_buckets entries must be two-item width/height pairs"
+                )
+            width, height = int(bucket[0]), int(bucket[1])
+            if width <= 0 or height <= 0:
+                raise ValueError("image_resize_buckets entries must be positive")
+            converted.append((width, height))
+        return converted
+
+    @field_validator("image_resize_pad_color", mode="before")
+    @classmethod
+    def convert_image_resize_pad_color(cls, image_resize_pad_color):
+        """
+        Convert YAML list colors to tuples for PIL.
+        """
+        if isinstance(image_resize_pad_color, list):
+            return tuple(int(part) for part in image_resize_pad_color)
+        return image_resize_pad_color

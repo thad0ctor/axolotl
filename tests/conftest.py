@@ -142,6 +142,24 @@ def download_smollm2_135m_instruct_model():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def download_smolvlm_500m_instruct_model():
+    # Processor/tokenizer only — skip ~1 GB of weight shards.
+    snapshot_download_w_retry(
+        "HuggingFaceTB/SmolVLM-500M-Instruct",
+        repo_type="model",
+        allow_patterns=[
+            "*.json",
+            "*.txt",
+            "*.model",
+            "*.jinja",
+            "tokenizer*",
+            "vocab*",
+            "merges*",
+        ],
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
 def download_smollm2_135m_gptq_model():
     # download the model
     snapshot_download_w_retry("lilmeaty/SmolLM2-135M-Instruct-GPTQ", repo_type="model")
@@ -723,3 +741,20 @@ def test_load_fixtures(
 def disable_telemetry(monkeypatch):
     monkeypatch.setenv("AXOLOTL_DO_NOT_TRACK", "1")
     yield
+
+
+@pytest.fixture
+def mm_tiling_plugin():
+    """Register the mm_tiling plugin so cfg-driven tiling resolves in tests."""
+    from axolotl.integrations.base import PluginManager
+    from axolotl.integrations.mm_tiling import MMTilingPlugin
+
+    pm = PluginManager.get_instance()
+    saved = dict(pm.plugins)
+    pm.plugins.clear()
+    pm.plugins["mm_tiling"] = MMTilingPlugin()
+    try:
+        yield
+    finally:
+        pm.plugins.clear()
+        pm.plugins.update(saved)

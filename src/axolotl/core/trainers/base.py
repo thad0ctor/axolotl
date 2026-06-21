@@ -61,12 +61,49 @@ from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 
 LOG = get_logger(__name__)
 
+_MULTIMODAL_COLLATOR_CLASS_NAMES = {
+    "MultiModalChatDataCollator",
+    "MultiModalPretrainDataCollator",
+}
+
 REDUCTION_FNS = {
     "mean": torch.mean,
     "min": torch.min,
     "max": torch.max,
     "sum": torch.sum,
 }
+
+
+def _is_multimodal_data_collator(data_collator: Any) -> bool:
+    return data_collator.__class__.__name__ in _MULTIMODAL_COLLATOR_CLASS_NAMES
+
+
+def _apply_multimodal_dataloader_overrides(
+    dataloader_params: dict[str, Any],
+    args: Any,
+    data_collator: Any,
+) -> bool:
+    if not (
+        args.multimodal_sample_packing_dataloader
+        and _is_multimodal_data_collator(data_collator)
+    ):
+        return False
+
+    if args.multimodal_sample_packing_dataloader_num_workers is not None:
+        dataloader_params["num_workers"] = (
+            args.multimodal_sample_packing_dataloader_num_workers
+        )
+    if args.multimodal_sample_packing_dataloader_pin_memory is not None:
+        dataloader_params["pin_memory"] = (
+            args.multimodal_sample_packing_dataloader_pin_memory
+        )
+    if args.multimodal_sample_packing_dataloader_persistent_workers is not None:
+        dataloader_params["persistent_workers"] = (
+            args.multimodal_sample_packing_dataloader_persistent_workers
+        )
+    if dataloader_params["num_workers"] == 0:
+        dataloader_params["persistent_workers"] = False
+    return True
 
 
 class AxolotlTrainer(
@@ -291,6 +328,9 @@ class AxolotlTrainer(
             "pin_memory": self.args.dataloader_pin_memory,
             "persistent_workers": self.args.dataloader_persistent_workers,
         }
+        use_mm_packing_dataloader = _apply_multimodal_dataloader_overrides(
+            dataloader_params, self.args, data_collator
+        )
 
         if not isinstance(dataset, torch.utils.data.IterableDataset):
             dataloader_params["drop_last"] = get_not_null(
@@ -306,13 +346,29 @@ class AxolotlTrainer(
                 else:
                     dataloader_params["sampler"] = sampler
 
-            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+            if dataloader_params["num_workers"] > 0:
+                dataloader_params["prefetch_factor"] = (
+                    self.args.multimodal_sample_packing_dataloader_prefetch_factor
+                    if use_mm_packing_dataloader
+                    and self.args.multimodal_sample_packing_dataloader_prefetch_factor
+                    is not None
+                    else self.args.dataloader_prefetch_factor
+                )
             if is_training:
                 dataloader_params["worker_init_fn"] = partial(
                     seed_worker,
-                    num_workers=self.args.dataloader_num_workers,
+                    num_workers=dataloader_params["num_workers"],
                     rank=self.args.process_index,
                 )
+        elif (
+            use_mm_packing_dataloader
+            and self.args.multimodal_sample_packing_dataloader_prefetch_factor
+            is not None
+            and dataloader_params["num_workers"] > 0
+        ):
+            dataloader_params["prefetch_factor"] = (
+                self.args.multimodal_sample_packing_dataloader_prefetch_factor
+            )
         if self.args.sample_packing and (
             (is_training and not self.args.pretraining)
             or (not is_training and self.args.eval_sample_packing is not False)
@@ -335,8 +391,13 @@ class AxolotlTrainer(
 
         # Accelerator.free_memory() will destroy the references, so
         # we need to store the non-prepared version for eval dataloaders.
+        # Use the effective flag: MM overrides can enable persistent workers
+        # even when self.args.dataloader_persistent_workers is False.
         # fmt: off
-        if dataloader_key is not None and self.args.dataloader_persistent_workers:
+        effective_persistent_workers = dataloader_params.get(
+            "persistent_workers", self.args.dataloader_persistent_workers
+        )
+        if dataloader_key is not None and effective_persistent_workers:
             if hasattr(self, "_eval_dataloaders"):
                 self._eval_dataloaders[dataloader_key] = dataloader  # type: ignore
             else:

@@ -2,7 +2,6 @@
 
 import functools
 import os
-import tempfile
 from typing import Literal
 
 from datasets import (
@@ -10,6 +9,7 @@ from datasets import (
     DatasetDict,
     IterableDataset,
     IterableDatasetDict,
+    concatenate_datasets,
     load_dataset,
 )
 from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -20,6 +20,7 @@ from axolotl.utils.data.shared import (
     create_train_validation_split,
     datasets_with_name_generator,
     generate_dataset_hash_from_config,
+    generate_pretraining_dataset_hash,
     load_dataset_with_config,
     load_preprocessed_dataset,
     merge_datasets,
@@ -134,7 +135,9 @@ def _prepare_streaming_dataset(
     """
     if cfg.pretraining_dataset:
         dataset_config = _extract_pretraining_config(cfg)
-        train_dataset = _load_streaming_dataset(dataset_config, cfg, tokenizer)
+        train_dataset = _load_streaming_dataset(
+            dataset_config, cfg, tokenizer, processor=processor
+        )
     elif cfg.sample_packing:
         # TODO(djsaunde): Implement for multiple datasets
         dataset_config = DictDefault(cfg.datasets[0])
@@ -142,7 +145,9 @@ def _prepare_streaming_dataset(
         # Ensure we have a split set - default to 'train' if not specified
         if not hasattr(dataset_config, "split") or not dataset_config.split:
             dataset_config.split = "train"
-        train_dataset = _load_streaming_dataset(dataset_config, cfg, tokenizer)
+        train_dataset = _load_streaming_dataset(
+            dataset_config, cfg, tokenizer, processor=processor
+        )
     else:
         # Use legacy loading function for non-packed streaming datasets
         train_dataset, eval_dataset, prompters = _load_and_prepare_datasets(
@@ -160,17 +165,70 @@ def _prepare_streaming_dataset(
     # Load evaluation dataset if specified
     eval_dataset = None
     if cfg.test_datasets:
-        _, eval_dataset, _ = _load_and_prepare_datasets(
-            tokenizer,
-            cfg,
-            split="test",
-            processor=processor,
-            streaming=False,
+        test_dicts = [t if isinstance(t, dict) else dict(t) for t in cfg.test_datasets]
+        is_mm_cpt_eval = any(
+            t.get("type") == "multimodal_pretrain" or bool(t.get("multimodal"))
+            for t in test_dicts
         )
+        if is_mm_cpt_eval:
+            # Modality homogeneity is enforced by check_multimodal_cpt at config
+            # parse time; every entry here is guaranteed to be MM.
+            eval_streams = [
+                _load_streaming_dataset(
+                    _pretraining_config_from_entry(entry),
+                    cfg,
+                    tokenizer,
+                    processor=processor,
+                    is_eval=True,
+                )
+                for entry in test_dicts
+            ]
+            eval_dataset = (
+                eval_streams[0]
+                if len(eval_streams) == 1
+                else concatenate_datasets(eval_streams)
+            )
+        else:
+            _, eval_dataset, _ = _load_and_prepare_datasets(
+                tokenizer,
+                cfg,
+                split="test",
+                processor=processor,
+                streaming=False,
+            )
 
-    # For streaming, we return max_steps directly from config or -1 if not set
-    total_num_steps = cfg.max_steps if cfg.max_steps else -1
+    # Map-style train_dataset (mm-CPT cache hit) needs real total_num_steps for warmup/scheduler.
+    if isinstance(train_dataset, Dataset):
+        if cfg.max_steps:
+            total_num_steps = min(
+                calculate_total_num_steps(cfg, train_dataset), cfg.max_steps
+            )
+        else:
+            total_num_steps = calculate_total_num_steps(cfg, train_dataset)
+    else:
+        total_num_steps = cfg.max_steps if cfg.max_steps else -1
     return train_dataset, eval_dataset, total_num_steps, []
+
+
+def _pretraining_config_from_entry(entry: dict) -> DictDefault:
+    return DictDefault(
+        {
+            "path": entry["path"],
+            "name": entry.get("name"),
+            "revision": entry.get("revision"),
+            "skip": entry.get("skip"),
+            "split": entry.get("split", "train"),
+            "data_files": entry.get("data_files"),
+            "ds_type": entry.get("ds_type"),
+            "type": entry.get("type", "pretrain"),
+            "text_column": entry.get("text_column", "text"),
+            "multimodal": entry.get("multimodal"),
+            "image_column": entry.get("image_column", "images"),
+            "image_base_dir": entry.get("image_base_dir"),
+            "image_token": entry.get("image_token"),
+            "trust_remote_code": entry.get("trust_remote_code", False),
+        }
+    )
 
 
 def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
@@ -178,34 +236,152 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
     if isinstance(cfg.pretraining_dataset, list) and isinstance(
         cfg.pretraining_dataset[0], dict
     ):
-        config = cfg.pretraining_dataset[0]
-        return DictDefault(
-            {
-                "path": config["path"],
-                "name": config["name"],
-                "skip": config["skip"],
-                "split": config.get("split", "train"),
-                "data_files": config.get("data_files"),
-                "type": config.get("type", "pretrain"),
-            }
-        )
+        return _pretraining_config_from_entry(cfg.pretraining_dataset[0])
     # Simple string path case
     return DictDefault(
         {
             "path": cfg.pretraining_dataset,
             "name": None,
+            "revision": None,
             "skip": 0,
             "split": "train",
             "data_files": None,
+            "ds_type": None,
             "type": "pretrain",
+            "text_column": "text",
+            "multimodal": None,
+            "image_column": "images",
+            "image_base_dir": None,
+            "image_token": None,  # nosec
+            "trust_remote_code": False,
         }
     )
 
 
+def _is_multimodal_pretrain_config(pretraining_config: DictDefault) -> bool:
+    return pretraining_config.get("type") == "multimodal_pretrain" or bool(
+        pretraining_config.get("multimodal")
+    )
+
+
+def _mm_pretrain_cache_enabled(
+    cfg: DictDefault, pretraining_config: DictDefault, is_eval: bool
+) -> bool:
+    if is_eval:
+        return False
+    if not cfg.dataset_prepared_path or cfg.skip_prepare_dataset:
+        return False
+    if cfg.accelerator_config and cfg.accelerator_config.dispatch_batches:
+        return False
+    return _is_multimodal_pretrain_config(pretraining_config)
+
+
+def _build_mm_pretrain_cache(
+    pretraining_config: DictDefault,
+    cfg: DictDefault,
+    tokenizer: PreTrainedTokenizer,
+    processor: ProcessorMixin | None,
+    dataset_hash: str,
+) -> Dataset:
+    ds_type = pretraining_config.get("ds_type")
+    if ds_type:
+        raw_dataset = load_dataset(
+            ds_type,
+            split=pretraining_config["split"],
+            name=pretraining_config["name"],
+            data_files=(pretraining_config["data_files"] or pretraining_config["path"]),
+            trust_remote_code=pretraining_config.get("trust_remote_code", False),
+        )
+    else:
+        raw_dataset = load_dataset(
+            pretraining_config["path"],
+            split=pretraining_config["split"],
+            name=pretraining_config["name"],
+            revision=pretraining_config.get("revision"),
+            data_files=pretraining_config["data_files"],
+            trust_remote_code=pretraining_config.get("trust_remote_code", False),
+        )
+    if pretraining_config["skip"]:
+        LOG.info(f"Skipping {pretraining_config['skip']} samples from the dataset")
+        raw_dataset = raw_dataset.select(
+            range(pretraining_config["skip"], len(raw_dataset))
+        )
+    processed = wrap_streaming_dataset(
+        raw_dataset,
+        tokenizer,
+        cfg,
+        ds_wrapper_fn=None,
+        processor=processor,
+        pretraining_config=pretraining_config,
+        is_eval=False,
+        cache_prep=True,
+    )
+    save_preprocessed_dataset(cfg, processed, dataset_hash, split="train")
+    return processed
+
+
+def _processor_fingerprint(processor: ProcessorMixin | None) -> str | None:
+    if processor is None:
+        return None
+    # Module-qualified identity so same-named classes in different modules don't collide.
+    proc_cls = type(processor)
+    parts = [f"{proc_cls.__module__}.{proc_cls.__qualname__}"]
+    for attr in ("image_token", "video_token", "image_seq_length"):
+        if hasattr(processor, attr):
+            parts.append(f"{attr}={getattr(processor, attr)!r}")
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is not None:
+        ip_cls = type(image_processor)
+        parts.append(f"image_processor={ip_cls.__module__}.{ip_cls.__qualname__}")
+        for attr in ("size", "patch_size", "merge_size", "min_pixels", "max_pixels"):
+            if hasattr(image_processor, attr):
+                parts.append(f"ip.{attr}={getattr(image_processor, attr)!r}")
+    return "|".join(parts)
+
+
+def _load_or_build_mm_pretrain_cache(
+    pretraining_config: DictDefault,
+    cfg: DictDefault,
+    tokenizer: PreTrainedTokenizer,
+    processor: ProcessorMixin | None,
+) -> Dataset:
+    dataset_hash = generate_pretraining_dataset_hash(
+        cfg,
+        pretraining_config,
+        tokenizer.name_or_path,
+        _processor_fingerprint(processor),
+    )
+
+    loader = FileLockLoader(cfg)
+    try:
+
+        def _load_or_build():
+            cached = load_preprocessed_dataset(cfg, dataset_hash)
+            if cached is not None:
+                return cached
+            return _build_mm_pretrain_cache(
+                pretraining_config, cfg, tokenizer, processor, dataset_hash
+            )
+
+        return loader.load(_load_or_build)
+    finally:
+        loader.cleanup()
+
+
 def _load_streaming_dataset(
-    pretraining_config: DictDefault, cfg: DictDefault, tokenizer: PreTrainedTokenizer
-) -> IterableDataset:
+    pretraining_config: DictDefault,
+    cfg: DictDefault,
+    tokenizer: PreTrainedTokenizer,
+    processor: ProcessorMixin | None = None,
+    is_eval: bool = False,
+) -> IterableDataset | Dataset:
     """Load and prepare a streaming dataset for pretraining."""
+    if _mm_pretrain_cache_enabled(cfg, pretraining_config, is_eval):
+        cached = _load_or_build_mm_pretrain_cache(
+            pretraining_config, cfg, tokenizer, processor
+        )
+        return cached.with_format("torch")
+
     # Create dataset wrapper partial function
     dataset_wrapper_partial = functools.partial(
         get_dataset_wrapper,
@@ -213,6 +389,7 @@ def _load_streaming_dataset(
         tokenizer=tokenizer,
         cfg=cfg,
         dataset_base_type=pretraining_config["type"],
+        processor=processor,
     )
 
     # Load the actual dataset
@@ -221,15 +398,31 @@ def _load_streaming_dataset(
         and cfg.accelerator_config.dispatch_batches
         and not is_local_main_process()
     ):
-        iter_dataset = _create_placeholder_dataset()
+        iter_dataset = _create_placeholder_dataset(pretraining_config)
     else:
-        iter_dataset = load_dataset(
-            pretraining_config["path"],
-            streaming=True,
-            split=pretraining_config["split"],
-            name=pretraining_config["name"],
-            data_files=pretraining_config["data_files"],
-        )
+        ds_type = pretraining_config.get("ds_type")
+        if ds_type:
+            # ds_type names the loader (e.g. 'json'); path is the data_files glob.
+            iter_dataset = load_dataset(
+                ds_type,
+                streaming=True,
+                split=pretraining_config["split"],
+                name=pretraining_config["name"],
+                data_files=(
+                    pretraining_config["data_files"] or pretraining_config["path"]
+                ),
+                trust_remote_code=pretraining_config.get("trust_remote_code", False),
+            )
+        else:
+            iter_dataset = load_dataset(
+                pretraining_config["path"],
+                streaming=True,
+                split=pretraining_config["split"],
+                name=pretraining_config["name"],
+                revision=pretraining_config.get("revision"),
+                data_files=pretraining_config["data_files"],
+                trust_remote_code=pretraining_config.get("trust_remote_code", False),
+            )
 
     # Apply skip if specified
     if pretraining_config["skip"]:
@@ -242,19 +435,36 @@ def _load_streaming_dataset(
         tokenizer,
         cfg,
         dataset_wrapper_partial,
+        processor=processor,
+        pretraining_config=pretraining_config,
+        is_eval=is_eval,
     )
 
     # Format for PyTorch
     return train_dataset.with_format("torch")
 
 
-def _create_placeholder_dataset() -> IterableDataset:
+def _create_placeholder_dataset(
+    pretraining_config: DictDefault | None = None,
+) -> IterableDataset:
     """Create a minimal placeholder dataset for non-main processes."""
-    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
-        f.write("text\n")
-        f.write("lorem ipsum dolor sit amet\n")
-        f.seek(0)
-        return load_dataset("csv", data_files=f.name, split="train", streaming=True)
+    text_column = "text"
+    image_column: str | None = None
+    if pretraining_config is not None:
+        text_column = pretraining_config.get("text_column") or "text"
+        is_mm = pretraining_config.get("type") == "multimodal_pretrain" or bool(
+            pretraining_config.get("multimodal")
+        )
+        if is_mm:
+            image_column = pretraining_config.get("image_column") or "images"
+
+    def _gen():
+        row = {text_column: "lorem ipsum dolor sit amet"}
+        if image_column is not None:
+            row[image_column] = []
+        yield row
+
+    return IterableDataset.from_generator(_gen)
 
 
 def _load_tokenized_prepared_datasets(

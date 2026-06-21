@@ -116,7 +116,8 @@ def add_position_ids(sample):
         # Position IDs for a single example
         # As a list
         sample["position_ids"] = list(range(seq_len))
-        sample["length"] = seq_len
+        if "length" not in sample:
+            sample["length"] = seq_len
 
     else:
         # ---- BATCHED EXAMPLES ----
@@ -130,7 +131,8 @@ def add_position_ids(sample):
 
         # Now store them back
         sample["position_ids"] = position_ids_batch
-        sample["length"] = lengths_batch
+        if "length" not in sample:
+            sample["length"] = lengths_batch
 
     return sample
 
@@ -221,6 +223,7 @@ def filter_sequences_by_length(
     min_sequence_len = min_sequence_len or 2
 
     input_ids = sample["input_ids"]
+    explicit_lengths = sample.get("length")
 
     # Edge case: if input_ids is empty
     if not input_ids:
@@ -230,7 +233,9 @@ def filter_sequences_by_length(
     # Check if single example or batched by looking at the first element
     if isinstance(input_ids[0], int):
         # Single example (input_ids is a list of int)
-        length = len(input_ids)
+        length = (
+            int(explicit_lengths) if explicit_lengths is not None else len(input_ids)
+        )
         if raise_on_drop and length > sequence_len:
             raise ValueError(
                 f"Sequence encountered with {length} tokens, which exceeds the maximum {sequence_len}."
@@ -239,8 +244,10 @@ def filter_sequences_by_length(
 
     # Batched (input_ids is a list of lists)
     results = []
-    for seq in input_ids:
-        length = len(seq)
+    for idx, seq in enumerate(input_ids):
+        length = (
+            int(explicit_lengths[idx]) if explicit_lengths is not None else len(seq)
+        )
         if raise_on_drop and length > sequence_len:
             raise ValueError(
                 f"Sequence encountered with {length} tokens, which exceeds the maximum {sequence_len}."
@@ -411,12 +418,15 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
         and not cfg.skip_prepare_dataset
         and not cfg.reward_model
     ):
-        total_num_tokens = np.sum(
-            train_dataset.select_columns("input_ids")
-            .to_pandas()["input_ids"]
-            .apply(len)
-            .values
-        )
+        if "length" in train_dataset.column_names:
+            total_num_tokens = np.sum(train_dataset["length"])
+        else:
+            total_num_tokens = np.sum(
+                train_dataset.select_columns("input_ids")
+                .to_pandas()["input_ids"]
+                .apply(len)
+                .values
+            )
         LOG.debug(f"total_num_tokens: {total_num_tokens:_}")
         if update:
             cfg.total_num_tokens = total_num_tokens

@@ -44,6 +44,8 @@ from axolotl.utils.collators import (
     V2BatchSamplerDataCollatorForSeq2Seq,
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
+from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
+from axolotl.utils.data.mm_image_transform import resolve_mm_image_transform
 from axolotl.utils.import_helper import get_cls_from_module_str
 from axolotl.utils.logging import get_logger
 
@@ -65,6 +67,45 @@ def _warn_if_num_workers_zero_for_mm(cfg, log) -> None:
     log.warning(
         "Increase dataloader_num_workers to speed up multimodal training with assistant-only loss masking (currently dataloader_num_workers=0)."
     )
+
+
+def _is_multimodal_cpt(cfg) -> bool:
+    return _get_mm_cpt_config(cfg) is not None
+
+
+def _entry_is_multimodal_cpt(entry) -> bool:
+    if entry is None:
+        return False
+    ds_type = None
+    mm_flag = None
+    if hasattr(entry, "type"):
+        ds_type = getattr(entry, "type", None)
+        mm_flag = getattr(entry, "multimodal", None)
+    elif isinstance(entry, dict):
+        ds_type = entry.get("type")
+        mm_flag = entry.get("multimodal")
+    return (ds_type == "multimodal_pretrain") or bool(mm_flag)
+
+
+def _get_mm_cpt_config(cfg, is_eval: bool = False):
+    if is_eval and getattr(cfg, "test_datasets", None):
+        for entry in cfg.test_datasets:
+            if _entry_is_multimodal_cpt(entry):
+                return entry
+    for collection_name in ("pretraining_dataset", "datasets"):
+        collection = getattr(cfg, collection_name, None)
+        if not collection:
+            continue
+        for entry in collection:
+            if _entry_is_multimodal_cpt(entry):
+                return entry
+    return None
+
+
+def _mm_cpt_get(pt_cfg, key, default=None):
+    if isinstance(pt_cfg, dict):
+        return pt_cfg.get(key, default)
+    return getattr(pt_cfg, key, default)
 
 
 class HFCausalTrainerBuilder(TrainerBuilderBase):
@@ -299,6 +340,17 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             training_arguments_kwargs["sample_packing_efficiency"] = (
                 self.cfg.sample_packing_eff_est
             )
+        training_arguments_kwargs["multimodal_sample_packing_dataloader"] = bool(
+            self.cfg.multimodal_sample_packing_dataloader
+        )
+        for key in (
+            "multimodal_sample_packing_dataloader_num_workers",
+            "multimodal_sample_packing_dataloader_prefetch_factor",
+            "multimodal_sample_packing_dataloader_pin_memory",
+            "multimodal_sample_packing_dataloader_persistent_workers",
+        ):
+            if self.cfg.get(key) is not None:
+                training_arguments_kwargs[key] = self.cfg.get(key)
 
         if self.cfg.relora and self.cfg.jagged_restart_steps:
             if self.cfg.relora_prune_ratio is not None:
@@ -353,6 +405,18 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         if self.cfg.image_resize_algorithm:
             training_arguments_kwargs["image_resize_algorithm"] = (
                 self.cfg.image_resize_algorithm
+            )
+        if self.cfg.get("image_resize_buckets"):
+            training_arguments_kwargs["image_resize_buckets"] = (
+                self.cfg.image_resize_buckets
+            )
+        if self.cfg.get("image_resize_no_upscale") is not None:
+            training_arguments_kwargs["image_resize_no_upscale"] = (
+                self.cfg.image_resize_no_upscale
+            )
+        if self.cfg.get("image_resize_pad_color") is not None:
+            training_arguments_kwargs["image_resize_pad_color"] = (
+                self.cfg.image_resize_pad_color
             )
 
         if self.cfg.plugins:
@@ -464,6 +528,57 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
 
         return trainer
 
+    def _build_mm_pretrain_collator(self, pad_to_multiple_of=None, is_eval=False):
+        from axolotl.prompt_strategies.multimodal_pretrain import (
+            build_image_token_spec,
+        )
+
+        pt_cfg = _get_mm_cpt_config(self.cfg, is_eval=is_eval) or {}
+        spec = build_image_token_spec(
+            self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
+        )
+        max_length = (
+            self.cfg.eval_sequence_len
+            if is_eval and self.cfg.eval_sequence_len
+            else self.cfg.sequence_len
+        )
+        use_sample_packing = bool(
+            self.cfg.sample_packing
+            and (not is_eval or self.cfg.eval_sample_packing is not False)
+        )
+        if use_sample_packing and not self.cfg.multipack_real_batches:
+            max_length *= self.cfg.micro_batch_size
+        collator_kwargs = {
+            "tokenizer": self.tokenizer,
+            "processor": self.processor,
+            "image_token_spec": spec,
+            "image_base_dir": _mm_cpt_get(pt_cfg, "image_base_dir"),
+            "max_length": max_length,
+            "sample_packing": use_sample_packing,
+            "image_size": self.cfg.get("image_size"),
+            "image_resize_algorithm": self.cfg.get("image_resize_algorithm"),
+            "image_resize_buckets": self.cfg.get("image_resize_buckets"),
+            "image_resize_no_upscale": bool(self.cfg.get("image_resize_no_upscale")),
+            "image_resize_pad_color": self.cfg.get("image_resize_pad_color"),
+            "image_transform": self._resolve_mm_image_transform_checked(),
+        }
+        if pad_to_multiple_of is not None:
+            if self.cfg.pad_to_sequence_len:
+                pad_to_multiple_of = max_length
+            collator_kwargs["pad_to_multiple_of"] = pad_to_multiple_of
+        return MultiModalPretrainDataCollator(**collator_kwargs)
+
+    def _resolve_mm_image_transform_checked(self):
+        transform = resolve_mm_image_transform(self.cfg)
+        if transform is None and self.cfg.get("image_tiling"):
+            raise ValueError(
+                "image_tiling is enabled but no image transform could be "
+                "resolved, so the run would train untiled. Ensure "
+                "`plugins: [axolotl.integrations.mm_tiling.MMTilingPlugin]` is "
+                "set and the tiling config is valid."
+            )
+        return transform
+
     def build_collator(
         self,
         training_args,  # type: "AxolotlTrainingArguments"  # type: ignore
@@ -471,6 +586,16 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         **kwargs,
     ):
         if training_args.pretraining:
+            # Intercept MM CPT before the text-only pretraining branches.
+            if (
+                self.cfg.processor_type
+                and self.processor
+                and _is_multimodal_cpt(self.cfg)
+            ):
+                return self._build_mm_pretrain_collator(
+                    pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+                    is_eval=is_eval,
+                )
             if (
                 self.cfg.pretraining_sample_concatenation is False
                 or self.cfg.micro_batch_size > 1
@@ -517,6 +642,104 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             tokenizer = collator_args.pop(0)
             kwargs["pad_token_id"] = tokenizer.pad_token_id
             kwargs.pop("padding")
+        elif (
+            self.cfg.processor_type and self.processor and _is_multimodal_cpt(self.cfg)
+        ):
+            return self._build_mm_pretrain_collator(
+                pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+                is_eval=is_eval,
+            )
+        elif self.cfg.processor_type and self.processor:
+            collator = MultiModalChatDataCollator
+            # Mirror ChatTemplateStrategy: per-dataset masking knobs from first MM dataset, else global cfg.
+            # NOTE: Multi-dataset configs use the first dataset's masking knobs for all datasets;
+            # heterogeneous per-dataset overrides are not supported in the MM path today.
+            ds_entries = self.cfg.datasets or []
+            ds_cfg = ds_entries[0] if ds_entries else None
+
+            def _ds_get(cfg_obj, key):
+                # Handle DictDefault / dict / pydantic uniformly:
+                # dict-style .get first, then attribute access.
+                if cfg_obj is None:
+                    return None
+                if hasattr(cfg_obj, "get"):
+                    try:
+                        return cfg_obj.get(key)
+                    except (AttributeError, KeyError, TypeError):
+                        pass
+                return getattr(cfg_obj, key, None)
+
+            roles_to_train = _ds_get(ds_cfg, "roles_to_train")
+            train_on_eos = _ds_get(ds_cfg, "train_on_eos")
+
+            # cfg.role_boundaries replaces the strategy's built-in markers.
+            role_boundaries_override = None
+            if self.cfg.role_boundaries:
+                role_boundaries_override = list(self.cfg.role_boundaries)
+
+            # Deduped union of per-dataset `field_messages` for the MM collator.
+            # Each entry may be a str or a list/tuple of names; flatten so the
+            # strategy receives flat string names, not nested lists.
+            field_messages = []
+            for dataset_cfg in ds_entries:
+                field_message = _ds_get(dataset_cfg, "field_messages")
+                if isinstance(field_message, str):
+                    candidates = [field_message]
+                elif isinstance(field_message, (list, tuple)):
+                    candidates = [name for name in field_message if name]
+                else:
+                    candidates = []
+                for name in candidates:
+                    if name not in field_messages:
+                        field_messages.append(name)
+
+            # build() calls build_collator twice (eval + train); log once.
+            if not is_eval:
+                LOG.info(
+                    "MM collator: train_on_inputs=%s roles_to_train=%s "
+                    "train_on_eos=%s role_boundaries_override=%s",
+                    bool(self.cfg.train_on_inputs),
+                    roles_to_train,
+                    train_on_eos,
+                    "set" if role_boundaries_override else "none",
+                )
+                _warn_if_num_workers_zero_for_mm(self.cfg, LOG)
+
+            kwargs["processing_strategy"] = get_processing_strategy(
+                self.processor,
+                training_args.chat_template,
+                self.cfg.chat_template,
+                image_size=training_args.image_size,
+                image_resize_algorithm=training_args.image_resize_algorithm,
+                image_resize_buckets=training_args.image_resize_buckets,
+                image_resize_no_upscale=bool(training_args.image_resize_no_upscale),
+                image_resize_pad_color=training_args.image_resize_pad_color,
+                image_transform=self._resolve_mm_image_transform_checked(),
+                train_on_inputs=bool(self.cfg.train_on_inputs),
+                roles_to_train=roles_to_train,
+                train_on_eos=train_on_eos,
+                role_boundaries_override=role_boundaries_override,
+                field_messages=field_messages or None,
+            )
+            use_mm_sample_packing = bool(
+                training_args.sample_packing
+                and (not is_eval or training_args.eval_sample_packing is not False)
+            )
+            kwargs["packing"] = use_mm_sample_packing
+            if use_mm_sample_packing:
+                max_length = (
+                    self.cfg.eval_sequence_len
+                    if is_eval and self.cfg.eval_sequence_len
+                    else self.cfg.sequence_len
+                )
+                if not self.cfg.multipack_real_batches:
+                    max_length *= self.cfg.micro_batch_size
+                kwargs["max_length"] = max_length
+                if (
+                    kwargs.get("pad_to_multiple_of") is not None
+                    and self.cfg.pad_to_sequence_len
+                ):
+                    kwargs["pad_to_multiple_of"] = max_length
         elif use_batch_sampler_collator:
             # Use V2BatchSamplerDataCollatorForSeq2Seq for flex attention,
             # supported multipack models, or non-flash-attention llama
@@ -531,73 +754,13 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 collator = V2BatchSamplerDataCollatorForSeq2Seq
             else:
                 collator = BatchSamplerDataCollatorForSeq2Seq
+        elif self.cfg.batch_flattening:
+            collator = DataCollatorWithFlattening
+            collator_args.pop(0)
+            kwargs.pop("pad_to_multiple_of", None)
+            kwargs.pop("padding", None)
         else:
-            if self.cfg.processor_type and self.processor:
-                collator = MultiModalChatDataCollator
-                # Mirror ChatTemplateStrategy: per-dataset masking knobs from first MM dataset, else global cfg.
-                # NOTE: Multi-dataset configs use the first dataset's masking knobs for all datasets;
-                # heterogeneous per-dataset overrides are not supported in the MM path today.
-                ds_entries = self.cfg.datasets or []
-                ds_cfg = ds_entries[0] if ds_entries else None
-
-                def _ds_get(cfg_obj, key):
-                    # Handle DictDefault / dict / pydantic uniformly:
-                    # dict-style .get first, then attribute access.
-                    if cfg_obj is None:
-                        return None
-                    if hasattr(cfg_obj, "get"):
-                        try:
-                            return cfg_obj.get(key)
-                        except (AttributeError, KeyError, TypeError):
-                            pass
-                    return getattr(cfg_obj, key, None)
-
-                roles_to_train = _ds_get(ds_cfg, "roles_to_train")
-                train_on_eos = _ds_get(ds_cfg, "train_on_eos")
-
-                # cfg.role_boundaries replaces the strategy's built-in markers.
-                role_boundaries_override = None
-                if self.cfg.role_boundaries:
-                    role_boundaries_override = list(self.cfg.role_boundaries)
-
-                # Deduped union of per-dataset `field_messages` for the MM collator.
-                field_messages = []
-                for dataset_cfg in ds_entries:
-                    field_message = _ds_get(dataset_cfg, "field_messages")
-                    if field_message and field_message not in field_messages:
-                        field_messages.append(field_message)
-
-                # build() calls build_collator twice (eval + train); log once.
-                if not is_eval:
-                    LOG.info(
-                        "MM collator: train_on_inputs=%s roles_to_train=%s "
-                        "train_on_eos=%s role_boundaries_override=%s",
-                        bool(self.cfg.train_on_inputs),
-                        roles_to_train,
-                        train_on_eos,
-                        "set" if role_boundaries_override else "none",
-                    )
-                    _warn_if_num_workers_zero_for_mm(self.cfg, LOG)
-
-                kwargs["processing_strategy"] = get_processing_strategy(
-                    self.processor,
-                    training_args.chat_template,
-                    self.cfg.chat_template,
-                    image_size=training_args.image_size,
-                    image_resize_algorithm=training_args.image_resize_algorithm,
-                    train_on_inputs=bool(self.cfg.train_on_inputs),
-                    roles_to_train=roles_to_train,
-                    train_on_eos=train_on_eos,
-                    role_boundaries_override=role_boundaries_override,
-                    field_messages=field_messages or None,
-                )
-            elif self.cfg.batch_flattening:
-                collator = DataCollatorWithFlattening
-                collator_args.pop(0)
-                kwargs.pop("pad_to_multiple_of", None)
-                kwargs.pop("padding", None)
-            else:
-                collator = DataCollatorForSeq2Seq
+            collator = DataCollatorForSeq2Seq
 
         kwargs["return_tensors"] = "pt"
 

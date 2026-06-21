@@ -37,6 +37,8 @@ class DatasetValidationMixin:
     @field_validator("datasets", mode="before")
     @classmethod
     def deprecate_sharegpt_datasets(cls, datasets):
+        if datasets is None:
+            return datasets
         for _, ds_cfg in enumerate(datasets):
             ds_type = (
                 ds_cfg.get("type")
@@ -1388,6 +1390,199 @@ class PretrainingValidationMixin:
             raise NotImplementedError(
                 "Sample packing with multiple streaming datasets is not yet supported"
             )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_multimodal_cpt(cls, data):
+        def _entry_is_mm(entry) -> bool:
+            if isinstance(entry, dict):
+                ds_type_ = entry.get("type")
+                mm_flag_ = entry.get("multimodal")
+            else:
+                ds_type_ = getattr(entry, "type", None)
+                mm_flag_ = getattr(entry, "multimodal", None)
+            return ds_type_ == "multimodal_pretrain" or bool(mm_flag_)
+
+        def _entry_has_mm_flag_without_dataset_type(entry) -> bool:
+            if isinstance(entry, dict):
+                ds_type_ = entry.get("type")
+                mm_flag_ = entry.get("multimodal")
+            else:
+                ds_type_ = getattr(entry, "type", None)
+                mm_flag_ = getattr(entry, "multimodal", None)
+            return bool(mm_flag_) and ds_type_ != "multimodal_pretrain"
+
+        def _datasets_entry_is_mm(entry) -> bool:
+            if isinstance(entry, dict):
+                return entry.get("type") == "multimodal_pretrain"
+            return getattr(entry, "type", None) == "multimodal_pretrain"
+
+        def _entry_get(entry, key):
+            if isinstance(entry, dict):
+                return entry.get(key)
+            return getattr(entry, key, None)
+
+        pd = data.get("pretraining_dataset")
+        pd_list = pd if isinstance(pd, list) else ([pd] if pd else [])
+        datasets = data.get("datasets") or []
+        datasets_list = datasets if isinstance(datasets, list) else [datasets]
+
+        pd_is_mm = any(_entry_is_mm(entry) for entry in pd_list)
+        if any(
+            _entry_has_mm_flag_without_dataset_type(entry) for entry in datasets_list
+        ):
+            raise ValueError(
+                "Multimodal CPT under `datasets` requires "
+                "`type: multimodal_pretrain`. The `multimodal: true` shortcut "
+                "is only supported for `pretraining_dataset` and `test_datasets`."
+            )
+        datasets_is_mm = any(_datasets_entry_is_mm(entry) for entry in datasets_list)
+        train_is_mm = pd_is_mm or datasets_is_mm
+
+        test_datasets = data.get("test_datasets") or []
+        mm_flags = [_entry_is_mm(t) for t in test_datasets]
+        if mm_flags:
+            if any(mm_flags) != all(mm_flags):
+                raise ValueError(
+                    "Mixing multimodal and non-multimodal entries in "
+                    "`test_datasets` is not supported. All eval entries "
+                    "must share modality."
+                )
+            if all(mm_flags) and not train_is_mm:
+                raise ValueError(
+                    "Multimodal `test_datasets` require multimodal CPT "
+                    "training (set `pretraining_dataset[0].type` or "
+                    "`datasets[0].type` to "
+                    "'multimodal_pretrain' or `multimodal: true`)."
+                )
+            if not any(mm_flags) and train_is_mm:
+                raise ValueError(
+                    "Multimodal CPT training requires multimodal "
+                    "`test_datasets` entries (type='multimodal_pretrain' "
+                    "or multimodal: true)."
+                )
+
+        if not train_is_mm:
+            return data
+
+        # MM config resolves from entry[0] only; multi-entry runs miscollate or silently demote.
+        if pd_is_mm and len(pd_list) > 1:
+            raise ValueError(
+                "Multimodal CPT supports exactly one `pretraining_dataset` "
+                f"entry (found {len(pd_list)}). Image settings "
+                "(`image_base_dir`, `image_token`) and MM-mode detection "
+                "both resolve from entry[0] only, so additional entries "
+                "would be silently miscollated or drop their MM config. "
+                "Split multimodal CPT into its own run."
+            )
+        if datasets_is_mm and len(datasets_list) > 1:
+            raise ValueError(
+                "Multimodal CPT supports exactly one `datasets` entry "
+                f"when using the non-streaming prepared path (found "
+                f"{len(datasets_list)}). Image settings (`image_base_dir`, "
+                "`image_token`) and MM-mode detection resolve once for the "
+                "collator, so mixed or multiple training entries are not "
+                "supported. Split multimodal CPT into its own run."
+            )
+        if pd_is_mm and datasets_is_mm:
+            raise ValueError(
+                "Multimodal CPT cannot be configured under both "
+                "`pretraining_dataset` and `datasets`. Use "
+                "`pretraining_dataset` for streaming or `datasets` for the "
+                "non-streaming prepared path."
+            )
+        if datasets_is_mm and data.get("streaming"):
+            raise ValueError(
+                "Multimodal CPT under `datasets` is the non-streaming prepared "
+                "path. For streaming, configure the entry under "
+                "`pretraining_dataset` with `streaming: true`."
+            )
+
+        if not data.get("processor_type"):
+            raise ValueError(
+                "Multimodal CPT (type: multimodal_pretrain) requires "
+                "`processor_type` to be set — e.g. `processor_type: AutoProcessor`. "
+                "Without a processor, images in the dataset cannot be turned "
+                "into pixel tensors."
+            )
+        mm_tiling_plugin = "axolotl.integrations.mm_tiling.MMTilingPlugin"
+        if (
+            data.get("image_tiling")
+            or data.get("image_tiling_shape_buckets")
+            or data.get("image_tiling_native_resolution")
+            or data.get("image_tiling_min_area") is not None
+        ) and mm_tiling_plugin not in set(data.get("plugins") or []):
+            raise ValueError(
+                "Image tiling is configured but the plugin that owns it is not "
+                "loaded, so tiling would be silently dropped. Add "
+                f"`plugins: [{mm_tiling_plugin}]`."
+            )
+        if (
+            data.get("sample_packing")
+            and pd_is_mm
+            and data.get("dataset_prepared_path")
+        ):
+            raise ValueError(
+                "Multimodal CPT `sample_packing: true` cannot currently build "
+                "a prepared dataset cache from the streaming `pretraining_dataset` "
+                "path. Disable `dataset_prepared_path` for online lookahead "
+                "packing, set `multimodal_sample_packing_cache_path` for the "
+                "SSD metadata cache, or use the non-streaming `datasets` path."
+            )
+        for key in (
+            "multimodal_sample_packing_ram_budget_mb",
+            "multimodal_sample_packing_visual_capacity",
+            "multimodal_sample_packing_dataloader_num_workers",
+            "multimodal_sample_packing_dataloader_prefetch_factor",
+            "image_tiling_min_area",
+        ):
+            value = data.get(key)
+            if value is not None and value < 0:
+                raise ValueError(f"`{key}` must be >= 0")
+        if data.get("chat_template"):
+            raise ValueError(
+                "Multimodal CPT (raw image+text pretraining) is incompatible "
+                "with `chat_template`. The point of the CPT path is to avoid "
+                "conversational scaffolding entirely. Remove `chat_template` "
+                "or switch to chat-template SFT."
+            )
+        if (
+            datasets_is_mm
+            and (data.get("excess_length_strategy") or "drop").lower() == "truncate"
+        ):
+            raise ValueError(
+                "Multimodal CPT under `datasets` cannot use "
+                "`excess_length_strategy: truncate`. The collator re-tokenizes "
+                "`_mm_text` with the processor at batch time, so truncating only "
+                "the prepared `input_ids` would not truncate the actual model "
+                "inputs. Use `drop` or `raise` instead."
+            )
+        # Keep `images` and `_mm_text` columns alive for the collator.
+        prev_remove_unused = data.get("remove_unused_columns")
+        if prev_remove_unused is not False:
+            LOG.info(
+                "Auto-set `remove_unused_columns: false` for multimodal CPT "
+                "to preserve `images` and `_mm_text` columns (previous value: %r)",
+                prev_remove_unused,
+            )
+            data["remove_unused_columns"] = False
+
+        test_datasets = data.get("test_datasets") or []
+        mm_test = [t for t in test_datasets if _entry_is_mm(t)]
+        if len(mm_test) > 1:
+            for key in ("image_base_dir", "image_token"):
+                values = {_entry_get(t, key) for t in mm_test}
+                if len(values) > 1:
+                    raise ValueError(
+                        f"Multimodal CPT eval requires `{key}` to be either "
+                        f"unset on all `test_datasets` entries or identical "
+                        f"across them. The eval collator resolves "
+                        f"`image_base_dir` and `image_token` once from the "
+                        f"first entry, so heterogeneous values would silently "
+                        f"miscollate later entries. Got: {sorted(map(str, values))}."
+                    )
+
         return data
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator
@@ -505,6 +506,102 @@ def try_load_from_hub(
         return None
 
 
+def _dataset_hash_component(dataset_config) -> str:
+    def _get(key: str, default=None):
+        if hasattr(dataset_config, "get"):
+            try:
+                return dataset_config.get(key, default)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        return getattr(dataset_config, key, default)
+
+    component = (
+        f"{_get('path')}:{_get('name')}:{_get('revision')}:{_get('data_files')}:"
+        f"{_get('type')}:{_get('ds_type')}:{_get('shards')}:"
+        f"{_get('conversation')}:{_get('split')}:{_get('temperature') or 1.0}"
+    )
+    if _get("type") == "multimodal_pretrain" or bool(_get("multimodal")):
+        component += (
+            f":{_get('text_column')}:{_get('image_column')}:"
+            f"{_get('image_base_dir')}:{_get('image_token')}"
+        )
+    return component
+
+
+def _mm_processing_fingerprint(cfg) -> str:
+    """Image tiling + resize knobs that change the cached encoding / packing.
+
+    Folded into the dataset-cache hashes so changing the tile policy (or disabling
+    tiling) invalidates a prepared dataset whose packed lengths were computed under
+    the old policy. Returns "" when nothing image-related is set, to avoid churning
+    hashes for text-only / non-tiling users.
+    """
+    from axolotl.utils.data.mm_image_transform import resolve_mm_image_transform
+
+    parts: list[str] = []
+    transform = resolve_mm_image_transform(cfg)
+    payload = transform.policy_payload() if transform is not None else None
+    if payload is not None:
+        parts.append("tiling=" + json.dumps(payload, sort_keys=True, default=str))
+    resize = {
+        key: cfg.get(key)
+        for key in (
+            "image_size",
+            "image_resize_algorithm",
+            "image_resize_buckets",
+            "image_resize_no_upscale",
+            "image_resize_pad_color",
+        )
+        if cfg.get(key) is not None
+    }
+    if resize:
+        parts.append("resize=" + json.dumps(resize, sort_keys=True, default=str))
+    return "|".join(parts)
+
+
+def generate_pretraining_dataset_hash(
+    cfg: DictDefault,
+    pretraining_config: DictDefault,
+    tokenizer_name: str,
+    processor_name: str | None,
+) -> str:
+    """Hash that pins the prepared mm-pretraining cache to the inputs that produced it."""
+    if cfg.get("added_tokens_overrides"):
+        tokenizer_source = cfg.tokenizer_config or tokenizer_name
+        tokenizer_fingerprint = f"{tokenizer_source}+overrides:" + ",".join(
+            f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
+        )
+    else:
+        tokenizer_fingerprint = tokenizer_name
+
+    # image_base_dir is consumed by the collator at runtime, not by the encoder, so it does not bind cached arrows.
+    keys = (
+        "path",
+        "name",
+        "revision",
+        "split",
+        "data_files",
+        "ds_type",
+        "type",
+        "text_column",
+        "image_column",
+        "image_token",
+        "multimodal",
+        "skip",
+    )
+    ds_fingerprint = "|".join(f"{k}={pretraining_config.get(k)!r}" for k in keys)
+    config_str = (
+        f"pretrain@{cfg.sequence_len}|"
+        f"{ds_fingerprint}|"
+        f"{tokenizer_fingerprint}|"
+        f"processor={processor_name or 'None'}"
+    )
+    mm_fingerprint = _mm_processing_fingerprint(cfg)
+    if mm_fingerprint:
+        config_str += f"|{mm_fingerprint}"
+    return str(md5(config_str))
+
+
 def generate_dataset_hash_from_config(
     cfg: DictDefault, cfg_datasets: list, tokenizer_name: str
 ) -> str:
@@ -521,7 +618,8 @@ def generate_dataset_hash_from_config(
     # When added_tokens_overrides is set, tokenizer.name_or_path contains output_dir.
     # Use the canonical tokenizer config + overrides content so the hash is stable across output_dir changes.
     if cfg.get("added_tokens_overrides"):
-        tokenizer_fingerprint = f"{cfg.tokenizer_config}+overrides:" + ",".join(
+        tokenizer_source = cfg.tokenizer_config or tokenizer_name
+        tokenizer_fingerprint = f"{tokenizer_source}+overrides:" + ",".join(
             f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
         )
     else:
@@ -531,9 +629,12 @@ def generate_dataset_hash_from_config(
         f"{cfg.sequence_len}@{cfg.sample_packing}@{cfg.eval_sample_packing}@"
         f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}@"
         f"{cfg.dataset_exact_deduplication or False}|"
-        f"{'|'.join(sorted([f'{d.path}:{d.type}:{d.shards}:{d.conversation}:{d.split}:{d.temperature or 1.0}' for d in cfg_datasets]))}"
+        f"{'|'.join(_dataset_hash_component(d) for d in cfg_datasets)}"
         f"|{tokenizer_fingerprint}"
     )
+    mm_fingerprint = _mm_processing_fingerprint(cfg)
+    if mm_fingerprint:
+        config_str += f"|{mm_fingerprint}"
     return str(md5(config_str))
 
 
