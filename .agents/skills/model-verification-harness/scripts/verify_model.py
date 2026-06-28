@@ -97,7 +97,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="scratch dir for configs/prepared-data/artifacts (default: a tempdir)",
     )
-    p.add_argument("--report", type=Path, default=None, help="write markdown report here")
+    p.add_argument(
+        "--report", type=Path, default=None, help="write markdown report here"
+    )
     p.add_argument(
         "--manifest", type=Path, default=None, help="write manifest.json here"
     )
@@ -117,7 +119,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="G4: directory of masking snapshots to diff against",
     )
+    p.add_argument(
+        "--features",
+        default="",
+        help="comma-separated feature intents to treat as EXPECTED in G2 "
+        "(e.g. sample_packing,fused_attn_kernel,quantization,densemixer); "
+        "absent ones stay advisory",
+    )
     return p
+
+
+def _parse_features(spec: str) -> dict[str, bool]:
+    return {tok.strip(): True for tok in spec.replace(",", " ").split() if tok.strip()}
 
 
 def _detect(base_model: str, repo_root: Path):
@@ -140,8 +153,18 @@ def _gpu_available() -> bool:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    repo_root = args.repo_root or _find_repo_root(Path.cwd()) or _find_repo_root(
-        Path(__file__).resolve()
+    # load_cfg logs the full resolved config at INFO; gates only care about
+    # WARNINGs (G1 captures those itself). AXOLOTL_LOG_LEVEL is the knob
+    # axolotl's logging filter honors, and it survives configure_logging() (which
+    # a plain setLevel would not). Respect an explicit user override.
+    import os
+
+    os.environ.setdefault("AXOLOTL_LOG_LEVEL", "WARNING")
+
+    repo_root = (
+        args.repo_root
+        or _find_repo_root(Path.cwd())
+        or _find_repo_root(Path(__file__).resolve())
     )
     if repo_root is None:
         print("could not locate an axolotl checkout (src/axolotl). Use --repo-root.")
@@ -155,7 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         features = _detect(args.base_model, repo_root)
     except Exception as exc:  # noqa: BLE001
-        print(f"could not detect model '{args.base_model}': {exc.__class__.__name__}: {exc}")
+        print(
+            f"could not detect model '{args.base_model}': {exc.__class__.__name__}: {exc}"
+        )
         return 2
 
     tmp_ctx = None
@@ -178,10 +203,13 @@ def main(argv: list[str] | None = None) -> int:
             "auto_bisect": args.auto_bisect or args.profile == "full",
             "emit_test": args.emit_test,
             "snapshot_dir": args.snapshot_dir,
+            **_parse_features(args.features),
         },
     )
 
-    print(f"Model verification harness — {features.model_config_type} ({features.base_model})")
+    print(
+        f"Model verification harness — {features.model_config_type} ({features.base_model})"
+    )
     print(f"repo: {repo_root}  ·  profile: {args.profile}  ·  gpu: {ctx.gpu_available}")
     print(f"gates: {sorted(selected)}\n")
 
@@ -220,9 +248,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.report is not None or args.manifest is not None:
         _emit_outputs(args, ctx, features, results)
 
-    print(f"\nSUMMARY: exit {code}  "
-          f"({sum(r.status is GateStatus.FINDINGS for r in results)} findings, "
-          f"{sum(r.status is GateStatus.COULD_NOT_RUN for r in results)} could-not-run)")
+    print(
+        f"\nSUMMARY: exit {code}  "
+        f"({sum(r.status is GateStatus.FINDINGS for r in results)} findings, "
+        f"{sum(r.status is GateStatus.COULD_NOT_RUN for r in results)} could-not-run)"
+    )
 
     if tmp_ctx is not None:
         tmp_ctx.cleanup()
