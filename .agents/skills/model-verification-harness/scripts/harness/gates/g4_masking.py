@@ -132,34 +132,50 @@ def run(ctx: GateContext) -> GateResult:
             GATE_ID, GATE_NAME, "chat fixture produced 0 prepared rows"
         )
 
-    row = train_dataset[0]
-    input_ids, labels = row["input_ids"], row["labels"]
-    spans = _split_spans(input_ids, labels)
-    decoded = [
-        (trained, tokenizer.decode(ids, skip_special_tokens=False))
-        for trained, ids in spans
-    ]
-    render = _render(decoded)
+    # The prepared dataset is shuffled, so a single row need not exercise every
+    # role (the fixture puts a system message in only some rows). Scan several
+    # rows and union their trained text so role coverage doesn't hinge on row 0.
+    n_scan = min(8, train_dataset.num_rows)
+    union_trained = ""
+    total_trained = 0
+    first_decoded: list[tuple[bool, str]] = []
+    first_norm: list[list[Any]] = []
+    first_n_tokens = 0
+    for i in range(n_scan):
+        row = train_dataset[i]
+        input_ids, labels = row["input_ids"], row["labels"]
+        decoded = [
+            (trained, tokenizer.decode(ids, skip_special_tokens=False))
+            for trained, ids in _split_spans(input_ids, labels)
+        ]
+        row_trained = "".join(t for tr, t in decoded if tr)
+        union_trained += "\n" + row_trained
+        total_trained += sum(1 for lab in labels if lab != runner.IGNORE_TOKEN_ID)
+        if i == 0:
+            first_decoded = decoded
+            first_norm = [[bool(tr), t] for tr, t in decoded]
+            first_n_tokens = len(input_ids)
 
-    n_trained = sum(1 for lab in labels if lab != runner.IGNORE_TOKEN_ID)
-    n_masked = len(labels) - n_trained
-    trained_text = "".join(t for tr, t in decoded if tr)
-
-    # normalized structure for snapshotting: stable (trained, text) list.
-    norm = [[bool(tr), t] for tr, t in decoded]
+    render = _render(first_decoded)
+    row0_trained = sum(
+        1 for lab in train_dataset[0]["labels"] if lab != runner.IGNORE_TOKEN_ID
+    )
+    n_masked = first_n_tokens - row0_trained
 
     data: dict[str, Any] = {
         "chat_template": template,
-        "n_tokens": len(input_ids),
-        "n_trained": n_trained,
+        "rows_scanned": n_scan,
+        "n_tokens": first_n_tokens,
+        "n_trained": row0_trained,
         "n_masked": n_masked,
+        "total_trained_tokens": total_trained,
         "render": render,
-        "spans": norm,
+        "spans": first_norm,
         "is_multimodal": ctx.features.is_multimodal,
     }
     details = [
-        f"chat_template={template}; {len(input_ids)} tokens "
-        f"({n_trained} trained / {n_masked} masked)",
+        f"chat_template={template}; scanned {n_scan} rows; "
+        f"{total_trained} trained tokens total",
         "decoded row 0 (**trained** vs masked):",
         f"  {render}",
     ]
@@ -169,14 +185,14 @@ def run(ctx: GateContext) -> GateResult:
     # --- intent: assistant TRAINED, user/system MASKED -------------------------
     assistant_contents, nonassistant_contents = _fixture_role_contents(fixture)
 
-    if n_trained == 0:
-        findings.append("no tokens trained at all — assistant span fully masked")
+    if total_trained == 0:
+        findings.append("no tokens trained across scanned rows — assistant span masked")
     # the silent-mislabel failure mode: any prompt (user/system) text in the loss.
     for needle in sorted(nonassistant_contents):
-        if needle in trained_text:
+        if needle in union_trained:
             findings.append(f"user/system content found in trained span: {needle!r}")
-    # at least one assistant content must be trained (else the span is fully masked).
-    if n_trained > 0 and not any(c in trained_text for c in assistant_contents):
+    # at least one assistant content must be trained somewhere in the scanned rows.
+    if total_trained > 0 and not any(c in union_trained for c in assistant_contents):
         findings.append(
             "no assistant content in trained span — assistant text appears masked"
         )
@@ -189,7 +205,7 @@ def run(ctx: GateContext) -> GateResult:
 
     # EOS/EOT: per train_on_eos default 'turn', a trained assistant turn's
     # terminator is trained. Report what the last trained span ends on.
-    if decoded and decoded[-1][0]:
+    if first_decoded and first_decoded[-1][0]:
         details.append(
             "note: last span is trained (assistant turn terminator trained per "
             "train_on_eos='turn' default)"
@@ -204,25 +220,25 @@ def run(ctx: GateContext) -> GateResult:
         if not snap_path.exists():
             snap_path.parent.mkdir(parents=True, exist_ok=True)
             snap_path.write_text(
-                json.dumps(norm, ensure_ascii=False, indent=2), "utf-8"
+                json.dumps(first_norm, ensure_ascii=False, indent=2), "utf-8"
             )
             snapshot_note = f"snapshot captured -> {snap_path}"
         else:
             saved = json.loads(snap_path.read_text(encoding="utf-8"))
-            if saved != norm:
+            if saved != first_norm:
                 snapshot_note = f"snapshot drift vs {snap_path}"
                 findings.append(
                     f"masking structure changed vs snapshot {snap_path.name}"
                 )
-                for i, (was, now) in enumerate(zip(saved, norm, strict=False)):
+                for i, (was, now) in enumerate(zip(saved, first_norm, strict=False)):
                     if was != now:
                         details.append(
                             f"  snapshot diff @span {i}: was {was!r} now {now!r}"
                         )
                         break
-                if len(saved) != len(norm):
+                if len(saved) != len(first_norm):
                     details.append(
-                        f"  snapshot diff: span count {len(saved)} -> {len(norm)}"
+                        f"  snapshot diff: span count {len(saved)} -> {len(first_norm)}"
                     )
             else:
                 snapshot_note = f"snapshot match ({snap_path.name})"
@@ -245,8 +261,8 @@ def run(ctx: GateContext) -> GateResult:
         GATE_NAME,
         GateStatus.PASS,
         summary=(
-            f"masking intent holds ({n_trained} trained / {n_masked} masked); "
-            f"{snapshot_note}"
+            f"masking intent holds ({total_trained} trained tokens across "
+            f"{n_scan} rows); {snapshot_note}"
         ),
         details=details,
         data=data,

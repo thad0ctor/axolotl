@@ -53,10 +53,17 @@ _FLAG_WARN_TOKENS = {
     "liger_glu_activation": ("glu", "swiglu"),
     "liger_rms_norm": ("rms_norm",),
     "activation_offloading": ("activation_offloading", "offload"),
-    "expert_backend": ("expert", "scattermoe", "sonicmoe", "kernel"),
-    "use_scattermoe": ("scattermoe", "kernel"),
+    # NB: no bare "kernel" — it appears in unrelated triton/liger advisories and
+    # would wrongly paint a healthy MoE cell WARNED_NO_OP.
+    "expert_backend": ("expert", "scattermoe", "sonicmoe"),
+    "use_scattermoe": ("scattermoe",),
     "moe_grouped_backend": ("moe_grouped", "grouped"),
 }
+
+# Flag names too generic to use as warning-attribution tokens (they appear in
+# incidental advisories — bf16 auto-cast, fp16 notices). A flag here only matters
+# via an explicit _FLAG_WARN_TOKENS entry, never as a bare-name fallback.
+_GENERIC_FLAG_DENY = {"bf16", "fp16", "tf32", "fp8", "use_kernels", "kernel"}
 
 # Keys whose presence in the resolved cfg (but not the input) signals a known
 # canonicalization rewrite (NORMALIZED) even though the literal input key is intact.
@@ -181,7 +188,10 @@ def _run_cfg(
 def _relevant_warnings(flags: dict[str, Any], records: list[str]) -> list[str]:
     tokens: list[str] = []
     for key in flags:
-        tokens.extend(_FLAG_WARN_TOKENS.get(key, (key,)))
+        if key in _FLAG_WARN_TOKENS:
+            tokens.extend(_FLAG_WARN_TOKENS[key])
+        elif key not in _GENERIC_FLAG_DENY and key != "plugins":
+            tokens.append(key)  # specific flag name as its own token
     out = []
     for msg in records:
         low = msg.lower()

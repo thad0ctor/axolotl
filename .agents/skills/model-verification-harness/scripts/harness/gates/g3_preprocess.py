@@ -26,7 +26,13 @@ def applies(ctx: GateContext) -> bool:  # noqa: ARG001 - always applies
 
 
 def run(ctx: GateContext) -> GateResult:
-    cfg_dict = runner.base_cfg(ctx.features.base_model, ctx.output_dir, "g3")
+    fixture = runner.write_completion_fixture(ctx.output_dir)
+    cfg_dict = runner.base_cfg(
+        ctx.features.base_model,
+        ctx.output_dir,
+        "g3",
+        datasets=[runner.completion_dataset_stanza(fixture)],
+    )
     cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, "g3")
 
     try:

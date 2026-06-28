@@ -73,6 +73,28 @@ def chat_dataset_stanza(fixture: Path) -> dict[str, Any]:
     }
 
 
+_TINY_COMPLETION_TEXT = (
+    "The quick brown fox jumps over the lazy dog. "
+    "Pack my box with five dozen liquor jugs. "
+    "Sphinx of black quartz, judge my vow. "
+)
+
+
+def write_completion_fixture(output_dir: Path, n_rows: int = 64) -> Path:
+    """Write a tiny local completion JSONL (no network) and return its path."""
+    path = output_dir / "tiny_completion.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fout:
+        for i in range(n_rows):
+            fout.write(json.dumps({"text": _TINY_COMPLETION_TEXT * (1 + i % 3)}) + "\n")
+    return path
+
+
+def completion_dataset_stanza(fixture: Path) -> dict[str, Any]:
+    """A `datasets:` entry for the local completion fixture (offline)."""
+    return {"path": str(fixture), "type": "completion", "field": "text"}
+
+
 def base_cfg(
     base_model: str,
     output_dir: Path,
