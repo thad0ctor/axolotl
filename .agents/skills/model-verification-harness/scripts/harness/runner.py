@@ -142,12 +142,36 @@ def prepare(cfg, debug: bool = False):
 
 
 def preprocess_to_disk(cfg) -> Path:
-    """Run the preprocess entry point; return the dataset_prepared_path dir."""
+    """Run the preprocess entry point; return the dataset_prepared_path dir.
+
+    Mirrors the CLI's ``do_cli`` setup (``AXOLOTL_IS_PREPROCESS`` env +
+    ``cfg.is_preprocess = True``) so do_preprocess takes the same path a user's
+    ``axolotl preprocess`` would — otherwise the artifact gate can false-pass.
+    """
+    import os
+
     from axolotl.cli.args import PreprocessCliArgs
     from axolotl.cli.preprocess import do_preprocess
 
+    os.environ["AXOLOTL_IS_PREPROCESS"] = "1"
+    try:
+        cfg.is_preprocess = True
+    except Exception:  # noqa: BLE001 - DictDefault accepts attr set; be defensive
+        pass
     do_preprocess(cfg, PreprocessCliArgs())
     return Path(cfg.dataset_prepared_path)
+
+
+def has_saved_dataset(prepared_path: Path) -> bool:
+    """True if ``prepared_path`` holds a real saved HF dataset (so we can prove the
+    preprocess STEP wrote it, rather than load_datasets silently reprocessing)."""
+    if not prepared_path.exists():
+        return False
+    markers = ("dataset_info.json", "state.json")
+    for p in prepared_path.rglob("*"):
+        if p.name in markers or p.suffix == ".arrow":
+            return True
+    return False
 
 
 def train_model(cfg, dataset_meta):

@@ -150,6 +150,16 @@ def _gpu_available() -> bool:
         return False
 
 
+def _axolotl_import_path() -> str:
+    try:
+        import importlib
+
+        mod = importlib.import_module("axolotl")
+        return getattr(mod, "__file__", "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
@@ -170,6 +180,26 @@ def main(argv: list[str] | None = None) -> int:
         print("could not locate an axolotl checkout (src/axolotl). Use --repo-root.")
         return 2
 
+    # Single source of truth: make `import axolotl` resolve to the SAME tree the
+    # static gates introspect (repo_root) and the manifest's SHA reports, so no two
+    # gates can silently validate different checkouts. Prepend to sys.path (for this
+    # process) and PYTHONPATH (so the G6/G7 subprocess workers inherit it too).
+    src_dir = repo_root / "src"
+    if src_dir.is_dir():
+        sys.path.insert(0, str(src_dir))
+        prev = os.environ.get("PYTHONPATH", "")
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [str(src_dir)] + ([prev] if prev else [])
+        )
+    axolotl_import_path = _axolotl_import_path()
+    if axolotl_import_path and str(src_dir) not in axolotl_import_path:
+        print(
+            f"  ! WARNING: `import axolotl` resolves to {axolotl_import_path}, NOT "
+            f"under --repo-root {repo_root}. Static gates read repo_root while run "
+            "gates import the resolved axolotl — verdicts could mix trees. Run inside "
+            "the env whose axolotl matches --repo-root (or set --repo-root to it)."
+        )
+
     selected = _parse_gates(args.gates)
     if not selected:
         print(f"no valid gates in --gates {args.gates!r}; choose from {GATE_ORDER}")
@@ -187,6 +217,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_dir is not None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         output_dir = args.output_dir
+    elif args.emit_test:
+        # --emit-test writes a scaffold under output_dir; a throwaway tempdir would
+        # delete it on exit, so persist to cwd and tell the user where it landed.
+        output_dir = Path.cwd() / "verify-model-out"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  (--emit-test) artifacts kept under {output_dir}")
     else:
         tmp_ctx = tempfile.TemporaryDirectory(prefix="verify-model-")
         output_dir = Path(tmp_ctx.name)
@@ -203,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             "auto_bisect": args.auto_bisect or args.profile == "full",
             "emit_test": args.emit_test,
             "snapshot_dir": args.snapshot_dir,
+            "axolotl_import_path": axolotl_import_path,
             **_parse_features(args.features),
         },
     )
@@ -249,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
         results.append(
             GateResult.could_not_run(gate_id, gate_id, "gate module not available")
         )
+
+    # Surface the emitted regression test prominently (it persists under output_dir).
+    for r in results:
+        scaffold = r.data.get("scaffold_path") if isinstance(r.data, dict) else None
+        if scaffold:
+            print(f"  emitted regression test → {scaffold}")
 
     code = exit_code(results)
 

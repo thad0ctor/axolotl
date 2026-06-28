@@ -46,12 +46,36 @@ def run(ctx: GateContext) -> GateResult:
 
     try:
         prepared_path = runner.preprocess_to_disk(cfg)
-        dataset_meta = runner.prepare(cfg)
     except Exception as exc:  # noqa: BLE001 - model unloadable / offline / tokenizer
         return GateResult.could_not_run(
             GATE_ID,
             GATE_NAME,
             f"preprocess pipeline failed: {exc.__class__.__name__}: {exc}",
+        )
+
+    # Prove the PREPROCESS step itself wrote a loadable artifact, before prepare()
+    # (which would otherwise silently reprocess raw data if the artifact is absent
+    # and then the existence check would false-pass).
+    if not runner.has_saved_dataset(prepared_path):
+        return GateResult(
+            GATE_ID,
+            GATE_NAME,
+            GateStatus.FINDINGS,
+            summary=f"preprocess wrote no loadable dataset under {prepared_path}",
+            details=[
+                f"do_preprocess returned but {prepared_path} holds no saved HF "
+                "dataset (no dataset_info.json/state.json/*.arrow)"
+            ],
+            data={"prepared_path": str(prepared_path), "prepared_path_exists": False},
+        )
+
+    try:
+        dataset_meta = runner.prepare(cfg)
+    except Exception as exc:  # noqa: BLE001 - model unloadable / offline / tokenizer
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            f"prepared dataset would not load back: {exc.__class__.__name__}: {exc}",
         )
 
     train_dataset = dataset_meta.train_dataset

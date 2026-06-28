@@ -300,7 +300,7 @@ def _num(v: Any) -> str:
 
 
 # Gates whose verdict lives in their `details` lines (no dedicated section above).
-_DETAIL_GATES = ("G3", "G5", "G6", "G7")
+_DETAIL_GATES = ("G3", "G5", "G6", "G7", "G8")
 
 
 def _gate_details(results: list[GateResult]) -> list[str]:
@@ -334,6 +334,7 @@ def _reliability(results: list[GateResult]) -> list[str]:
 # build_manifest
 # --------------------------------------------------------------------------- #
 def build_manifest(args, ctx, features, results: list[GateResult]) -> dict[str, Any]:
+    import_path = ctx.options.get("axolotl_import_path", "") if ctx.options else ""
     manifest = {
         "tool": "model-verification-harness",
         "seed": ctx.seed,
@@ -344,6 +345,12 @@ def build_manifest(args, ctx, features, results: list[GateResult]) -> dict[str, 
         "output_dir": str(ctx.output_dir),
         "versions": _versions(ctx),
         "axolotl_git_sha": _git_sha(ctx.repo_root),
+        # which axolotl the run gates actually imported, and whether it matches the
+        # repo_root the static gates + SHA describe (else the run mixed two trees).
+        "axolotl_import_path": import_path,
+        "repo_import_match": bool(import_path)
+        and str(ctx.repo_root / "src") in import_path,
+        "emitted_test": _emitted_test(results),
         "gates": {
             "selected": sorted(ctx.selected_gates),
             "run": [r.gate_id for r in results],
@@ -359,6 +366,13 @@ def build_manifest(args, ctx, features, results: list[GateResult]) -> dict[str, 
     if flags is not None:
         manifest["config_flags"] = flags
     return _jsonable(manifest)
+
+
+def _emitted_test(results: list[GateResult]) -> str | None:
+    for r in results:
+        if isinstance(r.data, dict) and r.data.get("scaffold_path"):
+            return str(r.data["scaffold_path"])
+    return None
 
 
 def _model_block(features) -> dict[str, Any]:
