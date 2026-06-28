@@ -166,7 +166,7 @@ def test_g1_resolves_llama(tmp_path):
 # --- report + manifest ---------------------------------------------------------
 
 
-def test_report_and_manifest():
+def test_report_and_manifest(tmp_path):
     from harness import report
 
     g1 = GateResult(
@@ -213,7 +213,7 @@ def test_report_and_manifest():
         },
     )
     feats = _features("llama", "axolotl-ai-co/tiny-llama-50m")
-    ctx = GateContext(features=feats, repo_root=REPO_ROOT, output_dir=Path("/tmp"))
+    ctx = GateContext(features=feats, repo_root=REPO_ROOT, output_dir=tmp_path)
     md = report.render_report(ctx, feats, [g1, g2])
     assert "Model Verification Report" in md and "llama" in md
     assert "Compat matrix" in md

@@ -277,7 +277,11 @@ def _emit_scaffold(ctx: GateContext) -> dict[str, Any]:
         composites = [
             (
                 "representative",
-                {"flash_attention": True, "sample_packing": True, "bf16": True},
+                {
+                    "attn_implementation": "flash_attention_2",
+                    "sample_packing": True,
+                    "bf16": True,
+                },
             )
         ]
         limitation = (

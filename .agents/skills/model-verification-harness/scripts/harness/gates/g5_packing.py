@@ -13,8 +13,11 @@ restart at 0 (so the collator's cross-document reset is well-formed).
 ``utils/trainer.py`` (one ``range(len)`` per document); the multipack collator
 (``utils/collators/batching.py`` ``V2BatchSamplerDataCollatorForSeq2Seq``)
 concatenates those per-document arrays at COLLATE time, which is where the
-restart-at-boundary pattern actually materializes. So here we assert each
-prepared row's ``position_ids`` is a clean ``range(len)`` starting at 0.
+restart-at-boundary pattern actually materializes. So G5 does both: it asserts
+each prepared row's ``position_ids`` is a clean ``range(len)`` (the building
+block), AND drives the real ``V2BatchSamplerDataCollatorForSeq2Seq`` on a small
+pack group of prepared rows to prove the concatenated ``position_ids`` actually
+reset to 0 at each document boundary — so a collate-time regression can't pass.
 """
 
 from __future__ import annotations
@@ -38,6 +41,61 @@ def _supported_multipack_types() -> tuple[set[str], str | None]:
         return set(SUPPORTED_MULTIPACK_MODEL_TYPES), None
     except Exception as exc:  # noqa: BLE001
         return set(), f"{exc.__class__.__name__}: {exc}"
+
+
+def _check_collate_reset(cfg, train_dataset, n_docs: int = 4):
+    """Drive the real multipack collator on a small pack group and verify the
+    concatenated ``position_ids`` reset to 0 at each document boundary.
+
+    Returns ``(status, note)`` where status is ``"verified"`` (reset materialized),
+    ``"broken"`` (a finding — boundary did not reset), or ``"skipped"`` (could not
+    wire the collator in this context; the claim is downgraded honestly).
+    """
+    from axolotl.loaders import load_tokenizer
+    from axolotl.utils.collators import V2BatchSamplerDataCollatorForSeq2Seq
+
+    k = min(n_docs, train_dataset.num_rows)
+    if k < 2:
+        return "skipped", f"only {k} prepared row(s); need >=2 docs for a boundary"
+
+    keys = ("input_ids", "attention_mask", "labels", "position_ids")
+    group: list[dict[str, list[int]]] = []
+    for i in range(k):
+        row = train_dataset[i]
+        if "position_ids" not in row:
+            return "skipped", "prepared rows carry no position_ids to collate"
+        group.append({key: list(row[key]) for key in keys if key in row})
+
+    # squash_position_ids stays False (the multipack default): the collator keeps
+    # each document's per-document range, which is exactly the reset we assert.
+    tokenizer = load_tokenizer(cfg)
+    collator = V2BatchSamplerDataCollatorForSeq2Seq(tokenizer=tokenizer)
+    batch = collator(group)  # flat list -> one pack group of k documents
+    collated = [int(x) for x in batch["position_ids"][0].tolist()]
+
+    expected: list[int] = []
+    for doc in group:
+        expected.extend(range(len(doc["position_ids"])))
+    total = sum(len(doc["position_ids"]) for doc in group)
+    collated = collated[:total]  # ignore any right padding the collator appended
+
+    boundaries = []
+    offset = 0
+    for doc in group[:-1]:
+        offset += len(doc["position_ids"])
+        boundaries.append(offset)
+
+    if collated == expected and all(collated[b] == 0 for b in boundaries):
+        return (
+            "verified",
+            f"collate-time reset verified: {k} docs concatenated, position_ids "
+            f"restart at 0 at {len(boundaries)} document boundary(ies)",
+        )
+    return (
+        "broken",
+        f"collated position_ids do NOT reset at document boundaries (boundaries "
+        f"{boundaries}; got {collated[:24]}…)",
+    )
 
 
 def run(ctx: GateContext) -> GateResult:
@@ -74,6 +132,15 @@ def run(ctx: GateContext) -> GateResult:
     train_dataset = dataset_meta.train_dataset
     columns = list(train_dataset.column_names)
     n_rows = train_dataset.num_rows
+
+    # A clean verdict must be backed by a real packed sample. Zero prepared rows
+    # means the length / position_ids loops below no-op and would otherwise PASS.
+    if n_rows == 0:
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            "packing produced 0 prepared rows — no packed sample to validate",
+        )
 
     findings: list[str] = []
     details: list[str] = []
@@ -136,8 +203,7 @@ def run(ctx: GateContext) -> GateResult:
         else:
             pos_note = (
                 f"position_ids present and clean (range(len) starting at 0) on "
-                f"{checked} rows; collator concatenates these per-document arrays "
-                "into the cross-document reset pattern at collate time"
+                f"{checked} rows (per-document building block for the collate reset)"
             )
     else:
         pos_note = (
@@ -145,6 +211,19 @@ def run(ctx: GateContext) -> GateResult:
             f"{columns} — packing emits/squashes position_ids at collate time"
         )
     details.append(pos_note)
+
+    # (d) collate-time cross-document reset: drive the REAL multipack collator on a
+    # small pack group and confirm position_ids actually restart at 0 at each
+    # document boundary (the per-row range(len) check above is true by construction
+    # at prepare time and does not exercise the collator that can regress).
+    try:
+        collate_status, collate_note = _check_collate_reset(cfg, train_dataset)
+    except Exception as exc:  # noqa: BLE001 - collator wiring may be unavailable
+        collate_status = "skipped"
+        collate_note = f"collate-time reset not verified (collator unavailable: {exc})"
+    if collate_status == "broken":
+        findings.append(collate_note)
+    details.append(f"collate reset: {collate_note}")
 
     data: dict[str, Any] = {
         "model_config_type": ctx.model_config_type,
@@ -156,6 +235,8 @@ def run(ctx: GateContext) -> GateResult:
         "columns": columns,
         "has_position_ids": "position_ids" in columns,
         "position_ids_finding": pos_note,
+        "collate_reset_status": collate_status,
+        "collate_reset_note": collate_note,
     }
 
     if findings:
@@ -169,14 +250,15 @@ def run(ctx: GateContext) -> GateResult:
             data=data,
         )
 
+    reset_claim = {
+        "verified": "cross-document position_ids reset verified at collate time",
+        "skipped": "collate-time reset NOT verified (per-document range only)",
+    }.get(collate_status, "per-document position_ids clean")
     return GateResult(
         GATE_ID,
         GATE_NAME,
         GateStatus.PASS,
-        summary=(
-            f"packing ok: type packable, max len {max_len} ≤ {seq_len}, "
-            "per-document position_ids clean"
-        ),
+        summary=f"packing ok: type packable, max len {max_len} ≤ {seq_len}, {reset_claim}",
         details=details,
         data=data,
     )

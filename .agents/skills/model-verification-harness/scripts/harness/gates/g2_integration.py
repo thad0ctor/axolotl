@@ -430,17 +430,20 @@ def _check_patch_manager(p: Probe) -> tuple[set[str], bool]:
             )
         )
     # attention hijack (btlm/stablelm/mistral3/llava) lives in the same file
-    hijack = {"btlm", "stablelm_epoch", "mistral3", "llava"} & (
-        {p.mct} if ok else set()
-    )
-    if p.mct in {"btlm", "stablelm_epoch", "mistral3", "llava"}:
+    hijack_types = {"btlm", "stablelm_epoch", "mistral3", "llava"}
+    if p.mct in hijack_types:
+        # PRESENT only when the parsed dispatch actually keys on this type — a
+        # readable file alone must not vouch for a branch that isn't there.
+        present = ok and p.mct in types
         p.add(
             HookRow(
                 "attention hijack",
                 "loaders/patch_manager.py",
                 "hijack types",
-                PRESENT if (ok and hijack) else MISSING,
-                "flash-attn / sdpa hijack branch present",
+                PRESENT if present else MISSING,
+                "flash-attn / sdpa hijack branch present"
+                if present
+                else "hijack type but no dispatch branch found",
             )
         )
     return types, ok
@@ -1032,15 +1035,22 @@ def _check_custom_kernel_module(p: Probe) -> None:
 
 def _check_tiled_mlp(p: Probe) -> None:
     tdir = p.src("monkeypatch/tiled_mlp")
+    # Advisory unless tiled_mlp is actually requested: an absent generic package
+    # must not count as a G2 finding when nobody asked for it.
+    wants = bool(p.opt.get("tiled_mlp"))
+    if tdir.is_dir():
+        status, note = PRESENT, "generic tiled-MLP patch available (type-agnostic)"
+    elif wants:
+        status, note = MISSING, "tiled_mlp requested but package missing"
+    else:
+        status, note = NOT_EXPECTED, "tiled_mlp package missing (not requested)"
     p.add(
         HookRow(
             "tiled-MLP",
             "monkeypatch/tiled_mlp/",
-            "tiled_mlp (advisory)",
-            PRESENT if tdir.is_dir() else MISSING,
-            "generic tiled-MLP patch available (type-agnostic)"
-            if tdir.is_dir()
-            else "tiled_mlp package missing",
+            "tiled_mlp" if wants else "tiled_mlp (advisory)",
+            status,
+            note,
         )
     )
 

@@ -36,20 +36,21 @@ _SSM_HYBRID_FALLBACK = {"nemotron_h", "falcon_h1", "granitemoehybrid"}
 # --------------------------------------------------------------------------- #
 # config.json resolution
 # --------------------------------------------------------------------------- #
-def _load_config_dict(base_model: str) -> dict[str, Any]:
+def _load_config_dict(
+    base_model: str, trust_remote_code: bool = False
+) -> dict[str, Any]:
     local = Path(base_model).expanduser()
     local_cfg = local / "config.json"
     if local.is_dir() and local_cfg.is_file():
         return json.loads(local_cfg.read_text(encoding="utf-8"))
-    if local_cfg.is_file():  # base_model pointed straight at a config.json
-        return json.loads(local_cfg.read_text(encoding="utf-8"))
+    if local.is_file() and local.name == "config.json":  # base_model is a config.json
+        return json.loads(local.read_text(encoding="utf-8"))
 
     from transformers import AutoConfig
 
-    try:
-        config = AutoConfig.from_pretrained(base_model, trust_remote_code=False)
-    except Exception:  # noqa: BLE001 - remote-code archs need the second attempt
-        config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    # base_model is user input: only execute remote model code behind an explicit
+    # opt-in. Without it, let any load error propagate (orchestrator maps to exit 2).
+    config = AutoConfig.from_pretrained(base_model, trust_remote_code=trust_remote_code)
     return config.to_dict()
 
 
@@ -188,9 +189,11 @@ def _expert_count(config: dict[str, Any]) -> int | None:
     return None
 
 
-def detect_model(base_model: str, repo_root: Path) -> ModelFeatures:
+def detect_model(
+    base_model: str, repo_root: Path, trust_remote_code: bool = False
+) -> ModelFeatures:
     warnings: list[str] = []
-    config = _load_config_dict(base_model)
+    config = _load_config_dict(base_model, trust_remote_code=trust_remote_code)
 
     model_config_type = config.get("model_type") or ""
     architectures = list(config.get("architectures") or [])
