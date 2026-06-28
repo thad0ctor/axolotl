@@ -13,6 +13,13 @@ user/system content MASKED. A trained user/system token, or a fully-masked
 assistant span, is a FINDING. When ``options["snapshot_dir"]`` is set the
 normalized span structure is diffed against a captured baseline so masking
 regressions surface as drift; a missing snapshot is captured on first run.
+
+The prepared dataset is SHUFFLED, so row 0 is not stable across runs. The
+snapshot therefore captures a shuffle-invariant aggregate — the normalized
+``[trained, text]`` structure of every scanned row, sorted into a canonical order
+— rather than row 0 alone, so an unchanged masking structure never reports false
+drift just because a different example landed in slot 0. Row 0 is still rendered
+for the human report.
 """
 
 from __future__ import annotations
@@ -69,6 +76,15 @@ def _split_spans(input_ids, labels) -> list[tuple[bool, list[int]]]:
     if cur:
         spans.append((cur_trained, cur))  # type: ignore[arg-type]
     return spans
+
+
+def _row_norm(row, tokenizer) -> list[list[Any]]:
+    """Normalized ``[[trained, text], ...]`` span structure for one prepared row."""
+    decoded = [
+        (trained, tokenizer.decode(ids, skip_special_tokens=False))
+        for trained, ids in _split_spans(row["input_ids"], row["labels"])
+    ]
+    return [[bool(tr), t] for tr, t in decoded]
 
 
 def _render(decoded: list[tuple[bool, str]]) -> str:
@@ -215,30 +231,40 @@ def run(ctx: GateContext) -> GateResult:
     snap_dir = ctx.options.get("snapshot_dir")
     snapshot_note = "no snapshot_dir (diff skipped)"
     if snap_dir:
+        # Shuffle-invariant key: the normalized structure of EVERY prepared row
+        # (not just the n_scan window, whose membership shifts with the shuffle),
+        # sorted into a canonical order so row ordering can't perturb the diff.
+        snapshot_norm = sorted(
+            (
+                _row_norm(train_dataset[i], tokenizer)
+                for i in range(train_dataset.num_rows)
+            ),
+            key=lambda r: json.dumps(r, ensure_ascii=False),
+        )
         snap_path = Path(snap_dir) / f"{ctx.model_config_type}.json"
         data["snapshot_path"] = str(snap_path)
         if not snap_path.exists():
             snap_path.parent.mkdir(parents=True, exist_ok=True)
             snap_path.write_text(
-                json.dumps(first_norm, ensure_ascii=False, indent=2), "utf-8"
+                json.dumps(snapshot_norm, ensure_ascii=False, indent=2), "utf-8"
             )
             snapshot_note = f"snapshot captured -> {snap_path}"
         else:
             saved = json.loads(snap_path.read_text(encoding="utf-8"))
-            if saved != first_norm:
+            if saved != snapshot_norm:
                 snapshot_note = f"snapshot drift vs {snap_path}"
                 findings.append(
                     f"masking structure changed vs snapshot {snap_path.name}"
                 )
-                for i, (was, now) in enumerate(zip(saved, first_norm, strict=False)):
+                for i, (was, now) in enumerate(zip(saved, snapshot_norm, strict=False)):
                     if was != now:
                         details.append(
-                            f"  snapshot diff @span {i}: was {was!r} now {now!r}"
+                            f"  snapshot diff @row {i} (sorted): was {was!r} now {now!r}"
                         )
                         break
-                if len(saved) != len(first_norm):
+                if len(saved) != len(snapshot_norm):
                     details.append(
-                        f"  snapshot diff: span count {len(saved)} -> {len(first_norm)}"
+                        f"  snapshot diff: row count {len(saved)} -> {len(snapshot_norm)}"
                     )
             else:
                 snapshot_note = f"snapshot match ({snap_path.name})"

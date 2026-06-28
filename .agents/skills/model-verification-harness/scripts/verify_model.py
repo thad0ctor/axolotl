@@ -126,6 +126,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(e.g. sample_packing,fused_attn_kernel,quantization,densemixer); "
         "absent ones stay advisory",
     )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="allow AutoConfig to execute remote model code for --base-model "
+        "(off by default; only enable for fully trusted sources)",
+    )
     return p
 
 
@@ -133,12 +139,16 @@ def _parse_features(spec: str) -> dict[str, bool]:
     return {tok.strip(): True for tok in spec.replace(",", " ").split() if tok.strip()}
 
 
-def _detect(base_model: str, repo_root: Path):
+def _detect(base_model: str, repo_root: Path, trust_remote_code: bool = False):
     """Import + call the detector. Kept lazy so a missing/broken detect module
     surfaces as a clean could-not-run rather than an import crash at startup."""
     from harness.detect import detect_model
 
-    return detect_model(base_model=base_model, repo_root=repo_root)
+    return detect_model(
+        base_model=base_model,
+        repo_root=repo_root,
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def _gpu_available() -> bool:
@@ -148,6 +158,20 @@ def _gpu_available() -> bool:
         return bool(torch.cuda.is_available())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _is_under_repo_src(repo_root: Path, import_path: str) -> bool:
+    """Structural (not substring) containment: is the resolved `import axolotl`
+    path the repo's `src` dir or below it? Substring tests false-match siblings
+    like `/work/src-old/...` against `/work/src`."""
+    if not import_path:
+        return False
+    try:
+        src_dir = (repo_root / "src").resolve()
+        import_file = Path(import_path).resolve()
+    except OSError:
+        return False
+    return src_dir == import_file or src_dir in import_file.parents
 
 
 def _axolotl_import_path() -> str:
@@ -192,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             [str(src_dir)] + ([prev] if prev else [])
         )
     axolotl_import_path = _axolotl_import_path()
-    if axolotl_import_path and str(src_dir) not in axolotl_import_path:
+    if axolotl_import_path and not _is_under_repo_src(repo_root, axolotl_import_path):
         print(
             f"  ! WARNING: `import axolotl` resolves to {axolotl_import_path}, NOT "
             f"under --repo-root {repo_root}. Static gates read repo_root while run "
@@ -206,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        features = _detect(args.base_model, repo_root)
+        features = _detect(args.base_model, repo_root, args.trust_remote_code)
     except Exception as exc:  # noqa: BLE001
         print(
             f"could not detect model '{args.base_model}': {exc.__class__.__name__}: {exc}"
@@ -296,7 +320,10 @@ def main(argv: list[str] | None = None) -> int:
     code = exit_code(results)
 
     if args.report is not None or args.manifest is not None:
-        _emit_outputs(args, ctx, features, results)
+        # A requested-but-unwritable report/manifest is a could-not-run, not a
+        # silent warning: force exit 2 so the 0/1/2 contract still holds.
+        if not _emit_outputs(args, ctx, features, results):
+            code = 2
 
     print(
         f"\nSUMMARY: exit {code}  "
@@ -309,21 +336,30 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
-def _emit_outputs(args, ctx, features, results) -> None:
+def _emit_outputs(args, ctx, features, results) -> bool:
+    """Write the requested report/manifest. Returns False on any failure (import
+    or write) so the caller can map it to the could-not-run exit code."""
     try:
         from harness.report import build_manifest, render_report
     except Exception as exc:  # noqa: BLE001
         print(f"  ! report module unavailable: {exc}")
-        return
-    if args.report is not None:
-        args.report.write_text(render_report(ctx, features, results), encoding="utf-8")
-        print(f"  report → {args.report}")
-    if args.manifest is not None:
-        args.manifest.write_text(
-            json.dumps(build_manifest(args, ctx, features, results), indent=2),
-            encoding="utf-8",
-        )
-        print(f"  manifest → {args.manifest}")
+        return False
+    try:
+        if args.report is not None:
+            args.report.write_text(
+                render_report(ctx, features, results), encoding="utf-8"
+            )
+            print(f"  report → {args.report}")
+        if args.manifest is not None:
+            args.manifest.write_text(
+                json.dumps(build_manifest(args, ctx, features, results), indent=2),
+                encoding="utf-8",
+            )
+            print(f"  manifest → {args.manifest}")
+    except OSError as exc:
+        print(f"  ! failed to write outputs: {exc}")
+        return False
+    return True
 
 
 if __name__ == "__main__":

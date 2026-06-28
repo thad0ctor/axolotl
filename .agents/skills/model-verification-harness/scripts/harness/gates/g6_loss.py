@@ -279,7 +279,10 @@ def run(ctx: GateContext) -> GateResult:
         cfg = _build_cfg(ctx, name, extra, max_steps)
         res = _spawn_variant(ctx, name, cfg, timeout)
         if not res.get("ok"):
-            details.append(f"⚠️ {name}: could not train — {res.get('error')}")
+            # An applicable variant that cannot train is unverified, not benign:
+            # count it so the gate can't report PASS on a broken kernel path.
+            findings += 1
+            details.append(f"❌ {name}: could not train — {res.get('error')}")
             rows.append({"variant": name, "ran": False, "error": res.get("error")})
             continue
 
@@ -306,7 +309,7 @@ def run(ctx: GateContext) -> GateResult:
             verdict = "diverged"
             findings += 1
 
-        tb = _tb_note(ctx, res.get("output_dir", ""), blowup)
+        tb = _tb_note(ctx, res.get("output_dir", ""), strict)
         icon = "✅" if verdict == "pass" else "❌"
         details.append(
             f"{icon} {name}: {verdict} — n={len(losses)} init~{init_mean:.4f} "

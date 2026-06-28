@@ -333,6 +333,19 @@ def _reliability(results: list[GateResult]) -> list[str]:
 # --------------------------------------------------------------------------- #
 # build_manifest
 # --------------------------------------------------------------------------- #
+def _import_under_repo_src(repo_root: Path, import_path: str) -> bool:
+    # Structural containment, not a substring test: `/work/src-old/...` must NOT
+    # count as under `/work/src`. Kept local so report.py stays self-contained.
+    if not import_path:
+        return False
+    try:
+        src_dir = (repo_root / "src").resolve()
+        import_file = Path(import_path).resolve()
+    except OSError:
+        return False
+    return src_dir == import_file or src_dir in import_file.parents
+
+
 def build_manifest(args, ctx, features, results: list[GateResult]) -> dict[str, Any]:
     import_path = ctx.options.get("axolotl_import_path", "") if ctx.options else ""
     manifest = {
@@ -348,8 +361,7 @@ def build_manifest(args, ctx, features, results: list[GateResult]) -> dict[str, 
         # which axolotl the run gates actually imported, and whether it matches the
         # repo_root the static gates + SHA describe (else the run mixed two trees).
         "axolotl_import_path": import_path,
-        "repo_import_match": bool(import_path)
-        and str(ctx.repo_root / "src") in import_path,
+        "repo_import_match": _import_under_repo_src(ctx.repo_root, import_path),
         "emitted_test": _emitted_test(results),
         "gates": {
             "selected": sorted(ctx.selected_gates),

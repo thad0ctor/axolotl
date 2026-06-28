@@ -212,6 +212,21 @@ def run(ctx: GateContext) -> GateResult:
     rows: list[dict[str, Any]] = []
 
     variants, skip_notes = _kernel_variants(ctx)
+    for note in skip_notes:
+        details.append(f"· {note}")
+
+    # No applicable kernel variant (e.g. no GPU -> all triton variants dropped):
+    # skip BEFORE spawning any baseline train, else the GPU-only gate wastes a
+    # subprocess and a failed baseline could turn "no GPU" into could_not_run.
+    if not variants:
+        return GateResult(
+            GATE_ID,
+            GATE_NAME,
+            GateStatus.SKIPPED,
+            summary=f"no applicable kernel variant to compare; {'; '.join(skip_notes)}",
+            details=details,
+            data={"baseline_step0": None, "variants": rows, "skipped": skip_notes},
+        )
 
     # A bf16 variant must be compared to a bf16 baseline, else fp32->bf16 precision
     # loss is conflated with kernel-math change. Build one baseline per dtype used.
@@ -236,22 +251,6 @@ def run(ctx: GateContext) -> GateResult:
                 f"baseline bf16 (eager, no kernels): step0 = {base_bf16:.6f}"
             )
 
-    for note in skip_notes:
-        details.append(f"· {note}")
-
-    if not variants:
-        return GateResult(
-            GATE_ID,
-            GATE_NAME,
-            GateStatus.SKIPPED,
-            summary=(
-                f"no applicable kernel variant to compare "
-                f"(baseline step0={base_fp32:.4f}); {'; '.join(skip_notes)}"
-            ),
-            details=details,
-            data={"baseline_step0": base_fp32, "variants": rows, "skipped": skip_notes},
-        )
-
     findings = 0
     compared = 0
     for v in variants:
@@ -261,9 +260,11 @@ def run(ctx: GateContext) -> GateResult:
         base_loss = baselines.get(dtype)
         if base_loss is None:
             # Never compare a bf16 variant to an fp32 baseline — that conflates
-            # precision with kernel math. Skip rather than emit a bogus verdict.
+            # precision with kernel math. An applicable variant we cannot compare
+            # is an unverified coverage gap, so fail rather than silently skip.
+            findings += 1
             details.append(
-                f"⚠️ {name}: no {dtype} baseline available — skipped "
+                f"❌ {name}: no {dtype} baseline available — failed "
                 "(would not be an apples-to-apples comparison)"
             )
             rows.append(
@@ -279,7 +280,8 @@ def run(ctx: GateContext) -> GateResult:
         res = g6_loss._spawn_variant(ctx, f"g7_{name}", cfg, timeout)
         loss = _step0(res)
         if loss is None:
-            details.append(f"⚠️ {name}: step-0 loss unavailable — {res.get('error')}")
+            findings += 1
+            details.append(f"❌ {name}: step-0 loss unavailable — {res.get('error')}")
             rows.append({"variant": name, "step0": None, "error": res.get("error")})
             continue
 

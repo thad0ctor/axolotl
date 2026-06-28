@@ -137,15 +137,23 @@ def _capture():
             axolotl_log.removeHandler(sink)
 
 
-def _reset_plugins() -> None:
+class _ResetFailure(RuntimeError):
+    """Plugin-manager reset failed: the cell's isolation is compromised, so its
+    verdict can't be trusted -> route to COULD_NOT_RUN, never a normal verdict."""
+
+
+def _reset_plugins() -> BaseException | None:
     # The PluginManager is a process singleton that accumulates registrations; reset
     # it so each composite's load_cfg sees only the plugins its own YAML declares.
+    # Return the failure instead of swallowing it: a failed reset means plugin state
+    # can leak across composites and silently shadow later verdicts.
     try:
         from axolotl.integrations.base import PluginManager
 
         PluginManager._instance = None  # noqa: SLF001
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as err:  # noqa: BLE001
+        return err
+    return None
 
 
 def _base_cfg(ctx: GateContext, composite_id: str) -> dict[str, Any]:
@@ -174,7 +182,11 @@ def _run_cfg(
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(cfg_dict), encoding="utf-8")
 
-    _reset_plugins()
+    reset_err = _reset_plugins()
+    if reset_err is not None:
+        # don't run load_cfg on un-isolated state; surface as could-not-run so the
+        # cell never becomes a (possibly leaked-state) normal verdict.
+        return None, _ResetFailure(f"{type(reset_err).__name__}: {reset_err}"), []
     resolved: dict | None = None
     exc: BaseException | None = None
     with _capture() as records:
@@ -473,9 +485,11 @@ def run(ctx: GateContext) -> GateResult:
     could_not_run = 0
     for cell in cells:
         resolved, exc, records = _run_cfg(ctx, cell.flags, cell.composite_id)
-        # A pipeline that cannot even import the model config (offline / bad id) is
-        # an environment problem, not a config verdict.
-        if exc is not None and _is_environment_error(exc):
+        # A pipeline that cannot even import the model config (offline / bad id) or a
+        # failed plugin reset is an environment/isolation problem, not a config verdict.
+        if exc is not None and (
+            isinstance(exc, _ResetFailure) or _is_environment_error(exc)
+        ):
             could_not_run += 1
             outcomes.append(
                 _Outcome(
