@@ -237,6 +237,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         results.append(result)
         print(f"{gate_id} {result.name}: {result.status.icon} {result.summary}")
+        # Hand G1's matrix to later gates (G8's --emit-test scaffolds from the
+        # passing composites); gates can't see each other's results directly.
+        if gate_id == "G1" and result.data.get("matrix"):
+            (output_dir / "g1_matrix.json").write_text(
+                json.dumps({"matrix": result.data["matrix"]}, default=str),
+                encoding="utf-8",
+            )
 
     for gate_id in selected - available_ids:
         results.append(
