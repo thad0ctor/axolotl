@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Model-verification harness — the reproducible "workflow feeder".
+
+Given a model (``--base-model``, a path or HF id) it resolves the
+``model_config_type``, detects arch features (MoE / multimodal / SSM-hybrid),
+prunes the gate ladder to what's relevant, runs the selected gates, and emits a
+standardized markdown report + ``manifest.json`` with the liger-style exit code:
+
+    0 = all selected gates clean · 1 = findings · 2 = could not run reliably
+
+The gates (cheap→expensive, CPU→GPU):
+
+    G1 config        composite-first compat matrix via the real load_cfg pipeline
+    G2 integration   adaptive "wired-everywhere" checklist (AST/registry)
+    G3 preprocess    tiny preprocess → prepared dataset exists
+    G4 masking       decode trained/masked spans, diff vs snapshot
+    G5 packing       packed len ≤ seq, position_ids reset, multipack membership
+    G6 loss          train ~15 steps → finite & decreasing (GPU)
+    G7 consistency   kernel step-0 loss ≈ baseline (the shadow detector, GPU)
+    G8 coverage      test-coverage gaps + --emit-test scaffolder
+
+Run it inside the training env (kernels/plugins are env-specific):
+
+    python verify_model.py --base-model axolotl-ai-co/tiny-llama-50m --gates G1,G2
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+# Make the sibling ``harness`` package importable when run as a bare script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from harness import (  # noqa: E402
+    GATE_ORDER,
+    GateContext,
+    GateResult,
+    GateStatus,
+    exit_code,
+)
+from harness.gates import load_gates  # noqa: E402
+
+
+def _find_repo_root(start: Path) -> Path | None:
+    for base in (start, *start.parents):
+        if (base / "src" / "axolotl").is_dir():
+            return base
+    return None
+
+
+def _parse_gates(spec: str) -> set[str]:
+    if spec.strip().lower() == "all":
+        return set(GATE_ORDER)
+    out: set[str] = set()
+    for tok in spec.replace(",", " ").split():
+        tok = tok.strip().upper()
+        if tok in GATE_ORDER:
+            out.add(tok)
+    return out
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument(
+        "--base-model",
+        required=True,
+        help="model to verify: a local path or HF id (user-supplied is required)",
+    )
+    p.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="axolotl checkout to introspect (default: auto-locate from cwd)",
+    )
+    p.add_argument(
+        "--gates",
+        default="all",
+        help="comma-separated gate ids to run (e.g. G1,G2) or 'all' (default)",
+    )
+    p.add_argument(
+        "--profile",
+        choices=["smoke", "full", "multigpu"],
+        default="smoke",
+        help="matrix breadth (G1): smoke≈5 composites, full=+auto-bisect, "
+        "multigpu=+parallelism flags",
+    )
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="scratch dir for configs/prepared-data/artifacts (default: a tempdir)",
+    )
+    p.add_argument("--report", type=Path, default=None, help="write markdown report here")
+    p.add_argument(
+        "--manifest", type=Path, default=None, help="write manifest.json here"
+    )
+    p.add_argument(
+        "--auto-bisect",
+        action="store_true",
+        help="G1: decompose a failing composite to the minimal failing flag set",
+    )
+    p.add_argument(
+        "--emit-test",
+        action="store_true",
+        help="G8: scaffold a regression test from the verified matrix",
+    )
+    p.add_argument(
+        "--snapshot-dir",
+        type=Path,
+        default=None,
+        help="G4: directory of masking snapshots to diff against",
+    )
+    return p
+
+
+def _detect(base_model: str, repo_root: Path):
+    """Import + call the detector. Kept lazy so a missing/broken detect module
+    surfaces as a clean could-not-run rather than an import crash at startup."""
+    from harness.detect import detect_model
+
+    return detect_model(base_model=base_model, repo_root=repo_root)
+
+
+def _gpu_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    repo_root = args.repo_root or _find_repo_root(Path.cwd()) or _find_repo_root(
+        Path(__file__).resolve()
+    )
+    if repo_root is None:
+        print("could not locate an axolotl checkout (src/axolotl). Use --repo-root.")
+        return 2
+
+    selected = _parse_gates(args.gates)
+    if not selected:
+        print(f"no valid gates in --gates {args.gates!r}; choose from {GATE_ORDER}")
+        return 2
+
+    try:
+        features = _detect(args.base_model, repo_root)
+    except Exception as exc:  # noqa: BLE001
+        print(f"could not detect model '{args.base_model}': {exc.__class__.__name__}: {exc}")
+        return 2
+
+    tmp_ctx = None
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = args.output_dir
+    else:
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="verify-model-")
+        output_dir = Path(tmp_ctx.name)
+
+    ctx = GateContext(
+        features=features,
+        repo_root=repo_root,
+        output_dir=output_dir,
+        profile=args.profile,
+        seed=args.seed,
+        gpu_available=_gpu_available(),
+        selected_gates=selected,
+        options={
+            "auto_bisect": args.auto_bisect or args.profile == "full",
+            "emit_test": args.emit_test,
+            "snapshot_dir": args.snapshot_dir,
+        },
+    )
+
+    print(f"Model verification harness — {features.model_config_type} ({features.base_model})")
+    print(f"repo: {repo_root}  ·  profile: {args.profile}  ·  gpu: {ctx.gpu_available}")
+    print(f"gates: {sorted(selected)}\n")
+
+    modules, import_errors = load_gates()
+    for err in import_errors:
+        print(f"  ! gate unavailable: {err}")
+
+    results: list[GateResult] = []
+    available_ids = set()
+    for mod in modules:
+        gate_id = mod.GATE_ID
+        available_ids.add(gate_id)
+        if gate_id not in selected:
+            continue
+        name = getattr(mod, "GATE_NAME", gate_id)
+        try:
+            if hasattr(mod, "applies") and not mod.applies(ctx):
+                results.append(GateResult.skipped(gate_id, name, "not applicable"))
+                print(f"{gate_id} {name}: {GateStatus.SKIPPED.icon} skipped (n/a)")
+                continue
+            result = mod.run(ctx)
+        except Exception as exc:  # noqa: BLE001 - a gate crash is a could-not-run, not fatal
+            result = GateResult.could_not_run(
+                gate_id, name, f"{exc.__class__.__name__}: {exc}"
+            )
+        results.append(result)
+        print(f"{gate_id} {result.name}: {result.status.icon} {result.summary}")
+
+    for gate_id in selected - available_ids:
+        results.append(
+            GateResult.could_not_run(gate_id, gate_id, "gate module not available")
+        )
+
+    code = exit_code(results)
+
+    if args.report is not None or args.manifest is not None:
+        _emit_outputs(args, ctx, features, results)
+
+    print(f"\nSUMMARY: exit {code}  "
+          f"({sum(r.status is GateStatus.FINDINGS for r in results)} findings, "
+          f"{sum(r.status is GateStatus.COULD_NOT_RUN for r in results)} could-not-run)")
+
+    if tmp_ctx is not None:
+        tmp_ctx.cleanup()
+    return code
+
+
+def _emit_outputs(args, ctx, features, results) -> None:
+    try:
+        from harness.report import build_manifest, render_report
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! report module unavailable: {exc}")
+        return
+    if args.report is not None:
+        args.report.write_text(render_report(ctx, features, results), encoding="utf-8")
+        print(f"  report → {args.report}")
+    if args.manifest is not None:
+        args.manifest.write_text(
+            json.dumps(build_manifest(args, ctx, features, results), indent=2),
+            encoding="utf-8",
+        )
+        print(f"  manifest → {args.manifest}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
