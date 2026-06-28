@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .. import GateContext, GateResult, GateStatus
@@ -194,11 +195,24 @@ def run(ctx: GateContext) -> GateResult:
         return GateResult.could_not_run(
             GATE_ID, GATE_NAME, "fp32 baseline step-0 loss unavailable"
         )
+    # a non-finite baseline makes every Δ a misleading shadow finding -> fail on the baseline
+    if not math.isfinite(base_fp32):
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            f"fp32 baseline step-0 loss is non-finite ({base_fp32}) — cannot compare variants",
+        )
     baselines["fp32"] = base_fp32
     details.append(f"baseline fp32 (eager, no kernels): step0 = {base_fp32:.6f}")
     if any(v["bf16"] for v in variants):
         base_bf16 = _step0(_baseline("bf16"))
         if base_bf16 is not None:
+            if not math.isfinite(base_bf16):
+                return GateResult.could_not_run(
+                    GATE_ID,
+                    GATE_NAME,
+                    f"bf16 baseline step-0 loss is non-finite ({base_bf16}) — cannot compare variants",
+                )
             baselines["bf16"] = base_bf16
             details.append(
                 f"baseline bf16 (eager, no kernels): step0 = {base_bf16:.6f}"

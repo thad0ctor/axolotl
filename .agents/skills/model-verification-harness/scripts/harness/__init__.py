@@ -11,7 +11,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 class GateStatus(enum.Enum):
     """Per-gate outcome; aggregates into the exit code."""
 
-    PASS = "pass"  # nosec B105
+    PASS = "pass"  # nosec B105  # noqa: S105
     FINDINGS = "findings"
     COULD_NOT_RUN = "could_not_run"
     SKIPPED = "skipped"
@@ -124,14 +124,14 @@ GateModule = Any
 GATE_ORDER: list[str] = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"]
 
 __all__ = [
-    "GateStatus",
-    "Verdict",
-    "ModelFeatures",
-    "GateContext",
-    "GateResult",
-    "Gate",
-    "exit_code",
-    "GATE_ORDER",
-    "GateModule",
     "Callable",
+    "GATE_ORDER",
+    "Gate",
+    "GateContext",
+    "GateModule",
+    "GateResult",
+    "GateStatus",
+    "ModelFeatures",
+    "Verdict",
+    "exit_code",
 ]

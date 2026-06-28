@@ -99,7 +99,9 @@ def _capture():
 
         MultiProcessAdapter.warning_once.cache_clear()
     except Exception:  # noqa: BLE001
-        pass
+        logging.getLogger(__name__).debug(
+            "warning_once cache reset skipped", exc_info=True
+        )
 
     with warnings.catch_warnings(record=True) as wlist:
         warnings.simplefilter("always")

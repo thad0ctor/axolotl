@@ -40,10 +40,12 @@ def _prepare_with_template(ctx: GateContext, fixture: Path):
 
 def _split_spans(input_ids, labels) -> list[tuple[bool, list[int]]]:
     """Group consecutive tokens by trained (label != IGNORE) vs masked."""
+    if len(input_ids) != len(labels):
+        raise ValueError(f"row has {len(input_ids)} input_ids but {len(labels)} labels")
     spans: list[tuple[bool, list[int]]] = []
     cur_trained: bool | None = None
     cur: list[int] = []
-    for tid, lab in zip(input_ids, labels, strict=False):
+    for tid, lab in zip(input_ids, labels, strict=True):
         trained = lab != runner.IGNORE_TOKEN_ID
         if trained != cur_trained:
             if cur:
@@ -218,24 +220,35 @@ def run(ctx: GateContext) -> GateResult:
             )
             snapshot_note = f"snapshot captured -> {snap_path}"
         else:
-            saved = json.loads(snap_path.read_text(encoding="utf-8"))
-            if saved != snapshot_norm:
-                snapshot_note = f"snapshot drift vs {snap_path}"
-                findings.append(
-                    f"masking structure changed vs snapshot {snap_path.name}"
+            try:
+                saved = json.loads(snap_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                snap_path.write_text(
+                    json.dumps(snapshot_norm, ensure_ascii=False, indent=2), "utf-8"
                 )
-                for i, (was, now) in enumerate(zip(saved, snapshot_norm, strict=False)):
-                    if was != now:
-                        details.append(
-                            f"  snapshot diff @row {i} (sorted): was {was!r} now {now!r}"
-                        )
-                        break
-                if len(saved) != len(snapshot_norm):
-                    details.append(
-                        f"  snapshot diff: row count {len(saved)} -> {len(snapshot_norm)}"
-                    )
+                snapshot_note = (
+                    f"prior snapshot unreadable ({exc.__class__.__name__}); recaptured"
+                )
             else:
-                snapshot_note = f"snapshot match ({snap_path.name})"
+                if saved != snapshot_norm:
+                    snapshot_note = f"snapshot drift vs {snap_path}"
+                    findings.append(
+                        f"masking structure changed vs snapshot {snap_path.name}"
+                    )
+                    for i, (was, now) in enumerate(
+                        zip(saved, snapshot_norm, strict=False)
+                    ):
+                        if was != now:
+                            details.append(
+                                f"  snapshot diff @row {i} (sorted): was {was!r} now {now!r}"
+                            )
+                            break
+                    if len(saved) != len(snapshot_norm):
+                        details.append(
+                            f"  snapshot diff: row count {len(saved)} -> {len(snapshot_norm)}"
+                        )
+                else:
+                    snapshot_note = f"snapshot match ({snap_path.name})"
     data["snapshot_result"] = snapshot_note
     details.append(f"snapshot: {snapshot_note}")
 

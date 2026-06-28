@@ -1065,7 +1065,7 @@ def run(ctx: GateContext) -> GateResult:
     expected = len(rows) - len(not_exp)
 
     data: dict[str, Any] = {
-        "model_config_type": ctx.model_config_type,
+        "model_config_type": p.mct,
         "checklist": [r.as_dict() for r in rows],
         "counts": {
             "expected": expected,

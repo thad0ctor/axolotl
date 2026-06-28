@@ -32,8 +32,19 @@ def load_gates() -> tuple[list[ModuleType], list[str]]:
         except Exception as exc:  # noqa: BLE001 - a broken gate must not kill the run
             errors.append(f"{gate_id} ({mod_name}): {exc.__class__.__name__}: {exc}")
             continue
-        if not (hasattr(mod, "GATE_ID") and hasattr(mod, "run")):
-            errors.append(f"{gate_id} ({mod_name}): does not satisfy the Gate contract")
+        missing = [
+            name
+            for name in ("GATE_ID", "GATE_NAME", "applies", "run")
+            if not hasattr(mod, name)
+        ]
+        if missing:
+            errors.append(
+                f"{gate_id} ({mod_name}): missing Gate contract fields: "
+                f"{', '.join(missing)}"
+            )
+            continue
+        if mod.GATE_ID != gate_id:
+            errors.append(f"{gate_id} ({mod_name}): declares GATE_ID={mod.GATE_ID!r}")
             continue
         modules.append(mod)
     return modules, errors

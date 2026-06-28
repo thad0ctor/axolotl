@@ -191,6 +191,8 @@ def run(ctx: GateContext) -> GateResult:
     except Exception as exc:  # noqa: BLE001 - collator wiring may be unavailable
         collate_status = "skipped"
         collate_note = f"collate-time reset not verified (collator unavailable: {exc})"
+    if collate_status == "skipped":
+        return GateResult.could_not_run(GATE_ID, GATE_NAME, collate_note)
     if collate_status == "broken":
         findings.append(collate_note)
     details.append(f"collate reset: {collate_note}")
@@ -220,10 +222,7 @@ def run(ctx: GateContext) -> GateResult:
             data=data,
         )
 
-    reset_claim = {
-        "verified": "cross-document position_ids reset verified at collate time",
-        "skipped": "collate-time reset NOT verified (per-document range only)",
-    }.get(collate_status, "per-document position_ids clean")
+    reset_claim = "cross-document position_ids reset verified at collate time"
     return GateResult(
         GATE_ID,
         GATE_NAME,

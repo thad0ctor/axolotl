@@ -108,10 +108,14 @@ def _scan(ctx: GateContext) -> dict[str, Any]:
         except OSError:
             continue
         rel = str(path.relative_to(ctx.repo_root))
-        for s in surface_low:
+        file_surface_hit = False
+        for idx, s in enumerate(surface_low):
             if s in text:
-                surface_hits[surfaces[surface_low.index(s)]] = True
-        if not any(rx.search(text) for rx in tok_res):
+                surface_hits[surfaces[idx]] = True
+                file_surface_hit = True
+        # a patch-surface mention counts as a reference too, else surface-only coverage
+        # still reports the model "undefended"
+        if not (any(rx.search(text) for rx in tok_res) or file_surface_hit):
             continue
         referencing.append(rel)
         for cap, tokens in _CAPABILITIES.items():
@@ -248,17 +252,9 @@ def _emit_scaffold(ctx: GateContext) -> dict[str, Any]:
     else:
         composites = []
     if not composites:
-        # no matrix or no passing cells: fall back to one representative runnable case
-        composites = [
-            (
-                "representative",
-                {
-                    "attn_implementation": "flash_attention_2",
-                    "sample_packing": True,
-                    "bf16": True,
-                },
-            )
-        ]
+        # no matrix/passing cells: emit a default placeholder (no model- or
+        # hardware-specific flags) so the scaffold is runnable for any target model
+        composites = [("representative", {})]
         limitation = (
             "no G1 matrix file available to G8 (gates can't read each other's "
             "results); scaffolded a single representative case — re-run with a "

@@ -175,7 +175,9 @@ def detect_model(
     warnings: list[str] = []
     config = _load_config_dict(base_model, trust_remote_code=trust_remote_code)
 
-    model_config_type = config.get("model_type") or ""
+    model_config_type = config.get("model_type")
+    if not isinstance(model_config_type, str) or not model_config_type:
+        raise ValueError("config.json must contain a non-empty string model_type")
     architectures = list(config.get("architectures") or [])
     extra: dict[str, Any] = {}
 

@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                 encoding="utf-8",
             )
 
-    for gate_id in selected - available_ids:
+    for gate_id in sorted(selected - available_ids):
         results.append(
             GateResult.could_not_run(gate_id, gate_id, "gate module not available")
         )

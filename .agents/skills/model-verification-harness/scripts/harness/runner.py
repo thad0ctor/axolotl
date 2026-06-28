@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -126,10 +127,8 @@ def preprocess_to_disk(cfg) -> Path:
     prev_env = os.environ.get("AXOLOTL_IS_PREPROCESS")
     prev_flag = getattr(cfg, "is_preprocess", None)
     os.environ["AXOLOTL_IS_PREPROCESS"] = "1"
-    try:
+    with suppress(Exception):  # DictDefault attr set; be defensive if it rejects
         cfg.is_preprocess = True
-    except Exception:  # noqa: BLE001 - DictDefault accepts attr set; be defensive
-        pass
     try:
         do_preprocess(cfg, PreprocessCliArgs())
     finally:
@@ -137,10 +136,8 @@ def preprocess_to_disk(cfg) -> Path:
             os.environ.pop("AXOLOTL_IS_PREPROCESS", None)
         else:
             os.environ["AXOLOTL_IS_PREPROCESS"] = prev_env
-        try:
+        with suppress(Exception):
             cfg.is_preprocess = prev_flag
-        except Exception:  # noqa: BLE001
-            pass
     return Path(cfg.dataset_prepared_path)
 
 
