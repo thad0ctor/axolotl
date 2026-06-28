@@ -25,7 +25,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 class GateStatus(enum.Enum):
     """Per-gate outcome. Maps to the aggregate exit code (see :func:`exit_code`)."""
 
-    PASS = "pass"  # gate ran, nothing to flag
+    PASS = "pass"  # nosec B105 - enum value, not a secret  # gate ran, nothing to flag
     FINDINGS = "findings"  # gate ran, surfaced issues a human must review
     COULD_NOT_RUN = "could_not_run"  # genuine inability (model won't load, etc.)
     SKIPPED = "skipped"  # not applicable to this model, or not selected
