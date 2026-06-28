@@ -156,6 +156,50 @@ def _spawn_variant(
     }
 
 
+_KERNEL_NS = ("liger", "cut_cross_entropy", "scattermoe", "sonicmoe")
+
+
+def _engagement(model) -> dict[str, Any]:
+    """Fingerprint whether a kernel actually patched the model, so G7 can tell a
+    real numerical match from a kernel that silently no-op'd (the same Δ=0). Looks
+    at the top model's forward (CE/CCE patch the forward fn) and submodule class
+    namespaces (rms_norm/swiglu swap module classes)."""
+    fwd_module = ""
+    try:
+        fwd = type(model).forward
+        fwd_module = getattr(fwd, "__module__", "") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    namespaces: set[str] = set()
+    try:
+        for m in model.modules():
+            mod = type(m).__module__ or ""
+            if any(k in mod for k in _KERNEL_NS):
+                namespaces.add(mod)
+    except Exception:  # noqa: BLE001
+        pass
+    # liger_cross_entropy patches loss symbols at MODULE scope (a transient
+    # LigerCrossEntropyLoss never appears on model.modules()), so also inspect the
+    # modeling module's loss symbols + the model's loss_function attribute.
+    try:
+        import importlib
+
+        loss_fn = getattr(model, "loss_function", None)
+        if loss_fn is not None:
+            lm = getattr(loss_fn, "__module__", "") or ""
+            if any(k in lm for k in _KERNEL_NS):
+                namespaces.add(lm)
+        modmod = importlib.import_module(type(model).__module__)
+        for sym in ("CrossEntropyLoss", "cross_entropy", "fixed_cross_entropy"):
+            obj = getattr(modmod, sym, None)
+            om = getattr(obj, "__module__", "") or ""
+            if any(k in om for k in _KERNEL_NS):
+                namespaces.add(om)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"forward_module": fwd_module, "kernel_namespaces": sorted(namespaces)}
+
+
 def _worker(cfg_path: str, out_path: str) -> None:
     """Run inside the fresh subprocess: resolve -> prepare -> train -> dump losses."""
     result: dict[str, Any] = {"ok": False}
@@ -172,11 +216,12 @@ def _worker(cfg_path: str, out_path: str) -> None:
         cfg = resolve_cfg(Path(cfg_path))
         set_seed(int(cfg.seed or 42))
         dataset_meta = prepare(cfg)
-        _, _, trainer = train_model(cfg, dataset_meta)
+        model, _, trainer = train_model(cfg, dataset_meta)
         result = {
             "ok": True,
             "loss_history": loss_history(trainer),
             "output_dir": str(cfg.output_dir),
+            "engagement": _engagement(model),
         }
     except BaseException as err:  # noqa: BLE001 - report any failure as the variant error
         import traceback

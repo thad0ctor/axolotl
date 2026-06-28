@@ -113,6 +113,8 @@ def render_report(ctx, features, results: list[GateResult]) -> str:
     lines.extend(_compat_matrix(results))
     lines.extend(_integration_checklist(results))
     lines.extend(_masking_sample(results))
+    lines.extend(_consistency_table(results))
+    lines.extend(_gate_details(results))
     lines.extend(_reliability(results))
 
     code = exit_code(results)
@@ -219,20 +221,22 @@ def _masking_sample(results: list[GateResult]) -> list[str]:
     g4 = _by_id(results).get("G4")
     if not (g4 and isinstance(g4.data, dict)):
         return []
+    # Prefer the gate's own pre-rendered string (correct by construction); fall
+    # back to reconstructing from the structured spans.
+    render = g4.data.get("render")
+    out = ["## Masking sample", "(trained spans in **bold**)"]
+    if isinstance(render, str) and render:
+        out.append(render)
+        out.append("")
+        return out
     spans = None
-    for key in ("masking_sample", "sample_spans", "spans", "decoded_sample"):
+    for key in ("spans", "sample_spans", "masking_sample", "decoded_sample"):
         if g4.data.get(key):
             spans = g4.data[key]
             break
     if spans is None:
         return []
-    out = ["## Masking sample"]
-    if isinstance(spans, str):
-        out.append(spans)
-    elif isinstance(spans, list):
-        out.append(_render_spans(spans))
-    else:
-        out.append(str(spans))
+    out.append(_render_spans(spans) if isinstance(spans, list) else str(spans))
     out.append("")
     return out
 
@@ -244,11 +248,72 @@ def _render_spans(spans: list[Any]) -> str:
             text = str(span.get("text", ""))
             trained = bool(span.get("trained", not span.get("masked", True)))
         elif isinstance(span, (list, tuple)) and len(span) >= 2:
-            text, trained = str(span[0]), bool(span[1])
+            # G4 stores [trained_bool, text]; tolerate the reverse order too.
+            if isinstance(span[0], bool):
+                trained, text = bool(span[0]), str(span[1])
+            else:
+                text, trained = str(span[0]), bool(span[1])
         else:
             text, trained = str(span), False
         parts.append(f"**{text}**" if trained else text)
     return "".join(parts)
+
+
+def _consistency_table(results: list[GateResult]) -> list[str]:
+    g7 = _by_id(results).get("G7")
+    if not (g7 and isinstance(g7.data, dict)):
+        return []
+    rows = g7.data.get("variants") or []
+    if not rows:
+        return []
+    base = g7.data.get("baseline_step0")
+    out = ["## Numerical consistency (G7)"]
+    if base is not None:
+        out.append(f"baseline step-0 loss: {base}")
+    out.append("| variant | step0 | Δ vs base | rel | tol | engaged | within tol |")
+    out.append("|---|---|---|---|---|---|---|")
+    eng_label = {True: "yes", False: "**NO**", None: "unknown"}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append(
+            "| {v} | {s} | {d} | {rel} | {t} | {eng} | {w} |".format(
+                v=_cell_text(r.get("variant", "?"), 40),
+                s=_num(r.get("step0")),
+                d=_num(r.get("delta")),
+                rel=_num(r.get("rel_delta")),
+                t=_num(r.get("tol")),
+                eng=eng_label.get(r.get("engaged"), "—") if "engaged" in r else "—",
+                w=""
+                if r.get("within_tol") is None
+                else ("yes" if r.get("within_tol") else "**NO**"),
+            )
+        )
+    out.append("")
+    return out
+
+
+def _num(v: Any) -> str:
+    if isinstance(v, (int, float)):
+        return f"{v:.4g}"
+    return "—" if v is None else str(v)
+
+
+# Gates whose verdict lives in their `details` lines (no dedicated section above).
+_DETAIL_GATES = ("G3", "G5", "G6", "G7")
+
+
+def _gate_details(results: list[GateResult]) -> list[str]:
+    out: list[str] = []
+    by_id = _by_id(results)
+    for gid in _DETAIL_GATES:
+        r = by_id.get(gid)
+        if not r or not r.details:
+            continue
+        out.append(f"## {r.gate_id} {r.name} — detail")
+        out.extend(f"- {line}" for line in r.details)
+        out.append("")
+    return out
 
 
 def _reliability(results: list[GateResult]) -> list[str]:

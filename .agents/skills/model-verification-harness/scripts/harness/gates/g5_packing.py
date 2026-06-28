@@ -42,8 +42,13 @@ def _supported_multipack_types() -> tuple[set[str], str | None]:
 
 def run(ctx: GateContext) -> GateResult:
     seq_len = 256
+    fixture = runner.write_completion_fixture(ctx.output_dir)
     cfg_dict = runner.base_cfg(
-        ctx.features.base_model, ctx.output_dir, "g5", sequence_len=seq_len
+        ctx.features.base_model,
+        ctx.output_dir,
+        "g5",
+        datasets=[runner.completion_dataset_stanza(fixture)],
+        sequence_len=seq_len,
     )
     cfg_dict["sample_packing"] = True
     cfg_dict["eval_sample_packing"] = False

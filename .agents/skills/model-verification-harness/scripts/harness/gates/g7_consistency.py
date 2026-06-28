@@ -23,8 +23,17 @@ Determinism (the load-bearing part):
 
 We do NOT force ``torch.use_deterministic_algorithms`` (some ops lack a
 deterministic kernel and would raise); ``rtol`` is loose enough that
-run-to-run float noise is well inside it. bf16 variants (CCE) legitimately differ
-more, so they use a wider ``rtol_bf16``.
+run-to-run float noise is well inside it. bf16 variants (CCE) are compared
+against a bf16 baseline (not fp32) so the delta isolates kernel-math change from
+fp32->bf16 precision loss, and they use a wider ``rtol_bf16``.
+
+Engagement (the no-op shadow): a kernel that silently fails to patch the model
+yields the SAME Δ≈0 as a genuine numerical match, so the numeric check alone would
+pass it green. Each variant therefore also carries an engagement fingerprint (the
+worker reports the patched forward module + kernel submodule namespaces); a variant
+expected to engage that leaves no fingerprint is flagged NOT ENGAGED regardless of
+its loss. Engagement isn't fingerprintable for every kernel (e.g. the fused-attn
+hijack) — those report "engage-unknown" and rely on the numeric check.
 """
 
 from __future__ import annotations
@@ -98,6 +107,11 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
                 "name": "liger_cross_entropy",
                 "flags": {"plugins": [_LIGER_PLUGIN], "liger_cross_entropy": True},
                 "bf16": False,
+                # CE is swapped at module scope (transient LigerCrossEntropyLoss),
+                # not on the model instance, so engagement isn't reliably
+                # fingerprintable across transformers versions -> engage-unknown,
+                # rely on the numeric check rather than risk a false NOT-ENGAGED.
+                "markers": (),
             }
         )
         variants.append(
@@ -105,6 +119,7 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
                 "name": "liger_rms_norm",
                 "flags": {"plugins": [_LIGER_PLUGIN], "liger_rms_norm": True},
                 "bf16": False,
+                "markers": ("liger",),  # swaps RMSNorm module classes -> detectable
             }
         )
     else:
@@ -123,6 +138,7 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
                     "bf16": True,
                 },
                 "bf16": True,
+                "markers": ("cut_cross_entropy",),
             }
         )
     else:
@@ -139,6 +155,7 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
                     "bf16": True,
                 },
                 "bf16": True,
+                "markers": (),  # attention hijack isn't a module/forward swap we fingerprint
             }
         )
     else:
@@ -147,6 +164,22 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
         )
 
     return variants, notes
+
+
+def _engaged(res: dict[str, Any], markers: tuple[str, ...]) -> bool | None:
+    """True/False when the kernel's engagement is fingerprintable (markers present
+    in the worker fingerprint), None when it can't be fingerprinted. A variant that
+    is expected to engage but doesn't (False) is a no-op shadow: same Δ=0 as a
+    genuine match, so the numeric check alone would pass it green."""
+    if not markers:
+        return None
+    eng = res.get("engagement") or {}
+    hay = (
+        str(eng.get("forward_module", ""))
+        + " "
+        + " ".join(eng.get("kernel_namespaces", []))
+    ).lower()
+    return any(m in hay for m in markers)
 
 
 def _build_cfg(ctx: GateContext, name: str, flags: dict[str, Any]) -> dict[str, Any]:
@@ -178,19 +211,31 @@ def run(ctx: GateContext) -> GateResult:
     details: list[str] = []
     rows: list[dict[str, Any]] = []
 
-    base_cfg = _build_cfg(ctx, "baseline", {})
-    base_res = g6_loss._spawn_variant(ctx, "g7_baseline", base_cfg, timeout)
-    base_loss = _step0(base_res)
-    if base_loss is None:
-        return GateResult.could_not_run(
-            GATE_ID,
-            GATE_NAME,
-            f"baseline step-0 loss unavailable — {base_res.get('error', 'no loss logged')}",
-        )
-    details.append(f"baseline (eager, no kernels): step0 loss = {base_loss:.6f}")
-    rows.append({"variant": "baseline", "step0": base_loss, "delta": 0.0, "tol": None})
-
     variants, skip_notes = _kernel_variants(ctx)
+
+    # A bf16 variant must be compared to a bf16 baseline, else fp32->bf16 precision
+    # loss is conflated with kernel-math change. Build one baseline per dtype used.
+    def _baseline(dtype: str):
+        flags = {"bf16": True} if dtype == "bf16" else {}
+        cfg = _build_cfg(ctx, f"baseline_{dtype}", flags)
+        return g6_loss._spawn_variant(ctx, f"g7_baseline_{dtype}", cfg, timeout)
+
+    baselines: dict[str, float] = {}
+    base_fp32 = _step0(_baseline("fp32"))
+    if base_fp32 is None:
+        return GateResult.could_not_run(
+            GATE_ID, GATE_NAME, "fp32 baseline step-0 loss unavailable"
+        )
+    baselines["fp32"] = base_fp32
+    details.append(f"baseline fp32 (eager, no kernels): step0 = {base_fp32:.6f}")
+    if any(v["bf16"] for v in variants):
+        base_bf16 = _step0(_baseline("bf16"))
+        if base_bf16 is not None:
+            baselines["bf16"] = base_bf16
+            details.append(
+                f"baseline bf16 (eager, no kernels): step0 = {base_bf16:.6f}"
+            )
+
     for note in skip_notes:
         details.append(f"· {note}")
 
@@ -201,17 +246,19 @@ def run(ctx: GateContext) -> GateResult:
             GateStatus.SKIPPED,
             summary=(
                 f"no applicable kernel variant to compare "
-                f"(baseline step0={base_loss:.4f}); {'; '.join(skip_notes)}"
+                f"(baseline step0={base_fp32:.4f}); {'; '.join(skip_notes)}"
             ),
             details=details,
-            data={"baseline_step0": base_loss, "variants": rows, "skipped": skip_notes},
+            data={"baseline_step0": base_fp32, "variants": rows, "skipped": skip_notes},
         )
 
     findings = 0
     compared = 0
     for v in variants:
         name = v["name"]
+        dtype = "bf16" if v["bf16"] else "fp32"
         tol = rtol_bf16 if v["bf16"] else rtol
+        base_loss = baselines.get(dtype, base_fp32)
         cfg = _build_cfg(ctx, name, v["flags"])
         res = g6_loss._spawn_variant(ctx, f"g7_{name}", cfg, timeout)
         loss = _step0(res)
@@ -220,21 +267,45 @@ def run(ctx: GateContext) -> GateResult:
             rows.append({"variant": name, "step0": None, "error": res.get("error")})
             continue
 
+        # ENGAGEMENT first: a kernel that silently no-op'd yields the SAME Δ≈0 as a
+        # genuine match, so the numeric check alone would pass it green. This is the
+        # shadow class the gate exists to catch.
+        engaged = _engaged(res, v["markers"])
+        if engaged is False:
+            findings += 1
+            compared += 1
+            details.append(
+                f"❌ NOT ENGAGED {name} ({dtype}): step0={loss:.6f} but the kernel "
+                f"left no fingerprint ({v['markers']}) — it silently did not patch the "
+                "model (no-op shadow), so an in-range loss is meaningless"
+            )
+            rows.append(
+                {
+                    "variant": name,
+                    "step0": loss,
+                    "dtype": dtype,
+                    "engaged": False,
+                    "within_tol": None,
+                    "note": "kernel did not engage",
+                }
+            )
+            continue
+
         compared += 1
         delta = abs(loss - base_loss)
         rel = delta / abs(base_loss) if base_loss else float("inf")
         within = delta <= tol * abs(base_loss)
-        dtype = "bf16" if v["bf16"] else "fp32"
+        eng_s = {True: "engaged", None: "engage-unknown", False: "NOT-engaged"}[engaged]
         if within:
             details.append(
-                f"✅ {name} ({dtype}): step0={loss:.6f} Δ={delta:.2e} "
-                f"(rel={rel:.2e} <= {tol:.0e})"
+                f"✅ {name} ({dtype}, {eng_s}): step0={loss:.6f} Δ={delta:.2e} "
+                f"(rel={rel:.2e} <= {tol:.0e}, vs {dtype} baseline {base_loss:.6f})"
             )
         else:
             findings += 1
             details.append(
-                f"❌ SHADOW SUSPECT {name} ({dtype}): step0={loss:.6f} "
-                f"vs baseline {base_loss:.6f}, Δ={delta:.2e} rel={rel:.2e} "
+                f"❌ SHADOW SUSPECT {name} ({dtype}, {eng_s}): step0={loss:.6f} "
+                f"vs {dtype} baseline {base_loss:.6f}, Δ={delta:.2e} rel={rel:.2e} "
                 f"EXCEEDS rtol {tol:.0e} — kernel changed the math"
             )
         rows.append(
@@ -245,6 +316,7 @@ def run(ctx: GateContext) -> GateResult:
                 "rel_delta": rel,
                 "tol": tol,
                 "dtype": dtype,
+                "engaged": engaged,
                 "within_tol": within,
             }
         )
@@ -257,7 +329,8 @@ def run(ctx: GateContext) -> GateResult:
         )
 
     data = {
-        "baseline_step0": base_loss,
+        "baseline_step0": base_fp32,
+        "baselines": baselines,
         "variants": rows,
         "rtol": rtol,
         "rtol_bf16": rtol_bf16,
@@ -265,8 +338,8 @@ def run(ctx: GateContext) -> GateResult:
     }
     status = GateStatus.FINDINGS if findings else GateStatus.PASS
     summary = (
-        f"{compared} kernel variant(s) vs baseline step0={base_loss:.4f}; "
-        f"{'all within tol' if not findings else f'{findings} SHADOW SUSPECT'}"
+        f"{compared} kernel variant(s) vs baseline step0={base_fp32:.4f}; "
+        f"{'all engaged + within tol' if not findings else f'{findings} flagged (shadow/no-op)'}"
     )
     return GateResult(
         GATE_ID, GATE_NAME, status, summary=summary, details=details, data=data
