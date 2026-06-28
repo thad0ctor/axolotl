@@ -68,7 +68,9 @@ def _model_tokens(ctx: GateContext) -> list[str]:
     base = (feats.base_model or "").rstrip("/").split("/")[-1].lower()
     if base:
         toks.add(base)
-    return sorted(t for t in toks if t)
+    # drop 1-2 char tokens: too promiscuous for a content search (e.g. a loop var
+    # "x" would match nearly every test file and fake coverage).
+    return sorted(t for t in toks if len(t) >= 3)
 
 
 def _patch_surfaces(ctx: GateContext) -> list[str]:
