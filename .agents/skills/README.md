@@ -84,6 +84,41 @@ wheel, or a repo checkout — it locates `liger_kernel/transformers/monkey_patch
 within whatever you give it. Upstream repo:
 [`linkedin/Liger-Kernel`](https://github.com/linkedin/Liger-Kernel).
 
+### `model-verification-harness`
+
+A reproducible smoke gate for model-support PRs. It detects a model's
+`model_config_type` and arch features, then runs a tiered gate ladder — config
+compat matrix, wired-everywhere integration checklist, preprocess/masking/packing
+checks, and (on GPU) loss-sanity + cross-variant numerical consistency that
+catches silent kernel-shadowing — and emits a standardized report + manifest. Full
+reference: [`model-verification-harness/SKILL.md`](model-verification-harness/SKILL.md).
+
+**Trigger it** — describe the task; the skill matches on phrasings like:
+
+- "verify model support" / "run the model verification harness" / "smoke-test this model PR"
+- "does `<model>` wire into axolotl correctly?" / "is `<model>` wired everywhere it should hook?"
+- "check the liger/CCE/kernel compat for `<model>`"
+- "debug masking / sample-packing for `<model>`"
+
+Or invoke it explicitly by name: **`/model-verification-harness`**.
+
+**Run it** (in the training env — kernels/plugins are env-specific):
+
+```bash
+# CPU-only smoke (CI-gateable)
+python .agents/skills/model-verification-harness/scripts/verify_model.py \
+  --base-model <path-or-hf-id> --gates G1,G2,G3,G4,G5,G8 --report report.md
+
+# Full incl. GPU gates (loss + numerical consistency), with auto-bisection
+python .agents/skills/model-verification-harness/scripts/verify_model.py \
+  --base-model <path-or-hf-id> --gates all --profile full --report report.md
+```
+
+Exit code is `0` clean / `1` findings / `2` could-not-run, so it can gate CI
+(G1–G5 + G8 are CPU; G6/G7 need a GPU and are local/on-demand). The
+flagship **G7** asserts a kernel's step-0 loss matches the eager baseline within
+`rtol` — the silent numerical-shadowing class that "did it train" CI misses.
+
 ## Adding a skill
 
 Create `.agents/skills/<your-skill>/SKILL.md` with `name` (matching the directory,
