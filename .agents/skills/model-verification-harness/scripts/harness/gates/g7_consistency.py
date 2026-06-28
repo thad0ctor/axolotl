@@ -258,7 +258,23 @@ def run(ctx: GateContext) -> GateResult:
         name = v["name"]
         dtype = "bf16" if v["bf16"] else "fp32"
         tol = rtol_bf16 if v["bf16"] else rtol
-        base_loss = baselines.get(dtype, base_fp32)
+        base_loss = baselines.get(dtype)
+        if base_loss is None:
+            # Never compare a bf16 variant to an fp32 baseline — that conflates
+            # precision with kernel math. Skip rather than emit a bogus verdict.
+            details.append(
+                f"⚠️ {name}: no {dtype} baseline available — skipped "
+                "(would not be an apples-to-apples comparison)"
+            )
+            rows.append(
+                {
+                    "variant": name,
+                    "step0": None,
+                    "dtype": dtype,
+                    "error": f"no {dtype} baseline",
+                }
+            )
+            continue
         cfg = _build_cfg(ctx, name, v["flags"])
         res = g6_loss._spawn_variant(ctx, f"g7_{name}", cfg, timeout)
         loss = _step0(res)
