@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""Model-verification harness — the reproducible "workflow feeder".
-
-Given a model (``--base-model``, a path or HF id) it resolves the
-``model_config_type``, detects arch features (MoE / multimodal / SSM-hybrid),
-prunes the gate ladder to what's relevant, runs the selected gates, and emits a
-standardized markdown report + ``manifest.json`` with the liger-style exit code:
-
-    0 = all selected gates clean · 1 = findings · 2 = could not run reliably
-
-The gates (cheap→expensive, CPU→GPU):
-
-    G1 config        composite-first compat matrix via the real load_cfg pipeline
-    G2 integration   adaptive "wired-everywhere" checklist (AST/registry)
-    G3 preprocess    tiny preprocess → prepared dataset exists
-    G4 masking       decode trained/masked spans, diff vs snapshot
-    G5 packing       packed len ≤ seq, position_ids reset, multipack membership
-    G6 loss          train ~15 steps → finite & decreasing (GPU)
-    G7 consistency   kernel step-0 loss ≈ baseline (the shadow detector, GPU)
-    G8 coverage      test-coverage gaps + --emit-test scaffolder
-
-Run it inside the training env (kernels/plugins are env-specific):
-
-    python verify_model.py --base-model axolotl-ai-co/tiny-llama-50m --gates G1,G2
-"""
+"""Resolve a model, run the selected gates, and emit a report + manifest with a 0/1/2 exit code (clean / findings / could-not-run). Run inside the training env."""
 
 from __future__ import annotations
 
@@ -32,7 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make the sibling ``harness`` package importable when run as a bare script.
+# importable when run as a bare script
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from harness import (  # noqa: E402
@@ -140,8 +117,8 @@ def _parse_features(spec: str) -> dict[str, bool]:
 
 
 def _detect(base_model: str, repo_root: Path, trust_remote_code: bool = False):
-    """Import + call the detector. Kept lazy so a missing/broken detect module
-    surfaces as a clean could-not-run rather than an import crash at startup."""
+    # lazy so a broken detect module surfaces as could-not-run, not a startup crash
+
     from harness.detect import detect_model
 
     return detect_model(
@@ -161,9 +138,7 @@ def _gpu_available() -> bool:
 
 
 def _is_under_repo_src(repo_root: Path, import_path: str) -> bool:
-    """Structural (not substring) containment: is the resolved `import axolotl`
-    path the repo's `src` dir or below it? Substring tests false-match siblings
-    like `/work/src-old/...` against `/work/src`."""
+    # structural containment, not substring: `/work/src-old` must not match `/work/src`
     if not import_path:
         return False
     try:
@@ -187,10 +162,7 @@ def _axolotl_import_path() -> str:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    # load_cfg logs the full resolved config at INFO; gates only care about
-    # WARNINGs (G1 captures those itself). AXOLOTL_LOG_LEVEL is the knob
-    # axolotl's logging filter honors, and it survives configure_logging() (which
-    # a plain setLevel would not). Respect an explicit user override.
+    # AXOLOTL_LOG_LEVEL survives configure_logging() where a plain setLevel would not
     import os
 
     os.environ.setdefault("AXOLOTL_LOG_LEVEL", "WARNING")
@@ -204,10 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         print("could not locate an axolotl checkout (src/axolotl). Use --repo-root.")
         return 2
 
-    # Single source of truth: make `import axolotl` resolve to the SAME tree the
-    # static gates introspect (repo_root) and the manifest's SHA reports, so no two
-    # gates can silently validate different checkouts. Prepend to sys.path (for this
-    # process) and PYTHONPATH (so the G6/G7 subprocess workers inherit it too).
+    # make `import axolotl` resolve to repo_root in-process AND on PYTHONPATH, so the
+    # G6/G7 subprocess workers introspect the same tree as the static gates
     src_dir = repo_root / "src"
     if src_dir.is_dir():
         sys.path.insert(0, str(src_dir))
@@ -242,8 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         output_dir = args.output_dir
     elif args.emit_test:
-        # --emit-test writes a scaffold under output_dir; a throwaway tempdir would
-        # delete it on exit, so persist to cwd and tell the user where it landed.
+        # persist to cwd: a tempdir would delete the emitted scaffold on exit
         output_dir = Path.cwd() / "verify-model-out"
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"  (--emit-test) artifacts kept under {output_dir}")
@@ -298,8 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         results.append(result)
         print(f"{gate_id} {result.name}: {result.status.icon} {result.summary}")
-        # Hand G1's matrix to later gates (G8's --emit-test scaffolds from the
-        # passing composites); gates can't see each other's results directly.
+        # gates can't see each other's results; drop G1's matrix for G8 --emit-test
         if gate_id == "G1" and result.data.get("matrix"):
             (output_dir / "g1_matrix.json").write_text(
                 json.dumps({"matrix": result.data["matrix"]}, default=str),
@@ -311,7 +279,6 @@ def main(argv: list[str] | None = None) -> int:
             GateResult.could_not_run(gate_id, gate_id, "gate module not available")
         )
 
-    # Surface the emitted regression test prominently (it persists under output_dir).
     for r in results:
         scaffold = r.data.get("scaffold_path") if isinstance(r.data, dict) else None
         if scaffold:
@@ -320,8 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     code = exit_code(results)
 
     if args.report is not None or args.manifest is not None:
-        # A requested-but-unwritable report/manifest is a could-not-run, not a
-        # silent warning: force exit 2 so the 0/1/2 contract still holds.
+        # a requested-but-unwritable report/manifest forces exit 2 (could-not-run)
         if not _emit_outputs(args, ctx, features, results):
             code = 2
 
@@ -337,8 +303,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _emit_outputs(args, ctx, features, results) -> bool:
-    """Write the requested report/manifest. Returns False on any failure (import
-    or write) so the caller can map it to the could-not-run exit code."""
+    """Returns False on any import/write failure so the caller can map it to exit 2."""
     try:
         from harness.report import build_manifest, render_report
     except Exception as exc:  # noqa: BLE001

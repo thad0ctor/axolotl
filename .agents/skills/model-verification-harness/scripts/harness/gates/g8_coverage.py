@@ -1,21 +1,4 @@
-"""G8 — test-coverage gaps + a regression-test scaffolder.
-
-Axolotl has no ``test_<model>.py`` convention: a model type is exercised by
-whatever e2e/monkeypatch/integration test happens to mention it (its
-``model_config_type``, its base-model fixture id, or one of its patch-surface
-module names). G8 therefore searches the WHOLE test tree by CONTENT and reports
-which gates/flags appear covered vs uncovered for this type.
-
-Codecov patch status is informational (``codecov.yml``: ``informational: true``),
-so a gap is ADVISORY: the gate is FINDINGS only when ZERO references exist
-anywhere (the type is truly undefended), otherwise PASS with an advisory gap list.
-
-Sub-modes:
-  static    (default) content-grep the tree -> covered/uncovered capabilities
-  emit-test (``--emit-test``) scaffold a parametrized e2e from the verified G1
-            matrix into ``ctx.output_dir`` (never into the repo's tests/)
-  measured  (best-effort) report patch-surface line coverage if ``coverage`` ran
-"""
+"""G8 — test-coverage gaps + a regression-test scaffolder. Axolotl has no test_<model>.py convention, so G8 content-greps the whole test tree for this type; a gap is ADVISORY (FINDINGS only when ZERO references exist). --emit-test scaffolds a parametrized e2e from the verified G1 matrix."""
 
 from __future__ import annotations
 
@@ -29,9 +12,8 @@ from .. import GateContext, GateResult, GateStatus
 GATE_ID = "G8"
 GATE_NAME = "coverage"
 
-# Capability label -> content tokens that mark a test as exercising it. A model is
-# "covered for X" when a test that references this type also contains one of X's
-# tokens. Tokens are matched case-insensitively as substrings of file content.
+# capability label -> content tokens (case-insensitive substrings) marking a test
+# that references this type as also exercising that capability
 _CAPABILITIES: dict[str, tuple[str, ...]] = {
     "lora": ("lora",),
     "qlora / 4bit": ("qlora", "load_in_4bit"),
@@ -68,8 +50,7 @@ def _model_tokens(ctx: GateContext) -> list[str]:
     base = (feats.base_model or "").rstrip("/").split("/")[-1].lower()
     if base:
         toks.add(base)
-    # drop 1-2 char tokens: too promiscuous for a content search (e.g. a loop var
-    # "x" would match nearly every test file and fake coverage).
+    # drop 1-2 char tokens: too promiscuous for a content search (fake coverage)
     return sorted(t for t in toks if len(t) >= 3)
 
 
@@ -158,12 +139,7 @@ _PASSING_VERDICTS = {"supported", "normalized"}
 
 
 def _load_matrix(ctx: GateContext) -> list[dict[str, Any]] | None:
-    """Read a G1 matrix the orchestrator may have dropped for cross-gate use.
-
-    Gates can't see each other's GateResults (run only gets ctx), so the matrix
-    is read from a file by convention if present; otherwise the caller scaffolds a
-    single representative case and records the limitation.
-    """
+    """Read a G1 matrix the orchestrator may have dropped, since gates can't see each other's GateResults."""
     candidates = []
     opt_path = ctx.options.get("g1_matrix_file")
     if opt_path:
@@ -272,8 +248,7 @@ def _emit_scaffold(ctx: GateContext) -> dict[str, Any]:
     else:
         composites = []
     if not composites:
-        # Either no matrix file was available or none of its cells passed: fall
-        # back to a single representative case so the scaffold is still runnable.
+        # no matrix or no passing cells: fall back to one representative runnable case
         composites = [
             (
                 "representative",

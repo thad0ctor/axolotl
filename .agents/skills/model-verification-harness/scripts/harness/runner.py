@@ -1,21 +1,4 @@
-"""Shared execution helpers for the run-based gates (G3..G7).
-
-These wrap the *real* axolotl entry points so each gate drives the same path a
-user's `axolotl preprocess` / `axolotl train` would, against the harness-owned
-isolated ``output_dir``:
-
-    load_cfg(path)                       -> resolved DictDefault   (resolve)
-    load_datasets(cfg=…, cli_args=…)     -> TrainDatasetMeta       (prepare; G3/G4/G5)
-    do_preprocess(cfg, cli_args)         -> prepared data on disk  (G3 plumbing)
-    train(cfg, dataset_meta)             -> (model, tok, trainer)  (G6/G7)
-
-The prepared ``train_dataset`` carries ``input_ids`` / ``labels`` /
-``attention_mask`` columns, so G4/G5 read it in memory rather than guessing the
-on-disk hash path.
-
-Everything writes only under ``ctx.output_dir``. ``IGNORE_TOKEN_ID`` is re-exported
-so masking gates do not re-hardcode -100.
-"""
+"""Wrap the real axolotl preprocess/train entry points for the run-based gates (G3..G7); everything writes only under ``ctx.output_dir``."""
 
 from __future__ import annotations
 
@@ -27,8 +10,7 @@ import yaml
 
 IGNORE_TOKEN_ID = -100
 
-# A tiny instruct fixture (chat-template masking needs role structure that a raw
-# completion corpus lacks). Written locally so gates need no network dataset.
+# tiny instruct fixture; chat-template masking needs role structure, written locally (offline)
 _TINY_CHAT_ROWS = [
     {
         "messages": [
@@ -49,7 +31,6 @@ _TINY_CHAT_ROWS = [
 
 
 def write_chat_fixture(output_dir: Path, n_repeat: int = 16) -> Path:
-    """Write a tiny chat_template JSONL fixture and return its path."""
     path = output_dir / "tiny_chat.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = (_TINY_CHAT_ROWS * n_repeat)[: max(n_repeat, len(_TINY_CHAT_ROWS))]
@@ -60,12 +41,7 @@ def write_chat_fixture(output_dir: Path, n_repeat: int = 16) -> Path:
 
 
 def chat_dataset_stanza(fixture: Path) -> dict[str, Any]:
-    """A `datasets:` entry for the local chat fixture (chat_template strategy).
-
-    axolotl routes a `path` that exists on disk through its local-file loader
-    (``_load_from_local_path``), inferring the json loader from the extension, so
-    no network/hub access is needed.
-    """
+    """A `datasets:` entry routed through axolotl's on-disk local-file loader (offline)."""
     return {
         "path": str(fixture),
         "type": "chat_template",
@@ -81,7 +57,6 @@ _TINY_COMPLETION_TEXT = (
 
 
 def write_completion_fixture(output_dir: Path, n_rows: int = 64) -> Path:
-    """Write a tiny local completion JSONL (no network) and return its path."""
     path = output_dir / "tiny_completion.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fout:
@@ -91,7 +66,6 @@ def write_completion_fixture(output_dir: Path, n_rows: int = 64) -> Path:
 
 
 def completion_dataset_stanza(fixture: Path) -> dict[str, Any]:
-    """A `datasets:` entry for the local completion fixture (offline)."""
     return {"path": str(fixture), "type": "completion", "field": "text"}
 
 
@@ -127,7 +101,6 @@ def write_cfg(output_dir: Path, cfg_dict: dict[str, Any], name: str) -> Path:
 
 
 def resolve_cfg(cfg_path: Path):
-    """load_cfg the written YAML through the real pipeline."""
     from axolotl.cli.config import load_cfg
 
     return load_cfg(str(cfg_path))
@@ -144,16 +117,7 @@ def prepare(cfg, debug: bool = False):
 def preprocess_to_disk(cfg) -> Path:
     """Run the preprocess entry point; return the dataset_prepared_path dir.
 
-    Mirrors the CLI's ``do_cli`` setup (``AXOLOTL_IS_PREPROCESS`` env +
-    ``cfg.is_preprocess = True``) so do_preprocess takes the same path a user's
-    ``axolotl preprocess`` would — otherwise the artifact gate can false-pass.
-
-    Both flags are scoped to the do_preprocess call and RESTORED afterwards:
-    leaving them set would (a) leak preprocess mode into later gates (G4-G7, whose
-    subprocesses copy the env) and (b) make a subsequent ``prepare(cfg)`` skip
-    loading the saved artifact from disk (``is_preprocess`` truthy bypasses the
-    prepared-dataset load), so the "load it back" check would silently reprocess.
-    """
+    The AXOLOTL_IS_PREPROCESS env + cfg.is_preprocess flag are set then RESTORED, else preprocess mode leaks into later gates and a subsequent prepare() skips loading the saved artifact."""
     import os
 
     from axolotl.cli.args import PreprocessCliArgs
@@ -181,8 +145,7 @@ def preprocess_to_disk(cfg) -> Path:
 
 
 def has_saved_dataset(prepared_path: Path) -> bool:
-    """True if ``prepared_path`` holds a real saved HF dataset (so we can prove the
-    preprocess STEP wrote it, rather than load_datasets silently reprocessing)."""
+    """True if the preprocess STEP wrote a loadable saved HF dataset (not silently reprocessed)."""
     if not prepared_path.exists():
         return False
     markers = ("dataset_info.json", "state.json")
@@ -193,7 +156,7 @@ def has_saved_dataset(prepared_path: Path) -> bool:
 
 
 def train_model(cfg, dataset_meta):
-    """Drive a (short) training run; returns (model, tokenizer, trainer)."""
+    """Returns (model, tokenizer, trainer)."""
     from axolotl.train import train
 
     return train(cfg, dataset_meta)

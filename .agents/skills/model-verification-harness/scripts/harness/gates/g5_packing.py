@@ -1,24 +1,4 @@
-"""G5 — packing / trimming gate: does sample_packing produce valid sequences?
-
-Packing concatenates several documents into one ``sequence_len``-long row and
-relies on per-document ``position_ids`` (and a varlen attention backend) to keep
-documents from attending across each other. Two silent failures: a model type
-absent from ``SUPPORTED_MULTIPACK_MODEL_TYPES`` packs into a no-op/garbage attn
-mask, and a trimming bug emits rows longer than ``sequence_len``. G5 drives the
-real prepare path with ``sample_packing: True`` and asserts the type is packable,
-every prepared row fits ``sequence_len``, and the per-document ``position_ids``
-restart at 0 (so the collator's cross-document reset is well-formed).
-
-``position_ids`` are added at PREPARE time by ``add_position_ids`` in
-``utils/trainer.py`` (one ``range(len)`` per document); the multipack collator
-(``utils/collators/batching.py`` ``V2BatchSamplerDataCollatorForSeq2Seq``)
-concatenates those per-document arrays at COLLATE time, which is where the
-restart-at-boundary pattern actually materializes. So G5 does both: it asserts
-each prepared row's ``position_ids`` is a clean ``range(len)`` (the building
-block), AND drives the real ``V2BatchSamplerDataCollatorForSeq2Seq`` on a small
-pack group of prepared rows to prove the concatenated ``position_ids`` actually
-reset to 0 at each document boundary — so a collate-time regression can't pass.
-"""
+"""G5 — packing gate: drive the real prepare path with ``sample_packing: True`` and assert the type is packable, every row fits ``sequence_len``, and per-document ``position_ids`` restart at 0. ``position_ids`` are built per-document at prepare time and concatenated by the collator at collate time, so G5 checks both: each row is a clean ``range(len)`` and the real collator's concatenated ``position_ids`` reset at each document boundary."""
 
 from __future__ import annotations
 
@@ -44,13 +24,7 @@ def _supported_multipack_types() -> tuple[set[str], str | None]:
 
 
 def _check_collate_reset(cfg, train_dataset, n_docs: int = 4):
-    """Drive the real multipack collator on a small pack group and verify the
-    concatenated ``position_ids`` reset to 0 at each document boundary.
-
-    Returns ``(status, note)`` where status is ``"verified"`` (reset materialized),
-    ``"broken"`` (a finding — boundary did not reset), or ``"skipped"`` (could not
-    wire the collator in this context; the claim is downgraded honestly).
-    """
+    """Drive the real multipack collator and verify concatenated ``position_ids`` reset at each document boundary; returns (status, note) ∈ verified | broken | skipped."""
     from axolotl.loaders import load_tokenizer
     from axolotl.utils.collators import V2BatchSamplerDataCollatorForSeq2Seq
 
@@ -66,8 +40,8 @@ def _check_collate_reset(cfg, train_dataset, n_docs: int = 4):
             return "skipped", "prepared rows carry no position_ids to collate"
         group.append({key: list(row[key]) for key in keys if key in row})
 
-    # squash_position_ids stays False (the multipack default): the collator keeps
-    # each document's per-document range, which is exactly the reset we assert.
+    # squash_position_ids stays False (multipack default): the collator keeps each
+    # document's per-document range, which is exactly the reset we assert
     tokenizer = load_tokenizer(cfg)
     collator = V2BatchSamplerDataCollatorForSeq2Seq(tokenizer=tokenizer)
     batch = collator(group)  # flat list -> one pack group of k documents
@@ -110,8 +84,7 @@ def run(ctx: GateContext) -> GateResult:
     )
     cfg_dict["sample_packing"] = True
     cfg_dict["eval_sample_packing"] = False
-    # varlen backend isolates documents; only matters at train, but set it when a
-    # GPU is around. On CPU preprocess sdpa is fine and only warns.
+    # varlen backend isolates documents; only matters at train, so set it only with a GPU
     attn_note = ""
     if ctx.gpu_available:
         cfg_dict["flash_attention"] = True
@@ -133,8 +106,7 @@ def run(ctx: GateContext) -> GateResult:
     columns = list(train_dataset.column_names)
     n_rows = train_dataset.num_rows
 
-    # A clean verdict must be backed by a real packed sample. Zero prepared rows
-    # means the length / position_ids loops below no-op and would otherwise PASS.
+    # zero prepared rows would make the length / position_ids loops no-op and PASS
     if n_rows == 0:
         return GateResult.could_not_run(
             GATE_ID,
@@ -212,10 +184,8 @@ def run(ctx: GateContext) -> GateResult:
         )
     details.append(pos_note)
 
-    # (d) collate-time cross-document reset: drive the REAL multipack collator on a
-    # small pack group and confirm position_ids actually restart at 0 at each
-    # document boundary (the per-row range(len) check above is true by construction
-    # at prepare time and does not exercise the collator that can regress).
+    # (d) collate-time cross-document reset: the per-row check above is true by
+    # construction at prepare time and doesn't exercise the collator that can regress
     try:
         collate_status, collate_note = _check_collate_reset(cfg, train_dataset)
     except Exception as exc:  # noqa: BLE001 - collator wiring may be unavailable

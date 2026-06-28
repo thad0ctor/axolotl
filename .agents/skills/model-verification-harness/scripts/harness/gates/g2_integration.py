@@ -1,28 +1,4 @@
-"""G2 — integration gate: is the model wired everywhere it should hook?
-
-Axolotl registers a model type at ~two dozen dispatch points (multipack, the
-PatchManager ladder, liger/CCE routing, the MoE arch block, multimodal mappings,
-embedding-name overrides, ...). Almost none are unconditionally required: each is
-gated on an arch feature, so checking everything for every model drowns the real
-gaps in noise. G2 is therefore adaptive — it derives the *expected* hook set from
-``ctx.features`` and only asserts those.
-
-For each expected hook it borrows the liger-sync audit's central distinction
-(``audit_liger_sync.py``): a hook is not pass/fail but four-way —
-
-    present_explicit  the type has a real dedicated branch / registry entry
-    generic_fallback  it runs via a GENERIC path that may be wrong for this arch
-                      (the PR #3752 shadow failure mode — surfaced, never green)
-    missing           expected for this feature but absent
-    not_expected      feature absent, hook irrelevant (not a gap)
-
-Registries that import cleanly are introspected live (``MOE_ARCH_BLOCK``,
-``MODEL_TYPE_TO_APPLY_LIGER_FN``, CCE ``PATCH_FNS``, ...). if/elif dispatch ladders
-keyed on ``model_config_type`` are read with AST, exactly like the liger template's
-``_model_type_constants``. When a dispatch shape can't be read statically the row
-records a reliability warning and the gate leans toward COULD_NOT_RUN rather than
-vouching for a verdict it could not compute.
-"""
+"""G2 — integration gate: derive the *expected* hook set from ``ctx.features`` and classify each four-way (present_explicit / generic_fallback / missing / not_expected). generic_fallback is the shadow failure mode — surfaced, never green; an unreadable dispatch shape leans toward COULD_NOT_RUN."""
 
 from __future__ import annotations
 
@@ -72,14 +48,12 @@ class HookRow:
 
 @dataclass
 class Probe:
-    """Shared state for the checks: repo paths, the resolved feature facts, and a
-    running list of reliability warnings (drifted/unreadable dispatch shapes)."""
+    """Shared state for the checks: paths, feature facts, reliability warnings."""
 
     ctx: GateContext
     warnings: list[str] = field(default_factory=list)
     rows: list[HookRow] = field(default_factory=list)
-    # set when a check needed to read something load-bearing and couldn't, so the
-    # aggregate can't be trusted -> COULD_NOT_RUN
+    # set when a load-bearing read failed, so the aggregate can't be trusted -> COULD_NOT_RUN
     critical_unreadable: bool = False
 
     @property
@@ -140,12 +114,7 @@ def _compared_model_types(test: ast.expr) -> set[str]:
 
 
 def _file_model_types(path: Path) -> tuple[set[str], bool]:
-    """Every string a file dispatches on via a model-type comparison.
-
-    Whole-file (not just one ladder): a type counts as explicitly handled if any
-    branch keys on it. Returns (types, readable); readable=False on a missing file
-    or syntax error so the caller can degrade instead of undercounting.
-    """
+    """Every string a file dispatches on via a model-type comparison (whole-file). readable=False on a missing/syntax-error file so the caller can degrade."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
@@ -158,8 +127,7 @@ def _file_model_types(path: Path) -> tuple[set[str], bool]:
 
 
 def _named_set(path: Path, name: str) -> tuple[set[str], bool]:
-    """String members of a literal set/tuple/list assigned to ``name`` (module- or
-    class-level). Used for ``_FUSED_ATTN_KERNEL_SUPPORTED`` / ``_SSM_HYBRID...``."""
+    """String members of a literal set/tuple/list assigned to ``name``."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):  # noqa: BLE001
@@ -176,11 +144,7 @@ def _named_set(path: Path, name: str) -> tuple[set[str], bool]:
 
 
 def _func_string_keys(path: Path, func_name: str) -> tuple[set[str], bool]:
-    """All string constants a function dispatches on via ``== "x"`` comparisons.
-
-    get_processing_strategy keys on ``chat_template_type`` (not model_type), so this
-    collects any equality-compared string literal inside the named function.
-    """
+    """All string constants a function dispatches on via ``==``/``in`` (get_processing_strategy keys on chat_template_type, not model_type)."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):  # noqa: BLE001
@@ -300,8 +264,7 @@ def _check_model_loads(p: Probe) -> None:
 
 
 def _check_chat_template(p: Probe) -> None:
-    # Advisory: a named/bundled template is nice, but inline jinja and
-    # tokenizer_default are equally valid, so this never reports a gap.
+    # advisory: inline jinja and tokenizer_default are equally valid, so never a gap
     enum_vals: set[str] = set()
     ev, _ = _safe_import("axolotl.utils.schemas.enums", "ChatTemplate")
     if ev is not None:
@@ -432,8 +395,7 @@ def _check_patch_manager(p: Probe) -> tuple[set[str], bool]:
     # attention hijack (btlm/stablelm/mistral3/llava) lives in the same file
     hijack_types = {"btlm", "stablelm_epoch", "mistral3", "llava"}
     if p.mct in hijack_types:
-        # PRESENT only when the parsed dispatch actually keys on this type — a
-        # readable file alone must not vouch for a branch that isn't there.
+        # PRESENT only when the dispatch actually keys on this type, not just readable
         present = ok and p.mct in types
         p.add(
             HookRow(
@@ -503,9 +465,8 @@ def _check_fused_attn(p: Probe) -> None:
 
 
 def _check_liger(p: Probe) -> None:
-    # explicit = a dedicated elif branch in plugin.py OR native upstream support
-    # (MODEL_TYPE_TO_APPLY_LIGER_FN, the blessed generic path). generic_fallback =
-    # neither, so the only route left is the experimental patch_lce_forward FLCE.
+    # explicit = a dedicated elif branch OR native MODEL_TYPE_TO_APPLY_LIGER_FN;
+    # generic_fallback = neither, leaving only the experimental patch_lce_forward FLCE
     native, nerr = _safe_import(
         "liger_kernel.transformers.monkey_patch", "MODEL_TYPE_TO_APPLY_LIGER_FN"
     )
@@ -561,8 +522,8 @@ def _check_liger(p: Probe) -> None:
 
 
 def _check_cce(p: Probe) -> None:
-    # explicit = an upstream-registered PATCH_FNS entry; otherwise patch_llama_like
-    # installs a generic llama-shaped patch (logged "experimental") = generic_fallback.
+    # explicit = an upstream PATCH_FNS entry; else patch_llama_like installs a generic
+    # llama-shaped patch = generic_fallback
     patch_fns, err = _safe_import("cut_cross_entropy.transformers.patch", "PATCH_FNS")
     if err is not None:
         p.warn(f"CCE PATCH_FNS not importable ({err}); routing classification degraded")
@@ -646,8 +607,8 @@ def _check_moe(p: Probe) -> None:
                 "is_moe=True but no MOE_ARCH_BLOCK entry (MoE FSDP wrap will be wrong)",
             )
         )
-    # kernel adapters: dedicated dsv4/gemma4 adapters vs the generic scattermoe/sonicmoe
-    # ExpertsInterface backend (the designed path for any MoE, not a fallback bug).
+    # dedicated dsv4/gemma4 adapters vs the generic scattermoe/sonicmoe backend
+    # (the designed path for any MoE, not a fallback bug)
     adapters = p.src("integrations/kernels/adapters")
     stems = (
         {f.stem for f in adapters.glob("*.py")} - {"__init__"}
@@ -1035,8 +996,7 @@ def _check_custom_kernel_module(p: Probe) -> None:
 
 def _check_tiled_mlp(p: Probe) -> None:
     tdir = p.src("monkeypatch/tiled_mlp")
-    # Advisory unless tiled_mlp is actually requested: an absent generic package
-    # must not count as a G2 finding when nobody asked for it.
+    # advisory unless tiled_mlp is requested: an absent generic package isn't a gap
     wants = bool(p.opt.get("tiled_mlp"))
     if tdir.is_dir():
         status, note = PRESENT, "generic tiled-MLP patch available (type-agnostic)"

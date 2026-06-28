@@ -1,26 +1,4 @@
-"""G4 — masking / chat-template gate: are the right tokens trained?
-
-The highest-value run-based check. A chat-template strategy silently mislabels
-when its turn-boundary logic drifts for an arch (wrong EOS/EOT token, role offset
-off-by-one): training still "works" but the model learns to predict the *prompt*,
-or the assistant span is fully masked and nothing is learned. Neither raises.
-
-So G4 drives the real ``chat_template`` strategy on a tiny instruct fixture,
-decodes row 0 into trained-vs-masked spans, and asserts INTENT against the
-semantics in ``prompt_strategies/chat_template.py`` (default ``roles_to_train =
-["assistant"]``, ``train_on_eos = "turn"``): assistant content must be TRAINED and
-user/system content MASKED. A trained user/system token, or a fully-masked
-assistant span, is a FINDING. When ``options["snapshot_dir"]`` is set the
-normalized span structure is diffed against a captured baseline so masking
-regressions surface as drift; a missing snapshot is captured on first run.
-
-The prepared dataset is SHUFFLED, so row 0 is not stable across runs. The
-snapshot therefore captures a shuffle-invariant aggregate — the normalized
-``[trained, text]`` structure of every scanned row, sorted into a canonical order
-— rather than row 0 alone, so an unchanged masking structure never reports false
-drift just because a different example landed in slot 0. Row 0 is still rendered
-for the human report.
-"""
+"""G4 — masking gate: drive the real ``chat_template`` strategy, decode trained-vs-masked spans, and assert assistant content is TRAINED and user/system MASKED (the silent-mislabel failure mode). The prepared dataset is shuffled, so the snapshot captures a shuffle-invariant sorted aggregate of every row, not row 0."""
 
 from __future__ import annotations
 
@@ -33,7 +11,7 @@ from .. import GateContext, GateResult, GateStatus, runner
 GATE_ID = "G4"
 GATE_NAME = "masking"
 
-# tried in order; first that resolves + prepares wins.
+# tried in order; first that resolves + prepares wins
 _CHAT_TEMPLATE_CANDIDATES = ["llama3", "tokenizer_default"]
 
 
@@ -42,8 +20,7 @@ def applies(ctx: GateContext) -> bool:  # noqa: ARG001 - always applies (text + 
 
 
 def _prepare_with_template(ctx: GateContext, fixture: Path):
-    """Try each chat_template candidate; return (cfg, dataset_meta, template) or
-    raise the last error if none resolves+prepares."""
+    """Try each chat_template candidate; return (cfg, dataset_meta, template) or raise the last error."""
     stanza = runner.chat_dataset_stanza(fixture)
     last_exc: Exception | None = None
     for template in _CHAT_TEMPLATE_CANDIDATES:
@@ -88,8 +65,7 @@ def _row_norm(row, tokenizer) -> list[list[Any]]:
 
 
 def _render(decoded: list[tuple[bool, str]]) -> str:
-    """Trained spans in **bold** markers, masked spans plain — a human can read
-    off exactly which text the loss sees."""
+    """Trained spans in **bold**, masked spans plain."""
     out: list[str] = []
     for trained, text in decoded:
         out.append(f"**{text}**" if trained else text)
@@ -97,11 +73,7 @@ def _render(decoded: list[tuple[bool, str]]) -> str:
 
 
 def _fixture_role_contents(fixture: Path) -> tuple[set[str], set[str]]:
-    """Union of (assistant, non-assistant) message contents across the fixture.
-
-    The prepared dataset is shuffled, so row 0 need not be fixture line 0; we check
-    intent against the whole vocabulary instead of one fixed row.
-    """
+    """Union of (assistant, non-assistant) message contents across the fixture."""
     assistant: set[str] = set()
     nonassistant: set[str] = set()
     with fixture.open(encoding="utf-8") as fin:
@@ -148,9 +120,8 @@ def run(ctx: GateContext) -> GateResult:
             GATE_ID, GATE_NAME, "chat fixture produced 0 prepared rows"
         )
 
-    # The prepared dataset is shuffled, so a single row need not exercise every
-    # role (the fixture puts a system message in only some rows). Scan several
-    # rows and union their trained text so role coverage doesn't hinge on row 0.
+    # shuffled dataset: scan several rows and union their trained text so role
+    # coverage doesn't hinge on row 0
     n_scan = min(8, train_dataset.num_rows)
     union_trained = ""
     total_trained = 0
@@ -203,11 +174,10 @@ def run(ctx: GateContext) -> GateResult:
 
     if total_trained == 0:
         findings.append("no tokens trained across scanned rows — assistant span masked")
-    # the silent-mislabel failure mode: any prompt (user/system) text in the loss.
+    # the silent-mislabel failure mode: any prompt (user/system) text in the loss
     for needle in sorted(nonassistant_contents):
         if needle in union_trained:
             findings.append(f"user/system content found in trained span: {needle!r}")
-    # at least one assistant content must be trained somewhere in the scanned rows.
     if total_trained > 0 and not any(c in union_trained for c in assistant_contents):
         findings.append(
             "no assistant content in trained span — assistant text appears masked"
@@ -219,8 +189,7 @@ def run(ctx: GateContext) -> GateResult:
             "only text label structure checked"
         )
 
-    # EOS/EOT: per train_on_eos default 'turn', a trained assistant turn's
-    # terminator is trained. Report what the last trained span ends on.
+    # per train_on_eos default 'turn', a trained assistant turn's terminator is trained
     if first_decoded and first_decoded[-1][0]:
         details.append(
             "note: last span is trained (assistant turn terminator trained per "
@@ -231,9 +200,8 @@ def run(ctx: GateContext) -> GateResult:
     snap_dir = ctx.options.get("snapshot_dir")
     snapshot_note = "no snapshot_dir (diff skipped)"
     if snap_dir:
-        # Shuffle-invariant key: the normalized structure of EVERY prepared row
-        # (not just the n_scan window, whose membership shifts with the shuffle),
-        # sorted into a canonical order so row ordering can't perturb the diff.
+        # shuffle-invariant key: every prepared row's normalized structure, sorted
+        # into a canonical order so row ordering can't perturb the diff
         snapshot_norm = sorted(
             (
                 _row_norm(train_dataset[i], tokenizer)

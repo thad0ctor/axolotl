@@ -1,11 +1,4 @@
-"""CPU-only, offline tests for the model-verification harness.
-
-Covers the static gates (G1 config resolution, G2 integration) plus model
-detection, the exit-code contract, the report/manifest renderer, and G8 static
-coverage. The run gates (G3-G7) drive real preprocess/train and are exercised
-out-of-band (local/on-demand), not here — these stay fast and network-free by
-pointing every model at a synthetic local config.json.
-"""
+"""CPU-only, offline tests for the static gates (G1/G2/G8), detection, the exit-code contract, and the report/manifest renderer."""
 
 from __future__ import annotations
 

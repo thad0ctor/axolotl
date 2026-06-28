@@ -1,16 +1,8 @@
-"""Resolve the base model a gate run should exercise.
-
-Per the harness decision, verification runs against a *user-supplied* base model
-(``strategy="path"``); we deliberately do not shrink-from-config. ``strategy=
-"checkpoint"`` is an opt-in convenience that maps an architecture to a known
-tiny checkpoint from the ``axolotl-ai-co/tiny-*`` family used across the repo's
-own tests, for when the caller has no model in hand.
-"""
+"""Resolve the base model a gate run exercises: a user-supplied path, or an opt-in tiny checkpoint matched by architecture."""
 
 from __future__ import annotations
 
-# arch keyword (matched as a substring of model_config_type) -> tiny HF id.
-# Ids are the ones axolotl's own tests/examples pull (see tests/**, examples/**).
+# arch keyword (substring of model_config_type) -> tiny HF id
 TINY_CHECKPOINTS: dict[str, str] = {
     "llama": "axolotl-ai-co/tiny-llama-50m",
     "mixtral": "axolotl-ai-co/tiny-mixtral-30m",
@@ -29,12 +21,7 @@ def resolve_base_model(
     model_config_type: str,
     strategy: str = "path",
 ) -> str:
-    """Return the base model path/id to verify against.
-
-    ``path``       require and pass through ``base_model``.
-    ``checkpoint`` fall back to a tiny checkpoint matched by architecture when
-                   ``base_model`` is None.
-    """
+    """Return the base model to verify against per ``strategy`` ('path' | 'checkpoint')."""
     if strategy == "path":
         if not base_model:
             raise ValueError(

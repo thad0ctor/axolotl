@@ -1,13 +1,4 @@
-"""G3 — preprocess gate: does the model survive the real tokenize/prepare path?
-
-The cheapest end-to-end signal: drive the actual ``axolotl preprocess`` entry
-point against a tiny completion corpus and confirm it lands a prepared dataset on
-disk whose ``train_dataset`` carries the columns the trainer reads
-(``input_ids`` / ``labels`` / ``attention_mask``) with >0 rows. A model that
-can't even tokenize never reaches G4..G7, so this gate gatekeeps the run-based
-ladder: an environment/load failure here is COULD_NOT_RUN (we can't vouch for
-anything downstream), while a prepared-but-malformed dataset is a real FINDING.
-"""
+"""G3 — preprocess gate: drive the real ``axolotl preprocess`` on a tiny corpus and confirm it lands a prepared dataset with the trainer's columns (input_ids/labels/attention_mask) and >0 rows. A load failure is COULD_NOT_RUN; a prepared-but-malformed dataset is a FINDING."""
 
 from __future__ import annotations
 
@@ -53,9 +44,8 @@ def run(ctx: GateContext) -> GateResult:
             f"preprocess pipeline failed: {exc.__class__.__name__}: {exc}",
         )
 
-    # Prove the PREPROCESS step itself wrote a loadable artifact, before prepare()
-    # (which would otherwise silently reprocess raw data if the artifact is absent
-    # and then the existence check would false-pass).
+    # prove the preprocess step wrote a loadable artifact before prepare(), which
+    # would otherwise silently reprocess raw data and false-pass
     if not runner.has_saved_dataset(prepared_path):
         return GateResult(
             GATE_ID,

@@ -1,10 +1,4 @@
-"""Gate registry.
-
-Each gate lives in its own module (``gN_<name>.py``) and exposes the
-:class:`~harness.Gate` surface. ``load_gates`` imports the ones that exist, in
-ladder order, so a partially-built harness still runs the gates it has and
-reports the rest as unavailable rather than crashing.
-"""
+"""Gate registry: import the gate modules that exist, in ladder order, reporting the rest as unavailable."""
 
 from __future__ import annotations
 
@@ -13,7 +7,6 @@ from types import ModuleType
 
 from .. import GATE_ORDER
 
-# gate id -> module name under this package
 _GATE_MODULES: dict[str, str] = {
     "G1": "g1_config",
     "G2": "g2_integration",
@@ -27,8 +20,7 @@ _GATE_MODULES: dict[str, str] = {
 
 
 def load_gates() -> tuple[list[ModuleType], list[str]]:
-    """Return ``(modules, errors)`` — gate modules in ladder order plus a list of
-    human-readable import failures for gates that are missing or broken."""
+    """Return ``(modules, errors)``: gate modules in ladder order plus import-failure strings."""
     modules: list[ModuleType] = []
     errors: list[str] = []
     for gate_id in GATE_ORDER:

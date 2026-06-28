@@ -1,14 +1,4 @@
-"""Standardized markdown report + reproducibility manifest.
-
-``verify_model.py`` calls exactly two entry points here:
-
-    render_report(ctx, features, results) -> str   (the human report)
-    build_manifest(args, ctx, features, results) -> dict   (json.dumps-able)
-
-Both must be robust to a partially-built ladder: any gate may be absent or carry
-an empty ``data``. Every section renders what is present and never raises — an
-unknown gate degrades to its one-line summary.
-"""
+"""Standardized markdown report + reproducibility manifest. Every section renders what is present and never raises, so a partially-built ladder still produces output."""
 
 from __future__ import annotations
 
@@ -221,8 +211,7 @@ def _masking_sample(results: list[GateResult]) -> list[str]:
     g4 = _by_id(results).get("G4")
     if not (g4 and isinstance(g4.data, dict)):
         return []
-    # Prefer the gate's own pre-rendered string (correct by construction); fall
-    # back to reconstructing from the structured spans.
+    # prefer the gate's pre-rendered string; else reconstruct from structured spans
     render = g4.data.get("render")
     out = ["## Masking sample", "(trained spans in **bold**)"]
     if isinstance(render, str) and render:
@@ -334,8 +323,7 @@ def _reliability(results: list[GateResult]) -> list[str]:
 # build_manifest
 # --------------------------------------------------------------------------- #
 def _import_under_repo_src(repo_root: Path, import_path: str) -> bool:
-    # Structural containment, not a substring test: `/work/src-old/...` must NOT
-    # count as under `/work/src`. Kept local so report.py stays self-contained.
+    # structural containment, not substring: `/work/src-old` must not match `/work/src`
     if not import_path:
         return False
     try:
@@ -358,8 +346,7 @@ def build_manifest(args, ctx, features, results: list[GateResult]) -> dict[str, 
         "output_dir": str(ctx.output_dir),
         "versions": _versions(ctx),
         "axolotl_git_sha": _git_sha(ctx.repo_root),
-        # which axolotl the run gates actually imported, and whether it matches the
-        # repo_root the static gates + SHA describe (else the run mixed two trees).
+        # which axolotl the run gates imported, and whether it matches repo_root
         "axolotl_import_path": import_path,
         "repo_import_match": _import_under_repo_src(ctx.repo_root, import_path),
         "emitted_test": _emitted_test(results),

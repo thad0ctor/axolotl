@@ -1,22 +1,4 @@
-"""G6 — loss sanity: does a short real train produce finite, non-diverging loss?
-
-G6 drives the REAL ``axolotl.train`` entry point (via ``harness.runner``) for a
-handful of training steps on the tiny CI fixture, for a small set of variants
-(baseline = no kernels; on a non-smoke profile add a liger variant when the arch
-has native liger support). It then reads the per-step ``loss_history`` and asserts
-two things a "did it train at all" check misses:
-
-    * every logged loss is FINITE — a single NaN/inf is a hard FINDINGS.
-    * loss does not BLOW UP — the final-window mean must stay at-or-below the
-      initial-window mean times ``loss_blowup_ratio`` (default 1.5). Tiny
-      randomly-pretrained models are noisy over ~12 steps, so a brittle strict
-      ``final <= initial * 0.95`` is reported as an informational note, not the
-      gate verdict (documented weakening, see ``run``).
-
-Each variant trains in a FRESH subprocess (``-m harness.gates.g6_loss --worker``)
-so liger/CCE monkeypatches — which are installed process-wide and never undone —
-cannot leak from one variant into the next. The worker is shared with G7.
-"""
+"""G6 — loss sanity: drive the real ``axolotl.train`` for a few steps and assert every logged loss is FINITE and the final-window mean stays at-or-below the initial-window mean × ``loss_blowup_ratio``. Each variant trains in a FRESH subprocess so process-wide liger/CCE monkeypatches can't leak between variants (worker shared with G7)."""
 
 from __future__ import annotations
 
@@ -37,7 +19,6 @@ _LIGER_PLUGIN = "axolotl.integrations.liger.LigerPlugin"
 
 
 def applies(ctx: GateContext) -> bool:
-    # A short train runs on CPU too (slow); run() degrades if even that is infeasible.
     return True
 
 
@@ -56,9 +37,7 @@ def _liger_native_types() -> set[str]:
 
 
 def _variants(ctx: GateContext) -> list[tuple[str, dict[str, Any]]]:
-    """(name, extra-flags) per variant. Baseline always; a liger CE variant on a
-    non-smoke profile when the model has native liger support and a GPU (the
-    triton kernels need CUDA)."""
+    """(name, extra-flags) per variant: baseline always; a liger CE variant on non-smoke + native-liger + GPU."""
     variants: list[tuple[str, dict[str, Any]]] = [("baseline", {})]
     if ctx.profile != "smoke" and ctx.gpu_available:
         if ctx.model_config_type in _liger_native_types():
@@ -86,8 +65,7 @@ def _build_cfg(
             "logging_steps": 1,
             "save_strategy": "no",
             "use_tensorboard": True,
-            # eager keeps the run CPU-runnable and isolates kernel deltas to the
-            # CE/RMS path (liger CE does not touch attention).
+            # eager keeps the run CPU-runnable and isolates kernel deltas to the CE/RMS path
             "attn_implementation": "eager",
         }
     )
@@ -101,11 +79,7 @@ def _build_cfg(
 def _spawn_variant(
     ctx: GateContext, name: str, cfg_dict: dict[str, Any], timeout: float
 ) -> dict[str, Any]:
-    """Train one variant in a fresh interpreter; return the parsed worker result.
-
-    Isolation is the point: liger/CCE patch transformers classes globally and are
-    never reverted, so an in-process baseline-then-kernel comparison is unsound.
-    """
+    """Train one variant in a fresh interpreter; return the parsed worker result. Isolation matters: liger/CCE patch transformers classes globally and are never reverted."""
     from ..runner import write_cfg
 
     workdir = ctx.output_dir / "g6_work"
@@ -123,9 +97,8 @@ def _spawn_variant(
         str(cfg_path),
         str(out_path),
     ]
-    # The child must import `harness` (scripts dir) and `axolotl` (repo src). The
-    # orchestrator self-paths via sys.path, which a subprocess does not inherit —
-    # so propagate both on PYTHONPATH explicitly rather than relying on the caller.
+    # subprocess doesn't inherit the orchestrator's sys.path, so propagate the
+    # harness (scripts dir) and axolotl (repo src) on PYTHONPATH explicitly
     scripts_dir = Path(__file__).resolve().parents[2]
     src_dir = ctx.repo_root / "src"
     env = os.environ.copy()
@@ -160,10 +133,7 @@ _KERNEL_NS = ("liger", "cut_cross_entropy", "scattermoe", "sonicmoe")
 
 
 def _engagement(model) -> dict[str, Any]:
-    """Fingerprint whether a kernel actually patched the model, so G7 can tell a
-    real numerical match from a kernel that silently no-op'd (the same Δ=0). Looks
-    at the top model's forward (CE/CCE patch the forward fn) and submodule class
-    namespaces (rms_norm/swiglu swap module classes)."""
+    """Fingerprint whether a kernel actually patched the model, so G7 can tell a real match from a silent no-op (same Δ=0). Inspects the model forward and submodule class namespaces."""
     fwd_module = ""
     try:
         fwd = type(model).forward
@@ -178,9 +148,8 @@ def _engagement(model) -> dict[str, Any]:
                 namespaces.add(mod)
     except Exception:  # noqa: BLE001
         pass
-    # liger_cross_entropy patches loss symbols at MODULE scope (a transient
-    # LigerCrossEntropyLoss never appears on model.modules()), so also inspect the
-    # modeling module's loss symbols + the model's loss_function attribute.
+    # liger_cross_entropy patches loss symbols at module scope (never on
+    # model.modules()), so also inspect the modeling module + loss_function attr
     try:
         import importlib
 
@@ -242,8 +211,7 @@ def _window(n: int) -> int:
 
 
 def _tb_note(ctx: GateContext, output_dir: str, ratio: float) -> str:
-    """Best-effort reuse of the e2e tensorboard checker for an extra learning
-    signal; never the gate verdict (its strict ratio is brittle on tiny models)."""
+    """Best-effort reuse of the e2e tensorboard checker; never the gate verdict (its strict ratio is brittle on tiny models)."""
     try:
         if str(ctx.repo_root) not in sys.path:
             sys.path.insert(0, str(ctx.repo_root))
@@ -279,8 +247,8 @@ def run(ctx: GateContext) -> GateResult:
         cfg = _build_cfg(ctx, name, extra, max_steps)
         res = _spawn_variant(ctx, name, cfg, timeout)
         if not res.get("ok"):
-            # An applicable variant that cannot train is unverified, not benign:
-            # count it so the gate can't report PASS on a broken kernel path.
+            # an applicable variant that can't train is unverified: count it so a
+            # broken kernel path can't report PASS
             findings += 1
             details.append(f"❌ {name}: could not train — {res.get('error')}")
             rows.append({"variant": name, "ran": False, "error": res.get("error")})

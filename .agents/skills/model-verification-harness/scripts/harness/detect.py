@@ -1,18 +1,4 @@
-"""Derive a model's :class:`ModelFeatures` from its HF config + axolotl registries.
-
-``model_config_type`` is axolotl's routing key; every gate keys off it. axolotl
-sets it verbatim from the HF ``config.model_type`` with no normalization
-(``src/axolotl/utils/config/__init__.py``: ``cfg.model_config_type =
-model_config.model_type``), so this module does the same and resolves each
-architecture flag against the *live* registry that drives the corresponding
-runtime behaviour.
-
-Detection never hard-fails on one missing signal: if a registry/import is
-unavailable, that single field degrades to its safe default and a note is
-appended to ``extra["detect_warnings"]`` (mirrors the liger audit's reliability
-warnings). Only an unresolvable config raises -- the orchestrator maps that to
-exit 2.
-"""
+"""Derive ModelFeatures from a model's HF config + axolotl registries; an unavailable registry degrades one field to its default rather than failing (only an unresolvable config raises)."""
 
 from __future__ import annotations
 
@@ -29,7 +15,7 @@ VALIDATION_REL = Path("src/axolotl/utils/schemas/validation.py")
 MODEL_LOADER_REL = Path("src/axolotl/loaders/model.py")
 
 _EXPERT_COUNT_KEYS = ("num_experts", "num_local_experts", "num_experts_per_tok")
-# Used only if the static set in validation.py can't be read (see _ssm_hybrid_types).
+# fallback if validation.py can't be read (see _ssm_hybrid_types)
 _SSM_HYBRID_FALLBACK = {"nemotron_h", "falcon_h1", "granitemoehybrid"}
 
 
@@ -43,13 +29,12 @@ def _load_config_dict(
     local_cfg = local / "config.json"
     if local.is_dir() and local_cfg.is_file():
         return json.loads(local_cfg.read_text(encoding="utf-8"))
-    if local.is_file() and local.name == "config.json":  # base_model is a config.json
+    if local.is_file() and local.name == "config.json":
         return json.loads(local.read_text(encoding="utf-8"))
 
     from transformers import AutoConfig
 
-    # base_model is user input: only execute remote model code behind an explicit
-    # opt-in. Without it, let any load error propagate (orchestrator maps to exit 2).
+    # only execute remote model code behind an explicit opt-in
     config = AutoConfig.from_pretrained(base_model, trust_remote_code=trust_remote_code)
     return config.to_dict()
 
@@ -70,9 +55,7 @@ def _str_constants(node: ast.expr) -> list[str]:
 
 
 def _type_dispatch_constants(tree: ast.AST, attrs: set[str]) -> set[str]:
-    # Collect string literals positionally compared (== / in) against a model-type
-    # attribute. Eq/In only (not NotIn) so an early-return guard like
-    # `if model_config_type not in (...)` doesn't invert into "every other type".
+    # Eq/In only (not NotIn): a `not in (...)` guard must not invert into every other type
     out: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Compare):
@@ -92,14 +75,12 @@ def _patch_dispatch_types(repo_root: Path, warnings: list[str]) -> set[str] | No
     except (OSError, UnicodeError, SyntaxError) as exc:
         warnings.append(f"patch_manager.py unreadable ({exc.__class__.__name__})")
         return None
-    # Branches key off either cfg.model_config_type or model_config.model_type;
-    # both hold the same (un-normalized) HF type, so collect from both attrs.
+    # both attrs hold the same un-normalized HF type
     return _type_dispatch_constants(tree, {"model_config_type", "model_type"})
 
 
 def _ssm_hybrid_types(repo_root: Path, warnings: list[str]) -> set[str]:
-    # The real set is a function-local in validation.py, so it can't be imported;
-    # read it statically and fall back to a pinned copy if the shape drifts.
+    # the real set is a function-local in validation.py, so read it statically
     path = repo_root / VALIDATION_REL
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -124,8 +105,7 @@ def _ssm_hybrid_types(repo_root: Path, warnings: list[str]) -> set[str]:
 
 
 def _check_model_requirement_types(repo_root: Path) -> set[str]:
-    # Types whose _check_model_requirements branch gates on a dep (lfm2 family:
-    # causal-conv1d must be ABSENT). Best-effort; empty set on any read failure.
+    # types whose _check_model_requirements branch gates on a dep (lfm2: causal-conv1d must be absent)
     path = repo_root / MODEL_LOADER_REL
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -178,7 +158,7 @@ def _embed_layers(model_config_type: str, warnings: list[str]) -> list[str]:
 
 
 def _expert_count(config: dict[str, Any]) -> int | None:
-    # VLM wrappers nest the backbone under text_config; check both levels.
+    # VLM wrappers nest the backbone under text_config; check both levels
     for scope in (config, config.get("text_config") or {}):
         if not isinstance(scope, dict):
             continue
@@ -199,15 +179,14 @@ def detect_model(
     architectures = list(config.get("architectures") or [])
     extra: dict[str, Any] = {}
 
-    # MoE: registry membership OR a positive expert-count signal in the config.
+    # MoE: registry membership OR a positive expert-count signal
     moe_block = _moe_arch_block(warnings)
     expert_count = _expert_count(config)
     is_moe = model_config_type in moe_block or expert_count is not None
     if expert_count is not None:
         extra["num_experts"] = expert_count
 
-    # Multimodal: routed as image-text-to-text, the pixtral name heuristic, or a
-    # nested vision sub-config (axolotl utils/config sets is_multimodal the same way).
+    # multimodal: image-text-to-text routing, pixtral name heuristic, or nested vision config
     mm_types = _multimodal_types(warnings)
     is_multimodal = (
         model_config_type in mm_types
@@ -225,7 +204,7 @@ def detect_model(
     )
 
     if model_config_type in _check_model_requirement_types(repo_root):
-        # lfm2 family: _check_model_requirements raises if causal-conv1d IS present.
+        # lfm2: _check_model_requirements raises if causal-conv1d IS present
         extra["causal_conv1d_conflict"] = True
 
     if warnings:

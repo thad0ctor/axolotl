@@ -1,17 +1,4 @@
-"""G1 — config-resolution compat matrix.
-
-G1 drives the REAL ``axolotl.cli.config.load_cfg`` pipeline (plugins ->
-gpu_capabilities -> validate_config -> normalize_config) over a small set of
-*maximal-compatible* composites and a couple of oracle probes, then assigns each
-matrix cell a four-way :class:`Verdict`. It is resolution-only: no GPU, no model
-load beyond ``config.json``, no training — so the full set is cheap.
-
-The validator oracle is partial: many bad combos warn or silently no-op instead
-of raising. WARNED_NO_OP is the silent-shadowing class (same failure mode as the
-liger-0.8.0 bug) and is the high-value signal, so warnings are captured on BOTH
-channels — Python ``warnings`` and the ``axolotl`` logging tree — and surfaced as
-FINDINGS, never a green check.
-"""
+"""G1 — config-resolution compat matrix: drive the real ``load_cfg`` pipeline over a set of composites and assign each a four-way :class:`Verdict`. WARNED_NO_OP (accepted but silently no-ops) is the high-value signal, surfaced as FINDINGS, never a green check."""
 
 from __future__ import annotations
 
@@ -28,8 +15,7 @@ from .. import GateContext, GateResult, GateStatus, Verdict
 GATE_ID = "G1"
 GATE_NAME = "config"
 
-# Cross-entropy group: exactly one may be enabled (validation.py
-# check_cross_entropy_conflicts). Drives one composite per option.
+# cross-entropy group: exactly one may be enabled (check_cross_entropy_conflicts)
 _CE_OPTIONS = (
     "none",
     "liger_cross_entropy",
@@ -42,9 +28,8 @@ _LIGER_PLUGIN = "axolotl.integrations.liger.LigerPlugin"
 _CCE_PLUGIN = "axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin"
 _KERNELS_PLUGIN = "axolotl.integrations.kernels.KernelsPlugin"
 
-# Optional flag key -> substrings that mark a captured warning as "about" it. Used
-# to attribute a warning to a flag the cell set (so incidental warnings — FSDP1
-# deprecation, bf16 auto — don't falsely paint a cell WARNED_NO_OP).
+# flag key -> substrings marking a warning as "about" it, so incidental warnings
+# (FSDP1 deprecation, bf16 auto) don't falsely paint a cell WARNED_NO_OP
 _FLAG_WARN_TOKENS = {
     "sample_packing": ("sample_packing",),
     "batch_flattening": ("batch_flattening",),
@@ -53,20 +38,17 @@ _FLAG_WARN_TOKENS = {
     "liger_glu_activation": ("glu", "swiglu"),
     "liger_rms_norm": ("rms_norm",),
     "activation_offloading": ("activation_offloading", "offload"),
-    # NB: no bare "kernel" — it appears in unrelated triton/liger advisories and
-    # would wrongly paint a healthy MoE cell WARNED_NO_OP.
+    # no bare "kernel": it appears in unrelated triton/liger advisories
     "expert_backend": ("expert", "scattermoe", "sonicmoe"),
     "use_scattermoe": ("scattermoe",),
     "moe_grouped_backend": ("moe_grouped", "grouped"),
 }
 
-# Flag names too generic to use as warning-attribution tokens (they appear in
-# incidental advisories — bf16 auto-cast, fp16 notices). A flag here only matters
-# via an explicit _FLAG_WARN_TOKENS entry, never as a bare-name fallback.
+# flag names too generic to attribute warnings by (only matter via an explicit
+# _FLAG_WARN_TOKENS entry, never as a bare-name fallback)
 _GENERIC_FLAG_DENY = {"bf16", "fp16", "tf32", "fp8", "use_kernels", "kernel"}
 
-# Keys whose presence in the resolved cfg (but not the input) signals a known
-# canonicalization rewrite (NORMALIZED) even though the literal input key is intact.
+# keys appearing in the resolved cfg but not the input signal a NORMALIZED rewrite
 _CANONICALIZATION_WATCH = (
     "use_scattermoe",
     "use_sonicmoe",
@@ -75,7 +57,6 @@ _CANONICALIZATION_WATCH = (
 
 
 def applies(ctx: GateContext) -> bool:
-    # Config resolution is meaningful for every model; G1 always runs.
     return True
 
 
@@ -99,14 +80,7 @@ class _Outcome:
 
 @contextmanager
 def _capture():
-    """Capture warnings on both channels for one ``load_cfg`` call.
-
-    axolotl emits most advisories through ``logging`` (get_logger(__name__), all
-    children of the ``axolotl`` logger), not ``warnings.warn`` — so a logging
-    handler on the ``axolotl`` root is required in addition to catch_warnings.
-    ``warning_once`` is lru_cached process-wide; clearing it lets the same advisory
-    re-fire for each composite that triggers it.
-    """
+    """Capture warnings on both channels (Python ``warnings`` + the ``axolotl`` logger) for one ``load_cfg`` call; clear ``warning_once``'s process-wide cache so advisories re-fire per composite."""
     records: list[str] = []
 
     class _Sink(logging.Handler):
@@ -138,15 +112,12 @@ def _capture():
 
 
 class _ResetFailure(RuntimeError):
-    """Plugin-manager reset failed: the cell's isolation is compromised, so its
-    verdict can't be trusted -> route to COULD_NOT_RUN, never a normal verdict."""
+    """Plugin-manager reset failed: the cell's isolation is compromised -> COULD_NOT_RUN."""
 
 
 def _reset_plugins() -> BaseException | None:
-    # The PluginManager is a process singleton that accumulates registrations; reset
-    # it so each composite's load_cfg sees only the plugins its own YAML declares.
-    # Return the failure instead of swallowing it: a failed reset means plugin state
-    # can leak across composites and silently shadow later verdicts.
+    # the PluginManager is a process singleton; reset so each load_cfg sees only its
+    # own plugins. Return the failure: a leaked reset can silently shadow later verdicts
     try:
         from axolotl.integrations.base import PluginManager
 
@@ -184,8 +155,7 @@ def _run_cfg(
 
     reset_err = _reset_plugins()
     if reset_err is not None:
-        # don't run load_cfg on un-isolated state; surface as could-not-run so the
-        # cell never becomes a (possibly leaked-state) normal verdict.
+        # don't run load_cfg on un-isolated state; surface as could-not-run
         return None, _ResetFailure(f"{type(reset_err).__name__}: {reset_err}"), []
     resolved: dict | None = None
     exc: BaseException | None = None
@@ -203,7 +173,7 @@ def _relevant_warnings(flags: dict[str, Any], records: list[str]) -> list[str]:
         if key in _FLAG_WARN_TOKENS:
             tokens.extend(_FLAG_WARN_TOKENS[key])
         elif key not in _GENERIC_FLAG_DENY and key != "plugins":
-            tokens.append(key)  # specific flag name as its own token
+            tokens.append(key)
     out = []
     for msg in records:
         low = msg.lower()
@@ -219,7 +189,7 @@ def _normalized_changes(flags: dict[str, Any], resolved: dict) -> dict[str, Any]
             continue
         if key in resolved and resolved[key] != val:
             changes[key] = {"in": val, "out": resolved[key]}
-    # canonicalizations that add a derived key rather than rewriting the input one
+    # canonicalizations that add a derived key rather than rewriting the input
     for key in _CANONICALIZATION_WATCH:
         if key not in flags and key in resolved:
             changes[key] = {"in": None, "out": resolved[key]}
@@ -282,12 +252,10 @@ def _classify(
 
 
 def _composites(ctx: GateContext) -> list[_Cell]:
-    """One maximal-compatible composite per cross-entropy option, spreading the
-    optional flags so each is exercised >=1 across the set, then oracle probes."""
+    """One maximal-compatible composite per cross-entropy option, then oracle probes."""
     is_moe = ctx.features.is_moe
     cells: list[_Cell] = []
 
-    # C0 / none: sample_packing (SUPPORTED on a multipack model) + gc + offloading.
     cells.append(
         _Cell(
             "c0_none_packing",
@@ -302,7 +270,6 @@ def _composites(ctx: GateContext) -> list[_Cell]:
         )
     )
 
-    # C1 / liger_cross_entropy: batch_flattening (varlen + not sample_packing) + glu/rms.
     cells.append(
         _Cell(
             "c1_liger_ce_batchflatten",
@@ -319,7 +286,6 @@ def _composites(ctx: GateContext) -> list[_Cell]:
         )
     )
 
-    # C2 / FLCE: token_scaling (requires FLCE) + scaling_softmax (requires flex).
     cells.append(
         _Cell(
             "c2_flce_flex_softmax",
@@ -335,7 +301,6 @@ def _composites(ctx: GateContext) -> list[_Cell]:
         )
     )
 
-    # C3 / cut_cross_entropy: requires bf16/fp16 + the CCE plugin.
     cells.append(
         _Cell(
             "c3_cce_bf16",
@@ -351,11 +316,8 @@ def _composites(ctx: GateContext) -> list[_Cell]:
         )
     )
 
-    # C4 / chunked: sample_packing on a non-varlen backend. This is a deliberate
-    # oracle probe for the WARNED_NO_OP channel (expect="warn"), NOT a model
-    # property — its firing is EXPECTED and must not count as a model finding
-    # (mirrors p_dual_ce for the REJECTED channel). chunked_cross_entropy keeps
-    # this cell in its own CE slot so every CE option is still exercised once.
+    # deliberate oracle probe for the WARNED_NO_OP channel (expect="warn"): its
+    # firing is EXPECTED and must not count as a model finding (cf. p_dual_ce)
     cells.append(
         _Cell(
             "c4_chunked_packing_sdpa",
@@ -370,7 +332,7 @@ def _composites(ctx: GateContext) -> list[_Cell]:
     )
 
     if is_moe:
-        # expert_backend canonicalizes onto use_scattermoe -> NORMALIZED probe.
+        # expert_backend canonicalizes onto use_scattermoe -> NORMALIZED probe
         cells.append(
             _Cell(
                 "c5_moe_expert_backend",
@@ -388,7 +350,7 @@ def _composites(ctx: GateContext) -> list[_Cell]:
     if ctx.profile == "multigpu":
         cells.extend(_multigpu_composites(ctx))
 
-    # Oracle probes (expected rejects) — confirm the partial oracle still fires.
+    # oracle probe (expected reject): confirm the partial oracle still fires
     cells.append(
         _Cell(
             "p_dual_ce",
@@ -417,7 +379,6 @@ def _multigpu_composites(ctx: GateContext) -> list[_Cell]:
             "resolve",
             "multigpu: FSDP2 resolves",
         ),
-        # liger_rms_norm + tensor parallelism is rejected by the liger args.
         _Cell(
             "mg_liger_rmsnorm_tp",
             {
@@ -437,8 +398,7 @@ def _multigpu_composites(ctx: GateContext) -> list[_Cell]:
 
 
 def _bisect(ctx: GateContext, cell: _Cell) -> list[str]:
-    """ddmin over the cell's optional flags: smallest subset whose load_cfg still
-    rejects. Used on an UNEXPECTED reject to name the culprit flag set."""
+    """ddmin over the cell's optional flags: smallest subset whose load_cfg still rejects."""
     items = [(k, v) for k, v in cell.flags.items() if k != "plugins"]
     plugins = cell.flags.get("plugins")
 
@@ -485,8 +445,8 @@ def run(ctx: GateContext) -> GateResult:
     could_not_run = 0
     for cell in cells:
         resolved, exc, records = _run_cfg(ctx, cell.flags, cell.composite_id)
-        # A pipeline that cannot even import the model config (offline / bad id) or a
-        # failed plugin reset is an environment/isolation problem, not a config verdict.
+        # an unimportable config (offline / bad id) or a failed reset is an
+        # environment/isolation problem, not a config verdict
         if exc is not None and (
             isinstance(exc, _ResetFailure) or _is_environment_error(exc)
         ):
@@ -569,15 +529,14 @@ def _assemble(
                 unexpected_reject += 1
                 findings += 1
             elif o.verdict == Verdict.WARNED_NO_OP:
-                # a cell built to be valid that warns/no-ops is the real signal
+                # a cell built valid that warns/no-ops is the real signal
                 warned += 1
                 findings += 1
                 resolved_ok += 1
             elif o.verdict != Verdict.REJECTED:
                 resolved_ok += 1
         elif cell.expect == "warn":
-            # oracle probe for the WARNED_NO_OP channel: firing is expected (not a
-            # finding); resolving clean means the warn path silently stopped working.
+            # oracle probe: firing is expected; resolving clean means the warn path regressed
             total_resolvable += 1
             if o.verdict == Verdict.WARNED_NO_OP:
                 resolved_ok += 1
@@ -592,7 +551,7 @@ def _assemble(
                 )
         else:  # expect reject
             if o.verdict != Verdict.REJECTED:
-                # the oracle did NOT fire on a combo we built to be invalid
+                # the oracle did NOT fire on a combo built to be invalid
                 findings += 1
                 details.append(
                     f"  !! {cell.composite_id} was built invalid but RESOLVED "

@@ -1,40 +1,4 @@
-"""G7 — cross-variant numerical consistency (the flagship gate).
-
-Kernels (liger CE / liger RMSNorm / cut-cross-entropy / fused attention) are
-SPEED swaps, not MATH changes: with identical weights, data and seed, the STEP-0
-(pre-update) training loss with a kernel ON must equal the baseline step-0 loss
-within ``rtol``. A cell that exceeds tol is a silent numerical regression — the
-liger-0.8.0 *shadow* failure mode, where a kernel routes through a wrong generic
-path and "did it train" CI still goes green. G7 names the kernel and the delta.
-
-Determinism (the load-bearing part):
-
-  * Each variant trains in a FRESH subprocess (reusing G6's ``_spawn_variant`` /
-    shared worker), so the GLOBAL, never-reverted liger/CCE monkeypatches of one
-    variant cannot leak into another — the only difference between two runs is the
-    kernel under test.
-  * Every variant gets the SAME ``seed`` and the SAME dataset cfg, so axolotl
-    tokenizes identically and the seeded sampler draws the SAME first batch; the
-    weights are the loaded pretrained checkpoint (no random init — full finetune),
-    so no RNG diverges across variants.
-  * step-0 loss = first ``loss_history`` entry from a ``max_steps=1``,
-    ``logging_steps=1`` run: the loss logged after step 1 is the forward loss on
-    batch 0 computed with the initial weights, i.e. pre-update.
-
-We do NOT force ``torch.use_deterministic_algorithms`` (some ops lack a
-deterministic kernel and would raise); ``rtol`` is loose enough that
-run-to-run float noise is well inside it. bf16 variants (CCE) are compared
-against a bf16 baseline (not fp32) so the delta isolates kernel-math change from
-fp32->bf16 precision loss, and they use a wider ``rtol_bf16``.
-
-Engagement (the no-op shadow): a kernel that silently fails to patch the model
-yields the SAME Δ≈0 as a genuine numerical match, so the numeric check alone would
-pass it green. Each variant therefore also carries an engagement fingerprint (the
-worker reports the patched forward module + kernel submodule namespaces); a variant
-expected to engage that leaves no fingerprint is flagged NOT ENGAGED regardless of
-its loss. Engagement isn't fingerprintable for every kernel (e.g. the fused-attn
-hijack) — those report "engage-unknown" and rely on the numeric check.
-"""
+"""G7 — cross-variant numerical consistency: with identical weights/data/seed, a kernel's STEP-0 loss must equal the baseline within ``rtol``, else it silently changed the math. Each variant runs in a fresh subprocess (isolating global monkeypatches) and carries an engagement fingerprint so a kernel that silently no-op'd (same Δ≈0) is flagged NOT ENGAGED rather than passing green. bf16 variants are compared against a bf16 baseline so precision loss isn't conflated with kernel math."""
 
 from __future__ import annotations
 
@@ -51,8 +15,7 @@ _CCE_PLUGIN = "axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin"
 
 
 def applies(ctx: GateContext) -> bool:
-    # A single forward (step-0 loss) is cheap; the kernel comparison needs a GPU
-    # (triton), handled in run() by degrading to SKIPPED when no kernel applies.
+    # always applies; run() degrades to SKIPPED when no kernel variant is applicable
     return True
 
 
@@ -89,9 +52,7 @@ def _fused_attn_types() -> set[str]:
 
 
 def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]:
-    """Return (variants, skip-notes). A variant is included only when the registry
-    says the kernel is applicable to this model_config_type; bf16/fused variants
-    carry a looser tol flag. All kernels are triton -> require a GPU."""
+    """Return (variants, skip-notes); a variant is included only when the registry says the kernel applies to this type. All kernels are triton -> require a GPU."""
     mct = ctx.model_config_type
     variants: list[dict[str, Any]] = []
     notes: list[str] = []
@@ -107,10 +68,8 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
                 "name": "liger_cross_entropy",
                 "flags": {"plugins": [_LIGER_PLUGIN], "liger_cross_entropy": True},
                 "bf16": False,
-                # CE is swapped at module scope (transient LigerCrossEntropyLoss),
-                # not on the model instance, so engagement isn't reliably
-                # fingerprintable across transformers versions -> engage-unknown,
-                # rely on the numeric check rather than risk a false NOT-ENGAGED.
+                # CE is swapped at module scope, not on the model instance, so it
+                # isn't reliably fingerprintable -> engage-unknown, rely on the numeric check
                 "markers": (),
             }
         )
@@ -167,10 +126,7 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
 
 
 def _engaged(res: dict[str, Any], markers: tuple[str, ...]) -> bool | None:
-    """True/False when the kernel's engagement is fingerprintable (markers present
-    in the worker fingerprint), None when it can't be fingerprinted. A variant that
-    is expected to engage but doesn't (False) is a no-op shadow: same Δ=0 as a
-    genuine match, so the numeric check alone would pass it green."""
+    """True/False when fingerprintable (markers in the worker fingerprint), None when not. False on an expected-to-engage variant is a no-op shadow (same Δ=0 as a genuine match)."""
     if not markers:
         return None
     eng = res.get("engagement") or {}
@@ -183,10 +139,9 @@ def _engaged(res: dict[str, Any], markers: tuple[str, ...]) -> bool | None:
 
 
 def _build_cfg(ctx: GateContext, name: str, flags: dict[str, Any]) -> dict[str, Any]:
-    """A 1-step cfg; flags override the eager/no-kernel baseline. Step-0 loss is
-    the first logged loss."""
+    """A 1-step cfg; flags override the eager/no-kernel baseline."""
     cfg = g6_loss._build_cfg(ctx, f"consistency_{name}", {}, max_steps=1)
-    # baseline forces eager; kernel variants may re-specify attn (e.g. fused).
+    # baseline forces eager; kernel variants may re-specify attn (e.g. fused)
     cfg.update(flags)
     return cfg
 
@@ -215,9 +170,8 @@ def run(ctx: GateContext) -> GateResult:
     for note in skip_notes:
         details.append(f"· {note}")
 
-    # No applicable kernel variant (e.g. no GPU -> all triton variants dropped):
-    # skip BEFORE spawning any baseline train, else the GPU-only gate wastes a
-    # subprocess and a failed baseline could turn "no GPU" into could_not_run.
+    # skip BEFORE spawning any baseline, else a failed baseline could turn "no GPU"
+    # into could_not_run
     if not variants:
         return GateResult(
             GATE_ID,
@@ -228,8 +182,7 @@ def run(ctx: GateContext) -> GateResult:
             data={"baseline_step0": None, "variants": rows, "skipped": skip_notes},
         )
 
-    # A bf16 variant must be compared to a bf16 baseline, else fp32->bf16 precision
-    # loss is conflated with kernel-math change. Build one baseline per dtype used.
+    # one baseline per dtype: a bf16 variant must compare to a bf16 baseline
     def _baseline(dtype: str):
         flags = {"bf16": True} if dtype == "bf16" else {}
         cfg = _build_cfg(ctx, f"baseline_{dtype}", flags)
@@ -259,9 +212,8 @@ def run(ctx: GateContext) -> GateResult:
         tol = rtol_bf16 if v["bf16"] else rtol
         base_loss = baselines.get(dtype)
         if base_loss is None:
-            # Never compare a bf16 variant to an fp32 baseline — that conflates
-            # precision with kernel math. An applicable variant we cannot compare
-            # is an unverified coverage gap, so fail rather than silently skip.
+            # an applicable variant we can't compare apples-to-apples is an
+            # unverified gap, so fail rather than silently skip
             findings += 1
             details.append(
                 f"❌ {name}: no {dtype} baseline available — failed "
@@ -285,9 +237,8 @@ def run(ctx: GateContext) -> GateResult:
             rows.append({"variant": name, "step0": None, "error": res.get("error")})
             continue
 
-        # ENGAGEMENT first: a kernel that silently no-op'd yields the SAME Δ≈0 as a
-        # genuine match, so the numeric check alone would pass it green. This is the
-        # shadow class the gate exists to catch.
+        # engagement first: a silent no-op yields the same Δ≈0 as a genuine match,
+        # which is the shadow class this gate exists to catch
         engaged = _engaged(res, v["markers"])
         if engaged is False:
             findings += 1
