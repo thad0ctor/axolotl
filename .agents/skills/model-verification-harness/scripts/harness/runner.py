@@ -147,18 +147,36 @@ def preprocess_to_disk(cfg) -> Path:
     Mirrors the CLI's ``do_cli`` setup (``AXOLOTL_IS_PREPROCESS`` env +
     ``cfg.is_preprocess = True``) so do_preprocess takes the same path a user's
     ``axolotl preprocess`` would — otherwise the artifact gate can false-pass.
+
+    Both flags are scoped to the do_preprocess call and RESTORED afterwards:
+    leaving them set would (a) leak preprocess mode into later gates (G4-G7, whose
+    subprocesses copy the env) and (b) make a subsequent ``prepare(cfg)`` skip
+    loading the saved artifact from disk (``is_preprocess`` truthy bypasses the
+    prepared-dataset load), so the "load it back" check would silently reprocess.
     """
     import os
 
     from axolotl.cli.args import PreprocessCliArgs
     from axolotl.cli.preprocess import do_preprocess
 
+    prev_env = os.environ.get("AXOLOTL_IS_PREPROCESS")
+    prev_flag = getattr(cfg, "is_preprocess", None)
     os.environ["AXOLOTL_IS_PREPROCESS"] = "1"
     try:
         cfg.is_preprocess = True
     except Exception:  # noqa: BLE001 - DictDefault accepts attr set; be defensive
         pass
-    do_preprocess(cfg, PreprocessCliArgs())
+    try:
+        do_preprocess(cfg, PreprocessCliArgs())
+    finally:
+        if prev_env is None:
+            os.environ.pop("AXOLOTL_IS_PREPROCESS", None)
+        else:
+            os.environ["AXOLOTL_IS_PREPROCESS"] = prev_env
+        try:
+            cfg.is_preprocess = prev_flag
+        except Exception:  # noqa: BLE001
+            pass
     return Path(cfg.dataset_prepared_path)
 
 
