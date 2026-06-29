@@ -68,7 +68,12 @@ def _apply_compile_boundaries() -> None:
     from . import arch_wiring
     from ._vendor.sparselora import api
     from ._vendor.sparselora.modules import llama, predictors
+    from .fast_tokens import install_fast_tokens
     from .sparse_linear_4bit import SparseLinear4bit
+
+    # Install the contiguous-block token split/join before wrapping the mask
+    # builder, so the torch.compiler.disable below wraps the fast version.
+    install_fast_tokens()
 
     disable = torch.compiler.disable
     llama.SparseLlamaMLP.forward = disable(llama.SparseLlamaMLP.forward)  # type: ignore[method-assign]
