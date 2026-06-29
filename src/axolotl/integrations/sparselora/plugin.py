@@ -81,6 +81,16 @@ def _apply_compile_boundaries() -> None:
     # Generic attention has its own forward; the MLP/linear paths inherit the
     # (already-disabled) vendored functions, so only the override needs marking.
     arch_wiring.SparseAttention.forward = disable(arch_wiring.SparseAttention.forward)  # type: ignore[method-assign]
+    # Phi3 fused attention overrides forward indirectly via _qkv (data-dependent
+    # combined-index slicing); the fused MLP overrides the (already-disabled)
+    # SwiGLU _block. Disable their forwards explicitly so Dynamo graph-breaks
+    # around the contextual-sparsity selection in both.
+    arch_wiring.SparseFusedQKVAttention.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseFusedQKVAttention.forward
+    )
+    arch_wiring.SparseFusedGateUpMLP.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseFusedGateUpMLP.forward
+    )
     arch_wiring.SparseLinearBias.forward = disable(arch_wiring.SparseLinearBias.forward)  # type: ignore[method-assign]
     api._compute_output_token_mask = disable(api._compute_output_token_mask)
     for cls in (
@@ -173,9 +183,10 @@ class SparseLoRAPlugin(BasePlugin):
             )
 
         # The vendored MLP sparse path passes indices as a kwarg that only a
-        # plain SparseLinear accepts; a LoRA-wrapped MLP projection (gate/up/down)
-        # collides with the patched lora_forward. z-lab's recipe is attention-only.
-        mlp_proj_names = {"gate_proj", "up_proj", "down_proj"}
+        # plain SparseLinear accepts; a LoRA-wrapped MLP projection (gate/up/down,
+        # or the fused gate_up_proj) collides with the patched lora_forward.
+        # z-lab's recipe is attention-only.
+        mlp_proj_names = {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
         mlp_lora = [
             name
             for name, module in model.named_modules()
@@ -192,14 +203,16 @@ class SparseLoRAPlugin(BasePlugin):
         # The vendored predictor buffers are sized with the configured rank, so a
         # projection smaller than predictor_rank fails at load_state_dict after
         # calibration has already run. Fail early with the offending projection.
-        from .factors import linear_weight, projections_for
+        # output_sparse_weights slices fused qkv_proj/gate_up_proj into their
+        # logical sub-blocks, so the check sees the real per-sub-block dims.
+        from .factors import output_sparse_weights
 
         rank = cfg.sparselora.predictor_rank
         too_small = [
-            f"{name}.{proj} (min dim {min(linear_weight(getattr(modules[name], proj)).shape)})"
+            f"{name}.{proj} (min dim {min(weight.shape)})"
             for name in target_names
-            for proj in projections_for(modules[name])
-            if min(linear_weight(getattr(modules[name], proj)).shape) < rank
+            for proj, weight in output_sparse_weights(modules[name]).items()
+            if min(weight.shape) < rank
         ]
         if too_small:
             raise ValueError(

@@ -15,9 +15,17 @@ Two observations make this possible:
   :class:`SparseAttention` handles all three from attributes copied off the base
   module, falling back to Llama semantics when they are absent.
 
-Nothing here edits vendored code: the bias-aware linear and generic attention
-subclass the vendored classes, and registration goes through the public
-``register_sparse_module`` extension point.
+Phi3 fuses q/k/v into one ``qkv_proj`` and gate/up into one ``gate_up_proj``.
+:class:`SparseFusedQKVAttention` / :class:`SparseFusedGateUpMLP` slice the fused
+weight into its q/k/v (or gate/up) sub-blocks and project them in one call with a
+combined index, selecting exactly the channels the separate-projection path
+would — so they subclass the generic modules and reuse the same predictors.
+
+The sparse modules here subclass the vendored classes and register through the
+public ``register_sparse_module`` extension point. (The one vendored change the
+fused path needs — teaching ``get_sparsity_mode`` that ``qkv_proj``/
+``gate_up_proj`` are output-sparse — lives in ``_vendor`` and is documented in
+``_vendor/PROVENANCE.md``.)
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ from ._vendor.sparselora.modules.predictors import (
     FFNPredictor,
     GQAAttentionPredictor,
 )
+from .factors import fused_qkv_sizes
 
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction
@@ -69,12 +78,30 @@ def is_standard_attention(module: nn.Module) -> bool:
     return all(hasattr(module, proj) for proj in _ATTN_PROJECTIONS)
 
 
+def is_fused_gate_up_mlp(module: nn.Module) -> bool:
+    """Phi3-style fused MLP: a single ``gate_up_proj`` Linear plus ``down_proj``
+    (rather than separate ``gate_proj``/``up_proj``)."""
+    return hasattr(module, "gate_up_proj") and hasattr(module, "down_proj")
+
+
+def is_fused_qkv_attention(module: nn.Module) -> bool:
+    """Phi3-style fused attention: a single ``qkv_proj`` Linear plus ``o_proj``
+    (rather than separate ``q_proj``/``k_proj``/``v_proj``)."""
+    return hasattr(module, "qkv_proj") and hasattr(module, "o_proj")
+
+
 def has_partial_rotary(module: nn.Module) -> bool:
     """True if the attention rotates only part of the head dim (StableLM/Phi/
     GPT-NeoX style). The generic sparse attention applies RoPE to the full head
     dim, so partial-rotary models can't be reproduced and are refused."""
     config = getattr(module, "config", None)
     return config is not None and getattr(config, "partial_rotary_factor", 1.0) < 1.0
+
+
+def gate_activation(module: nn.Module):
+    """The MLP's gate activation, under either the ``act_fn`` (Llama/Qwen/Gemma)
+    or ``activation_fn`` (Phi3) attribute name. None if neither is present."""
+    return getattr(module, "act_fn", None) or getattr(module, "activation_fn", None)
 
 
 def gate_kind(module: nn.Module) -> Optional[str]:
@@ -85,7 +112,7 @@ def gate_kind(module: nn.Module) -> Optional[str]:
     vs ``nn.SiLU``, ``GELUTanh`` vs ``PytorchGELUTanh``), so probe numerically.
     Returns None for any other (unsupported) gate.
     """
-    act = getattr(module, "act_fn", None)
+    act = gate_activation(module)
     if act is None:
         return None
     try:
@@ -188,15 +215,13 @@ class _GELUFFNPredictor(FFNPredictor):
         return scores.topk(k).indices.flatten()
 
 
-def _create_mlp_predictor(base: nn.Module, rank: int, layer_name: str, cfg, kind: str):
-    """Like the vendored ``create_mlp_predictor`` but picks the predictor class by
-    gate activation (SiLU vs gelu_tanh)."""
-    from ._vendor.sparselora.modules import svd
+def _build_mlp_predictor(tensors: dict, p: str, rank: int, device, kind: str):
+    """Assemble an FFN predictor from the ``gate_proj``/``up_proj`` factor tensors.
 
-    device = base.gate_proj.weight.device
-    dtype = svd._float_dtype(base.gate_proj.weight)
-    tensors = svd._load_tensors(cfg, device, dtype)
-    p = layer_name
+    Shared by the separate (``gate_proj``/``up_proj``) and fused (sliced
+    ``gate_up_proj``) paths — both write the same factor keys, so the predictor
+    is identical; only where ``device``/``dtype`` come from differs.
+    """
     w1 = torch.stack([tensors[f"{p}.gate_proj.w1"], tensors[f"{p}.up_proj.w1"]])
     w2 = torch.stack([tensors[f"{p}.gate_proj.w2"], tensors[f"{p}.up_proj.w2"]])
 
@@ -205,6 +230,33 @@ def _create_mlp_predictor(base: nn.Module, rank: int, layer_name: str, cfg, kind
     pred.load_state_dict({"w1": w1, "w2": w2})
     pred.eval()
     return pred.to(device=device, dtype=torch.bfloat16)
+
+
+def _create_mlp_predictor(base: nn.Module, rank: int, layer_name: str, cfg, kind: str):
+    """Like the vendored ``create_mlp_predictor`` but picks the predictor class by
+    gate activation (SiLU vs gelu_tanh)."""
+    from ._vendor.sparselora.modules import svd
+
+    device = base.gate_proj.weight.device
+    dtype = svd._float_dtype(base.gate_proj.weight)
+    tensors = svd._load_tensors(cfg, device, dtype)
+    return _build_mlp_predictor(tensors, layer_name, rank, device, kind)
+
+
+def _create_fused_mlp_predictor(
+    base: nn.Module, rank: int, layer_name: str, cfg, kind: str
+):
+    """MLP predictor for a fused ``gate_up_proj`` MLP (Phi3).
+
+    The factor tensors already carry separate ``gate_proj``/``up_proj`` keys
+    (``factors.compute_factor_tensors`` slices the fused weight), so only the
+    ``device``/``dtype`` source — the fused projection's weight — changes.
+    """
+    from ._vendor.sparselora.modules import svd
+
+    weight = base.gate_up_proj.weight
+    tensors = svd._load_tensors(cfg, weight.device, svd._float_dtype(weight))
+    return _build_mlp_predictor(tensors, layer_name, rank, weight.device, kind)
 
 
 class SparseSwiGLUMLP(SparseLlamaMLP):
@@ -239,12 +291,65 @@ class SparseSwiGLUMLP(SparseLlamaMLP):
                 base, cfg.predictor_rank, name, cfg, self._gate_kind
             )
 
+    def _gate_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """Gated activation ``act(gate) * up`` using the matching kernel/path."""
+        if self._gate_kind == "silu" and _silu_mul is not None:
+            return _silu_mul(gate, up)
+        return self.act_fn(gate) * up
+
     def _block(self, x: torch.Tensor, **kw: Any) -> torch.Tensor:
         gate, up = self.gate_proj(x, **kw), self.up_proj(x, **kw)
-        if self._gate_kind == "silu" and _silu_mul is not None:
-            gated = _silu_mul(gate, up)
+        return self.down_proj(self._gate_mul(gate, up), **kw)
+
+
+class SparseFusedGateUpMLP(SparseSwiGLUMLP):
+    """Sparse SwiGLU MLP for a fused ``gate_up_proj`` (Phi3).
+
+    Phi3 fuses gate and up into one Linear whose output rows are ``[gate | up]``
+    (``up_states.chunk(2, dim=-1)``). The predictor selects intermediate channels
+    ``i``; kept channel ``i`` corresponds to row ``i`` (gate) and ``intermediate +
+    i`` (up) of ``gate_up_proj`` and column ``i`` of ``down_proj``. The sparse path
+    projects both halves in one fused call with the combined index
+    ``[i, intermediate + i]``, splits, gates, then gathers ``down_proj`` at ``i``
+    — selecting exactly the channels the separate-projection path would.
+    """
+
+    inherited_attributes = ["gate_up_proj", "down_proj"]
+
+    def __init__(
+        self, base: nn.Module, *, name: str, idx: int, sparsity: float, cfg
+    ) -> None:
+        SparseModule.__init__(self, base)
+        self.sparsity = sparsity
+        self._gate_kind = gate_kind(base)
+        if self._gate_kind is None:
+            raise ValueError(
+                f"SparseFusedGateUpMLP: unsupported gate activation on "
+                f"{type(base).__name__}; only SiLU and gelu_tanh gated MLPs are "
+                "supported."
+            )
+        self.act_fn = gate_activation(base)
+        self.intermediate_size = base.down_proj.in_features
+        if self.sparsity > 0:
+            self.pred = _create_fused_mlp_predictor(
+                base, cfg.predictor_rank, name, cfg, self._gate_kind
+            )
+
+    def _block(self, x: torch.Tensor, **kw: Any) -> torch.Tensor:
+        idx = kw.get("sparse_indices")
+        if idx is None:
+            fused = self.gate_up_proj(x)
         else:
-            gated = self.act_fn(gate) * up
+            # gate row i and up row (intermediate + i) for each kept channel i.
+            combined = torch.cat([idx, idx + self.intermediate_size])
+            fused = self.gate_up_proj(x, sparse_indices=combined)
+        # The fused output is always [gate_block | up_block] of equal halves,
+        # whether the (bare) gate_up_proj returns the selected channels (mode
+        # "out", width 2*len(idx)) or the full padded width (mode "out_scatter");
+        # split by the actual width so both paths gate correctly.
+        half = fused.shape[-1] // 2
+        gate, up = fused[..., :half], fused[..., half : 2 * half]
+        gated = self._gate_mul(gate, up)
         return self.down_proj(gated, **kw)
 
 
@@ -277,17 +382,14 @@ class _AttentionPredictorHD(AttentionPredictor):
         self.register_buffer("w2", torch.empty(3, rank, out_size))
 
 
-def _create_attn_predictor(base: nn.Module, rank: int, layer_name: str, cfg):
-    """Like the vendored ``create_attn_predictor`` but tolerant of decoupled
-    ``head_dim`` (q/k/v out dims sized from the factor tensors, not ``hidden``).
+def _build_attn_predictor(tensors: dict, p: str, rank: int, device):
+    """Assemble a (GQA-aware, decoupled-head_dim-tolerant) attention predictor
+    from the ``q/k/v_proj`` factor tensors.
+
+    Shared by the separate (q/k/v_proj) and fused (sliced qkv_proj) paths: both
+    write the same factor keys, so the predictor is identical and only the
+    ``device``/``dtype`` source differs.
     """
-    from ._vendor.sparselora.modules import svd
-
-    device = base.q_proj.base_layer.weight.device
-    dtype = svd._float_dtype(base.q_proj.base_layer.weight)
-    tensors = svd._load_tensors(cfg, device, dtype)
-
-    p = layer_name
     q = [tensors[f"{p}.q_proj.w1"], tensors[f"{p}.q_proj.w2"]]
     k = [tensors[f"{p}.k_proj.w1"], tensors[f"{p}.k_proj.w2"]]
     v = [tensors[f"{p}.v_proj.w1"], tensors[f"{p}.v_proj.w2"]]
@@ -313,6 +415,32 @@ def _create_attn_predictor(base: nn.Module, rank: int, layer_name: str, cfg):
     pred.eval()
     pred = torch.compile(pred)
     return pred.to(device=device, dtype=torch.bfloat16)
+
+
+def _create_attn_predictor(base: nn.Module, rank: int, layer_name: str, cfg):
+    """Like the vendored ``create_attn_predictor`` but tolerant of decoupled
+    ``head_dim`` (q/k/v out dims sized from the factor tensors, not ``hidden``).
+    """
+    from ._vendor.sparselora.modules import svd
+
+    weight = base.q_proj.base_layer.weight
+    tensors = svd._load_tensors(cfg, weight.device, svd._float_dtype(weight))
+    return _build_attn_predictor(tensors, layer_name, rank, weight.device)
+
+
+def _create_fused_attn_predictor(base: nn.Module, rank: int, layer_name: str, cfg):
+    """Attention predictor for a fused ``qkv_proj`` (Phi3).
+
+    The factor tensors already carry separate ``q/k/v_proj`` keys (sliced from
+    the fused weight), so only the ``device``/``dtype`` source — the fused
+    projection's (possibly LoRA-wrapped) weight — changes.
+    """
+    from ._vendor.sparselora.modules import svd
+
+    qkv = base.qkv_proj
+    weight = getattr(qkv, "base_layer", qkv).weight
+    tensors = svd._load_tensors(cfg, weight.device, svd._float_dtype(weight))
+    return _build_attn_predictor(tensors, layer_name, rank, weight.device)
 
 
 class SparseAttention(SparseLlamaAttention):
@@ -352,6 +480,23 @@ class SparseAttention(SparseLlamaAttention):
             base_mod, "eager_attention_forward", eager_attention_forward
         )
 
+    def _qkv(self, hidden_states: torch.Tensor, masks, sparse: bool):
+        """Project to flat ``(Q, K, V, v_i)``; override point for fused qkv_proj.
+
+        ``v_i`` (the selected value channels) is threaded back to ``o_proj``;
+        ``None`` on the dense path.
+        """
+        if sparse:
+            q_i, k_i, v_i = self.pred.predict(hidden_states, self.sparsity)
+            Q, K, V = self._proj_qkv(hidden_states, masks, q_i, k_i, v_i)
+            return Q, K, V, v_i
+        return (
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+            None,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -366,15 +511,7 @@ class SparseAttention(SparseLlamaAttention):
         hidden_shape = (*input_shape, -1, self.head_dim)
         sparse = self.enabled and self.sparsity > 0
 
-        if sparse:
-            q_i, k_i, v_i = self.pred.predict(hidden_states, self.sparsity)
-            Q, K, V = self._proj_qkv(hidden_states, masks, q_i, k_i, v_i)
-        else:
-            Q, K, V = (
-                self.q_proj(hidden_states),
-                self.k_proj(hidden_states),
-                self.v_proj(hidden_states),
-            )
+        Q, K, V, v_i = self._qkv(hidden_states, masks, sparse)
 
         Q = Q.view(hidden_shape)
         K = K.view(hidden_shape)
@@ -431,6 +568,85 @@ class SparseAttention(SparseLlamaAttention):
         return attn_output, attn_weights
 
 
+class SparseFusedQKVAttention(SparseAttention):
+    """Sparse attention for a fused ``qkv_proj`` (Phi3).
+
+    Phi3 fuses q/k/v into one Linear whose output is
+    ``[q (num_heads*head_dim) | k (num_kv*head_dim) | v (num_kv*head_dim)]``.
+    The predictor selects q/k/v channels independently; the fused projection runs
+    in one call with the combined index ``[q_i | q_size + k_i | q_size + kv_size +
+    v_i]``, then the result is split back into Q/K/V. This selects exactly the
+    rows of ``qkv_proj`` that the separate q/k/v_proj path would, so the rest of
+    the attention computation (RoPE, the attention interface, ``o_proj``) is
+    inherited from :class:`SparseAttention` unchanged. GQA (k/v narrower than q)
+    is handled by the predictor and the per-sub-block offsets.
+    """
+
+    inherited_attributes = [
+        "qkv_proj",
+        "o_proj",
+        "config",
+        "layer_idx",
+        "head_dim",
+        "num_key_value_groups",
+        "scaling",
+        "attention_dropout",
+        "is_causal",
+    ]
+
+    def __init__(
+        self, base: nn.Module, *, name: str, idx: int, sparsity: float = 0, cfg
+    ) -> None:
+        SparseModule.__init__(self, base)
+        config = base.config
+        prf = getattr(config, "partial_rotary_factor", 1.0)
+        self._rotary_dim = int(prf * self.head_dim) if prf < 1.0 else None
+        self.sparsity = sparsity
+        self._q_size, self._kv_size = fused_qkv_sizes(base)
+        if self.sparsity > 0:
+            self.pred = _create_fused_attn_predictor(
+                base, cfg.predictor_rank, name, cfg
+            )
+        for attr in _OPTIONAL_ATTN_ATTRS:
+            setattr(self, attr, getattr(base, attr, None))
+        # Phi3 reads sliding_window off config, not the module; mirror that.
+        if getattr(self, "sliding_window", None) is None:
+            self.sliding_window = getattr(config, "sliding_window", None)
+        import sys
+
+        base_mod = sys.modules.get(type(base).__module__)
+        self._eager_attention = getattr(
+            base_mod, "eager_attention_forward", eager_attention_forward
+        )
+
+    def _split_qkv(self, fused: torch.Tensor):
+        q, kv = self._q_size, self._kv_size
+        return (
+            fused[..., :q],
+            fused[..., q : q + kv],
+            fused[..., q + kv : q + 2 * kv],
+        )
+
+    def _qkv(self, hidden_states: torch.Tensor, masks, sparse: bool):
+        if not sparse:
+            return (*self._split_qkv(self.qkv_proj(hidden_states)), None)
+
+        q_i, k_i, v_i = self.pred.predict(hidden_states, self.sparsity)
+        combined = torch.cat(
+            [q_i, self._q_size + k_i, self._q_size + self._kv_size + v_i]
+        )
+        if masks is None:
+            fused = self.qkv_proj(hidden_states, combined)
+        else:
+            sparse_x, dense_x = self.token_splits(hidden_states, masks)
+            fused = self.token_join(
+                self.qkv_proj(sparse_x, combined),
+                self.qkv_proj(dense_x),
+                masks,
+            )
+        return (*self._split_qkv(fused), v_i)
+
+
 def unsupported_reason(module: nn.Module) -> Optional[str]:
     """Why a target module can't be sparsified safely, or ``None``.
 
@@ -438,10 +654,13 @@ def unsupported_reason(module: nn.Module) -> Optional[str]:
     (Gemma2/Gemma3) gates — both the predictor's channel selection and the gated
     compute follow the model's activation. Any other gated activation is refused
     rather than silently miscomputed. (Gemma2 attention-logit softcapping is
-    reproduced in :class:`SparseAttention`, so it is not a blocker.)
+    reproduced in :class:`SparseAttention`, so it is not a blocker.) Fused Phi3
+    MLPs (``gate_up_proj``) are checked the same way.
     """
-    if is_swiglu_mlp(module) and gate_kind(module) is None:
-        act = type(getattr(module, "act_fn", None)).__name__
+    if (is_swiglu_mlp(module) or is_fused_gate_up_mlp(module)) and gate_kind(
+        module
+    ) is None:
+        act = type(gate_activation(module)).__name__
         return (
             f"{type(module).__name__} uses an unsupported gated activation "
             f"({act}); SparseLoRA's sparse MLP supports only SiLU and gelu_tanh "
@@ -453,11 +672,13 @@ def unsupported_reason(module: nn.Module) -> Optional[str]:
 def register_arch_wiring(model: nn.Module) -> dict[str, str]:
     """Auto-register sparse wiring for the loaded model's MLP/attention classes.
 
-    Introspects every module: SwiGLU MLPs map to :class:`SparseSwiGLUMLP`,
-    standard attention blocks to :class:`SparseAttention`. ``nn.Linear`` is
-    (re)mapped to the bias-aware :class:`SparseLinearBias` (a safe superset of
-    the vendored linear). Classes already registered — Llama, or anything a
-    caller registered explicitly — are left untouched. Idempotent.
+    Introspects every module: SwiGLU MLPs map to :class:`SparseSwiGLUMLP` and
+    standard attention to :class:`SparseAttention`; the Phi3-style fused
+    ``gate_up_proj`` / ``qkv_proj`` blocks map to :class:`SparseFusedGateUpMLP` /
+    :class:`SparseFusedQKVAttention`. ``nn.Linear`` is (re)mapped to the
+    bias-aware :class:`SparseLinearBias` (a safe superset of the vendored
+    linear). Classes already registered — Llama, or anything a caller registered
+    explicitly — are left untouched. Idempotent.
 
     Returns a ``{class_name: role}`` map of what was newly registered, for
     logging.
@@ -474,8 +695,16 @@ def register_arch_wiring(model: nn.Module) -> dict[str, str]:
             register_sparse_module(cls, SparseSwiGLUMLP)
             mapping[cls] = SparseSwiGLUMLP
             registered[cls.__name__] = "mlp"
+        elif is_fused_gate_up_mlp(module):
+            register_sparse_module(cls, SparseFusedGateUpMLP)
+            mapping[cls] = SparseFusedGateUpMLP
+            registered[cls.__name__] = "mlp"
         elif is_standard_attention(module):
             register_sparse_module(cls, SparseAttention)
             mapping[cls] = SparseAttention
+            registered[cls.__name__] = "attention"
+        elif is_fused_qkv_attention(module):
+            register_sparse_module(cls, SparseFusedQKVAttention)
+            mapping[cls] = SparseFusedQKVAttention
             registered[cls.__name__] = "attention"
     return registered

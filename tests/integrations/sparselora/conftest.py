@@ -144,6 +144,25 @@ def _tiny_gemma3(num_kv_heads: int = 2):
     )
 
 
+def _tiny_phi3(num_kv_heads: int = 2):
+    from transformers import Phi3Config, Phi3ForCausalLM
+
+    return Phi3ForCausalLM(
+        Phi3Config(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=num_kv_heads,
+            max_position_embeddings=64,
+            pad_token_id=0,
+            eos_token_id=1,
+            bos_token_id=2,
+        )
+    )
+
+
 # Architecture registry for the parametrized cross-arch tests.
 TINY_BUILDERS = {
     "llama": _tiny_llama,
@@ -152,6 +171,13 @@ TINY_BUILDERS = {
     "mistral": _tiny_mistral,
     "gemma2": _tiny_gemma2,
     "gemma3": _tiny_gemma3,
+    "phi3": _tiny_phi3,
+}
+
+# Phi3 fuses q/k/v into qkv_proj and gate/up into gate_up_proj, so its
+# attention LoRA target is qkv_proj (+ o_proj), not q/k/v_proj.
+_LORA_TARGETS = {
+    "phi3": ["qkv_proj", "o_proj"],
 }
 
 
@@ -163,7 +189,9 @@ def make_lora_model(arch: str, num_kv_heads: int = 2):
         LoraConfig(
             r=8,
             lora_alpha=16,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=_LORA_TARGETS.get(
+                arch, ["q_proj", "k_proj", "v_proj", "o_proj"]
+            ),
         ),
     )
     model.eval()

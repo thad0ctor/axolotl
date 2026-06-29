@@ -32,10 +32,12 @@ from torch.utils.data import DataLoader
 from axolotl.utils.logging import get_logger
 
 from .factors import (
-    ATTN_PROJECTIONS,
+    attn_projection_weights,
     is_attn_module,
+    is_fused_attn_module,
+    is_fused_mlp_module,
     is_mlp_module,
-    linear_weight,
+    mlp_projection_weights,
 )
 
 LOG = get_logger(__name__)
@@ -49,11 +51,24 @@ def method_name(method: Any) -> str:
     return method.value if hasattr(method, "value") else str(method)
 
 
+def _is_sparsifiable(module: nn.Module) -> bool:
+    return (
+        is_mlp_module(module)
+        or is_attn_module(module)
+        or is_fused_mlp_module(module)
+        or is_fused_attn_module(module)
+    )
+
+
 def discover_target_modules(model: nn.Module) -> list[str]:
-    """Full module paths of every sparsifiable MLP / attention block."""
+    """Full module paths of every sparsifiable MLP / attention block.
+
+    Covers both the separate-projection layout (gate/up + q/k/v) and the
+    Phi3-style fused layout (gate_up_proj + qkv_proj).
+    """
     names = []
     for name, module in model.named_modules():
-        if is_mlp_module(module) or is_attn_module(module):
+        if _is_sparsifiable(module):
             names.append(name)
     return names
 
@@ -103,9 +118,8 @@ def _ffn_recon_error(
     sparsity: float,
 ) -> float:
     """Relative L2 error of the MLP block when only predicted channels are kept."""
-    wg = linear_weight(module.gate_proj)
-    wu = linear_weight(module.up_proj)
-    wd = linear_weight(module.down_proj)
+    weights = mlp_projection_weights(module)
+    wg, wu, wd = weights["gate_proj"], weights["up_proj"], weights["down_proj"]
 
     # Predicted channel scores from the rank-r factors (mirrors FFNPredictor).
     xm = x.mean(dim=1).to(wg.dtype)  # (B, H)
@@ -127,8 +141,7 @@ def _attn_recon_error(x: torch.Tensor, module: nn.Module, sparsity: float) -> fl
     ``(1 - sparsity)`` projection channels, how much output energy is lost.
     """
     errs = []
-    for proj in ATTN_PROJECTIONS:
-        weight = linear_weight(getattr(module, proj))
+    for weight in attn_projection_weights(module).values():
         out = F.linear(x, weight).float()  # (B, T, D)
         energy = out.pow(2).sum(dim=(0, 1))  # (D,)
         total = energy.sum()
@@ -188,8 +201,9 @@ def run_sensitivity(
                 x = captured.get(name)
                 if x is None:
                     continue
+                is_mlp = is_mlp_module(module) or is_fused_mlp_module(module)
                 for s in SPARSITY_GRID:
-                    if is_mlp_module(module):
+                    if is_mlp:
                         err = _ffn_recon_error(x, module, factors, name, s)
                     else:
                         err = _attn_recon_error(x, module, s)

@@ -462,22 +462,194 @@ def test_registry_covers_silu_swiglu_families(config_cls, model_cls):
             assert unsupported_reason(mod) is None
 
 
-def test_phi3_fused_projections_not_registered():
-    """Phi3 fuses qkv_proj + gate_up_proj -> neither is_standard_attention nor
-    is_swiglu_mlp, so it is not auto-registered (cleanly unsupported)."""
+def test_phi3_fused_projections_detected_and_registered():
+    """Phi3 fuses q/k/v into qkv_proj and gate/up into gate_up_proj. These are not
+    the separate-projection layout, but the fused detectors recognize them and the
+    Phi3 sparse classes auto-register."""
     pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import (
+        get_module_mapping,
+    )
     from axolotl.integrations.sparselora.arch_wiring import (
+        SparseFusedGateUpMLP,
+        SparseFusedQKVAttention,
+        is_fused_gate_up_mlp,
+        is_fused_qkv_attention,
         is_standard_attention,
         is_swiglu_mlp,
     )
 
-    model = _tiny("Phi3Config", "Phi3ForCausalLM")
+    from .conftest import _tiny_phi3
+
+    model = _tiny_phi3()
     attn = [m for n, m in model.named_modules() if n.endswith("self_attn")][0]
     mlp = [m for n, m in model.named_modules() if n.endswith("mlp")][0]
-    assert not is_standard_attention(attn)  # fused qkv_proj
-    assert not is_swiglu_mlp(mlp)  # fused gate_up_proj
+    assert not is_standard_attention(attn) and is_fused_qkv_attention(attn)
+    assert not is_swiglu_mlp(mlp) and is_fused_gate_up_mlp(mlp)
+
     registered = register_arch_wiring(model)
-    assert "Phi3Attention" not in registered and "Phi3MLP" not in registered
+    assert registered.get("Phi3Attention") == "attention"
+    assert registered.get("Phi3MLP") == "mlp"
+    mapping = get_module_mapping()
+    assert mapping[type(attn)] is SparseFusedQKVAttention
+    assert mapping[type(mlp)] is SparseFusedGateUpMLP
+
+
+@pytest.mark.parametrize("num_kv_heads", [2, 4], ids=["gqa", "mha"])
+def test_phi3_factor_keys_and_validation(num_kv_heads):
+    """Fused qkv_proj/gate_up_proj slice into the same q/k/v + gate/up factor keys
+    as separate projections; _validate accepts [qkv_proj, o_proj] LoRA."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora.factors import (
+        compute_factor_tensors,
+        fused_qkv_sizes,
+    )
+
+    from .conftest import make_lora_model
+
+    model = make_lora_model("phi3", num_kv_heads=num_kv_heads)
+    targets = discover_target_modules(model)
+    assert sum(t.endswith("mlp") for t in targets) == 2
+    assert sum(t.endswith("self_attn") for t in targets) == 2
+
+    factors = compute_factor_tensors(model, targets, rank=8)
+    mlp = next(t for t in targets if t.endswith("mlp"))
+    attn = next(t for t in targets if t.endswith("self_attn"))
+    for key in (f"{mlp}.gate_proj.w1", f"{mlp}.up_proj.w2"):
+        assert key in factors
+    for key in (f"{attn}.q_proj.w1", f"{attn}.k_proj.w2", f"{attn}.v_proj.w1"):
+        assert key in factors
+
+    modules = dict(model.named_modules())
+    q_size, kv_size = fused_qkv_sizes(modules[attn])
+    # q/v factor out dims must match the sub-block sizes carved from qkv_proj.
+    assert factors[f"{attn}.q_proj.w2"].shape[-1] == q_size
+    assert factors[f"{attn}.v_proj.w2"].shape[-1] == kv_size
+    # GQA: k/v sub-blocks narrower than q; MHA: equal.
+    assert (kv_size < q_size) == (num_kv_heads < 4)
+
+    SparseLoRAPlugin()._validate(_validate_cfg(), model, targets)
+
+
+def test_phi3_rejects_mlp_lora():
+    """A LoRA adapter on the fused gate_up_proj (or down_proj) is rejected: the
+    SparseLoRA recipe is attention-only."""
+    pytest.importorskip("transformers")
+    from peft import LoraConfig, get_peft_model
+
+    from .conftest import _tiny_phi3
+
+    torch.manual_seed(0)
+    model = get_peft_model(
+        _tiny_phi3(),
+        LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
+        ),
+    ).eval()
+    register_arch_wiring(model)
+    with pytest.raises(ValueError, match="attention-only LoRA"):
+        SparseLoRAPlugin()._validate(
+            _validate_cfg(), model, discover_target_modules(model)
+        )
+
+
+@cuda_only
+@pytest.mark.parametrize("num_kv_heads", [2, 4], ids=["gqa", "mha"])
+def test_phi3_dense_apply_logit_exact(num_kv_heads):
+    """Dense-apply (sparsity 0) on Phi3 is logit-exact: the fused qkv_proj and
+    gate_up_proj slicing must reproduce the model's own split bit-for-bit."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
+    from axolotl.integrations.sparselora.arch_wiring import (
+        SparseFusedGateUpMLP,
+        SparseFusedQKVAttention,
+    )
+
+    from .conftest import make_lora_model
+
+    model = make_lora_model("phi3", num_kv_heads=num_kv_heads).to("cuda").eval()
+    ids = torch.randint(0, 128, (2, 16), device="cuda")
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits.clone()
+
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    d = tempfile.mkdtemp()
+    save_factors({}, d)  # dense schedule needs no factors
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.0 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+    assert any(isinstance(m, SparseFusedQKVAttention) for m in model.modules())
+    assert any(isinstance(m, SparseFusedGateUpMLP) for m in model.modules())
+    with torch.no_grad():
+        out = model(input_ids=ids).logits
+    assert torch.allclose(out, ref, atol=1e-4), (
+        "fused qkv/gate_up slicing diverged from reference"
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("num_kv_heads", [2, 4], ids=["gqa", "mha"])
+def test_phi3_sparse_apply_forward_backward(num_kv_heads):
+    """Phi3 at 0.5 sparsity: finite loss, a plausible reconstruction of the dense
+    model, and non-zero LoRA gradients."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
+    from axolotl.integrations.sparselora.arch_wiring import (
+        SparseFusedGateUpMLP,
+        SparseFusedQKVAttention,
+    )
+
+    from .conftest import make_lora_model
+
+    model = (
+        make_lora_model("phi3", num_kv_heads=num_kv_heads)
+        .to("cuda")
+        .to(torch.bfloat16)
+        .train()
+    )
+    ids = torch.randint(0, 128, (2, 24), device="cuda")
+    labels = ids.clone()
+    labels[:, :10] = -100
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits.clone()
+
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    factors = compute_factor_tensors(model, targets, rank=8)
+    d = tempfile.mkdtemp()
+    save_factors(factors, d)
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.5 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+    assert any(isinstance(m, SparseFusedQKVAttention) for m in model.modules())
+    assert any(isinstance(m, SparseFusedGateUpMLP) for m in model.modules())
+
+    out = model(input_ids=ids, labels=labels)
+    assert torch.isfinite(out.loss).item()
+    rel = (out.logits - ref).float().norm() / ref.float().norm()
+    assert rel < 1.0, f"sparse Phi3 reconstruction implausibly far: rel={rel:.3f}"
+    out.loss.backward()
+    grad_norm = sum(
+        p.grad.float().norm().item()
+        for n, p in model.named_parameters()
+        if p.grad is not None and "lora_" in n
+    )
+    assert grad_norm > 0
 
 
 def _stablelm_lora():

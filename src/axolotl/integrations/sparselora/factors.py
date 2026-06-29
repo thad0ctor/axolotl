@@ -27,6 +27,11 @@ from torch import nn
 MLP_PROJECTIONS = ("gate_proj", "up_proj")
 ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj")
 
+# Phi3-style fused projections: one Linear whose output rows concatenate the
+# separate projections. ``gate_up_proj`` = [gate | up]; ``qkv_proj`` = [q | k | v].
+FUSED_MLP_PROJECTION = "gate_up_proj"
+FUSED_ATTN_PROJECTION = "qkv_proj"
+
 
 def linear_weight(module: nn.Module) -> torch.Tensor:
     """Return the logical ``(out, in)`` weight of a (possibly LoRA-wrapped) Linear.
@@ -52,6 +57,89 @@ def is_mlp_module(module: nn.Module) -> bool:
 
 def is_attn_module(module: nn.Module) -> bool:
     return all(hasattr(module, proj) for proj in ATTN_PROJECTIONS)
+
+
+def is_fused_mlp_module(module: nn.Module) -> bool:
+    """Phi3-style fused MLP: a single ``gate_up_proj`` Linear plus ``down_proj``."""
+    return hasattr(module, FUSED_MLP_PROJECTION) and hasattr(module, "down_proj")
+
+
+def is_fused_attn_module(module: nn.Module) -> bool:
+    """Phi3-style fused attention: a single ``qkv_proj`` Linear plus ``o_proj``."""
+    return hasattr(module, FUSED_ATTN_PROJECTION) and hasattr(module, "o_proj")
+
+
+def fused_qkv_sizes(module: nn.Module) -> tuple[int, int]:
+    """``(q_size, kv_size)`` output split of a fused ``qkv_proj``.
+
+    ``qkv_proj`` out = ``[q (num_heads*head_dim) | k (num_kv*head_dim) | v (...)]``.
+    Sizes come from the attention module's config/attrs, mirroring how the model
+    itself slices the fused output.
+    """
+    config = module.config
+    head_dim = getattr(
+        module, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    q_size = config.num_attention_heads * head_dim
+    kv_size = config.num_key_value_heads * head_dim
+    return q_size, kv_size
+
+
+def fused_intermediate_size(module: nn.Module) -> int:
+    """Per-gate intermediate width of a fused ``gate_up_proj`` ( = down_proj in)."""
+    return module.down_proj.in_features
+
+
+def mlp_projection_weights(module: nn.Module) -> dict[str, torch.Tensor]:
+    """Logical ``{gate_proj, up_proj, down_proj}`` weights, fused or separate.
+
+    For a fused ``gate_up_proj`` the gate occupies the first ``intermediate`` rows
+    and up the next ``intermediate`` (matching ``up_states.chunk(2, dim=-1)``).
+    """
+    if is_fused_mlp_module(module) and not is_mlp_module(module):
+        gate_up = linear_weight(getattr(module, FUSED_MLP_PROJECTION))
+        i = fused_intermediate_size(module)
+        return {
+            "gate_proj": gate_up[:i],
+            "up_proj": gate_up[i : 2 * i],
+            "down_proj": linear_weight(module.down_proj),
+        }
+    return {
+        p: linear_weight(getattr(module, p))
+        for p in ("gate_proj", "up_proj", "down_proj")
+    }
+
+
+def attn_projection_weights(module: nn.Module) -> dict[str, torch.Tensor]:
+    """Logical ``{q_proj, k_proj, v_proj}`` weights, fused or separate."""
+    if is_fused_attn_module(module) and not is_attn_module(module):
+        qkv = linear_weight(getattr(module, FUSED_ATTN_PROJECTION))
+        q_size, kv_size = fused_qkv_sizes(module)
+        return {
+            "q_proj": qkv[:q_size],
+            "k_proj": qkv[q_size : q_size + kv_size],
+            "v_proj": qkv[q_size + kv_size : q_size + 2 * kv_size],
+        }
+    return {p: linear_weight(getattr(module, p)) for p in ATTN_PROJECTIONS}
+
+
+def output_sparse_weights(module: nn.Module) -> dict[str, torch.Tensor]:
+    """``{proj: (out, in) weight}`` for the output-sparse projections that need a
+    predictor: gate/up (MLP) or q/k/v (attention), fused or separate.
+
+    ``down_proj``/``o_proj`` are input-sparse and reuse the selected indices, so
+    they get no predictor factors.
+    """
+    if is_mlp_module(module) or is_fused_mlp_module(module):
+        w = mlp_projection_weights(module)
+        return {"gate_proj": w["gate_proj"], "up_proj": w["up_proj"]}
+    if is_attn_module(module) or is_fused_attn_module(module):
+        return attn_projection_weights(module)
+    raise ValueError(
+        "SparseLoRA target module is neither an MLP (gate_proj/up_proj or fused "
+        "gate_up_proj) nor an attention (q_proj/k_proj/v_proj or fused qkv_proj) "
+        f"module: {type(module).__name__}"
+    )
 
 
 def projections_for(module: nn.Module) -> tuple[str, ...]:
@@ -84,7 +172,10 @@ def compute_factor_tensors(
 
     Keys are ``{module_name}.{proj}.w1`` / ``.w2`` (e.g.
     ``model.layers.3.mlp.gate_proj.w1``), matching the vendored
-    ``create_mlp_predictor`` / ``create_attn_predictor`` lookups.
+    ``create_mlp_predictor`` / ``create_attn_predictor`` lookups. Fused Phi3
+    projections are sliced into their logical ``gate_proj``/``up_proj`` or
+    ``q_proj``/``k_proj``/``v_proj`` sub-blocks first, so the keys (and the
+    predictors that consume them) are identical to the separate-projection case.
     """
     modules = dict(model.named_modules())
     tensors: dict[str, torch.Tensor] = {}
@@ -92,8 +183,7 @@ def compute_factor_tensors(
         if name not in modules:
             raise KeyError(f"SparseLoRA target module not found in model: {name}")
         module = modules[name]
-        for proj in projections_for(module):
-            weight = linear_weight(getattr(module, proj))
+        for proj, weight in output_sparse_weights(module).items():
             w1, w2 = svd_factor(weight, rank)
             tensors[f"{name}.{proj}.w1"] = w1
             tensors[f"{name}.{proj}.w2"] = w2

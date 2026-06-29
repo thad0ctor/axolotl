@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edit: absolute 'sparselora.*' imports relativized. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: absolute 'sparselora.*' imports relativized; fused 'qkv_proj'/'gate_up_proj' added to _OUT_PROJS (Phi3-style fused projections — their base layer is output-sparse, exactly like the separate q/k/v + gate/up it concatenates). Do not edit; see _vendor/PROVENANCE.md.
 """Extensible registry mapping original module types to sparse replacements."""
 
 from typing import Dict, Type
@@ -11,7 +11,15 @@ _MODULE_REGISTRY: Dict[Type[nn.Module], Type[nn.Module]] = {
     nn.Linear: SparseLinear,
 }
 
-_OUT_PROJS = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}
+_OUT_PROJS = {
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "gate_proj",
+    "up_proj",
+    "qkv_proj",
+    "gate_up_proj",
+}
 _IN_PROJS = {"o_proj", "down_proj"}
 
 
