@@ -47,8 +47,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--base-model",
-        required=True,
-        help="model to verify: a local path or HF id (user-supplied is required)",
+        default=None,
+        help="model to verify: a local path or HF id (required unless --from-pr/"
+        "--from-diff selects discovery report mode)",
+    )
+    p.add_argument(
+        "--from-pr",
+        type=int,
+        default=None,
+        help="report mode: discover candidate new model_config_type(s) from a GitHub "
+        "PR's diff (fetched via `gh pr diff`); does not run the gates",
+    )
+    p.add_argument(
+        "--pr-repo",
+        default="axolotl-ai-cloud/axolotl",
+        help="OWNER/REPO for --from-pr (default: axolotl-ai-cloud/axolotl)",
+    )
+    p.add_argument(
+        "--from-diff",
+        type=Path,
+        default=None,
+        help="report mode: discover candidates from a unified diff file (offline)",
     )
     p.add_argument(
         "--repo-root",
@@ -210,6 +229,85 @@ def _axolotl_import_path() -> str:
         return ""
 
 
+def _fetch_pr_diff(pr: int, repo: str) -> tuple[str | None, str]:
+    """Return (diff_text, error). Uses `gh pr diff` with a fixed argv (no shell)."""
+    import subprocess  # nosec B404 - fixed argv below, no shell
+
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no user interpolation into a command string
+            ["gh", "pr", "diff", str(pr), "--repo", repo],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        return (
+            None,
+            "the `gh` CLI is not installed; install GitHub CLI or use --from-diff",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, f"`gh pr diff` failed: {exc.__class__.__name__}: {exc}"
+    if proc.returncode != 0:
+        return None, f"`gh pr diff` exit {proc.returncode}: {proc.stderr.strip()}"
+    return proc.stdout, ""
+
+
+def _run_discovery(args, repo_root: Path | None) -> int:
+    # report mode stays torch-free: only the static diff parser is imported here
+    from harness.discover import discover_from_diff
+
+    if args.from_diff is not None:
+        try:
+            diff_text = args.from_diff.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"could not read --from-diff {args.from_diff}: {exc}")
+            return 2
+        source = str(args.from_diff)
+    else:
+        diff_text, err = _fetch_pr_diff(args.from_pr, args.pr_repo)
+        if diff_text is None:
+            print(f"could not fetch PR #{args.from_pr} from {args.pr_repo}: {err}")
+            return 2
+        source = f"{args.pr_repo}#{args.from_pr}"
+
+    result = discover_from_diff(diff_text, repo_root=repo_root)
+    candidates = result["candidates"]
+    warnings = result["warnings"]
+
+    print(f"PR model auto-discovery — {source}")
+    print("=" * 60)
+    if not candidates:
+        print("\nNo candidate model_config_type found in the diff.")
+        for w in warnings:
+            print(f"  ! {w}")
+        return 2
+
+    print(f"\n{len(candidates)} candidate(s), ranked by evidence:\n")
+    for i, c in enumerate(candidates, 1):
+        kind = "NEW" if c["is_new"] else "extends"
+        print(f"  [{i}] {c['model_config_type']}  (score {c['score']}, {kind})")
+        print(
+            f"        base_model : {c['base_model'] or '(none — check example/README)'}"
+        )
+        print(f"        family     : {c['family_root']}")
+        print(f"        signals    : {', '.join(c['signals'])}")
+
+    if warnings:
+        print("\nReliability warnings (dynamic/external registration):")
+        for w in warnings:
+            print(f"  ! {w}")
+
+    top = candidates[0]
+    target = top["base_model"] or top["model_config_type"]
+    print("\nSuggested follow-up (check out the PR, pick GPUs, then run the gates):")
+    print(
+        f"  verify_model.py --base-model {target} "
+        f"--repo-root <PR checkout> --gates G1,G2 [--trust-remote-code] [--gpus ...]"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
@@ -217,6 +315,15 @@ def main(argv: list[str] | None = None) -> int:
     import os
 
     os.environ.setdefault("AXOLOTL_LOG_LEVEL", "WARNING")
+
+    if args.from_pr is not None or args.from_diff is not None:
+        # report mode: discover candidates, never auto-run the gates (needs a checkout + GPU)
+        repo_root = args.repo_root or _find_repo_root(Path.cwd())
+        return _run_discovery(args, repo_root)
+
+    if not args.base_model:
+        print("--base-model is required (or use --from-pr/--from-diff for discovery).")
+        return 2
 
     repo_root = (
         args.repo_root

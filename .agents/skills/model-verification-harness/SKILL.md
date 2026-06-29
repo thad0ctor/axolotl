@@ -30,6 +30,26 @@ plugins are env-specific, so verify against the exact env you train with.
 
 G1–G5 + G8 are CPU and CI-gateable. **G6/G7 need a GPU and are local/on-demand.**
 
+## Stage 0: Discover (when verifying a PR)
+
+If the user points at a PR ("verify model PR #N", "does this PR wire the model right"),
+auto-discover the new model instead of asking them to dig for it:
+
+```bash
+python .agents/skills/model-verification-harness/scripts/verify_model.py --from-pr N
+# or, offline, from a saved diff:  --from-diff pr.diff
+```
+
+This is a fast, torch-free static pass over the PR's diff. It prints the candidate
+new `model_config_type`(s) ranked by evidence (new `monkeypatch/models/<x>/`, new
+`examples/<x>/` + its `base_model:`, additions to multipack / MOE_ARCH_BLOCK /
+fused-attn / SSM-hybrid sets / enums / a kernel adapter / dispatch branches), marks
+each **new vs extends-existing**, surfaces the canonical `base_model`, and warns
+about registration that can't be read statically (CCE pin-bump, native-liger table,
+processor-class multimodal routing, a transformers bump). Present the candidates to
+the user (checklist if more than one), confirm the one to verify, then continue to
+Stage 2 with that `--base-model` and `--repo-root <PR checkout>`.
+
 ## Stage 1: Detect
 
 The harness reads the model's `config.json` and resolves `model_config_type` (the

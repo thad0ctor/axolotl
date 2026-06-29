@@ -304,3 +304,108 @@ def test_g8_undefended_type_findings(tmp_path):
     bogus = "qzx" + "nonexistent" + "arch7"
     res = g8_coverage.run(_ctx(_features(bogus, f"acme/{bogus}"), tmp_path))
     assert res.status == GateStatus.FINDINGS  # zero references -> undefended
+
+
+# --- PR discovery (discover_from_diff) -----------------------------------------
+
+
+def _newfile(path: str, body: str) -> str:
+    lines = [f"+{ln}" for ln in body.splitlines()]
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        f"--- /dev/null\n+++ b/{path}\n"
+        "@@ -0,0 +1,1 @@\n" + "\n".join(lines) + "\n"
+    )
+
+
+def _hunk(path: str, added: list[str], context: tuple[str, ...] = ()) -> str:
+    body = "".join(f" {c}\n" for c in context) + "".join(f"+{a}\n" for a in added)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n+++ b/{path}\n"
+        "@@ -1,1 +1,9 @@\n" + body
+    )
+
+
+def test_discover_new_model_diff():
+    from harness.discover import discover_from_diff
+
+    diff = (
+        _newfile(
+            "examples/glmnova/cfg.yaml",
+            "base_model: acme/GLM-Nova-9B\nchat_template: glmnova\n",
+        )
+        + _newfile(
+            "src/axolotl/monkeypatch/models/glmnova/__init__.py",
+            "# bespoke kernels\n",
+        )
+        + _hunk(
+            "src/axolotl/monkeypatch/multipack.py",
+            ['    "glmnova",'],
+            context=('    "glm4",',),
+        )
+    )
+    res = discover_from_diff(diff)
+    cands = res["candidates"]
+    assert cands, "expected at least one candidate"
+    top = cands[0]
+    assert top["model_config_type"] == "glmnova"
+    assert top["base_model"] == "acme/GLM-Nova-9B"
+    assert top["is_new"] is True
+    assert {"model_dir", "example", "multipack"} <= set(top["signals"])
+    assert (
+        top["score"] >= 8
+    )  # model dir + example + base_model + multipack + multi-class
+
+
+def test_discover_family_diff():
+    from harness.discover import discover_from_diff
+
+    diff = (
+        _newfile("examples/qwen9/cfg.yaml", "base_model: q/Qwen9\n")
+        + _hunk(
+            "src/axolotl/monkeypatch/multipack.py",
+            ['    "qwen9",', '    "qwen9_moe",'],
+        )
+        + _hunk(
+            "src/axolotl/common/architectures.py",
+            ['    "qwen9_moe": "Qwen9SparseMoeBlock",'],
+        )
+    )
+    res = discover_from_diff(diff)
+    types = {c["model_config_type"] for c in res["candidates"]}
+    assert {"qwen9", "qwen9_moe"} <= types
+    roots = {c["family_root"] for c in res["candidates"]}
+    assert "qwen9" in roots  # qwen9_moe strips to the qwen9 family
+
+
+def test_discover_extends_only():
+    from harness.discover import discover_from_diff
+
+    # "gemma" added to multipack but it already exists in fused-attn (pre-image context)
+    diff = _hunk(
+        "src/axolotl/loaders/patch_manager.py",
+        ['    "gemma",'],
+        context=('    "gemma",', '    "llama",'),
+    )
+    res = discover_from_diff(diff)
+    gemma = next(
+        (c for c in res["candidates"] if c["model_config_type"] == "gemma"), None
+    )
+    assert gemma is not None
+    assert gemma["is_new"] is False  # pre-existed in the container -> extends
+
+
+def test_discover_dynamic_only_warns():
+    from harness.discover import discover_from_diff
+
+    diff = _hunk(
+        "pyproject.toml",
+        ['    "transformers==5.12.1",'],
+        context=('    "transformers==5.10.2",',),
+    )
+    res = discover_from_diff(diff)
+    # a pin bump alone must not produce a confident new-type candidate
+    assert not any(c["is_new"] for c in res["candidates"])
+    assert any("transformers" in w for w in res["warnings"])
