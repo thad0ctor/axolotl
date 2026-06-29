@@ -47,18 +47,20 @@ MLP sparsity is universal: the SwiGLU forward (`down(silu(gate(x)) * up(x))`) is
 | Arch | Handled by |
 |------|-----------|
 | Qwen2 | q/k/v projection **bias** via `SparseLinearBias`; `sliding_window` forwarded to the attention interface |
-| Qwen3 | `q_norm`/`k_norm` (RMSNorm on the head dim) applied between view and RoPE transpose; `sliding_window` |
+| Qwen3 | `q_norm`/`k_norm` (RMSNorm on the head dim) applied between view and RoPE transpose; `sliding_window`; **decoupled head_dim** (q_out ≠ hidden) via the fixed GQA predictor |
 | Mistral | `sliding_window` from config |
-| Gemma2/Gemma3 | **rejected** at validation — generic attention does not apply attention-logit softcapping |
+| StableLM, Cohere | SiLU SwiGLU + standard attention — auto-registered, no special handling |
+| Gemma2/Gemma3 | **rejected** at validation — their SwiGLU gate is `gelu_pytorch_tanh`, but the FFN predictor and sparse MLP kernel hardcode SiLU. (Gemma2 attention-logit softcapping *is* reproduced — forwarded to the attention interface — so it is not the blocker; the GELU MLP is.) |
+| Phi3 | not auto-registered — fused `qkv_proj` / `gate_up_proj` are neither standard attention nor SwiGLU MLP |
 
-Registration is automatic at apply time; no per-arch user config. To extend to an architecture whose attention semantics the generic path doesn't cover, register a custom sparse class via `register_sparse_module` — see the [`sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md) skill.
+Registration is automatic at apply time; no per-arch user config. The generic attention also forwards Gemma2's `attn_logit_softcapping` and uses each architecture's own eager-attention fallback, so arch-specific attention terms are applied. To extend to an architecture the generic path doesn't cover, register a custom sparse class via `register_sparse_module` — see the [`sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md) skill.
 
 ## Constraints (v1)
 
 - Attention-only LoRA (`q/k/v/o_proj`); MLP must not be LoRA-wrapped — **validated at startup**.
 - Base: full-precision (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`, `load_in_4bit`; via `SparseLinear4bit`). 8-bit (`load_in_8bit`) not supported.
 - `sample_packing: false`.
-- SwiGLU-MLP + standard-attention architectures (Llama, Qwen2, Qwen3, Mistral, ...), auto-detected. Attention-logit softcapping (Gemma2/Gemma3) is rejected; extend other custom attention via `register_sparse_module`.
+- SwiGLU-MLP (SiLU-gated) + standard-attention architectures (Llama, Qwen2, Qwen3, Mistral, StableLM, Cohere, ...), auto-detected. Non-SiLU gated MLPs (Gemma2/Gemma3 `gelu_pytorch_tanh`) and fused-projection models (Phi3) are rejected/skipped; extend custom wiring via `register_sparse_module`.
 - Single-GPU / DDP; no FSDP or DeepSpeed ZeRO-3.
 - `torch_compile: true` works — the dynamic sparse regions are `torch.compiler.disable` boundaries (graph-break + eager), the rest compiles.
 

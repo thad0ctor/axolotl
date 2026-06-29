@@ -70,7 +70,7 @@ def _tiny_qwen3(num_kv_heads: int = 2):
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=num_kv_heads,
-            head_dim=16,
+            head_dim=32,  # decoupled: q_out=128 != hidden=64 (like real Qwen3)
             max_position_embeddings=64,
         )
     )

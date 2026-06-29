@@ -91,35 +91,100 @@ class TestCrossArchCPU:
         )
 
 
-def test_gemma2_softcapping_rejected():
-    """Generic attention does not apply Gemma's softcap -> must refuse, not corrupt."""
+def _tiny_gemma2(**overrides):
+    from transformers import Gemma2Config, Gemma2ForCausalLM
+
+    kw = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=64,
+        attn_logit_softcapping=50.0,
+    )
+    kw.update(overrides)
+    return Gemma2ForCausalLM(Gemma2Config(**kw))
+
+
+def test_gemma_mlp_activation_rejected():
+    """Gemma's gelu_pytorch_tanh MLP can't use the SiLU-hardcoded FFN path."""
     pytest.importorskip("transformers")
     from peft import LoraConfig, get_peft_model
-    from transformers import Gemma2Config, Gemma2ForCausalLM
 
     torch.manual_seed(0)
     model = get_peft_model(
-        Gemma2ForCausalLM(
-            Gemma2Config(
-                vocab_size=128,
-                hidden_size=64,
-                intermediate_size=128,
-                num_hidden_layers=2,
-                num_attention_heads=4,
-                num_key_value_heads=2,
-                head_dim=16,
-                max_position_embeddings=64,
-                attn_logit_softcapping=50.0,
-            )
-        ),
+        _tiny_gemma2(),
         LoraConfig(
             r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
         ),
     )
-    with pytest.raises(ValueError, match="softcapping"):
+    with pytest.raises(ValueError, match="non-SiLU"):
         SparseLoRAPlugin()._validate(
             _validate_cfg(), model, discover_target_modules(model)
         )
+
+
+def test_is_silu_gated_detection():
+    """SiLU MLPs pass; Gemma's gelu MLP fails — numeric probe, class-agnostic."""
+    from axolotl.integrations.sparselora.arch_wiring import is_silu_gated
+
+    qwen2 = make_lora_model("qwen2")
+    mods = dict(qwen2.named_modules())
+    mlp = mods[next(t for t in discover_target_modules(qwen2) if t.endswith("mlp"))]
+    assert is_silu_gated(mlp)
+
+    gemma_mlp = [m for n, m in _tiny_gemma2().named_modules() if n.endswith("mlp")][0]
+    assert not is_silu_gated(gemma_mlp)
+
+
+def test_sparseattention_applies_softcap():
+    """SparseAttention forwards Gemma2's attn-logit softcap -> dense-apply parity.
+
+    Sparsify only the attention blocks (MLP left as the original Gemma2MLP, which
+    we don't support), at sparsity 0.0 so the dense branch runs. If softcap were
+    dropped the logits would diverge from the unmodified reference.
+    """
+    pytest.importorskip("transformers")
+    from peft import LoraConfig, get_peft_model
+
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
+    from axolotl.integrations.sparselora.arch_wiring import register_arch_wiring
+
+    torch.manual_seed(0)
+    base = _tiny_gemma2(attn_logit_softcapping=30.0)
+    base.config._attn_implementation = "eager"  # softcap path needs eager
+    model = get_peft_model(
+        base,
+        LoraConfig(
+            r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+        ),
+    ).eval()
+
+    ids = torch.randint(0, 128, (2, 16))
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits.clone()
+
+    register_arch_wiring(model)
+    attn_targets = [
+        t for t in discover_target_modules(model) if t.endswith("self_attn")
+    ]
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.0 for t in attn_targets}, predictor_rank=8, path="."
+        ),
+    )
+    with torch.no_grad():
+        out = model(input_ids=ids).logits
+    assert torch.allclose(out, ref, atol=1e-4), (
+        "softcap dropped: SparseAttention dense forward diverged from reference"
+    )
 
 
 class TestSparseLinearBias:
@@ -207,3 +272,138 @@ def test_sparse_apply_forward_backward(arch):
         if p.grad is not None and "lora_" in n
     )
     assert grad_norm > 0
+
+
+# ---------------------------------------------------------------------------
+# Decoupled head_dim predictor fix (Qwen3: q_out != hidden_size)
+# ---------------------------------------------------------------------------
+
+
+def test_decoupled_head_dim_attn_predictor_loads():
+    """Qwen3 sets head_dim != hidden/num_heads, so q_proj is wider than hidden.
+
+    The vendored GQAAttentionPredictor sizes q2 as (hidden, rank) and crashes on
+    load; the fixed creator sizes it at q_out. Predict runs on CPU (no liger).
+    """
+    from peft import LoraConfig, get_peft_model
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    from axolotl.integrations.sparselora.arch_wiring import _create_attn_predictor
+
+    torch.manual_seed(0)
+    # hidden 64, 4 q-heads, head_dim 32 -> q_out 128 != hidden 64; GQA (2 kv).
+    model = get_peft_model(
+        Qwen3ForCausalLM(
+            Qwen3Config(
+                vocab_size=128,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                max_position_embeddings=64,
+            )
+        ),
+        LoraConfig(
+            r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+        ),
+    ).eval()
+
+    targets = discover_target_modules(model)
+    attn = next(t for t in targets if t.endswith("self_attn"))
+    modules = dict(model.named_modules())
+    # q_out (128) must differ from hidden (64), else this wouldn't exercise the fix.
+    assert modules[attn].q_proj.base_layer.weight.shape[0] == 128
+
+    factors = compute_factor_tensors(model, targets, rank=8)
+    d = tempfile.mkdtemp()
+    save_factors(factors, d)
+    cfg = type("C", (), {"path": d, "predictor_rank": 8})()
+
+    pred = _create_attn_predictor(modules[attn], 8, attn, cfg)  # must not raise
+    x = torch.randn(1, 6, 64, dtype=torch.bfloat16)  # predictor is bf16
+    q_i, k_i, v_i = pred.predict(x, 0.5)
+    assert q_i.numel() > 0 and k_i.numel() > 0 and v_i.numel() > 0
+    # q indices must address the full (wider) q dim, not hidden.
+    assert int(q_i.max()) < 128
+
+
+# ---------------------------------------------------------------------------
+# Registry coverage across more SwiGLU + standard-attention families
+# ---------------------------------------------------------------------------
+
+
+def _tiny(config_cls, model_cls, **extra):
+    import transformers as tf
+
+    cfg = getattr(tf, config_cls)(
+        vocab_size=256,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        **extra,
+    )
+    return getattr(tf, model_cls)(cfg)
+
+
+@pytest.mark.parametrize(
+    "config_cls,model_cls",
+    [("StableLmConfig", "StableLmForCausalLM"), ("CohereConfig", "CohereForCausalLM")],
+)
+def test_registry_covers_silu_swiglu_families(config_cls, model_cls):
+    """StableLM / Cohere are SiLU SwiGLU + standard attention -> auto-supported."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora.arch_wiring import (
+        is_standard_attention,
+        is_swiglu_mlp,
+        unsupported_reason,
+    )
+
+    model = _tiny(config_cls, model_cls)
+    registered = register_arch_wiring(model)
+    assert sorted(registered.values()) == ["attention", "mlp"]
+    for _, mod in model.named_modules():
+        if is_swiglu_mlp(mod) or is_standard_attention(mod):
+            assert unsupported_reason(mod) is None
+
+
+def test_phi3_fused_projections_not_registered():
+    """Phi3 fuses qkv_proj + gate_up_proj -> neither is_standard_attention nor
+    is_swiglu_mlp, so it is not auto-registered (cleanly unsupported)."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora.arch_wiring import (
+        is_standard_attention,
+        is_swiglu_mlp,
+    )
+
+    model = _tiny("Phi3Config", "Phi3ForCausalLM")
+    attn = [m for n, m in model.named_modules() if n.endswith("self_attn")][0]
+    mlp = [m for n, m in model.named_modules() if n.endswith("mlp")][0]
+    assert not is_standard_attention(attn)  # fused qkv_proj
+    assert not is_swiglu_mlp(mlp)  # fused gate_up_proj
+    registered = register_arch_wiring(model)
+    assert "Phi3Attention" not in registered and "Phi3MLP" not in registered
+
+
+def test_gemma3_text_mlp_refused_attention_supported():
+    """Gemma3 has no softcap by default but a gelu MLP: attention auto-registers,
+    MLP is refused for its non-SiLU gate."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora.arch_wiring import (
+        is_standard_attention,
+        is_swiglu_mlp,
+        unsupported_reason,
+    )
+
+    model = _tiny("Gemma3TextConfig", "Gemma3ForCausalLM", head_dim=16)
+    register_arch_wiring(model)
+    attn = [m for n, m in model.named_modules() if is_standard_attention(m)][0]
+    mlp = [m for n, m in model.named_modules() if is_swiglu_mlp(m)][0]
+    assert unsupported_reason(attn) is None  # softcap None on Gemma3
+    assert unsupported_reason(mlp) and "non-SiLU" in unsupported_reason(mlp)
