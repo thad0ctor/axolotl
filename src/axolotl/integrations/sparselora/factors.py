@@ -142,17 +142,6 @@ def output_sparse_weights(module: nn.Module) -> dict[str, torch.Tensor]:
     )
 
 
-def projections_for(module: nn.Module) -> tuple[str, ...]:
-    if is_mlp_module(module):
-        return MLP_PROJECTIONS
-    if is_attn_module(module):
-        return ATTN_PROJECTIONS
-    raise ValueError(
-        "SparseLoRA target module is neither an MLP (gate_proj/up_proj) nor an "
-        f"attention (q_proj/k_proj/v_proj) module: {type(module).__name__}"
-    )
-
-
 @torch.no_grad()
 def svd_factor(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Rank-``r`` factors ``(w1, w2)`` with ``w1 @ w2 ≈ weight.T``."""
