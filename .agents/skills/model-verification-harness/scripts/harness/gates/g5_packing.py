@@ -297,6 +297,9 @@ def run(ctx: GateContext) -> GateResult:
         }
     if parity["status"] == "mismatch":
         findings.append(parity["note"])
+    elif want_parity and parity["status"] in {"skipped", "unverified"}:
+        # parity was explicitly requested but couldn't run — don't pass it off as clean
+        return GateResult.could_not_run(GATE_ID, GATE_NAME, parity["note"])
     details.append(f"loss parity: {parity['note']}")
 
     data: dict[str, Any] = {

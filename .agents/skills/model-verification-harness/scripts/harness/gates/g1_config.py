@@ -699,6 +699,9 @@ def _assemble(
                 resolved_ok += 1
         elif cell.expect == "warn":
             # oracle probe: firing is expected; resolving clean means the warn path regressed
+            if o.verdict == Verdict.REJECTED and "COULD-NOT-RUN" in o.note:
+                # env failure, not an oracle regression — don't count it as a finding
+                continue
             total_resolvable += 1
             if o.verdict == Verdict.WARNED_NO_OP:
                 resolved_ok += 1

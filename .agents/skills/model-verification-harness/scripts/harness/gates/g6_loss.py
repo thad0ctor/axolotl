@@ -19,7 +19,8 @@ _LIGER_PLUGIN = "axolotl.integrations.liger.LigerPlugin"
 
 
 def applies(ctx: GateContext) -> bool:
-    return True
+    # GPU-only: a CPU train would just sit until train_timeout, so let the orchestrator skip it
+    return ctx.gpu_available
 
 
 # --- variant cfg construction --------------------------------------------------
@@ -271,6 +272,8 @@ def _tb_note(ctx: GateContext, output_dir: str, ratio: float) -> str:
 
 
 def run(ctx: GateContext) -> GateResult:
+    if not ctx.gpu_available:
+        return GateResult.skipped(GATE_ID, GATE_NAME, "GPU not available")
     try:
         import axolotl.train  # noqa: F401
     except BaseException as err:  # noqa: BLE001

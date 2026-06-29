@@ -394,6 +394,7 @@ def _invocation(args) -> dict[str, Any]:
         "profile",
         "seed",
         "auto_bisect",
+        "on_unavailable",
         "emit_test",
         "snapshot_dir",
         "features",

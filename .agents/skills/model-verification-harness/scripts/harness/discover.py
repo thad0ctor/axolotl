@@ -178,11 +178,13 @@ _FAMILY_SUFFIXES = ("_moe_text", "_unified_text", "_text", "_moe", "_unified", "
 _STOPWORDS = {"true", "false", "none", "auto", "default", "model_type", "self", "cfg"}
 
 _TOKEN = r"[A-Za-z][\w.\-]*"  # nosec B105 - a regex, not a secret
-_RE_MEMBER = re.compile(rf'^"({_TOKEN})"\s*,?\s*$')
-_RE_DICTKEY = re.compile(rf'^"({_TOKEN})"\s*:')
-_RE_ENUM = re.compile(rf'^[A-Za-z_]\w*\s*=\s*"({_TOKEN})"')
-_RE_SUBSCRIPT = re.compile(rf'MULTIMODAL_AUTO_MODEL_MAPPING\[\s*"({_TOKEN})"\s*\]')
-_RE_QUOTED = re.compile(rf'"({_TOKEN})"')
+_RE_MEMBER = re.compile(rf"^['\"]({_TOKEN})['\"]\s*,?\s*$")
+_RE_DICTKEY = re.compile(rf"^['\"]({_TOKEN})['\"]\s*:")
+_RE_ENUM = re.compile(rf"^[A-Za-z_]\w*\s*=\s*['\"]({_TOKEN})['\"]")
+_RE_SUBSCRIPT = re.compile(
+    rf"MULTIMODAL_AUTO_MODEL_MAPPING\[\s*['\"]({_TOKEN})['\"]\s*\]"
+)
+_RE_QUOTED = re.compile(rf"['\"]({_TOKEN})['\"]")
 _RE_YAML_BASE = re.compile(r"^\s*base_model:\s*(.+?)\s*(?:#.*)?$")
 _RE_YAML_CHAT = re.compile(r"^\s*chat_template:\s*(.+?)\s*(?:#.*)?$")
 
@@ -426,9 +428,9 @@ def discover_from_diff(diff_text: str, repo_root: Path | None = None) -> dict:
                 bag.add(seg, "model_dir", authoritative=False, new_file=True)
             seg = _path_segment(path, "examples/")
             if seg and seg not in {"", "README.md"}:
-                base = chat = None
+                base = None
                 if path.endswith((".yml", ".yaml")):
-                    base, chat = _yaml_base(fd)
+                    base, _chat = _yaml_base(fd)
                 bag.add(
                     seg, "example", authoritative=False, base_model=base, new_file=True
                 )

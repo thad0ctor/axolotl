@@ -329,6 +329,18 @@ def run(ctx: GateContext) -> GateResult:
     if reliability:
         data["reliability_warnings"] = reliability
 
+    if scan.get("error"):
+        # no tests/ tree (repo-root/setup issue) — can't assess coverage at all
+        details.append(f"scan error: {scan['error']}")
+        return GateResult(
+            GATE_ID,
+            GATE_NAME,
+            GateStatus.COULD_NOT_RUN,
+            summary=scan["error"],
+            details=details,
+            data=data,
+        )
+
     undefended = not scan["referencing_files"]
     if undefended:
         return GateResult(

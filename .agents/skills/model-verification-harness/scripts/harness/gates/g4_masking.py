@@ -380,11 +380,13 @@ def run(ctx: GateContext) -> GateResult:
             try:
                 saved = json.loads(snap_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                snap_path.write_text(
-                    json.dumps(snapshot_norm, ensure_ascii=False, indent=2), "utf-8"
-                )
-                snapshot_note = (
-                    f"prior snapshot unreadable ({exc.__class__.__name__}); recaptured"
+                # don't overwrite a corrupt baseline (that would fake a clean diff);
+                # flag it so a human re-captures deliberately
+                saved = None
+                snapshot_note = f"prior snapshot unreadable ({exc.__class__.__name__})"
+                findings.append(
+                    f"snapshot {snap_path.name} is unreadable ({exc.__class__.__name__}) "
+                    "— remove it to re-capture"
                 )
             else:
                 if saved != snapshot_norm:

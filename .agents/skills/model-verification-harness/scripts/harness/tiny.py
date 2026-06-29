@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 # arch keyword (substring of model_config_type) -> tiny HF id
@@ -80,7 +81,9 @@ def _shrink_model(base_model: str, output_dir: Path, trust_remote_code: bool) ->
             base_model, trust_remote_code=trust_remote_code
         ).save_pretrained(dest)
     except Exception:  # noqa: BLE001 - tokenizer is best-effort
-        pass
+        logging.getLogger(__name__).debug(
+            "tokenizer save skipped for shrunk model", exc_info=True
+        )
     return str(dest)
 
 
