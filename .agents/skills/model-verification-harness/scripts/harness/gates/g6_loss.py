@@ -1,4 +1,4 @@
-"""G6 — loss sanity: drive the real ``axolotl.train`` for a few steps and assert every logged loss is FINITE and the final-window mean stays at-or-below the initial-window mean × ``loss_blowup_ratio``. Each variant trains in a FRESH subprocess so process-wide liger/CCE monkeypatches can't leak between variants (worker shared with G7)."""
+"""G6 — loss sanity: short real ``axolotl.train`` per variant (each in a fresh subprocess so process-wide liger/CCE patches can't leak; worker shared with G7); assert every logged loss is finite and the final-window mean stays within ``loss_blowup_ratio`` of the initial."""
 
 from __future__ import annotations
 
