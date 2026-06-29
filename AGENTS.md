@@ -86,6 +86,14 @@ docs/                            # Quarto documentation site
 - Trainer mixins: `core/trainers/mixins/` for composable trainer behaviors
 - Schemas: all config validation via Pydantic in `utils/schemas/`
 
+## Agent Skills
+
+Repo-specific workflow guides (plus scripts) under `.agents/skills/`, auto-discovered by Claude Code (via the `.claude/skills` → `.agents/skills` symlink) and read natively by Codex/Gemini. See [`.agents/skills/README.md`](.agents/skills/README.md); layout is enforced by `tests/test_agent_skill_layout.py`.
+
+| Skill | What it does |
+|-------|--------------|
+| [`sparselora-add-model`](.agents/skills/sparselora-add-model/SKILL.md) | Adds or verifies a model architecture's SparseLoRA sparse wiring (`integrations/sparselora/arch_wiring.py`); introspects MLP/attention classes, runs a smoke apply+forward, and guides custom wiring for non-standard attention. |
+
 ## Comment Style
 
 - Default to no comment. Only add one when the WHY is non-obvious (hidden constraint, subtle invariant, workaround for a specific bug).
