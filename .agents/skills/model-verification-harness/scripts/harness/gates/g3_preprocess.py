@@ -44,8 +44,7 @@ def run(ctx: GateContext) -> GateResult:
             f"preprocess pipeline failed: {exc.__class__.__name__}: {exc}",
         )
 
-    # prove the preprocess step wrote a loadable artifact before prepare(), which
-    # would otherwise silently reprocess raw data and false-pass
+    # prove preprocess wrote a loadable artifact before prepare(), which would otherwise silently reprocess raw data and false-pass
     if not runner.has_saved_dataset(prepared_path):
         return GateResult(
             GATE_ID,

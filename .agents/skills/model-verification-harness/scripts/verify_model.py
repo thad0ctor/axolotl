@@ -334,8 +334,7 @@ def main(argv: list[str] | None = None) -> int:
         print("could not locate an axolotl checkout (src/axolotl). Use --repo-root.")
         return 2
 
-    # make `import axolotl` resolve to repo_root in-process AND on PYTHONPATH, so the
-    # G6/G7 subprocess workers introspect the same tree as the static gates
+    # make `import axolotl` resolve to repo_root in-process AND on PYTHONPATH, so G6/G7 subprocess workers see the same tree as the static gates
     src_dir = repo_root / "src"
     if src_dir.is_dir():
         sys.path.insert(0, str(src_dir))
@@ -479,9 +478,7 @@ def main(argv: list[str] | None = None) -> int:
 
     code = exit_code(results, on_unavailable=args.on_unavailable)
 
-    # Dual output (audit-style): print the full report sections to stdout AND, when
-    # requested, write the markdown/manifest files. A requested-but-unwritable file
-    # forces exit 2 (could-not-run).
+    # dual output: print the full report to stdout AND write the markdown/manifest when requested; a requested-but-unwritable file forces exit 2
     if not _emit_outputs(args, ctx, features, results):
         if args.report is not None or args.manifest is not None:
             code = 2
@@ -498,9 +495,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _emit_outputs(args, ctx, features, results) -> bool:
-    """Render the report once: print sections to stdout (unless --quiet) and write
-    --report/--manifest when requested. Returns False on an import or file-write
-    failure so a requested output that couldn't be produced maps to exit 2."""
+    """Render once: print to stdout (unless --quiet) + write --report/--manifest when requested. False on import/write failure so a missing requested output maps to exit 2."""
     try:
         from harness.report import build_manifest, render_report
     except Exception as exc:  # noqa: BLE001

@@ -285,8 +285,7 @@ def run(ctx: GateContext) -> GateResult:
             GATE_ID, GATE_NAME, "chat fixture produced 0 prepared rows"
         )
 
-    # shuffled dataset: scan several rows and union their trained text so role
-    # coverage doesn't hinge on row 0
+    # shuffled dataset: scan several rows and union their trained text so role coverage doesn't hinge on row 0
     n_scan = min(8, train_dataset.num_rows)
     union_trained = ""
     total_trained = 0
@@ -359,8 +358,7 @@ def run(ctx: GateContext) -> GateResult:
     snap_dir = ctx.options.get("snapshot_dir")
     snapshot_note = "no snapshot_dir (diff skipped)"
     if snap_dir:
-        # shuffle-invariant key: every prepared row's normalized structure, sorted
-        # into a canonical order so row ordering can't perturb the diff
+        # shuffle-invariant key: every prepared row's normalized structure, sorted canonical so row ordering can't perturb the diff
         snapshot_norm = sorted(
             (
                 _row_norm(train_dataset[i], tokenizer)
@@ -380,8 +378,7 @@ def run(ctx: GateContext) -> GateResult:
             try:
                 saved = json.loads(snap_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                # don't overwrite a corrupt baseline (that would fake a clean diff);
-                # flag it so a human re-captures deliberately
+                # don't overwrite a corrupt baseline (would fake a clean diff); flag it so a human re-captures deliberately
                 saved = None
                 snapshot_note = f"prior snapshot unreadable ({exc.__class__.__name__})"
                 findings.append(

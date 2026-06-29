@@ -41,8 +41,7 @@ def _check_collate_reset(cfg, train_dataset, n_docs: int = 4):
             return "skipped", "prepared rows carry no position_ids to collate"
         group.append({key: list(row[key]) for key in keys if key in row})
 
-    # squash_position_ids stays False (multipack default): the collator keeps each
-    # document's per-document range, which is exactly the reset we assert
+    # squash_position_ids stays False (multipack default): the collator keeps each document's per-document range, which is the reset we assert
     tokenizer = load_tokenizer(cfg)
     collator = V2BatchSamplerDataCollatorForSeq2Seq(tokenizer=tokenizer)
     batch = collator(group)  # flat list -> one pack group of k documents
@@ -107,8 +106,7 @@ def _packing_loss_parity(ctx: GateContext, seq_len: int) -> dict[str, Any]:
         )
         return cfg
 
-    # _spawn_variant honors ctx.options["gpus"] per-subprocess, so no parent env pin needed.
-    # packed: one pack/step; unpacked: a single batch of all docs -> identical token set at step 0
+    # _spawn_variant honors ctx.options["gpus"] per-subprocess; packed=one pack/step, unpacked=one batch of all docs -> same token set at step 0
     res_packed = g6_loss._spawn_variant(
         ctx, "g5_packed", _cfg("g5_packed", True, 1), timeout
     )
@@ -263,8 +261,7 @@ def run(ctx: GateContext) -> GateResult:
         )
     details.append(pos_note)
 
-    # (d) collate-time cross-document reset: the per-row check above is true by
-    # construction at prepare time and doesn't exercise the collator that can regress
+    # (d) collate-time cross-document reset: the per-row check above is true by construction and doesn't exercise the collator that can regress
     try:
         collate_status, collate_note = _check_collate_reset(cfg, train_dataset)
     except Exception as exc:  # noqa: BLE001 - collator wiring may be unavailable
@@ -276,9 +273,7 @@ def run(ctx: GateContext) -> GateResult:
         findings.append(collate_note)
     details.append(f"collate reset: {collate_note}")
 
-    # (e) packing must not change the math: step-0 loss packed-vs-unpacked parity.
-    # Opt-in (profile=full or pack_parity) — it spawns two train forwards, so it
-    # must not slow the default structural G5 on every GPU box.
+    # (e) packing must not change the math: step-0 loss packed-vs-unpacked parity. Opt-in (profile=full/pack_parity) since it spawns two train forwards
     want_parity = ctx.profile == "full" or bool(ctx.options.get("pack_parity"))
     if not want_parity:
         parity = {

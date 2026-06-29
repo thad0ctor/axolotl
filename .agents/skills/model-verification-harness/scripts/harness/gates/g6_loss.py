@@ -77,9 +77,7 @@ def _build_cfg(
 # --- subprocess worker (shared with G7) ----------------------------------------
 
 
-# transient env/compile failures (kernel won't compile / no resources in THIS env)
-# vs a kernel that compiles and changes the math (the real shadow signal). Matched
-# against the worker error + traceback; drives both retry and could_not_run classing.
+# transient env/compile failures (won't compile / no resources here) vs a kernel that compiles and changes the math; matched against error+traceback to drive retry and could_not_run classing
 _TRANSIENT_MARKERS = (
     "compilationerror",  # triton kernel failed to compile
     "out of resource",  # triton smem/register pressure at compile time
@@ -119,8 +117,7 @@ def _spawn_once(
         str(cfg_path),
         str(out_path),
     ]
-    # subprocess doesn't inherit the orchestrator's sys.path, so propagate the
-    # harness (scripts dir) and axolotl (repo src) on PYTHONPATH explicitly
+    # subprocess doesn't inherit sys.path, so propagate harness (scripts dir) + axolotl (repo src) on PYTHONPATH explicitly
     scripts_dir = Path(__file__).resolve().parents[2]
     src_dir = ctx.repo_root / "src"
     env = os.environ.copy()
@@ -190,8 +187,7 @@ def _engagement(model) -> dict[str, Any]:
                 namespaces.add(mod)
     except Exception:  # noqa: BLE001
         pass
-    # liger_cross_entropy patches loss symbols at module scope (never on
-    # model.modules()), so also inspect the modeling module + loss_function attr
+    # liger_cross_entropy patches loss symbols at module scope (never on model.modules()), so also inspect the modeling module + loss_function attr
     try:
         import importlib
 
@@ -249,8 +245,7 @@ def _worker(cfg_path: str, out_path: str) -> None:
 
 
 def _window(n: int) -> int:
-    # average over ~a quarter of the run (>=2 steps once the run is long enough) so a
-    # single noisy step on a tiny model can neither fake nor mask a real blowup
+    # average over ~a quarter of the run (>=2 steps when long enough) so a single noisy step can neither fake nor mask a real blowup
     if n >= 8:
         return min(3, max(2, n // 4))
     return max(1, n // 3)
@@ -383,8 +378,7 @@ def run(ctx: GateContext) -> GateResult:
         "strict_ratio": strict,
         "env_failed": env_failed,
     }
-    # real findings dominate (actionable shadow signal); env-only failures degrade the
-    # gate to could_not_run rather than masquerading as PASS
+    # real findings dominate (actionable shadow signal); env-only failures degrade to could_not_run rather than masquerading as PASS
     if findings:
         status = GateStatus.FINDINGS
         summary = f"{ran} ran; {findings} with NaN/inf or divergence" + (

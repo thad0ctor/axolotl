@@ -69,8 +69,7 @@ def _kernel_variants(ctx: GateContext) -> tuple[list[dict[str, Any]], list[str]]
                 "name": "liger_cross_entropy",
                 "flags": {"plugins": [_LIGER_PLUGIN], "liger_cross_entropy": True},
                 "bf16": False,
-                # CE is swapped at module scope, not on the model instance, so it
-                # isn't reliably fingerprintable -> engage-unknown, rely on the numeric check
+                # CE is swapped at module scope, not on the instance -> not reliably fingerprintable; engage-unknown, rely on the numeric check
                 "markers": (),
             }
         )
@@ -171,8 +170,7 @@ def run(ctx: GateContext) -> GateResult:
     for note in skip_notes:
         details.append(f"· {note}")
 
-    # skip BEFORE spawning any baseline, else a failed baseline could turn "no GPU"
-    # into could_not_run
+    # skip BEFORE spawning any baseline, else a failed baseline could turn "no GPU" into could_not_run
     if not variants:
         return GateResult(
             GATE_ID,
@@ -227,8 +225,7 @@ def run(ctx: GateContext) -> GateResult:
         tol = rtol_bf16 if v["bf16"] else rtol
         base_loss = baselines.get(dtype)
         if base_loss is None:
-            # no same-dtype baseline (it failed to produce a step-0 loss), so there's
-            # nothing to compare against — that's could-not-run, not a model shadow.
+            # no same-dtype baseline (it failed to produce a step-0 loss) -> nothing to compare against = could-not-run, not a model shadow
             env_failed += 1
             details.append(
                 f"⚠️ {name}: could_not_run — no {dtype} baseline to compare against"
@@ -282,8 +279,7 @@ def run(ctx: GateContext) -> GateResult:
                 )
             continue
 
-        # engagement first: a silent no-op yields the same Δ≈0 as a genuine match,
-        # which is the shadow class this gate exists to catch
+        # engagement first: a silent no-op yields the same Δ≈0 as a genuine match — the shadow class this gate exists to catch
         engaged = _engaged(res, v["markers"])
         if engaged is False:
             findings += 1
@@ -352,8 +348,7 @@ def run(ctx: GateContext) -> GateResult:
         "skipped": skip_notes,
         "env_failed": env_failed,
     }
-    # a kernel that RAN but diverges/no-ops is a real finding; one that couldn't compile
-    # only degrades the gate to could_not_run
+    # a kernel that RAN but diverges/no-ops is a real finding; one that couldn't compile only degrades to could_not_run
     if findings:
         status = GateStatus.FINDINGS
         summary = (

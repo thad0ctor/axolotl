@@ -19,8 +19,7 @@ _LIGER_PLUGIN = "axolotl.integrations.liger.LigerPlugin"
 _CCE_PLUGIN = "axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin"
 _KERNELS_PLUGIN = "axolotl.integrations.kernels.KernelsPlugin"
 
-# flag key -> substrings marking a warning as "about" it, so incidental warnings
-# (FSDP1 deprecation, bf16 auto) don't falsely paint a cell WARNED_NO_OP
+# flag key -> warning substrings, so incidental warnings (FSDP1/bf16) don't falsely paint a cell WARNED_NO_OP
 _FLAG_WARN_TOKENS = {
     "sample_packing": ("sample_packing",),
     "batch_flattening": ("batch_flattening",),
@@ -35,13 +34,10 @@ _FLAG_WARN_TOKENS = {
     "moe_grouped_backend": ("moe_grouped", "grouped"),
 }
 
-# flag names too generic to attribute warnings by (only matter via an explicit
-# _FLAG_WARN_TOKENS entry, never as a bare-name fallback). "rl" is a 2-char
-# substring that hits unrelated messages (early/control/url) -> deny.
+# flag names too generic to attribute warnings by bare name (e.g. "rl" hits early/control/url) -> deny
 _GENERIC_FLAG_DENY = {"bf16", "fp16", "tf32", "fp8", "use_kernels", "kernel", "rl"}
 
-# nested/structured keys whose resolved form always differs from the input
-# (pydantic fills defaults), so they're meaningless for warn/normalize attribution
+# structured keys whose resolved form always differs (pydantic defaults) -> useless for warn/normalize attribution
 _STRUCT_KEYS = ("plugins", "datasets", "trl")
 
 # keys appearing in the resolved cfg but not the input signal a NORMALIZED rewrite
@@ -114,8 +110,7 @@ class _ResetFailure(RuntimeError):
 
 
 def _reset_plugins() -> BaseException | None:
-    # the PluginManager is a process singleton; reset so each load_cfg sees only its
-    # own plugins. Return the failure: a leaked reset can silently shadow later verdicts
+    # PluginManager is a process singleton; reset so each load_cfg sees only its own plugins (a leaked reset shadows later verdicts)
     try:
         from axolotl.integrations.base import PluginManager
 
@@ -195,8 +190,7 @@ def _normalized_changes(flags: dict[str, Any], resolved: dict) -> dict[str, Any]
 
 
 def _support_note(ctx: GateContext, flags: dict[str, Any]) -> str:
-    """Registry cross-check that distinguishes a real SUPPORTED branch from an
-    accepted-but-inert flag."""
+    """Registry cross-check distinguishing a real SUPPORTED branch from an accepted-but-inert flag."""
     notes = []
     if flags.get("sample_packing"):
         from axolotl.monkeypatch.multipack import SUPPORTED_MULTIPACK_MODEL_TYPES
@@ -215,8 +209,7 @@ def _support_note(ctx: GateContext, flags: dict[str, Any]) -> str:
         else:
             notes.append(f"sample_packing: {mt} NOT in multipack registry")
     if flags.get("load_in_4bit") or flags.get("load_in_8bit"):
-        # resolution-only: the actual bnb skip-modules (jamba->mamba,
-        # falcon_h1->out_proj, model.py) only apply at load (a GPU gate)
+        # resolution-only: bnb skip-modules (jamba->mamba, falcon_h1->out_proj) only apply at load (a GPU gate)
         mt = ctx.features.model_config_type
         skip = {"jamba": "mamba", "falcon_h1": "out_proj"}.get(mt)
         notes.append(
@@ -324,8 +317,7 @@ def _composites(ctx: GateContext) -> list[_Cell]:
         )
     )
 
-    # deliberate oracle probe for the WARNED_NO_OP channel (expect="warn"): its
-    # firing is EXPECTED and must not count as a model finding (cf. p_dual_ce)
+    # oracle probe for the WARNED_NO_OP channel (expect="warn"): firing is EXPECTED, not a model finding
     cells.append(
         _Cell(
             "c4_chunked_packing_sdpa",
@@ -358,8 +350,7 @@ def _composites(ctx: GateContext) -> list[_Cell]:
     if ctx.profile == "multigpu":
         cells.extend(_multigpu_composites(ctx))
 
-    # quant/RL composites bloat the smoke set, so gate them behind the "full"
-    # profile or an explicit opt-in flag; smoke stays ~6 cells
+    # quant/RL composites bloat the smoke set -> gate behind profile=full or an opt-in flag; smoke stays ~6 cells
     if (
         ctx.profile == "full"
         or ctx.options.get("quant")
@@ -461,9 +452,7 @@ def _quant_composites(ctx: GateContext) -> list[_Cell]:
     ]
 
 
-# minimal valid RL dataset stanzas (mirroring examples/*): config resolution only.
-# full RL train/preprocess (data download, reward-fn import, vLLM) is a separate
-# prompted gate, NOT covered here.
+# minimal valid RL dataset stanzas (mirroring examples/*); config resolution only, not training
 _RL_DATASETS = {
     "dpo": [
         {
@@ -607,8 +596,7 @@ def run(ctx: GateContext) -> GateResult:
     could_not_run = 0
     for cell in cells:
         resolved, exc, records = _run_cfg(ctx, cell.flags, cell.composite_id)
-        # an unimportable config (offline / bad id) or a failed reset is an
-        # environment/isolation problem, not a config verdict
+        # unimportable config (offline/bad id) or failed reset = environment/isolation problem, not a config verdict
         if exc is not None and (
             isinstance(exc, _ResetFailure) or _is_environment_error(exc)
         ):

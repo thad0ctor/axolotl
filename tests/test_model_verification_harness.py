@@ -91,16 +91,14 @@ def test_main_g1_exit_clean(tmp_path):
             "--quiet",
         ]
     )
-    # G1 resolves the composites on a healthy llama -> clean (0); if load_cfg is
-    # unavailable in this env it self-reports could-not-run (2). Never crash.
+    # G1 resolves on a healthy llama -> clean (0); if load_cfg is unavailable it self-reports could-not-run (2). Never crash.
     assert code in (0, 2)
 
 
 def test_main_g2_findings_exit_one(tmp_path):
     import verify_model
 
-    # an unknown type with architectures -> G2 model-loads/liger/CCE generic-fallback
-    # -> a finding -> exit 1 (the static-gate exit contract via main()).
+    # unknown type with architectures -> G2 model-loads/liger/CCE generic-fallback -> finding -> exit 1 (static-gate contract via main())
     d = _write_config(
         tmp_path,
         "novel",
@@ -299,8 +297,7 @@ def test_g8_static_coverage_llama(tmp_path):
 def test_g8_undefended_type_findings(tmp_path):
     from harness.gates import g8_coverage
 
-    # build the token by concatenation so its contiguous literal never appears in
-    # this source file (else G8 would match this very test and not be "undefended").
+    # build the token by concatenation so its contiguous literal never appears in this file (else G8 matches this very test, not "undefended")
     bogus = "qzx" + "nonexistent" + "arch7"
     res = g8_coverage.run(_ctx(_features(bogus, f"acme/{bogus}"), tmp_path))
     assert res.status == GateStatus.FINDINGS  # zero references -> undefended

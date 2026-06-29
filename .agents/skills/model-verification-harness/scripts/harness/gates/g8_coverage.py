@@ -12,8 +12,7 @@ from .. import GateContext, GateResult, GateStatus
 GATE_ID = "G8"
 GATE_NAME = "coverage"
 
-# capability label -> content tokens (case-insensitive substrings) marking a test
-# that references this type as also exercising that capability
+# capability label -> content tokens (case-insensitive substrings) marking a referencing test as exercising that capability
 _CAPABILITIES: dict[str, tuple[str, ...]] = {
     "lora": ("lora",),
     "qlora / 4bit": ("qlora", "load_in_4bit"),
@@ -113,8 +112,7 @@ def _scan(ctx: GateContext) -> dict[str, Any]:
             if s in text:
                 surface_hits[surfaces[idx]] = True
                 file_surface_hit = True
-        # a patch-surface mention counts as a reference too, else surface-only coverage
-        # still reports the model "undefended"
+        # a patch-surface mention counts as a reference too, else surface-only coverage still reports the model "undefended"
         if not (any(rx.search(text) for rx in tok_res) or file_surface_hit):
             continue
         referencing.append(rel)
@@ -252,8 +250,7 @@ def _emit_scaffold(ctx: GateContext) -> dict[str, Any]:
     else:
         composites = []
     if not composites:
-        # no matrix/passing cells: emit a default placeholder (no model- or
-        # hardware-specific flags) so the scaffold is runnable for any target model
+        # no matrix/passing cells: emit a default placeholder (no model-/hardware-specific flags) so the scaffold runs for any target model
         composites = [("representative", {})]
         limitation = (
             "no G1 matrix file available to G8 (gates can't read each other's "

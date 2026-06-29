@@ -162,8 +162,7 @@ def _func_string_keys(path: Path, func_name: str) -> tuple[set[str], bool]:
 
 
 def _method_model_types(path: Path) -> tuple[dict[str, set[str]], bool]:
-    """Per-method (``FunctionDef.name`` -> types it dispatches on) so the patch_manager
-    lifecycle can be reported per-stage instead of one folded whole-file set."""
+    """Per-method (``FunctionDef.name`` -> types it dispatches on) so the patch_manager lifecycle can be reported per-stage."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
@@ -181,8 +180,7 @@ def _method_model_types(path: Path) -> tuple[dict[str, set[str]], bool]:
 
 
 def _preconfig_intercept_strings(path: Path) -> tuple[set[str], bool]:
-    """Model tokens the pre-config/pre-tokenizer remote-code intercepts key on. These
-    test ``"<token>" in cfg.base_model_config`` (substring), not model_config_type."""
+    """Model tokens the pre-config/pre-tokenizer remote-code intercepts key on (substring of cfg.base_model_config, not model_config_type)."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
@@ -202,8 +200,7 @@ def _preconfig_intercept_strings(path: Path) -> tuple[set[str], bool]:
 
 
 def _registered_adapter_modules(init_path: Path) -> tuple[set[str], bool]:
-    """Module stems imported by ``_all_adapters()`` — the actual kernel-adapter registry,
-    so a stray file that isn't wired in doesn't count as a dedicated adapter."""
+    """Module stems imported by ``_all_adapters()`` — the actual registry, so a stray unwired file isn't counted as a dedicated adapter."""
     try:
         tree = ast.parse(init_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
@@ -218,8 +215,7 @@ def _registered_adapter_modules(init_path: Path) -> tuple[set[str], bool]:
 
 
 def _adapter_info(path: Path) -> tuple[set[str], str | None, bool]:
-    """(model-type tokens, adapter class name, readable) for one adapter file. Tokens =
-    file stem + ``name=`` attr + model-type ``==``/``in``/``startswith`` constants."""
+    """(model-type tokens, adapter class name, readable) for one adapter file; tokens = stem + ``name=`` attr + type-compare constants."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
@@ -255,8 +251,7 @@ def _adapter_info(path: Path) -> tuple[set[str], str | None, bool]:
 
 
 def _family_match(mct: str, token: str) -> bool:
-    """mct hooks token's adapter on an exact match or a segment-boundary family prefix
-    (so ``gemma4_text`` matches the ``gemma4`` adapter but ``gemma4x`` does not)."""
+    """mct matches token on equality or a segment-boundary family prefix (``gemma4_text`` matches ``gemma4`` but ``gemma4x`` does not)."""
     if not mct or not token:
         return False
     if mct == token:
@@ -451,9 +446,7 @@ def _check_multipack(p: Probe) -> None:
         )
 
 
-# Named patch_manager lifecycle stages: (hook label, methods feeding it, present-note).
-# Split so a reviewer sees *which* stage a type hooks (main dispatch vs post-build loss)
-# rather than one folded "patch_manager" set.
+# patch_manager lifecycle stages (hook label, feeding methods, present-note); split so a reviewer sees which stage a type hooks
 _PM_STAGES: list[tuple[str, set[str], str]] = [
     (
         "PatchManager: pre-model dispatch",
@@ -616,8 +609,7 @@ def _check_fused_attn(p: Probe) -> None:
 
 
 def _check_liger(p: Probe) -> None:
-    # explicit = a dedicated elif branch OR native MODEL_TYPE_TO_APPLY_LIGER_FN;
-    # generic_fallback = neither, leaving only the experimental patch_lce_forward FLCE
+    # explicit = dedicated elif branch OR native MODEL_TYPE_TO_APPLY_LIGER_FN; generic_fallback = neither (only experimental patch_lce_forward FLCE)
     native, nerr = _safe_import(
         "liger_kernel.transformers.monkey_patch", "MODEL_TYPE_TO_APPLY_LIGER_FN"
     )
@@ -673,8 +665,7 @@ def _check_liger(p: Probe) -> None:
 
 
 def _check_cce(p: Probe) -> None:
-    # explicit = an upstream PATCH_FNS entry; else patch_llama_like installs a generic
-    # llama-shaped patch = generic_fallback
+    # explicit = an upstream PATCH_FNS entry; else patch_llama_like installs a generic llama-shaped patch = generic_fallback
     patch_fns, err = _safe_import("cut_cross_entropy.transformers.patch", "PATCH_FNS")
     if err is not None:
         p.warn(f"CCE PATCH_FNS not importable ({err}); routing classification degraded")
@@ -758,8 +749,7 @@ def _check_moe(p: Probe) -> None:
                 "is_moe=True but no MOE_ARCH_BLOCK entry (MoE FSDP wrap will be wrong)",
             )
         )
-    # dedicated dsv4/gemma4/glm adapter vs the generic scattermoe/sonicmoe backend
-    # (the generic path is the designed default for any MoE, not a fallback bug)
+    # dedicated dsv4/gemma4/glm adapter vs the generic scattermoe/sonicmoe backend (the designed default for any MoE, not a bug)
     adapters = p.src("integrations/kernels/adapters")
     registered, reg_ok = _registered_adapter_modules(adapters / "__init__.py")
     if not reg_ok:
@@ -1189,8 +1179,7 @@ def _check_example(p: Probe) -> None:
             dn = norm(d.name)
             if not dn:
                 continue
-            # require a real segment-prefix overlap (>=3 chars), not a loose substring,
-            # so model_config_type / its family must actually match the dir name
+            # require a real segment-prefix overlap (>=3 chars), not a loose substring, so the family must actually match the dir name
             short, long = (dn, mct_n) if len(dn) <= len(mct_n) else (mct_n, dn)
             if len(short) >= 3 and long.startswith(short):
                 matched = d.name

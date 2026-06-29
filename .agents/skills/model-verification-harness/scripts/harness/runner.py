@@ -172,8 +172,7 @@ def prepare(cfg, debug: bool = False):
 
 def preprocess_to_disk(cfg) -> Path:
     """Run the preprocess entry point; return the dataset_prepared_path dir.
-
-    The AXOLOTL_IS_PREPROCESS env + cfg.is_preprocess flag are set then RESTORED, else preprocess mode leaks into later gates and a subsequent prepare() skips loading the saved artifact."""
+    AXOLOTL_IS_PREPROCESS env + cfg.is_preprocess are set then RESTORED, else preprocess mode leaks and a later prepare() skips the saved artifact."""
     import os
 
     from axolotl.cli.args import PreprocessCliArgs
