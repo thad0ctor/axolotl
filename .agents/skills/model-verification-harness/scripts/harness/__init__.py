@@ -110,10 +110,15 @@ class Gate(Protocol):
     def run(self, ctx: GateContext) -> GateResult: ...
 
 
-def exit_code(results: list[GateResult]) -> int:
-    """Aggregate the exit contract: COULD_NOT_RUN (2) dominates FINDINGS (1); SKIPPED never counts."""
+def exit_code(results: list[GateResult], on_unavailable: str = "fail") -> int:
+    """Aggregate the exit contract: COULD_NOT_RUN (2) dominates FINDINGS (1); SKIPPED never counts.
+
+    on_unavailable="skip" downgrades COULD_NOT_RUN to non-blocking (treated like
+    SKIPPED) so a gate that can't run *here* (no GPU, kernel won't compile) doesn't
+    fail the run — the user's choice; default "fail" keeps the strict 0/1/2 contract.
+    """
     statuses = {r.status for r in results}
-    if GateStatus.COULD_NOT_RUN in statuses:
+    if on_unavailable == "fail" and GateStatus.COULD_NOT_RUN in statuses:
         return 2
     if GateStatus.FINDINGS in statuses:
         return 1

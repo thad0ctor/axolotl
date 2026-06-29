@@ -99,9 +99,15 @@ GPU gates retry a transient Triton/CUDA compile failure and classify a kernel th
 can't compile in this env as **could-not-run** (not a false finding) — distinct from
 a kernel that runs but changes the math (a real shadow finding).
 
+Run bare, it prints the full report sections to stdout **and** returns an exit code
+(audit-style, CI-gateable); `--report`/`--manifest` also write files; `--quiet`
+keeps only the per-gate summary lines.
+
 Exit code: **`0`** all selected gates clean · **`1`** findings · **`2`** could not
-run (model/env unloadable) — same contract as the liger audit, so CI can gate on
-it.
+run reliably (no GPU for G6/G7, kernel won't compile, model unloadable) — same
+contract as the liger audit. `--on-unavailable skip` makes a can't-run-here gate
+non-blocking (exit reflects only real findings) — offer it as a checklist choice
+when the user wants a partial run to still pass.
 
 > The harness must be invoked as the `verify_model.py` script (it has the
 > `__main__` guard datasets' multiprocess save needs). Run it directly, not via

@@ -124,6 +124,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="comma-separated CUDA device indices for the train gates (e.g. 1,2); "
         "default leaves CUDA visibility as-is",
     )
+    p.add_argument(
+        "--on-unavailable",
+        choices=["fail", "skip"],
+        default="fail",
+        help="how a gate that cannot run here (no GPU, kernel won't compile, model "
+        "unloadable) affects the exit code: fail=exit 2 (default, strict gate), "
+        "skip=non-blocking (exit reflects only real findings)",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress the full report sections on stdout (keep only per-gate "
+        "summary lines + exit code)",
+    )
     return p
 
 
@@ -354,11 +368,13 @@ def main(argv: list[str] | None = None) -> int:
         if scaffold:
             print(f"  emitted regression test → {scaffold}")
 
-    code = exit_code(results)
+    code = exit_code(results, on_unavailable=args.on_unavailable)
 
-    if args.report is not None or args.manifest is not None:
-        # a requested-but-unwritable report/manifest forces exit 2 (could-not-run)
-        if not _emit_outputs(args, ctx, features, results):
+    # Dual output (audit-style): print the full report sections to stdout AND, when
+    # requested, write the markdown/manifest files. A requested-but-unwritable file
+    # forces exit 2 (could-not-run).
+    if not _emit_outputs(args, ctx, features, results):
+        if args.report is not None or args.manifest is not None:
             code = 2
 
     print(
@@ -373,17 +389,20 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _emit_outputs(args, ctx, features, results) -> bool:
-    """Returns False on any import/write failure so the caller can map it to exit 2."""
+    """Render the report once: print sections to stdout (unless --quiet) and write
+    --report/--manifest when requested. Returns False on an import or file-write
+    failure so a requested output that couldn't be produced maps to exit 2."""
     try:
         from harness.report import build_manifest, render_report
     except Exception as exc:  # noqa: BLE001
         print(f"  ! report module unavailable: {exc}")
         return False
+    report_md = render_report(ctx, features, results)
+    if not args.quiet:
+        print("\n" + report_md)
     try:
         if args.report is not None:
-            args.report.write_text(
-                render_report(ctx, features, results), encoding="utf-8"
-            )
+            args.report.write_text(report_md, encoding="utf-8")
             print(f"  report → {args.report}")
         if args.manifest is not None:
             args.manifest.write_text(

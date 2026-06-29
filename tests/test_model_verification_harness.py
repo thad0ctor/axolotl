@@ -58,6 +58,70 @@ def test_exit_code_aggregation():
     assert exit_code([r(GateStatus.FINDINGS), r(GateStatus.COULD_NOT_RUN)]) == 2
 
 
+def test_exit_code_on_unavailable_skip():
+    def r(status):
+        return GateResult("Gx", "x", status)
+
+    # skip policy: could-not-run is non-blocking (reflects only real findings)
+    assert exit_code([r(GateStatus.COULD_NOT_RUN)], on_unavailable="skip") == 0
+    assert exit_code([r(GateStatus.FINDINGS), r(GateStatus.COULD_NOT_RUN)], "skip") == 1
+
+
+# --- verify_model.main(argv) exit-code contract (no GPU; static gates) ----------
+
+
+def test_main_g1_exit_clean(tmp_path):
+    import verify_model
+
+    d = _write_config(
+        tmp_path,
+        "llama",
+        {"model_type": "llama", "architectures": ["LlamaForCausalLM"]},
+    )
+    code = verify_model.main(
+        [
+            "--base-model",
+            str(d),
+            "--gates",
+            "G1",
+            "--repo-root",
+            str(REPO_ROOT),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--quiet",
+        ]
+    )
+    # G1 resolves the composites on a healthy llama -> clean (0); if load_cfg is
+    # unavailable in this env it self-reports could-not-run (2). Never crash.
+    assert code in (0, 2)
+
+
+def test_main_g2_findings_exit_one(tmp_path):
+    import verify_model
+
+    # an unknown type with architectures -> G2 model-loads/liger/CCE generic-fallback
+    # -> a finding -> exit 1 (the static-gate exit contract via main()).
+    d = _write_config(
+        tmp_path,
+        "novel",
+        {"model_type": "znovelarch_test", "architectures": ["ZNovelArchForCausalLM"]},
+    )
+    code = verify_model.main(
+        [
+            "--base-model",
+            str(d),
+            "--gates",
+            "G2",
+            "--repo-root",
+            str(REPO_ROOT),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--quiet",
+        ]
+    )
+    assert code == 1
+
+
 # --- detection -----------------------------------------------------------------
 
 
