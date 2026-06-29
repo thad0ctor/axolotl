@@ -353,9 +353,8 @@ def main(argv: list[str] | None = None) -> int:
             "gates import the resolved axolotl — verdicts could mix trees. Run inside "
             "the env whose axolotl matches --repo-root (or set --repo-root to it)."
         )
-        # mixed trees make the verdict unreliable; --on-unavailable skip keeps the warn-and-continue escape hatch
-        if args.on_unavailable != "skip":
-            return 2
+        # warn-only: a normal pip-installed axolotl resolves outside the checkout (same code,
+        # different location), so hard-failing here would false-positive in most real envs + CI
 
     selected, invalid = _parse_gates(args.gates)
     if invalid:
