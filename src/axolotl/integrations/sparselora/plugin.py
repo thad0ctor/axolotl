@@ -55,7 +55,11 @@ def _is_deepspeed_zero3(deepspeed: Any) -> bool:
                 return "zero3" in deepspeed
 
     if isinstance(config, dict):
-        return int(config.get("zero_optimization", {}).get("stage", 0)) == 3
+        zero = config.get("zero_optimization", {})
+        if not isinstance(zero, dict):
+            # Legacy boolean form maps to stage 1 (or 0), never 3.
+            return False
+        return int(zero.get("stage", 0)) == 3
 
     return "zero3" in str(deepspeed)
 

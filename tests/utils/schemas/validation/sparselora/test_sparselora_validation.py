@@ -54,12 +54,12 @@ def test_unknown_sparselora_key_rejected(min_base_cfg):
     # A typo in the `sparselora` block must error, not be silently ignored.
     cfg = _cfg(min_base_cfg, target_sparsity=0.9, target_sparsiti=0.9)
     prepare_plugins(cfg)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"target_sparsiti"):
         validate_config(cfg)
 
 
 def test_unknown_calibration_key_rejected(min_base_cfg):
     cfg = _cfg(min_base_cfg, calibration={"method": "proxy", "num_sample": 64})
     prepare_plugins(cfg)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"num_sample"):
         validate_config(cfg)

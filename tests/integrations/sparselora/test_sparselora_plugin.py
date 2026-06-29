@@ -156,6 +156,13 @@ class TestValidate:
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
         self._run(model, _validate_cfg(deepspeed={"zero_optimization": {"stage": 2}}))
 
+    @pytest.mark.parametrize("zero", [True, False])
+    def test_deepspeed_legacy_bool_zero_optimization(self, zero):
+        # Legacy boolean zero_optimization maps to stage 1/0 (never 3): must not
+        # crash on .get("stage") and must not be rejected.
+        model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
+        self._run(model, _validate_cfg(deepspeed={"zero_optimization": zero}))
+
 
 def _fake_trainer(model, n=4, t=16):
     def make(_):
