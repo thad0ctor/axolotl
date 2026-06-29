@@ -45,8 +45,13 @@ _FLAG_WARN_TOKENS = {
 }
 
 # flag names too generic to attribute warnings by (only matter via an explicit
-# _FLAG_WARN_TOKENS entry, never as a bare-name fallback)
-_GENERIC_FLAG_DENY = {"bf16", "fp16", "tf32", "fp8", "use_kernels", "kernel"}
+# _FLAG_WARN_TOKENS entry, never as a bare-name fallback). "rl" is a 2-char
+# substring that hits unrelated messages (early/control/url) -> deny.
+_GENERIC_FLAG_DENY = {"bf16", "fp16", "tf32", "fp8", "use_kernels", "kernel", "rl"}
+
+# nested/structured keys whose resolved form always differs from the input
+# (pydantic fills defaults), so they're meaningless for warn/normalize attribution
+_STRUCT_KEYS = ("plugins", "datasets", "trl")
 
 # keys appearing in the resolved cfg but not the input signal a NORMALIZED rewrite
 _CANONICALIZATION_WATCH = (
@@ -174,7 +179,7 @@ def _relevant_warnings(flags: dict[str, Any], records: list[str]) -> list[str]:
     for key in flags:
         if key in _FLAG_WARN_TOKENS:
             tokens.extend(_FLAG_WARN_TOKENS[key])
-        elif key not in _GENERIC_FLAG_DENY and key != "plugins":
+        elif key not in _GENERIC_FLAG_DENY and key not in _STRUCT_KEYS:
             tokens.append(key)
     out = []
     for msg in records:
@@ -187,7 +192,7 @@ def _relevant_warnings(flags: dict[str, Any], records: list[str]) -> list[str]:
 def _normalized_changes(flags: dict[str, Any], resolved: dict) -> dict[str, Any]:
     changes: dict[str, Any] = {}
     for key, val in flags.items():
-        if key in ("plugins",):
+        if key in _STRUCT_KEYS:
             continue
         if key in resolved and resolved[key] != val:
             changes[key] = {"in": val, "out": resolved[key]}
@@ -218,6 +223,16 @@ def _support_note(ctx: GateContext, flags: dict[str, Any]) -> str:
             notes.append("sample_packing: attn not varlen-capable (no-op risk)")
         else:
             notes.append(f"sample_packing: {mt} NOT in multipack registry")
+    if flags.get("load_in_4bit") or flags.get("load_in_8bit"):
+        # resolution-only: the actual bnb skip-modules (jamba->mamba,
+        # falcon_h1->out_proj, model.py) only apply at load (a GPU gate)
+        mt = ctx.features.model_config_type
+        skip = {"jamba": "mamba", "falcon_h1": "out_proj"}.get(mt)
+        notes.append(
+            f"quant resolves; load-time bnb skip_modules=[{skip}] for {mt}"
+            if skip
+            else "quant resolves (load-time bnb config is a separate load gate)"
+        )
     return "; ".join(notes)
 
 
@@ -352,6 +367,13 @@ def _composites(ctx: GateContext) -> list[_Cell]:
     if ctx.profile == "multigpu":
         cells.extend(_multigpu_composites(ctx))
 
+    # quant/RL composites bloat the smoke set, so gate them behind the "full"
+    # profile or an explicit opt-in flag; smoke stays ~6 cells
+    if ctx.profile == "full" or ctx.options.get("quant"):
+        cells.extend(_quant_composites(ctx))
+    if ctx.profile == "full" or ctx.options.get("rl"):
+        cells.extend(_rl_composites(ctx))
+
     # oracle probe (expected reject): confirm the partial oracle still fires
     cells.append(
         _Cell(
@@ -394,6 +416,149 @@ def _multigpu_composites(ctx: GateContext) -> list[_Cell]:
         ),
     ]
     return cells
+
+
+def _quant_composites(ctx: GateContext) -> list[_Cell]:
+    """bitsandbytes quant axes through load_cfg (peft.py validate_adapter/validate_qlora). Resolution-only: the real 4bit/8bit model load is a separate GPU/load gate."""
+    return [
+        _Cell(
+            "q0_qlora_4bit",
+            {
+                "adapter": "qlora",
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": "bfloat16",
+            },
+            "resolve",
+            "qlora + load_in_4bit (+bnb_4bit_*) normalizes for this model type",
+        ),
+        _Cell(
+            "q1_lora_8bit",
+            {"adapter": "lora", "load_in_8bit": True},
+            "resolve",
+            "lora + load_in_8bit (the valid int8 LoRA path)",
+        ),
+        _Cell(
+            "q2_qlora_pack_fa2",
+            {
+                "adapter": "qlora",
+                "load_in_4bit": True,
+                "sample_packing": True,
+                "attn_implementation": "flash_attention_2",
+            },
+            "resolve",
+            "qlora + sample_packing + flash_attention_2 (common quantized-LoRA path)",
+        ),
+        # oracle: quant without an adapter is rejected (peft.validate_adapter)
+        _Cell(
+            "q_oracle_4bit_noadapter",
+            {"load_in_4bit": True},
+            "reject",
+            "load_in_4bit without adapter -> expected REJECTED",
+        ),
+        # oracle: qlora must be 4bit, not 8bit (peft.validate_qlora)
+        _Cell(
+            "q_oracle_qlora_8bit",
+            {"adapter": "qlora", "load_in_8bit": True},
+            "reject",
+            "qlora + load_in_8bit -> expected REJECTED (qlora requires 4bit)",
+        ),
+    ]
+
+
+# minimal valid RL dataset stanzas (mirroring examples/*): config resolution only.
+# full RL train/preprocess (data download, reward-fn import, vLLM) is a separate
+# prompted gate, NOT covered here.
+_RL_DATASETS = {
+    "dpo": [
+        {
+            "path": "fozziethebeat/alpaca_messages_2k_dpo_test",
+            "type": "chat_template.default",
+            "field_messages": "conversation",
+            "field_chosen": "chosen",
+            "field_rejected": "rejected",
+        }
+    ],
+    "kto": [
+        {
+            "path": "argilla/ultrafeedback-binarized-preferences-cleaned-kto",
+            "type": "llama3.ultra",
+            "split": "train",
+        }
+    ],
+    "orpo": [
+        {
+            "path": "argilla/ultrafeedback-binarized-preferences-cleaned",
+            "type": "chat_template.argilla",
+        }
+    ],
+    "grpo": [
+        {
+            "path": "openai/gsm8k",
+            "name": "main",
+            "type": "rewards.prompt_transform",
+            "split": "train",
+        }
+    ],
+}
+
+
+def _rl_composites(ctx: GateContext) -> list[_Cell]:
+    """Resolve each RL mode through load_cfg with its minimal valid datasets/keys; surfaces rejects/normalizations per mode. Resolution-only, not training."""
+    return [
+        _Cell(
+            "rl_dpo",
+            {
+                "rl": "dpo",
+                "chat_template": "llama3",
+                "datasets": _RL_DATASETS["dpo"],
+                "sample_packing": False,
+            },
+            "resolve",
+            "rl: dpo with chosen/rejected dataset",
+        ),
+        _Cell(
+            "rl_kto",
+            {
+                "rl": "kto",
+                "datasets": _RL_DATASETS["kto"],
+                "remove_unused_columns": False,  # check_kto_config requires this
+                "sample_packing": False,
+            },
+            "resolve",
+            "rl: kto with binary-label dataset",
+        ),
+        _Cell(
+            "rl_orpo",
+            {
+                "rl": "orpo",
+                "chat_template": "chatml",
+                "datasets": _RL_DATASETS["orpo"],
+                "remove_unused_columns": False,
+                "sample_packing": False,
+            },
+            "resolve",
+            "rl: orpo single-stage alignment",
+        ),
+        _Cell(
+            "rl_grpo",
+            {
+                "rl": "grpo",
+                "chat_template": "tokenizer_default",
+                "datasets": _RL_DATASETS["grpo"],
+                "skip_prepare_dataset": True,
+                # num_generations must divide the gen batch (mbs*gas=2); see
+                # check_grpo_batch_size_divisibility
+                "trl": {
+                    "num_generations": 2,
+                    "max_completion_length": 128,
+                    "reward_funcs": ["rewards.accuracy_reward"],
+                },
+            },
+            "resolve",
+            "rl: grpo with reward-fn dataset (num_generations divides gen batch)",
+        ),
+    ]
 
 
 # --- delta-debug ---------------------------------------------------------------

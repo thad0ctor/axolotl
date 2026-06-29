@@ -39,17 +39,34 @@ checklist rows are pruned automatically from these features.
 
 ## Stage 2: Ask (the checklist prompt)
 
-Before running, confirm with the user:
+Present the user a short checklist (one multi-select for *what to test* + follow-up
+prompts) and wait for answers before running — don't assume:
 
-1. **Model** — the `--base-model` (a path or HF id). A user-supplied base is
-   **required** (there is no shrink-from-config default); for a brand-new arch
-   with no checkpoint, point it at any small instance of that arch.
-2. **Environment** — which `python` / venv / uv / conda to run in (the kernels are
-   env-specific — run inside the training env).
-3. **Profile** — `smoke` (≈5 maximal-compatible composites, every flag exercised
-   once), `full` (smoke + auto-bisect any failure to the minimal flag set), or
-   `multigpu` (adds the parallelism flags).
-4. **Gates** — default all; drop G6/G7 if no GPU.
+1. **Model & tiny strategy** — the `--base-model` (path or HF id) and
+   `--tiny-strategy`: `path` (default — use the given model as-is),
+   `checkpoint` (auto-match a tiny `axolotl-ai-co/tiny-*` by arch), or `shrink`
+   (random-init a 2-layer model from the target's `config.json` — use this for a
+   **brand-new arch with no published checkpoint**, so the run gates can still run).
+2. **What to verify (multi-select):** the static gates (G1 config / G2 integration /
+   G8 coverage — CPU, always cheap); the plumbing gates (G3 preprocess / G4 masking /
+   G5 packing); the **model-loading + GPU gates** (G6 loss / G7 numerical
+   consistency); and **opt-in extras** — quant axes (qlora/4bit/8bit) and RL config
+   resolution (dpo/kto/orpo/grpo) via `--profile full`, packing loss-parity via
+   `--features pack_parity`, multimodal image-token masking (auto when the model is
+   multimodal). **Distributed correctness** (FSDP2 / expert-parallel / context-parallel)
+   is *not* an automatic run — the harness verifies it wires + resolves
+   (`--profile multigpu`), but actually executing a multi-GPU run is a separate,
+   user-driven step; offer it as a checklist item and note it needs the real
+   multi-GPU launch.
+3. **Anything that loads a model or uses a GPU → pick GPUs.** If G6/G7/G5-parity or
+   `--tiny-strategy shrink/path` will load weights, show the detected GPUs (the
+   harness prints an inventory: index · name · memory) and ask **which devices** to
+   use, as a checklist. Pass the choice via `--gpus 1,2`. If the chosen GPU is
+   **incompatible** (too little memory for the model, or it's a card the user
+   excludes), say so and re-prompt rather than failing mid-run. With no GPU, drop
+   G6/G7 (they self-skip).
+4. **Environment** — which `python` / venv / uv / conda (kernels are env-specific —
+   run inside the training env).
 5. **Report** — whether to attach the markdown report to a PR summary.
 
 ## Stage 3: Run
@@ -60,16 +77,27 @@ python .agents/skills/model-verification-harness/scripts/verify_model.py \
   --base-model <path-or-hf-id> --gates G1,G2,G3,G4,G5,G8 \
   --report report.md --manifest manifest.json
 
-# Full incl. GPU gates (loss + numerical consistency), with bisection
+# Full incl. GPU gates (loss + numerical consistency) on chosen GPUs, + quant/RL cells
 python .agents/skills/model-verification-harness/scripts/verify_model.py \
-  --base-model <path-or-hf-id> --gates all --profile full --report report.md
+  --base-model <path-or-hf-id> --gates all --profile full --gpus 1,2 --report report.md
+
+# Brand-new arch with no checkpoint: shrink a 2-layer model from its config
+python .agents/skills/model-verification-harness/scripts/verify_model.py \
+  --base-model <hf-id-or-config-dir> --tiny-strategy shrink --gates all --gpus 1
 ```
 
-Useful flags: `--features sample_packing,fused_attn_kernel,…` marks those as
-**expected** in G2 (else advisory); `--snapshot-dir DIR` enables the G4 masking
-snapshot diff (first run captures, later runs compare); `--emit-test` scaffolds
-the G8 regression test; `--repo-root` points at the axolotl checkout to
-introspect (default: auto-locate). See `--help` for all.
+Useful flags: `--tiny-strategy {path,checkpoint,shrink}`; `--gpus 1,2` pins which
+CUDA devices the run gates use (the harness prints a GPU inventory when unset);
+`--profile full` adds the quant + RL config-resolution cells (and G1 auto-bisect);
+`--features sample_packing,pack_parity,…` marks G2 intents as expected / enables the
+G5 packed-vs-unpacked loss-parity check; `--snapshot-dir DIR` enables the G4 masking
+snapshot diff; `--emit-test` scaffolds the G8 regression test; `--trust-remote-code`
+opts into remote model code (off by default); `--repo-root` points at the axolotl
+checkout to introspect. See `--help` for all.
+
+GPU gates retry a transient Triton/CUDA compile failure and classify a kernel that
+can't compile in this env as **could-not-run** (not a false finding) — distinct from
+a kernel that runs but changes the math (a real shadow finding).
 
 Exit code: **`0`** all selected gates clean · **`1`** findings · **`2`** could not
 run (model/env unloadable) — same contract as the liger audit, so CI can gate on

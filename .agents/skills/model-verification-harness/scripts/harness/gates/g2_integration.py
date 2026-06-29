@@ -161,6 +161,113 @@ def _func_string_keys(path: Path, func_name: str) -> tuple[set[str], bool]:
     return set(), False
 
 
+def _method_model_types(path: Path) -> tuple[dict[str, set[str]], bool]:
+    """Per-method (``FunctionDef.name`` -> types it dispatches on) so the patch_manager
+    lifecycle can be reported per-stage instead of one folded whole-file set."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return {}, False
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            types: set[str] = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Compare):
+                    types |= _compared_model_types(sub)
+            if types:
+                out[node.name] = types
+    return out, True
+
+
+def _preconfig_intercept_strings(path: Path) -> tuple[set[str], bool]:
+    """Model tokens the pre-config/pre-tokenizer remote-code intercepts key on. These
+    test ``"<token>" in cfg.base_model_config`` (substring), not model_config_type."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return set(), False
+    targets = {"base_model_config", "tokenizer_config"}
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant):
+            for op, comp in zip(node.ops, node.comparators, strict=False):
+                if isinstance(op, ast.In) and isinstance(node.left.value, str):
+                    refs = {
+                        n.attr for n in ast.walk(comp) if isinstance(n, ast.Attribute)
+                    }
+                    if refs & targets:
+                        out.add(node.left.value)
+    return out, True
+
+
+def _registered_adapter_modules(init_path: Path) -> tuple[set[str], bool]:
+    """Module stems imported by ``_all_adapters()`` — the actual kernel-adapter registry,
+    so a stray file that isn't wired in doesn't count as a dedicated adapter."""
+    try:
+        tree = ast.parse(init_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return set(), False
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_all_adapters":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.ImportFrom) and sub.module:
+                    out.add(sub.module.rsplit(".", 1)[-1])
+    return out, True
+
+
+def _adapter_info(path: Path) -> tuple[set[str], str | None, bool]:
+    """(model-type tokens, adapter class name, readable) for one adapter file. Tokens =
+    file stem + ``name=`` attr + model-type ``==``/``in``/``startswith`` constants."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return set(), None, False
+    tokens = {path.stem}
+    cls_name: str | None = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name.endswith("Adapter")
+            and node.name != "ModelAdapter"
+        ):
+            cls_name = node.name
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "name" for t in node.targets
+        ):
+            tokens.update(_str_constants(node.value))
+        if isinstance(node, ast.Compare):
+            tokens |= _compared_model_types(node)
+        # str(getattr(cfg, "model_type", "")).startswith("gemma4") — gated on a type ref
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("startswith", "endswith")
+            and any(
+                isinstance(n, ast.Constant) and n.value in _TYPE_ATTRS
+                for n in ast.walk(node)
+            )
+        ):
+            for arg in node.args:
+                tokens.update(_str_constants(arg))
+    return tokens, cls_name, True
+
+
+def _family_match(mct: str, token: str) -> bool:
+    """mct hooks token's adapter on an exact match or a segment-boundary family prefix
+    (so ``gemma4_text`` matches the ``gemma4`` adapter but ``gemma4x`` does not)."""
+    if not mct or not token:
+        return False
+    if mct == token:
+        return True
+    if mct.startswith(token) and mct[len(token) : len(token) + 1] in ("", "_"):
+        return True
+    if token.startswith(mct) and token[len(mct) : len(mct) + 1] in ("", "_"):
+        return True
+    return False
+
+
 def _safe_import(modpath: str, attr: str) -> tuple[Any, str | None]:
     try:
         mod = importlib.import_module(modpath)
@@ -344,59 +451,103 @@ def _check_multipack(p: Probe) -> None:
         )
 
 
+# Named patch_manager lifecycle stages: (hook label, methods feeding it, present-note).
+# Split so a reviewer sees *which* stage a type hooks (main dispatch vs post-build loss)
+# rather than one folded "patch_manager" set.
+_PM_STAGES: list[tuple[str, set[str], str]] = [
+    (
+        "PatchManager: pre-model dispatch",
+        {"_apply_model_specific_patches", "_apply_mistral_cross_entropy_patch"},
+        "model-specific branch in the pre-model-load patch sequence",
+    ),
+    (
+        "PatchManager: Voxtral/Apertus pre-model",
+        {"_apply_voxtral_patches", "_apply_apertus_patches"},
+        "Voxtral/Apertus forward/activation patch",
+    ),
+    (
+        "PatchManager: post-build loss/conversion",
+        {"apply_post_model_build_patches", "_apply_gemma4_loss_kwargs"},
+        "post-build Gemma loss-kwargs / nemotron_h conversion fix",
+    ),
+    (
+        "PatchManager: post-load model patch",
+        {"_apply_llama_flash_attn_patches"},
+        "post-load flash-attn / swiglu patch",
+    ),
+]
+# known hijack types so a missing branch reads as drift, not "not a hijack type"
+_HIJACK_TYPES = {"btlm", "stablelm_epoch", "mistral3", "llava"}
+
+
 def _check_patch_manager(p: Probe) -> tuple[set[str], bool]:
     path = p.src("loaders/patch_manager.py")
-    types, ok = _file_model_types(path)
+    method_types, ok = _method_model_types(path)
+    needs = p.ctx.features.needs_patch
     if not ok:
-        p.warn(
-            "patch_manager.py dispatch unreadable", critical=p.ctx.features.needs_patch
-        )
-    gated = "needs_patch"
-    if not p.ctx.features.needs_patch:
+        p.warn("patch_manager.py dispatch unreadable", critical=needs)
         p.add(
             HookRow(
-                "PatchManager dispatch branch",
+                "PatchManager dispatch",
                 "loaders/patch_manager.py",
-                gated,
-                PRESENT if p.mct in types else NOT_EXPECTED,
-                "handled" if p.mct in types else "no model-specific patch declared",
+                "needs_patch",
+                MISSING if needs else NOT_EXPECTED,
+                "dispatch ladder unreadable",
             )
         )
-    elif not ok:
+        return set(), False
+
+    all_types: set[str] = set().union(*method_types.values()) if method_types else set()
+
+    # pre-config / pre-tokenizer remote-code intercept (substring keyed, not model_type)
+    pre_strs, _ = _preconfig_intercept_strings(path)
+    norm = lambda s: s.lower().replace("-", "").replace("_", "")  # noqa: E731
+    mct_n = norm(p.mct)
+    pre_hit = bool(mct_n) and any(
+        norm(s) and (mct_n == norm(s) or mct_n.startswith(norm(s))) for s in pre_strs
+    )
+    p.add(
+        HookRow(
+            "PatchManager: pre-config/tokenizer intercept",
+            "loaders/patch_manager.py",
+            "needs_patch",
+            PRESENT if pre_hit else NOT_EXPECTED,
+            "remote-code config/tokenizer intercept for this type"
+            if pre_hit
+            else "no pre-config/tokenizer remote-code intercept",
+        )
+    )
+
+    for hook, methods, present_note in _PM_STAGES:
+        stage_types: set[str] = set().union(
+            *(method_types.get(m, set()) for m in methods)
+        )
+        hit = p.mct in stage_types
         p.add(
             HookRow(
-                "PatchManager dispatch branch",
+                hook,
                 "loaders/patch_manager.py",
-                gated,
+                "needs_patch",
+                PRESENT if hit else NOT_EXPECTED,
+                present_note if hit else "no hook for this type at this stage",
+            )
+        )
+
+    # needs_patch guard: a patch was expected but the type hooks no lifecycle stage
+    if needs and not (pre_hit or p.mct in all_types):
+        p.add(
+            HookRow(
+                "PatchManager dispatch",
+                "loaders/patch_manager.py",
+                "needs_patch",
                 MISSING,
-                "needs_patch but dispatch ladder unreadable",
+                "needs_patch=True but no branch keys on this type at any lifecycle stage",
             )
         )
-    elif p.mct in types:
-        p.add(
-            HookRow(
-                "PatchManager dispatch branch",
-                "loaders/patch_manager.py",
-                gated,
-                PRESENT,
-                "has a model-type branch in patch_manager",
-            )
-        )
-    else:
-        p.add(
-            HookRow(
-                "PatchManager dispatch branch",
-                "loaders/patch_manager.py",
-                gated,
-                MISSING,
-                "needs_patch=True but no branch keys on this type",
-            )
-        )
-    # attention hijack (btlm/stablelm/mistral3/llava) lives in the same file
-    hijack_types = {"btlm", "stablelm_epoch", "mistral3", "llava"}
-    if p.mct in hijack_types:
-        # PRESENT only when the dispatch actually keys on this type, not just readable
-        present = ok and p.mct in types
+
+    # attention hijack (btlm/stablelm/mistral3/llava) lives in _patch_attention
+    if p.mct in _HIJACK_TYPES:
+        present = p.mct in method_types.get("_patch_attention", set())
         p.add(
             HookRow(
                 "attention hijack",
@@ -408,7 +559,7 @@ def _check_patch_manager(p: Probe) -> tuple[set[str], bool]:
                 else "hijack type but no dispatch branch found",
             )
         )
-    return types, ok
+    return all_types, ok
 
 
 def _check_fused_attn(p: Probe) -> None:
@@ -607,26 +758,35 @@ def _check_moe(p: Probe) -> None:
                 "is_moe=True but no MOE_ARCH_BLOCK entry (MoE FSDP wrap will be wrong)",
             )
         )
-    # dedicated dsv4/gemma4 adapters vs the generic scattermoe/sonicmoe backend
-    # (the designed path for any MoE, not a fallback bug)
+    # dedicated dsv4/gemma4/glm adapter vs the generic scattermoe/sonicmoe backend
+    # (the generic path is the designed default for any MoE, not a fallback bug)
     adapters = p.src("integrations/kernels/adapters")
-    stems = (
-        {f.stem for f in adapters.glob("*.py")} - {"__init__"}
-        if adapters.is_dir()
-        else set()
-    )
-    dedicated = any(s in p.mct or p.mct.startswith(s.rstrip("4")) for s in stems)
+    registered, reg_ok = _registered_adapter_modules(adapters / "__init__.py")
+    if not reg_ok:
+        p.warn("kernels adapter registry (_all_adapters) unreadable")
+        registered = (
+            {f.stem for f in adapters.glob("*.py")} - {"__init__"}
+            if adapters.is_dir()
+            else set()
+        )
+    dedicated_cls: str | None = None
+    for stem in sorted(registered):
+        toks, cls_name, tok_ok = _adapter_info(adapters / f"{stem}.py")
+        if not tok_ok:
+            p.warn(f"kernels adapter {stem}.py unreadable")
+            continue
+        if any(_family_match(p.mct, t) for t in toks):
+            dedicated_cls = cls_name or stem
+            break
     p.add(
         HookRow(
             "MoE kernel adapter",
-            "integrations/kernels/",
+            "integrations/kernels/adapters/",
             "is_moe",
             PRESENT,
-            (
-                "dedicated adapter present"
-                if dedicated
-                else f"generic scattermoe/sonicmoe backend ({sorted(stems)} dedicated)"
-            ),
+            f"dedicated {dedicated_cls} matches this type"
+            if dedicated_cls
+            else f"generic scattermoe/sonicmoe backend (dedicated adapters: {sorted(registered)})",
         )
     )
 
@@ -665,9 +825,10 @@ def _check_multimodal(p: Probe) -> None:
             HookRow(
                 "MM processing strategy",
                 "processing_strategies.py",
-                "is_multimodal",
+                "is_multimodal (via chat_template_type)",
                 PRESENT,
-                "dedicated processing strategy",
+                f"model_config_type {p.mct!r} matches a get_processing_strategy key; "
+                "note: selection is keyed on chat_template_type, not model_type",
             )
         )
     else:
@@ -675,10 +836,11 @@ def _check_multimodal(p: Probe) -> None:
             HookRow(
                 "MM processing strategy",
                 "processing_strategies.py",
-                "is_multimodal",
+                "is_multimodal (via chat_template_type)",
                 GENERIC,
-                "no dedicated strategy; generic image-token masking may mislabel for "
-                "this arch",
+                f"model_config_type {p.mct!r} not among get_processing_strategy keys "
+                "(best-effort: strategy is keyed on chat_template_type, not model_type); "
+                "generic image-token masking may mislabel for this arch",
             )
         )
 
@@ -1017,21 +1179,32 @@ def _check_tiled_mlp(p: Probe) -> None:
 
 def _check_example(p: Probe) -> None:
     ex = p.repo / "examples"
-    token = p.mct.split("_")[0].replace("-", "")
-    hit = ex.is_dir() and any(
-        token and token in d.name.replace("-", "").replace("_", "")
-        for d in ex.iterdir()
-        if d.is_dir()
-    )
+    norm = lambda s: s.lower().replace("-", "").replace("_", "")  # noqa: E731
+    mct_n = norm(p.mct)
+    matched: str | None = None
+    if ex.is_dir() and mct_n:
+        for d in ex.iterdir():
+            if not d.is_dir():
+                continue
+            dn = norm(d.name)
+            if not dn:
+                continue
+            # require a real segment-prefix overlap (>=3 chars), not a loose substring,
+            # so model_config_type / its family must actually match the dir name
+            short, long = (dn, mct_n) if len(dn) <= len(mct_n) else (mct_n, dn)
+            if len(short) >= 3 and long.startswith(short):
+                matched = d.name
+                break
     p.add(
         HookRow(
             "example config",
             "examples/",
             "recommended (advisory)",
-            PRESENT if hit else NOT_EXPECTED,
-            "an example dir mentions this family"
-            if hit
-            else "no obvious examples/<model>/ (advisory; see G8 for test coverage)",
+            PRESENT if matched else NOT_EXPECTED,
+            f"examples/{matched}/ matches this type/family"
+            if matched
+            else "no examples/<model>/ for this type/family (advisory; see G8 for "
+            "test coverage)",
         )
     )
 

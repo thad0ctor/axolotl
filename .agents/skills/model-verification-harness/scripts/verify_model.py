@@ -18,6 +18,7 @@ from harness import (  # noqa: E402
     GateResult,
     GateStatus,
     exit_code,
+    tiny,  # noqa: E402
 )
 from harness.gates import load_gates  # noqa: E402
 
@@ -109,6 +110,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="allow AutoConfig to execute remote model code for --base-model "
         "(off by default; only enable for fully trusted sources)",
     )
+    p.add_argument(
+        "--tiny-strategy",
+        choices=["path", "checkpoint", "shrink"],
+        default="path",
+        help="how to resolve the model the gates exercise: 'path' (use --base-model "
+        "as-is), 'checkpoint' (auto-match a tiny-* checkpoint by arch), 'shrink' "
+        "(build a 2-layer model from --base-model's own config)",
+    )
+    p.add_argument(
+        "--gpus",
+        default=None,
+        help="comma-separated CUDA device indices for the train gates (e.g. 1,2); "
+        "default leaves CUDA visibility as-is",
+    )
     return p
 
 
@@ -135,6 +150,28 @@ def _gpu_available() -> bool:
         return bool(torch.cuda.is_available())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _gpu_inventory() -> list[dict]:
+    """Per visible CUDA device: index, name, total_mem_gb — feeds the agent's GPU picker."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return []
+        out: list[dict] = []
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            out.append(
+                {
+                    "index": i,
+                    "name": props.name,
+                    "total_mem_gb": round(props.total_memory / (1024**3), 1),
+                }
+            )
+        return out
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _is_under_repo_src(repo_root: Path, import_path: str) -> bool:
@@ -199,14 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no valid gates in --gates {args.gates!r}; choose from {GATE_ORDER}")
         return 2
 
-    try:
-        features = _detect(args.base_model, repo_root, args.trust_remote_code)
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"could not detect model '{args.base_model}': {exc.__class__.__name__}: {exc}"
-        )
-        return 2
-
+    # output_dir is resolved before detect: 'shrink' writes the tiny model under it
     tmp_ctx = None
     if args.output_dir is not None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -219,6 +249,38 @@ def main(argv: list[str] | None = None) -> int:
     else:
         tmp_ctx = tempfile.TemporaryDirectory(prefix="verify-model-")
         output_dir = Path(tmp_ctx.name)
+
+    # model_config_type is unknown pre-detect; checkpoint/shrink rely on base_model here
+    try:
+        effective_base = tiny.resolve_base_model(
+            args.base_model,
+            "",
+            strategy=args.tiny_strategy,
+            output_dir=output_dir,
+            trust_remote_code=args.trust_remote_code,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"could not resolve base model (strategy={args.tiny_strategy}): "
+            f"{exc.__class__.__name__}: {exc}"
+        )
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+        return 2
+    if effective_base != args.base_model:
+        print(
+            f"  tiny-strategy={args.tiny_strategy}: resolved model → {effective_base}"
+        )
+
+    try:
+        features = _detect(effective_base, repo_root, args.trust_remote_code)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"could not detect model '{effective_base}': {exc.__class__.__name__}: {exc}"
+        )
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+        return 2
 
     ctx = GateContext(
         features=features,
@@ -233,6 +295,8 @@ def main(argv: list[str] | None = None) -> int:
             "emit_test": args.emit_test,
             "snapshot_dir": args.snapshot_dir,
             "axolotl_import_path": axolotl_import_path,
+            # train gates (G6/G7) read this and set CUDA_VISIBLE_DEVICES for their subprocess
+            "gpus": args.gpus,
             **_parse_features(args.features),
         },
     )
@@ -241,6 +305,12 @@ def main(argv: list[str] | None = None) -> int:
         f"Model verification harness — {features.model_config_type} ({features.base_model})"
     )
     print(f"repo: {repo_root}  ·  profile: {args.profile}  ·  gpu: {ctx.gpu_available}")
+    if args.gpus is None:
+        for dev in _gpu_inventory():
+            print(
+                f"  gpu[{dev['index']}] {dev['name']} ({dev['total_mem_gb']} GiB)  "
+                "— pass --gpus to pin train gates"
+            )
     print(f"gates: {sorted(selected)}\n")
 
     modules, import_errors = load_gates()

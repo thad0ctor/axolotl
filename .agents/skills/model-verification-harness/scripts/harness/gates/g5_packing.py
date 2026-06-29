@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Any
 
 from .. import GateContext, GateResult, GateStatus, runner
@@ -70,6 +72,99 @@ def _check_collate_reset(cfg, train_dataset, n_docs: int = 4):
         f"collated position_ids do NOT reset at document boundaries (boundaries "
         f"{boundaries}; got {collated[:24]}…)",
     )
+
+
+def _packing_loss_parity(ctx: GateContext, seq_len: int) -> dict[str, Any]:
+    """Packing must not change the math: step-0 loss with sample_packing on vs off over the SAME tokens must match within ``pack_rtol``. Needs a GPU (varlen attention is what isolates packed documents). Returns a status dict; never raises."""
+    from . import g6_loss  # subprocess train worker, isolates global multipack patches
+
+    rtol = float(ctx.options.get("pack_rtol", 2e-2))
+    timeout = float(ctx.options.get("train_timeout", 1200))
+    n_docs = 2
+    fixture = runner.write_parity_fixture(ctx.output_dir, n_docs)
+    stanza = runner.completion_dataset_stanza(fixture)
+
+    def _cfg(name: str, packing: bool, micro_batch_size: int) -> dict[str, Any]:
+        cfg = runner.base_cfg(
+            ctx.features.base_model,
+            ctx.output_dir,
+            name,
+            datasets=[stanza],
+            sequence_len=seq_len,
+        )
+        cfg.update(
+            {
+                "seed": ctx.seed,
+                "max_steps": 1,
+                "logging_steps": 1,
+                "save_strategy": "no",
+                "micro_batch_size": micro_batch_size,
+                "gradient_accumulation_steps": 1,
+                "bf16": True,
+                "flash_attention": True,  # varlen backend: isolates packed documents
+                "sample_packing": packing,
+                "eval_sample_packing": False,
+            }
+        )
+        return cfg
+
+    # honor a pinned GPU for the spawned workers
+    gpus = ctx.options.get("gpus")
+    prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if gpus is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = (
+            ",".join(str(g) for g in gpus)
+            if isinstance(gpus, (list, tuple))
+            else str(gpus)
+        )
+    try:
+        # packed: one pack/step; unpacked: a single batch of all docs -> identical token set at step 0
+        res_packed = g6_loss._spawn_variant(
+            ctx, "g5_packed", _cfg("g5_packed", True, 1), timeout
+        )
+        res_unpacked = g6_loss._spawn_variant(
+            ctx, "g5_unpacked", _cfg("g5_unpacked", False, n_docs), timeout
+        )
+    finally:
+        if gpus is not None:
+            if prev_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+
+    def _step0(res: dict[str, Any]) -> float | None:
+        losses = res.get("loss_history") or []
+        return float(losses[0]) if losses else None
+
+    lp, lu = _step0(res_packed), _step0(res_unpacked)
+    if lp is None or lu is None:
+        err = res_packed.get("error") if lp is None else res_unpacked.get("error")
+        return {
+            "status": "unverified",
+            "note": f"packing-vs-unpacked step-0 loss unavailable ({err})",
+        }
+    if not (math.isfinite(lp) and math.isfinite(lu)):
+        return {
+            "status": "unverified",
+            "note": f"non-finite step-0 loss (packed={lp}, unpacked={lu}) — cannot compare",
+            "packed_step0": lp,
+            "unpacked_step0": lu,
+        }
+    rel = abs(lp - lu) / abs(lu) if lu else float("inf")
+    status = "verified" if rel <= rtol else "mismatch"
+    note = (
+        f"packed step0={lp:.6f} vs unpacked step0={lu:.6f}, rel={rel:.2e} "
+        f"{'<=' if status == 'verified' else '>'} pack_rtol {rtol:.0e}"
+        + ("" if status == "verified" else " — packing changes loss")
+    )
+    return {
+        "status": status,
+        "note": note,
+        "packed_step0": lp,
+        "unpacked_step0": lu,
+        "rel_delta": rel,
+        "pack_rtol": rtol,
+    }
 
 
 def run(ctx: GateContext) -> GateResult:
@@ -197,6 +292,29 @@ def run(ctx: GateContext) -> GateResult:
         findings.append(collate_note)
     details.append(f"collate reset: {collate_note}")
 
+    # (e) packing must not change the math: step-0 loss packed-vs-unpacked parity.
+    # Opt-in (profile=full or pack_parity) — it spawns two train forwards, so it
+    # must not slow the default structural G5 on every GPU box.
+    want_parity = ctx.profile == "full" or bool(ctx.options.get("pack_parity"))
+    if not want_parity:
+        parity = {
+            "status": "skipped",
+            "note": "parity not requested (profile=full or --features pack_parity)",
+        }
+    elif ctx.gpu_available:
+        try:
+            parity = _packing_loss_parity(ctx, seq_len)
+        except Exception as exc:  # noqa: BLE001 - train worker wiring may be unavailable
+            parity = {"status": "unverified", "note": f"loss parity not run ({exc})"}
+    else:
+        parity = {
+            "status": "skipped",
+            "note": "no GPU: packing-vs-unpacked loss parity not run",
+        }
+    if parity["status"] == "mismatch":
+        findings.append(parity["note"])
+    details.append(f"loss parity: {parity['note']}")
+
     data: dict[str, Any] = {
         "model_config_type": ctx.model_config_type,
         "packable": packable,
@@ -209,6 +327,7 @@ def run(ctx: GateContext) -> GateResult:
         "position_ids_finding": pos_note,
         "collate_reset_status": collate_status,
         "collate_reset_note": collate_note,
+        "loss_parity": parity,
     }
 
     if findings:
@@ -227,7 +346,10 @@ def run(ctx: GateContext) -> GateResult:
         GATE_ID,
         GATE_NAME,
         GateStatus.PASS,
-        summary=f"packing ok: type packable, max len {max_len} ≤ {seq_len}, {reset_claim}",
+        summary=(
+            f"packing ok: type packable, max len {max_len} ≤ {seq_len}, {reset_claim}; "
+            f"loss parity {parity['status']}"
+        ),
         details=details,
         data=data,
     )

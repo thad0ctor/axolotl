@@ -1,4 +1,4 @@
-"""G4 — masking gate: drive the real ``chat_template`` strategy, decode trained-vs-masked spans, and assert assistant content is TRAINED and user/system MASKED (the silent-mislabel failure mode). The prepared dataset is shuffled, so the snapshot captures a shuffle-invariant sorted aggregate of every row, not row 0."""
+"""G4 — masking gate: drive the real ``chat_template`` strategy, decode trained-vs-masked spans, and assert assistant content is TRAINED and user/system MASKED (the silent-mislabel failure mode). The prepared dataset is shuffled, so the snapshot captures a shuffle-invariant sorted aggregate of every row, not row 0. For multimodal models it instead drives the real processor + MM collate path and asserts the image/placeholder tokens are MASKED while assistant text is TRAINED."""
 
 from __future__ import annotations
 
@@ -93,7 +93,170 @@ def _fixture_role_contents(fixture: Path) -> tuple[set[str], set[str]]:
     return assistant, nonassistant
 
 
+def _render_mm(input_ids, labels, tokenizer, cap: int = 12) -> str:
+    """Like _render but collapse long masked runs (image placeholders span hundreds of tokens)."""
+    out: list[str] = []
+    for trained, ids in _split_spans(input_ids, labels):
+        if not trained and len(ids) > cap:
+            out.append(f"…[{len(ids)} masked]…")
+        else:
+            text = tokenizer.decode(ids, skip_special_tokens=False)
+            out.append(f"**{text}**" if trained else text)
+    return "".join(out)
+
+
+def _run_multimodal(ctx: GateContext) -> GateResult:
+    """Drive the real processor + MM collate path and assert image/placeholder tokens are masked. Needs only the processor/tokenizer (not model weights), so it runs offline against any cached VLM."""
+    try:
+        from axolotl.loaders import load_tokenizer
+        from axolotl.loaders.processor import load_processor
+        from axolotl.processing_strategies import get_processing_strategy
+        from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
+    except Exception as exc:  # noqa: BLE001 - MM wiring unavailable in this env
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            f"multimodal modules unavailable: {exc.__class__.__name__}: {exc}",
+        )
+
+    cfg_dict = runner.mm_base_cfg(ctx.features.base_model, ctx.output_dir, "g4_mm")
+    cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, "g4_mm")
+    try:
+        cfg = runner.resolve_cfg(cfg_path)
+        tokenizer = load_tokenizer(cfg)
+        processor = load_processor(cfg, tokenizer)
+    except Exception as exc:  # noqa: BLE001 - no tiny VLM processor reachable here
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            "no tiny multimodal model to verify image masking "
+            f"({exc.__class__.__name__}: {exc})",
+        )
+
+    try:
+        strategy = get_processing_strategy(
+            processor, getattr(tokenizer, "chat_template", None), cfg.chat_template
+        )
+        sample, assistant_text = runner.multimodal_chat_sample()
+        collator = MultiModalChatDataCollator(
+            tokenizer=tokenizer, processing_strategy=strategy
+        )
+        batch = collator([sample])
+    except Exception as exc:  # noqa: BLE001 - processor may reject the synthetic sample
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            f"multimodal collate failed: {exc.__class__.__name__}: {exc}",
+        )
+
+    image_token_id = strategy.image_token_id
+    if image_token_id is None:
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            f"{type(strategy).__name__} exposed no image_token_id — cannot verify image masking",
+        )
+
+    input_ids = [int(x) for x in batch["input_ids"][0].tolist()]
+    labels = [int(x) for x in batch["labels"][0].tolist()]
+    n_img = sum(1 for t in input_ids if t == image_token_id)
+    n_img_trained = sum(
+        1
+        for t, lab in zip(input_ids, labels, strict=True)
+        if t == image_token_id and lab != runner.IGNORE_TOKEN_ID
+    )
+    total_trained = sum(1 for lab in labels if lab != runner.IGNORE_TOKEN_ID)
+    trained_text = tokenizer.decode(
+        [
+            t
+            for t, lab in zip(input_ids, labels, strict=True)
+            if lab != runner.IGNORE_TOKEN_ID
+        ],
+        skip_special_tokens=False,
+    )
+
+    # image-feature columns the processor must emit alongside the placeholder tokens
+    _img_cols = (
+        "pixel_values",
+        "pixel_attention_mask",
+        "image_sizes",
+        "image_grid_thw",
+        "aspect_ratio_ids",
+    )
+    img_cols = [c for c in batch if c in _img_cols]
+    render = _render_mm(input_ids, labels, tokenizer)
+
+    data: dict[str, Any] = {
+        "is_multimodal": True,
+        "strategy": type(strategy).__name__,
+        "image_token_id": image_token_id,
+        "n_tokens": len(input_ids),
+        "n_image_tokens": n_img,
+        "n_image_tokens_trained": n_img_trained,
+        "n_trained": total_trained,
+        "image_feature_columns": img_cols,
+        "render": render,
+    }
+    details = [
+        f"strategy={type(strategy).__name__}; image_token_id={image_token_id}; "
+        f"{len(input_ids)} tokens, {n_img} image placeholder tokens, {total_trained} trained",
+        "decoded sample (**trained** vs masked):",
+        f"  {render}",
+        "note: role masking (user/system MASKED) is strategy-dependent and not "
+        "asserted here; the universal MM invariant is image tokens MASKED + assistant TRAINED",
+    ]
+
+    findings: list[str] = []
+    if not img_cols:
+        findings.append(
+            f"no image-feature column in collated batch (keys={list(batch)})"
+        )
+    if n_img == 0:
+        # placeholder never expanded -> nothing to verify, not a false PASS
+        return GateResult.could_not_run(
+            GATE_ID,
+            GATE_NAME,
+            "image placeholder tokens absent from collated input_ids — cannot verify image masking",
+        )
+    if n_img_trained:
+        findings.append(
+            f"{n_img_trained}/{n_img} image placeholder tokens are TRAINED (label != IGNORE) — "
+            "image tokens leak into the loss"
+        )
+    if total_trained == 0:
+        findings.append("no tokens trained — assistant span masked")
+    elif assistant_text.strip() not in trained_text:
+        findings.append(
+            f"assistant content {assistant_text!r} not in trained span — assistant text appears masked"
+        )
+
+    if findings:
+        details.extend(f"finding: {f}" for f in findings)
+        return GateResult(
+            GATE_ID,
+            GATE_NAME,
+            GateStatus.FINDINGS,
+            summary="; ".join(findings[:3]) + (" …" if len(findings) > 3 else ""),
+            details=details,
+            data=data,
+        )
+    return GateResult(
+        GATE_ID,
+        GATE_NAME,
+        GateStatus.PASS,
+        summary=(
+            f"MM masking intent holds ({n_img} image tokens masked, "
+            f"{total_trained} trained tokens incl. assistant; cols={img_cols})"
+        ),
+        details=details,
+        data=data,
+    )
+
+
 def run(ctx: GateContext) -> GateResult:
+    if ctx.features.is_multimodal:
+        return _run_multimodal(ctx)
+
     fixture = runner.write_chat_fixture(ctx.output_dir)
 
     try:
@@ -183,12 +346,6 @@ def run(ctx: GateContext) -> GateResult:
     if total_trained > 0 and not any(c in union_trained for c in assistant_contents):
         findings.append(
             "no assistant content in trained span — assistant text appears masked"
-        )
-
-    if ctx.features.is_multimodal:
-        details.append(
-            "note: multimodal — image-token masking not decoded here; "
-            "only text label structure checked"
         )
 
     # per train_on_eos default 'turn', a trained assistant turn's terminator is trained

@@ -50,6 +50,50 @@ def chat_dataset_stanza(fixture: Path) -> dict[str, Any]:
     }
 
 
+def multimodal_chat_sample(image_px: int = 64) -> tuple[dict[str, Any], str]:
+    """In-memory processor chat sample (one image+text user turn, one assistant reply) for the MM masking decode; no disk fixture or model weights needed, only the processor/tokenizer. Returns (sample, assistant_text)."""
+    from PIL import Image
+
+    assistant_text = "The square is red."
+    sample = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What color is the square?"},
+                    {
+                        "type": "image",
+                        "image": Image.new("RGB", (image_px, image_px), (200, 30, 30)),
+                    },
+                ],
+            },
+            {"role": "assistant", "content": assistant_text},
+        ]
+    }
+    return sample, assistant_text
+
+
+def mm_base_cfg(base_model: str, output_dir: Path, name: str) -> dict[str, Any]:
+    """Minimal multimodal cfg; mirrors the example VLM configs (processor + collate-time tokenize, so on-disk prepare is skipped)."""
+    cfg = base_cfg(
+        base_model,
+        output_dir,
+        name,
+        datasets=[
+            {"path": base_model, "type": "chat_template", "field_messages": "messages"}
+        ],
+    )
+    cfg.update(
+        {
+            "processor_type": "AutoProcessor",
+            "skip_prepare_dataset": True,
+            "remove_unused_columns": False,
+            "sample_packing": False,
+        }
+    )
+    return cfg
+
+
 _TINY_COMPLETION_TEXT = (
     "The quick brown fox jumps over the lazy dog. "
     "Pack my box with five dozen liquor jugs. "
@@ -68,6 +112,17 @@ def write_completion_fixture(output_dir: Path, n_rows: int = 64) -> Path:
 
 def completion_dataset_stanza(fixture: Path) -> dict[str, Any]:
     return {"path": str(fixture), "type": "completion", "field": "text"}
+
+
+def write_parity_fixture(output_dir: Path, n_rows: int = 2, reps: int = 11) -> Path:
+    """A few LONG uniform docs that together fit one pack, so packed (micro_batch_size=1, one pack) and unpacked (micro_batch_size=n_rows) cover the SAME tokens at step 0. Docs are long and few so the per-document boundary label-shift (n_rows-1 positions) is a negligible fraction of tokens — a correct packing impl lands well within pack_rtol while broken cross-document attention blows far past it."""
+    path = output_dir / "tiny_parity.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = "The quick brown fox jumps over the lazy dog. " * reps
+    with path.open("w", encoding="utf-8") as fout:
+        for _ in range(n_rows):
+            fout.write(json.dumps({"text": doc}) + "\n")
+    return path
 
 
 def base_cfg(

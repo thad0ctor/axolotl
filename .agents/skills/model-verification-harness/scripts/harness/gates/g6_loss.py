@@ -76,7 +76,28 @@ def _build_cfg(
 # --- subprocess worker (shared with G7) ----------------------------------------
 
 
-def _spawn_variant(
+# transient env/compile failures (kernel won't compile / no resources in THIS env)
+# vs a kernel that compiles and changes the math (the real shadow signal). Matched
+# against the worker error + traceback; drives both retry and could_not_run classing.
+_TRANSIENT_MARKERS = (
+    "compilationerror",  # triton kernel failed to compile
+    "out of resource",  # triton smem/register pressure at compile time
+    "out of memory",  # CUDA OOM
+    "outofmemoryerror",
+    "nccl",  # collectives flake
+    "timeout after",  # our own subprocess timeout sentinel
+)
+
+
+def _transient_kind(res: dict[str, Any]) -> str | None:
+    """Matched transient/env marker (retryable, classes as could_not_run), else None."""
+    if res.get("ok"):
+        return None
+    blob = f"{res.get('error', '')} {res.get('traceback', '')}".lower()
+    return next((m for m in _TRANSIENT_MARKERS if m in blob), None)
+
+
+def _spawn_once(
     ctx: GateContext, name: str, cfg_dict: dict[str, Any], timeout: float
 ) -> dict[str, Any]:
     """Train one variant in a fresh interpreter; return the parsed worker result. Isolation matters: liger/CCE patch transformers classes globally and are never reverted."""
@@ -105,6 +126,11 @@ def _spawn_variant(
     existing = env.get("PYTHONPATH", "")
     parts = [str(scripts_dir), str(src_dir)] + ([existing] if existing else [])
     env["PYTHONPATH"] = os.pathsep.join(parts)
+    # user GPU pin (shared contract via ctx.options); unset -> inherit parent env
+    gpus = ctx.options.get("gpus")
+    if gpus:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpus)
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     try:
         proc = subprocess.run(  # nosec B603 - cmd is sys.executable + fixed args
             cmd,
@@ -127,6 +153,21 @@ def _spawn_variant(
         "ok": False,
         "error": f"worker exited {proc.returncode} with no result; tail: {' | '.join(tail)}",
     }
+
+
+def _spawn_variant(
+    ctx: GateContext, name: str, cfg_dict: dict[str, Any], timeout: float
+) -> dict[str, Any]:
+    """Spawn a variant, retrying transient kernel/compile/OOM/NCCL/timeout failures in a fresh subprocess before recording failure. ``retried`` records the extra attempts."""
+    retries = max(0, int(ctx.options.get("variant_retries", 1)))
+    res = _spawn_once(ctx, name, cfg_dict, timeout)
+    attempts = 0
+    while not res.get("ok") and attempts < retries and _transient_kind(res):
+        attempts += 1
+        res = _spawn_once(ctx, name, cfg_dict, timeout)
+    if attempts:
+        res["retried"] = attempts
+    return res
 
 
 _KERNEL_NS = ("liger", "cut_cross_entropy", "scattermoe", "sonicmoe")
@@ -207,7 +248,11 @@ def _worker(cfg_path: str, out_path: str) -> None:
 
 
 def _window(n: int) -> int:
-    return max(1, min(3, n // 3))
+    # average over ~a quarter of the run (>=2 steps once the run is long enough) so a
+    # single noisy step on a tiny model can neither fake nor mask a real blowup
+    if n >= 8:
+        return min(3, max(2, n // 4))
+    return max(1, n // 3)
 
 
 def _tb_note(ctx: GateContext, output_dir: str, ratio: float) -> str:
@@ -241,17 +286,45 @@ def run(ctx: GateContext) -> GateResult:
     rows: list[dict[str, Any]] = []
     details: list[str] = []
     findings = 0
+    env_failed = 0
     ran = 0
 
     for name, extra in _variants(ctx):
         cfg = _build_cfg(ctx, name, extra, max_steps)
         res = _spawn_variant(ctx, name, cfg, timeout)
+        retried = res.get("retried", 0)
+        rsfx = f" (retried {retried}x)" if retried else ""
         if not res.get("ok"):
-            # an applicable variant that can't train is unverified: count it so a
-            # broken kernel path can't report PASS
-            findings += 1
-            details.append(f"❌ {name}: could not train — {res.get('error')}")
-            rows.append({"variant": name, "ran": False, "error": res.get("error")})
+            kind = _transient_kind(res)
+            if kind:
+                # a kernel that won't COMPILE in this env is a limitation, not a math
+                # change -> surface as could_not_run, not a model finding
+                env_failed += 1
+                details.append(
+                    f"⚠️ {name}: could_not_run — {kind} (env/compile limit){rsfx}: "
+                    f"{res.get('error')}"
+                )
+                rows.append(
+                    {
+                        "variant": name,
+                        "ran": False,
+                        "could_not_run": True,
+                        "transient": kind,
+                        "retried": retried,
+                        "error": res.get("error"),
+                    }
+                )
+            else:
+                findings += 1
+                details.append(f"❌ {name}: could not train{rsfx} — {res.get('error')}")
+                rows.append(
+                    {
+                        "variant": name,
+                        "ran": False,
+                        "retried": retried,
+                        "error": res.get("error"),
+                    }
+                )
             continue
 
         losses = [float(x) for x in res.get("loss_history", [])]
@@ -300,23 +373,30 @@ def run(ctx: GateContext) -> GateResult:
             }
         )
 
-    if ran == 0:
-        return GateResult.could_not_run(
-            GATE_ID,
-            GATE_NAME,
-            "no variant could train (see details)",
-        )
     data = {
         "variants": rows,
         "max_steps": max_steps,
         "blowup_ratio": blowup,
         "strict_ratio": strict,
+        "env_failed": env_failed,
     }
-    status = GateStatus.FINDINGS if findings else GateStatus.PASS
-    summary = (
-        f"{ran} variant(s) trained; "
-        f"{'no NaN/inf, none diverged' if not findings else f'{findings} with NaN/inf or divergence'}"
-    )
+    # real findings dominate (actionable shadow signal); env-only failures degrade the
+    # gate to could_not_run rather than masquerading as PASS
+    if findings:
+        status = GateStatus.FINDINGS
+        summary = f"{ran} ran; {findings} with NaN/inf or divergence" + (
+            f"; {env_failed} env-limited" if env_failed else ""
+        )
+    elif env_failed or ran == 0:
+        status = GateStatus.COULD_NOT_RUN
+        summary = (
+            f"{ran} ran; {env_failed} variant(s) hit env/compile limits"
+            if env_failed
+            else "no variant could train (see details)"
+        )
+    else:
+        status = GateStatus.PASS
+        summary = f"{ran} variant(s) trained; no NaN/inf, none diverged"
     return GateResult(
         GATE_ID, GATE_NAME, status, summary=summary, details=details, data=data
     )

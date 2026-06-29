@@ -219,6 +219,7 @@ def run(ctx: GateContext) -> GateResult:
             )
 
     findings = 0
+    env_failed = 0
     compared = 0
     for v in variants:
         name = v["name"]
@@ -244,11 +245,41 @@ def run(ctx: GateContext) -> GateResult:
             continue
         cfg = _build_cfg(ctx, name, v["flags"])
         res = g6_loss._spawn_variant(ctx, f"g7_{name}", cfg, timeout)
+        retried = res.get("retried", 0)
+        rsfx = f" (retried {retried}x)" if retried else ""
         loss = _step0(res)
         if loss is None:
-            findings += 1
-            details.append(f"❌ {name}: step-0 loss unavailable — {res.get('error')}")
-            rows.append({"variant": name, "step0": None, "error": res.get("error")})
+            kind = g6_loss._transient_kind(res)
+            if kind:
+                # won't-compile here is an env limit, not the kernel changing the math
+                env_failed += 1
+                details.append(
+                    f"⚠️ {name}: could_not_run — {kind} (env/compile limit){rsfx}: "
+                    f"{res.get('error')}"
+                )
+                rows.append(
+                    {
+                        "variant": name,
+                        "step0": None,
+                        "could_not_run": True,
+                        "transient": kind,
+                        "retried": retried,
+                        "error": res.get("error"),
+                    }
+                )
+            else:
+                findings += 1
+                details.append(
+                    f"❌ {name}: step-0 loss unavailable{rsfx} — {res.get('error')}"
+                )
+                rows.append(
+                    {
+                        "variant": name,
+                        "step0": None,
+                        "retried": retried,
+                        "error": res.get("error"),
+                    }
+                )
             continue
 
         # engagement first: a silent no-op yields the same Δ≈0 as a genuine match,
@@ -305,11 +336,12 @@ def run(ctx: GateContext) -> GateResult:
         )
 
     if compared == 0:
-        return GateResult.could_not_run(
-            GATE_ID,
-            GATE_NAME,
-            "baseline ran but no kernel variant produced a step-0 loss to compare",
+        why = (
+            f"baseline ran but {env_failed} kernel variant(s) hit env/compile limits"
+            if env_failed
+            else "baseline ran but no kernel variant produced a step-0 loss to compare"
         )
+        return GateResult.could_not_run(GATE_ID, GATE_NAME, why)
 
     data = {
         "baseline_step0": base_fp32,
@@ -318,12 +350,29 @@ def run(ctx: GateContext) -> GateResult:
         "rtol": rtol,
         "rtol_bf16": rtol_bf16,
         "skipped": skip_notes,
+        "env_failed": env_failed,
     }
-    status = GateStatus.FINDINGS if findings else GateStatus.PASS
-    summary = (
-        f"{compared} kernel variant(s) vs baseline step0={base_fp32:.4f}; "
-        f"{'all engaged + within tol' if not findings else f'{findings} flagged (shadow/no-op)'}"
-    )
+    # a kernel that RAN but diverges/no-ops is a real finding; one that couldn't compile
+    # only degrades the gate to could_not_run
+    if findings:
+        status = GateStatus.FINDINGS
+        summary = (
+            f"{compared} compared vs baseline step0={base_fp32:.4f}; "
+            f"{findings} flagged (shadow/no-op)"
+            + (f"; {env_failed} env-limited" if env_failed else "")
+        )
+    elif env_failed:
+        status = GateStatus.COULD_NOT_RUN
+        summary = (
+            f"{compared} compared, all within tol; "
+            f"{env_failed} variant(s) hit env/compile limits"
+        )
+    else:
+        status = GateStatus.PASS
+        summary = (
+            f"{compared} kernel variant(s) vs baseline step0={base_fp32:.4f}; "
+            "all engaged + within tol"
+        )
     return GateResult(
         GATE_ID, GATE_NAME, status, summary=summary, details=details, data=data
     )
