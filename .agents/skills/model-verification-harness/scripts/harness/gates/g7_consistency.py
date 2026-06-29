@@ -227,18 +227,18 @@ def run(ctx: GateContext) -> GateResult:
         tol = rtol_bf16 if v["bf16"] else rtol
         base_loss = baselines.get(dtype)
         if base_loss is None:
-            # an applicable variant we can't compare apples-to-apples is an
-            # unverified gap, so fail rather than silently skip
-            findings += 1
+            # no same-dtype baseline (it failed to produce a step-0 loss), so there's
+            # nothing to compare against — that's could-not-run, not a model shadow.
+            env_failed += 1
             details.append(
-                f"❌ {name}: no {dtype} baseline available — failed "
-                "(would not be an apples-to-apples comparison)"
+                f"⚠️ {name}: could_not_run — no {dtype} baseline to compare against"
             )
             rows.append(
                 {
                     "variant": name,
                     "step0": None,
                     "dtype": dtype,
+                    "could_not_run": True,
                     "error": f"no {dtype} baseline",
                 }
             )

@@ -15,15 +15,6 @@ from .. import GateContext, GateResult, GateStatus, Verdict
 GATE_ID = "G1"
 GATE_NAME = "config"
 
-# cross-entropy group: exactly one may be enabled (check_cross_entropy_conflicts)
-_CE_OPTIONS = (
-    "none",
-    "liger_cross_entropy",
-    "liger_fused_linear_cross_entropy",
-    "cut_cross_entropy",
-    "chunked_cross_entropy",
-)
-
 _LIGER_PLUGIN = "axolotl.integrations.liger.LigerPlugin"
 _CCE_PLUGIN = "axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin"
 _KERNELS_PLUGIN = "axolotl.integrations.kernels.KernelsPlugin"
@@ -369,7 +360,11 @@ def _composites(ctx: GateContext) -> list[_Cell]:
 
     # quant/RL composites bloat the smoke set, so gate them behind the "full"
     # profile or an explicit opt-in flag; smoke stays ~6 cells
-    if ctx.profile == "full" or ctx.options.get("quant"):
+    if (
+        ctx.profile == "full"
+        or ctx.options.get("quant")
+        or ctx.options.get("quantization")
+    ):
         cells.extend(_quant_composites(ctx))
     if ctx.profile == "full" or ctx.options.get("rl"):
         cells.extend(_rl_composites(ctx))

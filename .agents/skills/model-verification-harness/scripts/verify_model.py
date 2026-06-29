@@ -418,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
             "axolotl_import_path": axolotl_import_path,
             # train gates (G6/G7) read this and set CUDA_VISIBLE_DEVICES for their subprocess
             "gpus": args.gpus,
+            # so the report's exit-code line matches the process's actual exit code
+            "on_unavailable": args.on_unavailable,
             **_parse_features(args.features),
         },
     )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 from .. import GateContext, GateResult, GateStatus, runner
@@ -108,29 +107,14 @@ def _packing_loss_parity(ctx: GateContext, seq_len: int) -> dict[str, Any]:
         )
         return cfg
 
-    # honor a pinned GPU for the spawned workers
-    gpus = ctx.options.get("gpus")
-    prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if gpus is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = (
-            ",".join(str(g) for g in gpus)
-            if isinstance(gpus, (list, tuple))
-            else str(gpus)
-        )
-    try:
-        # packed: one pack/step; unpacked: a single batch of all docs -> identical token set at step 0
-        res_packed = g6_loss._spawn_variant(
-            ctx, "g5_packed", _cfg("g5_packed", True, 1), timeout
-        )
-        res_unpacked = g6_loss._spawn_variant(
-            ctx, "g5_unpacked", _cfg("g5_unpacked", False, n_docs), timeout
-        )
-    finally:
-        if gpus is not None:
-            if prev_cvd is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+    # _spawn_variant honors ctx.options["gpus"] per-subprocess, so no parent env pin needed.
+    # packed: one pack/step; unpacked: a single batch of all docs -> identical token set at step 0
+    res_packed = g6_loss._spawn_variant(
+        ctx, "g5_packed", _cfg("g5_packed", True, 1), timeout
+    )
+    res_unpacked = g6_loss._spawn_variant(
+        ctx, "g5_unpacked", _cfg("g5_unpacked", False, n_docs), timeout
+    )
 
     def _step0(res: dict[str, Any]) -> float | None:
         losses = res.get("loss_history") or []

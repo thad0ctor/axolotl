@@ -1025,7 +1025,7 @@ def _check_model_py(p: Probe) -> None:
             )
         )
     # _check_model_requirements extra deps (e.g. causal_conv1d for lfm2/lfm2-vl)
-    needs_dep = bool(p.ctx.features.extra.get("causal_conv1d_required")) or p.mct in {
+    needs_dep = bool(p.ctx.features.extra.get("causal_conv1d_conflict")) or p.mct in {
         "lfm2",
         "lfm2-vl",
     }

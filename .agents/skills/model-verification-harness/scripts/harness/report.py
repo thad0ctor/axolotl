@@ -107,7 +107,11 @@ def render_report(ctx, features, results: list[GateResult]) -> str:
     lines.extend(_gate_details(results))
     lines.extend(_reliability(results))
 
-    code = exit_code(results)
+    # honor the run's --on-unavailable so this line matches the process exit code
+    on_unavailable = (
+        ctx.options.get("on_unavailable", "fail") if ctx.options else "fail"
+    )
+    code = exit_code(results, on_unavailable=on_unavailable)
     meaning = {
         0: "all selected gates clean",
         1: "findings need review",
