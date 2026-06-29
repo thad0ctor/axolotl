@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edit: absolute 'sparselora.*' imports relativized. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; defensive None-indices guard in lora_forward (skip the indices arg when None). Do not edit; see _vendor/PROVENANCE.md.
 from typing import Any, Optional
 
 import torch
@@ -49,7 +49,15 @@ def lora_forward(
     """Patched LoRA Linear forward that passes sparse indices through."""
     self._check_forward_args(x, *args, **kwargs)
 
-    result = self.base_layer(x, indices, *args, **kwargs)
+    # Axolotl local edit: the plugin's orphan_lora validation guarantees every
+    # patched base is a SparseLinear that accepts indices, but this patch is
+    # process-global; when indices is None, call layers without the indices arg
+    # so a plain nn.Linear base can't choke on an extra positional. The sparse
+    # path (indices is not None) is unchanged.
+    if indices is None:
+        result = self.base_layer(x, *args, **kwargs)
+    else:
+        result = self.base_layer(x, indices, *args, **kwargs)
     result_dtype = result.dtype
 
     for active_adapter in self.active_adapters:
@@ -67,7 +75,10 @@ def lora_forward(
             x_in = x
 
         x_in = x_in.to(lora_A.weight.dtype)
-        lora_out = lora_B(lora_A(x_in, indices, *args, **kwargs), indices, *args, **kwargs)
+        if indices is None:
+            lora_out = lora_B(lora_A(x_in, *args, **kwargs), *args, **kwargs)
+        else:
+            lora_out = lora_B(lora_A(x_in, indices, *args, **kwargs), indices, *args, **kwargs)
         lora_out = lora_out.to(result_dtype)
         result = torch.add(result, lora_out, alpha=scaling)
 

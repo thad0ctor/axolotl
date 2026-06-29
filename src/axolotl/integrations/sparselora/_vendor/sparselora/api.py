@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; non-nesting mask binding in _patch_forward/_patch_generate. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; non-nesting mask binding in _patch_forward/_patch_generate; Trainer auto-inject reads the schedule from its own model (not a closed-over config) so a second model gets its own start/end_step. Do not edit; see _vendor/PROVENANCE.md.
 """Core API for applying SparseLoRA to PEFT models."""
 
 import types
@@ -76,7 +76,7 @@ def _patch_generate(model: nn.Module) -> None:
     model.generate = types.MethodType(_generate, model)
 
 
-def _patch_trainer(config: SparseLoRAConfig) -> None:
+def _patch_trainer() -> None:
     """Monkey-patch ``Trainer.__init__`` to auto-inject :class:`SparseLoRACallback`."""
     global _trainer_init_patched
     if _trainer_init_patched:
@@ -87,10 +87,15 @@ def _patch_trainer(config: SparseLoRAConfig) -> None:
 
     def _patched_init(self, *args, **kwargs):
         _orig_init(self, *args, **kwargs)
+        # Axolotl local edit: read the schedule from THIS trainer's model rather
+        # than a config closed over at first-patch time, so a second model built
+        # in the same process gets its own start/end_step instead of the first
+        # model's. apply_sparselora stamps the schedule onto the model.
+        schedule = getattr(self.model, "_sparselora_schedule", None)
         has_sparselora = any(isinstance(m, SparseModule) for m in self.model.modules())
         already_registered = any(isinstance(cb, SparseLoRACallback) for cb in self.callback_handler.callbacks)
-        if has_sparselora and not already_registered:
-            self.add_callback(SparseLoRACallback(config.start_step, config.end_step))
+        if has_sparselora and schedule is not None and not already_registered:
+            self.add_callback(SparseLoRACallback(*schedule))
 
     transformers.Trainer.__init__ = _patched_init
 
@@ -135,7 +140,8 @@ def apply_sparselora(model: nn.Module, config: SparseLoRAConfig) -> nn.Module:
                         )
             pbar.update(1)
 
+    model._sparselora_schedule = (config.start_step, config.end_step)
     _patch_forward(model, config)
     _patch_generate(model)
-    _patch_trainer(config)
+    _patch_trainer()
     return model
