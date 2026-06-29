@@ -267,7 +267,7 @@ def run(ctx: GateContext) -> GateResult:
     except Exception as exc:  # noqa: BLE001 - collator wiring may be unavailable
         collate_status = "skipped"
         collate_note = f"collate-time reset not verified (collator unavailable: {exc})"
-    if collate_status == "skipped":
+    if collate_status == "skipped" and not findings:
         return GateResult.could_not_run(GATE_ID, GATE_NAME, collate_note)
     if collate_status == "broken":
         findings.append(collate_note)
@@ -310,8 +310,9 @@ def run(ctx: GateContext) -> GateResult:
         )
     if parity["status"] == "mismatch":
         findings.append(parity["note"])
-    elif want_parity and parity["status"] in {"skipped", "unverified"}:
+    elif want_parity and parity["status"] in {"skipped", "unverified"} and not findings:
         # parity was explicitly requested but couldn't run — don't pass it off as clean
+        # (only when no prior failure, else a definite finding would be masked)
         return GateResult.could_not_run(GATE_ID, GATE_NAME, parity["note"])
     details.append(f"loss parity: {parity['note']}")
 

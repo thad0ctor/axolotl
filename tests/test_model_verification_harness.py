@@ -579,3 +579,49 @@ def test_g4_bundled_template_exact_match_only():
     assert g4_masking._bundled_template_name("qwen3") == "qwen3"
     assert g4_masking._bundled_template_name("gemma2") is None
     assert g4_masking._bundled_template_name("znovel_arch_test") is None
+
+
+# --- CodeRabbit-round regressions ----------------------------------------------
+
+
+def test_g1_oserror_subclass_is_environment_error():
+    from harness.gates import g1_config
+
+    # FileNotFoundError/PermissionError/TimeoutError are OSError subclasses -> could-not-run
+    assert g1_config._is_environment_error(FileNotFoundError("x"))
+    assert g1_config._is_environment_error(PermissionError("x"))
+    assert not g1_config._is_environment_error(ValueError("logic bug"))
+
+
+def test_main_rejects_unknown_gate_token(tmp_path):
+    import verify_model
+
+    d = _write_config(
+        tmp_path,
+        "llama",
+        {"model_type": "llama", "architectures": ["LlamaForCausalLM"]},
+    )
+    # a typo like G1,G9 must fail fast (exit 2), not silently run only G1 and exit clean
+    code = verify_model.main(
+        [
+            "--base-model",
+            str(d),
+            "--gates",
+            "G1,G9",
+            "--repo-root",
+            str(REPO_ROOT),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--quiet",
+        ]
+    )
+    assert code == 2
+
+
+def test_parse_features_cannot_override_control_keys():
+    import verify_model
+
+    # feature flags spread first; explicit control keys must win
+    feats = verify_model._parse_features("on_unavailable")
+    merged = {**feats, "on_unavailable": "fail"}
+    assert merged["on_unavailable"] == "fail"

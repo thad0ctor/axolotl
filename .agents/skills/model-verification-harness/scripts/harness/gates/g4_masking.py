@@ -266,12 +266,17 @@ def _secondary_masking_pass(
             term_id = term["terminator_id"]
 
     findings: list[str] = []
-    _, nonassistant = _fixture_role_contents(used_fixture)
+    assistant, nonassistant = _fixture_role_contents(used_fixture)
     if total_trained == 0:
         findings.append("no tokens trained")
     for needle in sorted(nonassistant):
         if needle in union_trained:
             findings.append(f"user/system content trained: {needle!r}")
+    # total_trained>0 can be terminators-only; require assistant text in the trained span
+    if total_trained > 0 and not any(c in union_trained for c in assistant):
+        findings.append(
+            "no assistant content in trained span — assistant text appears masked"
+        )
     eos_warn = next((m for m in (warns or []) if _EOS_NOT_FOUND_RE.search(m)), None)
     if term_masked:
         tok = (

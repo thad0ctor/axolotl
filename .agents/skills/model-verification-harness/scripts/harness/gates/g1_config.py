@@ -637,7 +637,10 @@ _ENV_ERROR_MARKERS = (
 
 def _is_environment_error(exc: BaseException) -> bool:
     name = type(exc).__name__
-    if name in ("OSError", "ConnectionError", "HTTPError", "GatedRepoError"):
+    # OSError subclasses (FileNotFoundError/PermissionError/TimeoutError) are local runtime, not findings
+    if isinstance(exc, OSError):
+        return True
+    if name in ("ConnectionError", "HTTPError", "GatedRepoError"):
         return True
     low = f"{name}: {exc}".lower()
     return any(m in low for m in _ENV_ERROR_MARKERS)

@@ -10,6 +10,7 @@ locations can never drift.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -45,6 +46,9 @@ def test_at_least_one_skill() -> None:
 
 
 def test_claude_skills_symlink() -> None:
+    # git symlinks may not materialize on Windows checkouts (documented fallback)
+    if os.name == "nt" and not CLAUDE_SKILLS.is_symlink():
+        pytest.skip("git symlinks are not materialized in this checkout")
     assert CLAUDE_SKILLS.is_symlink(), ".claude/skills must be a symlink"
     # resolve() does not require the target to exist, so check the link is live too
     assert CLAUDE_SKILLS.exists(), ".claude/skills symlink is dangling"

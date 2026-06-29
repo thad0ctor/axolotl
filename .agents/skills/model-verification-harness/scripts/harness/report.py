@@ -417,6 +417,8 @@ def _invocation(args) -> dict[str, Any]:
         "emit_test",
         "snapshot_dir",
         "features",
+        "tiny_strategy",
+        "gpus",
         "trust_remote_code",
     )
     return {k: getattr(args, k, None) for k in keys}

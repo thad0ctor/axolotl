@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+import shutil
 from pathlib import Path
 
 # arch keyword (substring of model_config_type) -> tiny HF id
@@ -77,13 +77,16 @@ def _shrink_model(base_model: str, output_dir: Path, trust_remote_code: bool) ->
         ) from exc
     model.save_pretrained(dest)
     try:
+        # a tokenizer-less dir breaks every downstream load_tokenizer/prepare; fail at the source
         AutoTokenizer.from_pretrained(
             base_model, trust_remote_code=trust_remote_code
         ).save_pretrained(dest)
-    except Exception:  # noqa: BLE001 - tokenizer is best-effort
-        logging.getLogger(__name__).debug(
-            "tokenizer save skipped for shrunk model", exc_info=True
-        )
+    except Exception as exc:  # noqa: BLE001 - surface as could-not-run upstream
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RuntimeError(
+            f"could not save tokenizer for shrunk model {base_model!r} "
+            f"(model_type={model_type}): {exc.__class__.__name__}: {exc}"
+        ) from exc
     return str(dest)
 
 

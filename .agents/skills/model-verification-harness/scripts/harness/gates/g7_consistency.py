@@ -152,6 +152,24 @@ def _step0(res: dict[str, Any]) -> float | None:
 
 
 def run(ctx: GateContext) -> GateResult:
+    details: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    variants, skip_notes = _kernel_variants(ctx)
+    for note in skip_notes:
+        details.append(f"· {note}")
+
+    # skip BEFORE importing axolotl, else no-GPU/no-kernel would surface as could_not_run not SKIPPED
+    if not variants:
+        return GateResult(
+            GATE_ID,
+            GATE_NAME,
+            GateStatus.SKIPPED,
+            summary=f"no applicable kernel variant to compare; {'; '.join(skip_notes)}",
+            details=details,
+            data={"baseline_step0": None, "variants": rows, "skipped": skip_notes},
+        )
+
     try:
         import axolotl.train  # noqa: F401
     except BaseException as err:  # noqa: BLE001
@@ -162,24 +180,6 @@ def run(ctx: GateContext) -> GateResult:
     rtol = float(ctx.options.get("rtol", 2e-2))
     rtol_bf16 = float(ctx.options.get("rtol_bf16", 5e-2))
     timeout = float(ctx.options.get("train_timeout", 1200))
-
-    details: list[str] = []
-    rows: list[dict[str, Any]] = []
-
-    variants, skip_notes = _kernel_variants(ctx)
-    for note in skip_notes:
-        details.append(f"· {note}")
-
-    # skip BEFORE spawning any baseline, else a failed baseline could turn "no GPU" into could_not_run
-    if not variants:
-        return GateResult(
-            GATE_ID,
-            GATE_NAME,
-            GateStatus.SKIPPED,
-            summary=f"no applicable kernel variant to compare; {'; '.join(skip_notes)}",
-            details=details,
-            data={"baseline_step0": None, "variants": rows, "skipped": skip_notes},
-        )
 
     # one baseline per dtype: a bf16 variant must compare to a bf16 baseline
     def _baseline(dtype: str):

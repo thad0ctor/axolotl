@@ -12,6 +12,9 @@ from .. import GateContext, GateResult, GateStatus
 GATE_ID = "G8"
 GATE_NAME = "coverage"
 
+# config-driven models are defended by YAML/JSON fixtures, not just .py tests
+_TEST_TEXT_SUFFIXES = {".py", ".yml", ".yaml", ".json"}
+
 # capability label -> content tokens (case-insensitive substrings) marking a referencing test as exercising that capability
 _CAPABILITIES: dict[str, tuple[str, ...]] = {
     "lora": ("lora",),
@@ -98,10 +101,10 @@ def _scan(ctx: GateContext) -> dict[str, Any]:
     searched = sorted(
         str(p.relative_to(ctx.repo_root))
         for p in root.iterdir()
-        if p.is_dir() or p.suffix == ".py"
+        if p.is_dir() or p.suffix in _TEST_TEXT_SUFFIXES
     )
 
-    for path in sorted(root.rglob("*.py")):
+    for path in sorted(p for p in root.rglob("*") if p.suffix in _TEST_TEXT_SUFFIXES):
         try:
             text = path.read_text(encoding="utf-8", errors="ignore").lower()
         except OSError:

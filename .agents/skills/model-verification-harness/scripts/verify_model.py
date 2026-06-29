@@ -30,15 +30,18 @@ def _find_repo_root(start: Path) -> Path | None:
     return None
 
 
-def _parse_gates(spec: str) -> set[str]:
+def _parse_gates(spec: str) -> tuple[set[str], list[str]]:
     if spec.strip().lower() == "all":
-        return set(GATE_ORDER)
+        return set(GATE_ORDER), []
     out: set[str] = set()
+    invalid: list[str] = []
     for tok in spec.replace(",", " ").split():
         tok = tok.strip().upper()
         if tok in GATE_ORDER:
             out.add(tok)
-    return out
+        elif tok:
+            invalid.append(tok)
+    return out, invalid
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -350,8 +353,16 @@ def main(argv: list[str] | None = None) -> int:
             "gates import the resolved axolotl — verdicts could mix trees. Run inside "
             "the env whose axolotl matches --repo-root (or set --repo-root to it)."
         )
+        # mixed trees make the verdict unreliable; --on-unavailable skip keeps the warn-and-continue escape hatch
+        if args.on_unavailable != "skip":
+            return 2
 
-    selected = _parse_gates(args.gates)
+    selected, invalid = _parse_gates(args.gates)
+    if invalid:
+        print(
+            f"invalid gate(s) in --gates {args.gates!r}: {invalid}; choose from {GATE_ORDER}"
+        )
+        return 2
     if not selected:
         print(f"no valid gates in --gates {args.gates!r}; choose from {GATE_ORDER}")
         return 2
@@ -402,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
             tmp_ctx.cleanup()
         return 2
 
+    # spread features FIRST so a feature flag can never overwrite explicit control keys below
+    feature_options = _parse_features(args.features)
     ctx = GateContext(
         features=features,
         repo_root=repo_root,
@@ -411,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         gpu_available=_gpu_available(),
         selected_gates=selected,
         options={
+            **feature_options,
             "auto_bisect": args.auto_bisect or args.profile == "full",
             "emit_test": args.emit_test,
             "snapshot_dir": args.snapshot_dir,
@@ -421,7 +435,6 @@ def main(argv: list[str] | None = None) -> int:
             "on_unavailable": args.on_unavailable,
             # MM gate forwards this to processor/tokenizer load for remote-code VLMs
             "trust_remote_code": args.trust_remote_code,
-            **_parse_features(args.features),
         },
     )
 

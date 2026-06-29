@@ -1101,7 +1101,11 @@ def _check_model_py(p: Probe) -> None:
         p.warn("loaders/model.py model-type branches unreadable")
         return
     # quantization skip-modules / quant_storage (jamba/falcon_h1 special blocks)
-    wants_quant = bool(p.opt.get("quantization"))
+    wants_quant = bool(
+        p.opt.get("quantization")
+        or p.opt.get("load_in_4bit")
+        or p.opt.get("load_in_8bit")
+    )
     special_quant = {"jamba", "falcon_h1"}
     gated = "quantization + special block"
     if wants_quant and p.mct in special_quant:
