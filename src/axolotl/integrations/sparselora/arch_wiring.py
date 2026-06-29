@@ -53,7 +53,7 @@ from ._vendor.sparselora.modules.predictors import (
     FFNPredictor,
     GQAAttentionPredictor,
 )
-from .factors import fused_qkv_sizes
+from .factors import fused_intermediate_size, fused_qkv_sizes
 
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction
@@ -88,14 +88,6 @@ def is_fused_qkv_attention(module: nn.Module) -> bool:
     """Phi3-style fused attention: a single ``qkv_proj`` Linear plus ``o_proj``
     (rather than separate ``q_proj``/``k_proj``/``v_proj``)."""
     return hasattr(module, "qkv_proj") and hasattr(module, "o_proj")
-
-
-def has_partial_rotary(module: nn.Module) -> bool:
-    """True if the attention rotates only part of the head dim (StableLM/Phi/
-    GPT-NeoX style). The generic sparse attention applies RoPE to the full head
-    dim, so partial-rotary models can't be reproduced and are refused."""
-    config = getattr(module, "config", None)
-    return config is not None and getattr(config, "partial_rotary_factor", 1.0) < 1.0
 
 
 def gate_activation(module: nn.Module):
@@ -276,20 +268,31 @@ class SparseSwiGLUMLP(SparseLlamaMLP):
     ) -> None:
         SparseModule.__init__(self, base)
         self.sparsity = sparsity
-        self._gate_kind = gate_kind(base)
-        if self._gate_kind is None:
-            # The plugin's _validate refuses these via unsupported_reason(), but
-            # guard here too so direct register_arch_wiring() users don't silently
-            # get a wrong SiLU approximation of another gated activation.
+        self._gate_kind = self._require_gate_kind(base)
+        self._init_extra(base)
+        if self.sparsity > 0:
+            self.pred = self._build_predictor(base, name, cfg)
+
+    def _require_gate_kind(self, base: nn.Module) -> str:
+        # The plugin's _validate refuses unsupported gates via unsupported_reason(),
+        # but guard here too so direct register_arch_wiring() users don't silently
+        # get a wrong SiLU approximation of another gated activation.
+        kind = gate_kind(base)
+        if kind is None:
             raise ValueError(
-                f"SparseSwiGLUMLP: unsupported gate activation on "
+                f"{type(self).__name__}: unsupported gate activation on "
                 f"{type(base).__name__}; only SiLU and gelu_tanh gated MLPs are "
                 "supported."
             )
-        if self.sparsity > 0:
-            self.pred = _create_mlp_predictor(
-                base, cfg.predictor_rank, name, cfg, self._gate_kind
-            )
+        return kind
+
+    def _init_extra(self, base: nn.Module) -> None:
+        """Subclass setup hook. No-op for the separate gate/up projection."""
+
+    def _build_predictor(self, base: nn.Module, name: str, cfg):
+        return _create_mlp_predictor(
+            base, cfg.predictor_rank, name, cfg, self._gate_kind
+        )
 
     def _gate_mul(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         """Gated activation ``act(gate) * up`` using the matching kernel/path."""
@@ -316,24 +319,14 @@ class SparseFusedGateUpMLP(SparseSwiGLUMLP):
 
     inherited_attributes = ["gate_up_proj", "down_proj"]
 
-    def __init__(
-        self, base: nn.Module, *, name: str, idx: int, sparsity: float, cfg
-    ) -> None:
-        SparseModule.__init__(self, base)
-        self.sparsity = sparsity
-        self._gate_kind = gate_kind(base)
-        if self._gate_kind is None:
-            raise ValueError(
-                f"SparseFusedGateUpMLP: unsupported gate activation on "
-                f"{type(base).__name__}; only SiLU and gelu_tanh gated MLPs are "
-                "supported."
-            )
+    def _init_extra(self, base: nn.Module) -> None:
         self.act_fn = gate_activation(base)
-        self.intermediate_size = base.down_proj.in_features
-        if self.sparsity > 0:
-            self.pred = _create_fused_mlp_predictor(
-                base, cfg.predictor_rank, name, cfg, self._gate_kind
-            )
+        self.intermediate_size = fused_intermediate_size(base)
+
+    def _build_predictor(self, base: nn.Module, name: str, cfg):
+        return _create_fused_mlp_predictor(
+            base, cfg.predictor_rank, name, cfg, self._gate_kind
+        )
 
     def _block(self, x: torch.Tensor, **kw: Any) -> torch.Tensor:
         idx = kw.get("sparse_indices")
@@ -443,6 +436,28 @@ def _create_fused_attn_predictor(base: nn.Module, rank: int, layer_name: str, cf
     return _build_attn_predictor(tensors, layer_name, rank, weight.device)
 
 
+def _resolve_eager_attention(base: nn.Module):
+    """The base architecture's own ``eager_attention_forward``, or Llama's.
+
+    Using the base module's eager fn preserves arch-specific terms (e.g. Gemma2's
+    softcap) when the model runs eager; Llama's is the fallback when absent.
+    """
+    import sys
+
+    base_mod = sys.modules.get(type(base).__module__)
+    return getattr(base_mod, "eager_attention_forward", eager_attention_forward)
+
+
+def _partial_rotary_dim(config: Any, head_dim: int) -> Optional[int]:
+    """RoPE rotary width for partial-rotary models (StableLM/Phi), else ``None``.
+
+    ``partial_rotary_factor < 1.0`` rotates only the leading ``factor * head_dim``
+    of each head; the rest passes through. ``None`` means full-head RoPE.
+    """
+    prf = getattr(config, "partial_rotary_factor", 1.0) if config is not None else 1.0
+    return int(prf * head_dim) if prf < 1.0 else None
+
+
 class SparseAttention(SparseLlamaAttention):
     """Architecture-neutral sparse attention.
 
@@ -451,6 +466,10 @@ class SparseAttention(SparseLlamaAttention):
     ``sliding_window`` forwarded to the attention interface (Qwen2/Qwen3/
     Mistral). Projection bias (Qwen2) is handled by :class:`SparseLinearBias`.
     When none are present this reproduces Llama attention.
+
+    Subclasses customize three init hooks rather than reimplement ``__init__``:
+    :meth:`_init_extra` (extra attributes), :meth:`_build_predictor` (the sparse
+    predictor), and :meth:`_sliding_window_fallback` (window source).
     """
 
     def __init__(
@@ -459,26 +478,27 @@ class SparseAttention(SparseLlamaAttention):
         # Mirror SparseLlamaAttention.__init__ but build the predictor with the
         # decoupled-head_dim-tolerant creator (Qwen3 has q_out != hidden_size).
         SparseModule.__init__(self, base)
-        # Partial rotary (StableLM etc.): RoPE rotates only the first
-        # rotary_dim of each head; the rest passes through. The model's
-        # rotary_emb sizes cos/sin to rotary_dim, so we split Q/K accordingly.
         config = getattr(base, "config", None)
-        prf = getattr(config, "partial_rotary_factor", 1.0) if config else 1.0
-        self._rotary_dim = int(prf * self.head_dim) if prf < 1.0 else None
+        self._rotary_dim = _partial_rotary_dim(config, self.head_dim)
         self.sparsity = sparsity
+        self._init_extra(base, config)
         if self.sparsity > 0:
-            self.pred = _create_attn_predictor(base, cfg.predictor_rank, name, cfg)
+            self.pred = self._build_predictor(base, name, cfg)
         for attr in _OPTIONAL_ATTN_ATTRS:
             setattr(self, attr, getattr(base, attr, None))
-        # Use the base architecture's own eager attention as the fallback so
-        # arch-specific terms (e.g. Gemma2's softcap) are applied when the model
-        # runs eager; default to Llama's only if the module has none.
-        import sys
+        if getattr(self, "sliding_window", None) is None:
+            self.sliding_window = self._sliding_window_fallback(config)
+        self._eager_attention = _resolve_eager_attention(base)
 
-        base_mod = sys.modules.get(type(base).__module__)
-        self._eager_attention = getattr(
-            base_mod, "eager_attention_forward", eager_attention_forward
-        )
+    def _init_extra(self, base: nn.Module, config: Any) -> None:
+        """Subclass setup hook (e.g. fused qkv sizes). No-op for separate q/k/v."""
+
+    def _build_predictor(self, base: nn.Module, name: str, cfg):
+        return _create_attn_predictor(base, cfg.predictor_rank, name, cfg)
+
+    def _sliding_window_fallback(self, config: Any) -> Optional[int]:
+        """Sliding window when the module carries none. No fallback by default."""
+        return None
 
     def _qkv(self, hidden_states: torch.Tensor, masks, sparse: bool):
         """Project to flat ``(Q, K, V, v_i)``; override point for fused qkv_proj.
@@ -594,30 +614,15 @@ class SparseFusedQKVAttention(SparseAttention):
         "is_causal",
     ]
 
-    def __init__(
-        self, base: nn.Module, *, name: str, idx: int, sparsity: float = 0, cfg
-    ) -> None:
-        SparseModule.__init__(self, base)
-        config = base.config
-        prf = getattr(config, "partial_rotary_factor", 1.0)
-        self._rotary_dim = int(prf * self.head_dim) if prf < 1.0 else None
-        self.sparsity = sparsity
+    def _init_extra(self, base: nn.Module, config: Any) -> None:
         self._q_size, self._kv_size = fused_qkv_sizes(base)
-        if self.sparsity > 0:
-            self.pred = _create_fused_attn_predictor(
-                base, cfg.predictor_rank, name, cfg
-            )
-        for attr in _OPTIONAL_ATTN_ATTRS:
-            setattr(self, attr, getattr(base, attr, None))
-        # Phi3 reads sliding_window off config, not the module; mirror that.
-        if getattr(self, "sliding_window", None) is None:
-            self.sliding_window = getattr(config, "sliding_window", None)
-        import sys
 
-        base_mod = sys.modules.get(type(base).__module__)
-        self._eager_attention = getattr(
-            base_mod, "eager_attention_forward", eager_attention_forward
-        )
+    def _build_predictor(self, base: nn.Module, name: str, cfg):
+        return _create_fused_attn_predictor(base, cfg.predictor_rank, name, cfg)
+
+    def _sliding_window_fallback(self, config: Any) -> Optional[int]:
+        # Phi3 reads sliding_window off config, not the module; mirror that.
+        return getattr(config, "sliding_window", None)
 
     def _split_qkv(self, fused: torch.Tensor):
         q, kv = self._q_size, self._kv_size
