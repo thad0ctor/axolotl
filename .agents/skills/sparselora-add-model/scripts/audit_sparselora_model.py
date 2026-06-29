@@ -9,14 +9,18 @@ Given an architecture name (``--arch qwen2``) or a HuggingFace id
 2. checks each block exposes the SwiGLU MLP (gate/up/down) and standard
    attention (q/k/v/o) projections SparseLoRA needs,
 3. runs ``register_arch_wiring`` and reports which sparse module each MLP /
-   attention class maps to (and refuses architectures with unsupported
-   semantics, e.g. Gemma attention-logit softcapping),
-4. smoke-tests apply + forward: a sparse forward+backward on CUDA (predictors
-   need liger/Triton), or a dense apply+forward on CPU.
+   attention class maps to, including any unsupported semantics (e.g. a
+   non-SiLU/non-gelu_tanh gated MLP, or fused projections),
+4. smoke-tests sparse apply + forward/backward on CUDA when available; on CPU it
+   performs structural checks only, because the sparse predictors need GPU
+   kernels (liger/Triton).
 
-Exit status mirrors the liger audit: ``0`` supported & smoke passed, ``1`` not
+For ``--base-model``, the architecture is built from the repo's config (random
+weights, no checkpoint); custom repo code runs only with ``--trust-remote-code``.
+
+Exit status mirrors the liger audit: ``0`` structurally supported, ``1`` not
 supported (refused, missing projections, or a genuine apply/forward failure),
-``2`` could not audit (import/instantiation error, no usable device).
+``2`` could not audit (import/instantiation error).
 """
 
 from __future__ import annotations
@@ -67,17 +71,21 @@ def _tiny_model(arch: str, layers: int):
     return getattr(tf, model_cls)(config)
 
 
-def _from_pretrained(base_model: str, layers: int):
+def _from_pretrained(base_model: str, layers: int, trust_remote_code: bool = False):
     """Instantiate ``base_model``'s architecture from its config, shrunk to
-    ``layers`` layers (real hidden/head dims, random weights, no checkpoint)."""
+    ``layers`` layers (real hidden/head dims, random weights, no checkpoint).
+
+    ``trust_remote_code`` executes the model repo's custom code and is off by
+    default; pass ``--trust-remote-code`` only for repos you trust.
+    """
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(base_model, trust_remote_code=trust_remote_code)
     if hasattr(config, "num_hidden_layers"):
         config.num_hidden_layers = min(config.num_hidden_layers, layers)
     if getattr(config, "tie_word_embeddings", False):
         config.tie_word_embeddings = True
-    return AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    return AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
 
 
 @dataclass
@@ -254,6 +262,11 @@ def main() -> int:
     )
     ap.add_argument("--predictor-rank", type=int, default=8)
     ap.add_argument("--sparsity", type=float, default=0.5)
+    ap.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="execute the --base-model repo's custom code (off by default)",
+    )
     args = ap.parse_args()
 
     target = args.arch or args.base_model
@@ -261,7 +274,7 @@ def main() -> int:
         model = (
             _tiny_model(args.arch, args.layers)
             if args.arch
-            else _from_pretrained(args.base_model, args.layers)
+            else _from_pretrained(args.base_model, args.layers, args.trust_remote_code)
         )
     except Exception as exc:  # noqa: BLE001
         print(

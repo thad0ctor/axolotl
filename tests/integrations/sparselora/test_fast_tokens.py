@@ -118,7 +118,7 @@ def test_applied_model_logits_bit_identical(tiny_lora_model):
 
     orig_mask = api._compute_output_token_mask
     orig_split = SparseModule.token_splits
-    orig_join = SparseModule.token_join
+    orig_join = SparseModule.__dict__["token_join"]  # keep the staticmethod descriptor
     try:
         with torch.no_grad():
             ref = model(input_ids=ids, labels=labels).logits.clone()

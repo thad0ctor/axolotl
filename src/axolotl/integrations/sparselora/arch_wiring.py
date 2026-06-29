@@ -217,9 +217,18 @@ class SparseSwiGLUMLP(SparseLlamaMLP):
         SparseModule.__init__(self, base)
         self.sparsity = sparsity
         self._gate_kind = gate_kind(base)
+        if self._gate_kind is None:
+            # The plugin's _validate refuses these via unsupported_reason(), but
+            # guard here too so direct register_arch_wiring() users don't silently
+            # get a wrong SiLU approximation of another gated activation.
+            raise ValueError(
+                f"SparseSwiGLUMLP: unsupported gate activation on "
+                f"{type(base).__name__}; only SiLU and gelu_tanh gated MLPs are "
+                "supported."
+            )
         if self.sparsity > 0:
             self.pred = _create_mlp_predictor(
-                base, cfg.predictor_rank, name, cfg, self._gate_kind or "silu"
+                base, cfg.predictor_rank, name, cfg, self._gate_kind
             )
 
     def _block(self, x: torch.Tensor, **kw: Any) -> torch.Tensor:
