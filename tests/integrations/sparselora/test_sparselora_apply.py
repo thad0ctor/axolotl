@@ -70,6 +70,40 @@ def test_sparse_forward_backward_runs(tiny_lora_model):
     assert grad_norm > 0
 
 
+def test_mask_binding_does_not_nest_across_steps(tiny_lora_model):
+    """The masks partial must replace, not nest, on each forward (no leak)."""
+    import functools
+    import tempfile
+
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import SparseModule
+
+    model = tiny_lora_model.to("cuda").to(torch.bfloat16).train()
+    targets = discover_target_modules(model)
+    factors = compute_factor_tensors(model, targets, rank=8)
+    d = tempfile.mkdtemp()
+    save_factors(factors, d)
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.5 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+
+    ids = torch.randint(0, 128, (2, 16), device="cuda")
+    labels = ids.clone()
+    labels[:, :8] = -100
+    for _ in range(4):  # multiple steps would nest partials under the old code
+        model(input_ids=ids, labels=labels)
+
+    sparse_mods = [m for m in model.modules() if isinstance(m, SparseModule)]
+    assert sparse_mods
+    for m in sparse_mods:
+        assert isinstance(m.forward, functools.partial)
+        # The wrapped target is the captured base method, never another partial.
+        assert not isinstance(m.forward.func, functools.partial)
+        assert m.forward.func is m._sparse_base_forward
+
+
 def test_sparse_linear_4bit_dense_parity_and_sparse():
     """SparseLinear4bit dense path matches bnb Linear4bit; sparse path runs."""
     bnb = pytest.importorskip("bitsandbytes")

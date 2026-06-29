@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edit: absolute 'sparselora.*' imports relativized. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; non-nesting mask binding in _patch_forward/_patch_generate. Do not edit; see _vendor/PROVENANCE.md.
 """Core API for applying SparseLoRA to PEFT models."""
 
 import types
@@ -39,6 +39,17 @@ def _compute_output_token_mask(labels: torch.Tensor, input_ids: torch.Tensor) ->
     return masks
 
 
+def _base_forward(m: "SparseModule"):
+    # Axolotl local edit: capture each module's original bound forward ONCE so
+    # masks are always rebound onto it. Upstream did
+    # ``m.forward = partial(m.forward, masks=...)`` every call, which nests a new
+    # partial per step and keeps every step's mask tensor alive (a slow leak).
+    base = getattr(m, "_sparse_base_forward", None)
+    if base is None:
+        base = m._sparse_base_forward = m.forward
+    return base
+
+
 def _patch_forward(model: nn.Module, config: SparseLoRAConfig) -> None:
     _orig = model.forward
 
@@ -47,7 +58,7 @@ def _patch_forward(model: nn.Module, config: SparseLoRAConfig) -> None:
         masks = _compute_output_token_mask(labels, kwargs.get("input_ids")) if labels is not None else None
         for m in self.model.modules():
             if isinstance(m, SparseModule):
-                m.forward = partial(m.forward, masks=masks)
+                m.forward = partial(_base_forward(m), masks=masks)
         return _orig(*args, **kwargs)
 
     model.forward = types.MethodType(_forward, model)
@@ -59,7 +70,7 @@ def _patch_generate(model: nn.Module) -> None:
     def _generate(self, *args, **kwargs):
         for m in self.model.modules():
             if isinstance(m, SparseModule):
-                m.forward = partial(m.forward, masks=None)
+                m.forward = partial(_base_forward(m), masks=None)
         return _orig(*args, **kwargs)
 
     model.generate = types.MethodType(_generate, model)

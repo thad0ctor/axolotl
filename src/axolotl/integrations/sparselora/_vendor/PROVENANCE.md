@@ -17,6 +17,7 @@ Two changes were applied to the copied sources:
 
 - Absolute intra-package imports (`from sparselora.… import …`) were rewritten as relative imports (`from .… import …`) so the package works under `axolotl.integrations.sparselora._vendor.sparselora`. Affected: `__init__.py`, `callback.py`, `modules/svd.py`. The example in `modules/registry.py`'s docstring was left as-is.
 - `modules/svd.py`: a float-dtype guard (`_float_dtype`) so predictor factors load correctly when the base is a bitsandbytes 4-bit (QLoRA) weight, whose storage dtype is `uint8`. Upstream inferred the cast dtype directly from `base.weight.dtype`, which would cast the float SVD factors to `uint8` and corrupt them.
+- `api.py`: non-nesting mask binding in `_patch_forward`/`_patch_generate`. Upstream did `m.forward = partial(m.forward, masks=...)` on every forward, which nests a fresh `functools.partial` around the previous one each step and keeps every step's `masks` tensor alive for the whole run (a slow leak + growing call depth). The edit captures each module's original bound `forward` once (`m._sparse_base_forward`) and rebinds `masks` onto that, so each step replaces the previous wrapper.
 
 Each vendored file carries a one-line provenance header. **Do not hand-edit these files** — to update, re-copy from upstream at a new pinned commit and re-apply the import rewrite.
 
