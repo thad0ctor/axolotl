@@ -556,6 +556,42 @@ def test_plain_attention_is_not_gated():
     assert not is_gated_attention(attn)
 
 
+def test_batched_moe_experts_not_detected_as_mlp():
+    """A batched 3-D expert weight (MoE, e.g. Qwen3_5MoeExperts) exposes
+    gate_up_proj/down_proj as Parameters, not Linears. It must NOT be detected as
+    a fused SwiGLU MLP (that mis-wiring crashes at apply); only 2-D linear
+    projections — including the real shared-expert SwiGLU — are sparsifiable."""
+    from axolotl.integrations.sparselora.arch_wiring import (
+        is_fused_gate_up_mlp,
+        is_swiglu_mlp,
+    )
+
+    class BatchedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = torch.nn.Parameter(torch.zeros(8, 16, 32))
+            self.down_proj = torch.nn.Parameter(torch.zeros(8, 32, 16))
+
+    assert not is_fused_gate_up_mlp(BatchedExperts())
+
+    class RealFusedMLP(torch.nn.Module):  # Phi3-style: real 2-D Linears
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = torch.nn.Linear(16, 32)
+            self.down_proj = torch.nn.Linear(16, 16)
+
+    assert is_fused_gate_up_mlp(RealFusedMLP())
+
+    class SharedExpert(torch.nn.Module):  # MoE shared expert: real SwiGLU
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = torch.nn.Linear(16, 32)
+            self.up_proj = torch.nn.Linear(16, 32)
+            self.down_proj = torch.nn.Linear(32, 16)
+
+    assert is_swiglu_mlp(SharedExpert())
+
+
 def test_gated_split_and_gate_math():
     """SparseGatedAttention reproduces the reference per-head [query|gate] split
     and sigmoid gating bit-for-bit (this is the dense-apply parity guarantee)."""

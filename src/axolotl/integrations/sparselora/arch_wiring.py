@@ -70,24 +70,44 @@ _ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _OPTIONAL_ATTN_ATTRS = ("q_norm", "k_norm", "sliding_window", "attn_logit_softcapping")
 
 
+def _is_linear_proj(module: nn.Module, name: str) -> bool:
+    """True if ``module.<name>`` is a 2-D linear projection (``nn.Linear`` or a
+    LoRA/sparse/quantized wrapper of one), not a batched 3-D expert weight.
+
+    MoE expert blocks (e.g. ``Qwen3_5MoeExperts``) expose ``gate_up_proj`` /
+    ``down_proj`` as **batched 3-D Parameters** ``(num_experts, in, out)`` rather
+    than Linears. They satisfy a bare ``hasattr`` check and would be misdetected
+    as a fused SwiGLU MLP, so the structural detectors require a 2-D weight. The
+    routed experts are then left dense (contextual sparsity over grouped experts
+    is out of scope); the shared expert (a real 2-D SwiGLU) is still sparsified.
+    """
+    proj = getattr(module, name, None)
+    if proj is None:
+        return False
+    w = getattr(proj, "weight", proj)
+    return isinstance(w, torch.Tensor) and w.dim() == 2
+
+
 def is_swiglu_mlp(module: nn.Module) -> bool:
-    return all(hasattr(module, proj) for proj in _MLP_PROJECTIONS)
+    return all(_is_linear_proj(module, proj) for proj in _MLP_PROJECTIONS)
 
 
 def is_standard_attention(module: nn.Module) -> bool:
-    return all(hasattr(module, proj) for proj in _ATTN_PROJECTIONS)
+    return all(_is_linear_proj(module, proj) for proj in _ATTN_PROJECTIONS)
 
 
 def is_fused_gate_up_mlp(module: nn.Module) -> bool:
     """Phi3-style fused MLP: a single ``gate_up_proj`` Linear plus ``down_proj``
     (rather than separate ``gate_proj``/``up_proj``)."""
-    return hasattr(module, "gate_up_proj") and hasattr(module, "down_proj")
+    return _is_linear_proj(module, "gate_up_proj") and _is_linear_proj(
+        module, "down_proj"
+    )
 
 
 def is_fused_qkv_attention(module: nn.Module) -> bool:
     """Phi3-style fused attention: a single ``qkv_proj`` Linear plus ``o_proj``
     (rather than separate ``q_proj``/``k_proj``/``v_proj``)."""
-    return hasattr(module, "qkv_proj") and hasattr(module, "o_proj")
+    return _is_linear_proj(module, "qkv_proj") and _is_linear_proj(module, "o_proj")
 
 
 def _proj_out_features(proj: Any) -> Optional[int]:
