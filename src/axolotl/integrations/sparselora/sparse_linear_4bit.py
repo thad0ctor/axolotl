@@ -52,7 +52,7 @@ class SparseLinear4bit(SparseLinear):
         x = x.contiguous()
         weight = self._dense_weight(x.dtype)
         if sparse_indices is None or self.mode is None:
-            return F.linear(x, weight)
+            return F.linear(x, weight, self.bias)
 
         if self.mode == "in_gather":
             idx = (
@@ -64,10 +64,14 @@ class SparseLinear4bit(SparseLinear):
                 x = torch.gather(x, 2, idx).contiguous()
 
         if self.mode.startswith("in"):
+            # Input-sparse: output keeps the full out dim, so bias applies whole.
             w = weight[:, sparse_indices].contiguous()
-        else:
-            w = weight[sparse_indices].contiguous()
-        x = F.linear(x, w)
+            return F.linear(x, w, self.bias)
+
+        # Output-sparse: keep only the selected rows of weight (and bias).
+        w = weight[sparse_indices].contiguous()
+        b = None if self.bias is None else self.bias[sparse_indices].contiguous()
+        x = F.linear(x, w, b)
 
         if self.mode == "out_scatter" and x.shape[-1] != self.out_features:
             with torch.no_grad():
