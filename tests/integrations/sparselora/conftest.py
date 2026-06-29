@@ -12,17 +12,31 @@ def _restore_global_sparselora_patches():
     import peft.tuners.lora.layer as lora_layer
     import transformers
 
+    from axolotl.integrations.sparselora import fast_tokens
     from axolotl.integrations.sparselora._vendor.sparselora import api
+    from axolotl.integrations.sparselora._vendor.sparselora.modules.base import (
+        SparseModule,
+    )
 
     orig_lora_forward = lora_layer.Linear.forward
     orig_trainer_init = transformers.Trainer.__init__
     orig_patched_flag = api._trainer_init_patched
+    # The fast-tokens fast path rebinds these process-global hooks; snapshot so a
+    # test that installs it (directly or via the plugin) can't leak into others.
+    orig_mask = api._compute_output_token_mask
+    orig_split = SparseModule.__dict__["token_splits"]
+    orig_join = SparseModule.__dict__["token_join"]
+    orig_fast_flag = fast_tokens._INSTALLED
     try:
         yield
     finally:
         lora_layer.Linear.forward = orig_lora_forward
         transformers.Trainer.__init__ = orig_trainer_init
         api._trainer_init_patched = orig_patched_flag
+        api._compute_output_token_mask = orig_mask
+        SparseModule.token_splits = orig_split
+        SparseModule.token_join = orig_join
+        fast_tokens._INSTALLED = orig_fast_flag
 
 
 def _tiny_llama(num_kv_heads: int = 2):
