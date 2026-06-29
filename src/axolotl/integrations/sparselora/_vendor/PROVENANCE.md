@@ -1,6 +1,6 @@
 # Vendored: z-lab/sparselora
 
-This directory contains a verbatim copy of the [`sparselora`](https://github.com/z-lab/sparselora) Python package, vendored into Axolotl rather than installed via pip.
+This directory contains a vendored copy of the [`sparselora`](https://github.com/z-lab/sparselora) Python package — bundled into Axolotl rather than installed via pip, with a small set of local patches documented under [Local edits](#local-edits) below. It is otherwise upstream's code at the pinned commit.
 
 - **Upstream:** https://github.com/z-lab/sparselora
 - **Commit:** `a2fd69de93b1168080346ec113c99501f0bb58b1`
