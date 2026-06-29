@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; float-dtype guard for quantized (4-bit) bases; lru_cache the factors load so all modules in one apply share a single read. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; float-dtype guard for quantized (4-bit) bases; bounded lru_cache (maxsize=2) on the factors load so all modules in one apply share a single read without pinning device tensors across applies. Do not edit; see _vendor/PROVENANCE.md.
 """Load SVD-based sparsity predictors from safetensors."""
 
 import functools
@@ -19,13 +19,15 @@ def _resolve_safetensors(path: str) -> str:
     return hf_hub_download(path, "model.safetensors")
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=2)
 def _load_tensors_cached(path: str, device: str, dtype: torch.dtype) -> dict:
     # Axolotl local edit: upstream re-read+re-moved the whole factors file on
     # EVERY create_*_predictor call (once per sparsified module, ~O(layers**2)).
     # Cache keyed on (path, device, dtype) so all modules in one apply share one
     # load. The returned dict is only READ by the create_* functions (they
-    # torch.stack / load_state_dict, which copy), so sharing it is safe.
+    # torch.stack / load_state_dict, which copy), so sharing it is safe. Bounded
+    # to maxsize=2 (was None) so the DEVICE tensors can't pin VRAM across many
+    # distinct (path, device, dtype) applies in one process.
     return {k: v.to(device=device, dtype=dtype) for k, v in load_file(path).items()}
 
 

@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; non-nesting mask binding in _patch_forward/_patch_generate; Trainer auto-inject reads the schedule from its own model (not a closed-over config) so a second model gets its own start/end_step. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; non-nesting mask binding in _patch_forward/_patch_generate; Trainer auto-inject reads the schedule from its own model (not a closed-over config) so a second model gets its own start/end_step; _compute_output_token_mask derives the mask from labels alone (robust when input_ids is positional). Do not edit; see _vendor/PROVENANCE.md.
 """Core API for applying SparseLoRA to PEFT models."""
 
 import types
@@ -28,13 +28,19 @@ def _set_submodule(model: nn.Module, name: str, module: nn.Module) -> None:
     setattr(model, parts[-1], module)
 
 
-def _compute_output_token_mask(labels: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """Build a boolean mask that is True for output (non-context) tokens."""
+def _compute_output_token_mask(labels: torch.Tensor) -> torch.Tensor:
+    """Build a boolean mask that is True for output (non-context) tokens.
+
+    Derived from ``labels`` alone (same shape as ``input_ids``) so it is robust
+    when ``input_ids`` is passed positionally rather than as a kwarg. The
+    batch-wide contiguous ``[left:right]`` block is intentional — the
+    ``fast_tokens`` fast path relies on a single contiguous output span.
+    """
     is_ctx = (labels == -100)
     left = is_ctx.cumprod(dim=1).sum(dim=1).min().item()
     right_pad = is_ctx.flip(dims=[1]).cumprod(dim=1).sum(dim=1).min().item()
     right = labels.shape[-1] - right_pad if right_pad > 0 else labels.shape[-1]
-    masks = torch.zeros_like(input_ids, dtype=torch.bool)
+    masks = torch.zeros(labels.shape, dtype=torch.bool, device=labels.device)
     masks[..., left:right] = True
     return masks
 
@@ -55,7 +61,7 @@ def _patch_forward(model: nn.Module, config: SparseLoRAConfig) -> None:
 
     def _forward(self, *args, **kwargs):
         labels = kwargs.get("labels")
-        masks = _compute_output_token_mask(labels, kwargs.get("input_ids")) if labels is not None else None
+        masks = _compute_output_token_mask(labels) if labels is not None else None
         for m in self.model.modules():
             if isinstance(m, SparseModule):
                 m.forward = partial(_base_forward(m), masks=masks)

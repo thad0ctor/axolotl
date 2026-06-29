@@ -60,6 +60,24 @@ def test_compute_mask_context_matches_boundaries():
     assert ctx.has_dense
 
 
+def test_output_token_mask_needs_only_labels():
+    """The mask builds from labels alone (input_ids may be positional/absent)."""
+    from axolotl.integrations.sparselora._vendor.sparselora import api
+
+    labels = torch.full((2, 16), -100)
+    labels[:, 5:11] = 1
+    mask = api._compute_output_token_mask(labels)  # no input_ids
+    assert mask.dtype == torch.bool
+    assert mask.shape == labels.shape
+    expected = torch.zeros(2, 16, dtype=torch.bool)
+    expected[:, 5:11] = True
+    assert torch.equal(mask, expected)
+
+    # The fast-path replacement accepts the same single-arg call.
+    ctx = fast_tokens._compute_mask_context(labels)
+    assert (ctx.left, ctx.right, ctx.total) == (5, 11, 16)
+
+
 def test_split_join_bit_identical_to_boolean():
     torch.manual_seed(0)
     dummy = SparseModule.__new__(SparseModule)  # token_splits needs only self
