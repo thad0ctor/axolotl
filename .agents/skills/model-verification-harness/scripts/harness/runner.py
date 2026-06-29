@@ -31,10 +31,21 @@ _TINY_CHAT_ROWS = [
 ]
 
 
-def write_chat_fixture(output_dir: Path, n_repeat: int = 16) -> Path:
-    path = output_dir / "tiny_chat.jsonl"
+def write_chat_fixture(
+    output_dir: Path, n_repeat: int = 16, drop_system: bool = False
+) -> Path:
+    # some native templates (e.g. Gemma) raise on a system turn; drop_system lets G4 still
+    # exercise the model's own template instead of silently falling back to llama3
+    rows_src = _TINY_CHAT_ROWS
+    if drop_system:
+        rows_src = [
+            {"messages": [m for m in r["messages"] if m["role"] != "system"]}
+            for r in _TINY_CHAT_ROWS
+        ]
+    name = "tiny_chat_nosys.jsonl" if drop_system else "tiny_chat.jsonl"
+    path = output_dir / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = (_TINY_CHAT_ROWS * n_repeat)[: max(n_repeat, len(_TINY_CHAT_ROWS))]
+    rows = (rows_src * n_repeat)[: max(n_repeat, len(rows_src))]
     with path.open("w", encoding="utf-8") as fout:
         for row in rows:
             fout.write(json.dumps(row) + "\n")

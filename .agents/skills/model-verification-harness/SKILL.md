@@ -14,7 +14,7 @@ description: "Verifies that a model wires into axolotl correctly and trains sane
 | **G1** config | CPU | compat matrix via the real `load_cfg`; 4-way verdict per cell (rejected / normalized / **warned-no-op** / supported); bisects a reject to the minimal flag set. |
 | **G2** integration | CPU | adaptive "wired-everywhere" checklist; flags **silent generic fallbacks**, not just missing hooks. |
 | **G3** preprocess | CPU/GPU | prepared dataset has `input_ids`/`labels`/`attention_mask`. |
-| **G4** masking | CPU | assistant-trained / prompt-masked spans; snapshot diff; image-token masking when multimodal. |
+| **G4** masking | CPU | native template (tokenizer_default) first; assistant-trained / prompt-masked spans; turn-terminator trained (#3754 silent stop-token); snapshot diff; image-token masking when multimodal. |
 | **G5** packing | CPU/GPU | multipack membership, len ≤ `sequence_len`, per-doc `position_ids` reset (collate-time). |
 | **G6** loss | GPU | short real train → loss finite + non-diverging. |
 | **G7** consistency | GPU | **flagship**: a kernel's step-0 loss must ≈ baseline within `rtol` *and* actually engage — catches silent kernel-shadowing. |
@@ -38,7 +38,7 @@ G1–G5 + G8 are CPU and CI-gateable; **G6/G7 need a GPU (local/on-demand)**. `-
    ```
    Run bare it prints the report to stdout **and** returns an exit code (`--report`/`--manifest` also write files; `--quiet` = summary only). Invoke the script directly (it has the `__main__` guard datasets' multiprocess save needs), not via `python -c`.
    Exit **`0`** clean · **`1`** findings · **`2`** can't-run-here (no GPU / kernel won't compile / model unloadable). `--on-unavailable skip` makes can't-run non-blocking (offer as a checklist choice). GPU gates retry a transient Triton/CUDA compile error and mark a non-compiling kernel could-not-run, not a false finding.
-5. **Interpret.** Call out: **G2 generic-fallback ⚠️** (runs a generic path that may be wrong — review or add a dedicated branch) and **missing ❌** (wire it: multipack / patch_manager / MoE block / …); **G1 warned-no-op** (flag accepted but inert); **G4 finding** (prompt trained or assistant masked — a chat-template/masking bug); **G7 SHADOW SUSPECT** (kernel changed the math — highest value). On a green run, offer `--emit-test`.
+5. **Interpret.** Call out: **G2 generic-fallback ⚠️** (runs a generic path that may be wrong — review or add a dedicated branch) and **missing ❌** (wire it: multipack / patch_manager / MoE block / …); **G1 warned-no-op** (flag accepted but inert); **G4 finding** (prompt trained, assistant masked, or turn terminator masked / #3754 — a chat-template/masking bug); **G7 SHADOW SUSPECT** (kernel changed the math — highest value). On a green run, offer `--emit-test`.
 
 ## Notes
 

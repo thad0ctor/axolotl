@@ -1,8 +1,11 @@
-"""G4 — masking gate: drive the real ``chat_template`` strategy, decode trained-vs-masked spans, and assert assistant content is TRAINED and user/system MASKED (the silent-mislabel failure mode). The prepared dataset is shuffled, so the snapshot captures a shuffle-invariant sorted aggregate of every row, not row 0. For multimodal models it instead drives the real processor + MM collate path and asserts the image/placeholder tokens are MASKED while assistant text is TRAINED."""
+"""G4 — masking gate: drive the real ``chat_template`` strategy on the model's OWN template (tokenizer_default first), decode trained-vs-masked spans, and assert assistant content is TRAINED, user/system MASKED, and the assistant turn TERMINATOR is trained (the #3754 silent-stop-token failure mode). The prepared dataset is shuffled, so the snapshot captures a shuffle-invariant sorted aggregate of every row, not row 0. For multimodal models it instead drives the real processor + MM collate path and asserts the image/placeholder tokens are MASKED while assistant text is TRAINED."""
 
 from __future__ import annotations
 
 import json
+import logging
+import re
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -11,30 +14,62 @@ from .. import GateContext, GateResult, GateStatus, runner
 GATE_ID = "G4"
 GATE_NAME = "masking"
 
-# tried in order; first that resolves + prepares wins
-_CHAT_TEMPLATE_CANDIDATES = ["llama3", "tokenizer_default"]
+# native template first: family-specific terminator/role bugs (e.g. #3754) live in the
+# model's OWN template; llama3 is only a fallback for tokenizers that ship no chat_template
+_CHAT_TEMPLATE_CANDIDATES = ["tokenizer_default", "llama3"]
+
+_CHAT_WARN_LOGGER = "axolotl.prompt_strategies.chat_template"
+# strategy warns (but does not error) when the configured EOS/EOT is absent from the
+# rendered template — the exact silent path that leaves the turn terminator at -100 (#3754)
+_EOS_NOT_FOUND_RE = re.compile(r"(EOS|EOT) token .* not found in chat_template")
 
 
 def applies(ctx: GateContext) -> bool:  # noqa: ARG001 - always applies (text + MM)
     return True
 
 
-def _prepare_with_template(ctx: GateContext, fixture: Path):
-    """Try each chat_template candidate; return (cfg, dataset_meta, template) or raise the last error."""
-    stanza = runner.chat_dataset_stanza(fixture)
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with suppress(Exception):
+            self.messages.append(record.getMessage())
+
+
+@contextmanager
+def _capture_chat_warnings():
+    handler = _ListHandler()
+    logger = logging.getLogger(_CHAT_WARN_LOGGER)
+    logger.addHandler(handler)
+    try:
+        yield handler.messages
+    finally:
+        logger.removeHandler(handler)
+
+
+def _prepare_with_template(ctx: GateContext, fixtures: list[Path]):
+    """Try each (template, fixture); return (cfg, dataset_meta, template, warnings, fixture) or raise the last error. The no-system fixture lets a native template that rejects system turns (Gemma) still run instead of falling back to llama3."""
     last_exc: Exception | None = None
     for template in _CHAT_TEMPLATE_CANDIDATES:
-        cfg_dict = runner.base_cfg(
-            ctx.features.base_model, ctx.output_dir, f"g4_{template}", datasets=[stanza]
-        )
-        cfg_dict["chat_template"] = template
-        cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, f"g4_{template}")
-        try:
-            cfg = runner.resolve_cfg(cfg_path)
-            dataset_meta = runner.prepare(cfg)
-            return cfg, dataset_meta, template
-        except Exception as exc:  # noqa: BLE001 - template may not resolve for arch
-            last_exc = exc
+        for fixture in fixtures:
+            stanza = runner.chat_dataset_stanza(fixture)
+            cfg_dict = runner.base_cfg(
+                ctx.features.base_model,
+                ctx.output_dir,
+                f"g4_{template}",
+                datasets=[stanza],
+            )
+            cfg_dict["chat_template"] = template
+            cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, f"g4_{template}")
+            try:
+                cfg = runner.resolve_cfg(cfg_path)
+                with _capture_chat_warnings() as warnings:
+                    dataset_meta = runner.prepare(cfg)
+                return cfg, dataset_meta, template, list(warnings), fixture
+            except Exception as exc:  # noqa: BLE001 - template/fixture may not resolve for arch
+                last_exc = exc
     raise last_exc if last_exc else RuntimeError("no chat_template candidate tried")
 
 
@@ -91,6 +126,61 @@ def _fixture_role_contents(fixture: Path) -> tuple[set[str], set[str]]:
                 elif msg.get("role") in {"user", "system"}:
                     nonassistant.add(content)
     return assistant, nonassistant
+
+
+def _special_ids(tokenizer) -> set[int]:
+    """Special + added-vocab token ids — the candidate turn-terminator vocabulary."""
+    ids: set[int] = set()
+    with suppress(Exception):
+        ids |= {int(i) for i in (tokenizer.all_special_ids or []) if i is not None}
+    with suppress(Exception):
+        ids |= {int(i) for i in tokenizer.get_added_vocab().values()}
+    return ids
+
+
+def _terminator_status(
+    input_ids, labels, special_ids, window: int = 3
+) -> dict[str, Any]:
+    """Per trained assistant turn, is the closing terminator token trained or masked?
+
+    A correctly trained turn ends ON a terminator (last trained token is special). The
+    #3754 bug leaves the turn ending on content, with the special terminator just past it
+    (within ``window``, mirroring the strategy's +-3 search) still at IGNORE.
+    """
+    n = len(input_ids)
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if labels[i] != runner.IGNORE_TOKEN_ID:
+            j = i
+            while j < n and labels[j] != runner.IGNORE_TOKEN_ID:
+                j += 1
+            runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    trained = masked = 0
+    term_id: int | None = None
+    for _, e in runs:
+        if int(input_ids[e]) in special_ids:
+            trained += 1
+            term_id = int(input_ids[e])
+            continue
+        for k in range(e + 1, min(e + 1 + window, n)):
+            if int(input_ids[k]) in special_ids:
+                term_id = int(input_ids[k])
+                if labels[k] != runner.IGNORE_TOKEN_ID:
+                    trained += 1
+                else:
+                    masked += 1
+                break
+    return {
+        "turns": len(runs),
+        "terminators_trained": trained,
+        "terminators_masked": masked,
+        "terminator_id": term_id,
+    }
 
 
 def _render_mm(input_ids, labels, tokenizer, cap: int = 12) -> str:
@@ -258,9 +348,12 @@ def run(ctx: GateContext) -> GateResult:
         return _run_multimodal(ctx)
 
     fixture = runner.write_chat_fixture(ctx.output_dir)
+    fixture_nosys = runner.write_chat_fixture(ctx.output_dir, drop_system=True)
 
     try:
-        _cfg, dataset_meta, template = _prepare_with_template(ctx, fixture)
+        _cfg, dataset_meta, template, warn_msgs, used_fixture = _prepare_with_template(
+            ctx, [fixture, fixture_nosys]
+        )
     except Exception as exc:  # noqa: BLE001 - prepare/tokenizer unavailable
         return GateResult.could_not_run(
             GATE_ID,
@@ -287,8 +380,11 @@ def run(ctx: GateContext) -> GateResult:
 
     # shuffled dataset: scan several rows and union their trained text so role coverage doesn't hinge on row 0
     n_scan = min(8, train_dataset.num_rows)
+    special_ids = _special_ids(tokenizer)
     union_trained = ""
     total_trained = 0
+    term_trained = term_masked = 0
+    term_id: int | None = None
     first_decoded: list[tuple[bool, str]] = []
     first_norm: list[list[Any]] = []
     first_n_tokens = 0
@@ -302,6 +398,11 @@ def run(ctx: GateContext) -> GateResult:
         row_trained = "".join(t for tr, t in decoded if tr)
         union_trained += "\n" + row_trained
         total_trained += sum(1 for lab in labels if lab != runner.IGNORE_TOKEN_ID)
+        term = _terminator_status(input_ids, labels, special_ids)
+        term_trained += term["terminators_trained"]
+        term_masked += term["terminators_masked"]
+        if term["terminator_id"] is not None:
+            term_id = term["terminator_id"]
         if i == 0:
             first_decoded = decoded
             first_norm = [[bool(tr), t] for tr, t in decoded]
@@ -313,8 +414,10 @@ def run(ctx: GateContext) -> GateResult:
     )
     n_masked = first_n_tokens - row0_trained
 
+    system_dropped = used_fixture != fixture
     data: dict[str, Any] = {
         "chat_template": template,
+        "system_dropped": system_dropped,
         "rows_scanned": n_scan,
         "n_tokens": first_n_tokens,
         "n_trained": row0_trained,
@@ -330,11 +433,16 @@ def run(ctx: GateContext) -> GateResult:
         "decoded row 0 (**trained** vs masked):",
         f"  {render}",
     ]
+    if system_dropped:
+        details.append(
+            "note: native template rejected the system turn — re-ran without it; "
+            "system-masking not asserted this run"
+        )
 
     findings: list[str] = []
 
     # --- intent: assistant TRAINED, user/system MASKED -------------------------
-    assistant_contents, nonassistant_contents = _fixture_role_contents(fixture)
+    assistant_contents, nonassistant_contents = _fixture_role_contents(used_fixture)
 
     if total_trained == 0:
         findings.append("no tokens trained across scanned rows — assistant span masked")
@@ -347,12 +455,36 @@ def run(ctx: GateContext) -> GateResult:
             "no assistant content in trained span — assistant text appears masked"
         )
 
-    # per train_on_eos default 'turn', a trained assistant turn's terminator is trained
-    if first_decoded and first_decoded[-1][0]:
-        details.append(
-            "note: last span is trained (assistant turn terminator trained per "
-            "train_on_eos='turn' default)"
+    # --- terminator: the turn stop token must be trained (#3754) ----------------
+    # fixture never sets train_on_eos/eot, so the loader default 'turn' applies -> intended
+    eos_warning = next((m for m in warn_msgs if _EOS_NOT_FOUND_RE.search(m)), None)
+    data["terminator"] = {
+        "trained_turns": term_trained,
+        "masked_turns": term_masked,
+        "terminator_id": term_id,
+        "native_template": template == "tokenizer_default",
+        "eos_warning": eos_warning,
+    }
+    if term_masked:
+        tok = (
+            tokenizer.decode([term_id], skip_special_tokens=False)
+            if term_id is not None
+            else "?"
         )
+        findings.append(
+            f"assistant turn terminator {tok!r} (id {term_id}) MASKED on "
+            f"{term_masked} turn(s) despite train_on_eos='turn' — model won't learn to stop (#3754)"
+        )
+    elif eos_warning:
+        findings.append(
+            f"configured EOS/EOT absent from chat_template — terminator likely mislabeled: {eos_warning}"
+        )
+    elif term_trained:
+        details.append(
+            f"terminator trained on {term_trained} turn(s) (id {term_id}) under {template}"
+        )
+    else:
+        details.append("note: no turn terminator identified in trained spans")
 
     # --- snapshot diff ---------------------------------------------------------
     snap_dir = ctx.options.get("snapshot_dir")

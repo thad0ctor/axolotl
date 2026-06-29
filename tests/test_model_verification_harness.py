@@ -406,3 +406,56 @@ def test_discover_dynamic_only_warns():
     # a pin bump alone must not produce a confident new-type candidate
     assert not any(c["is_new"] for c in res["candidates"])
     assert any("transformers" in w for w in res["warnings"])
+
+
+# --- G4 terminator masking (#3754), pure-function offline ----------------------
+
+# tiny token map: 1=<eos> (special, never in chat), 107=<end_of_turn> (real terminator),
+# 9/10/11 = content, -100 = IGNORE
+_SPECIAL = {1, 107}
+
+
+def test_g4_terminator_masked_is_detected():
+    from harness.gates import g4_masking
+
+    # assistant content trained, terminator <end_of_turn> left at IGNORE (the bug)
+    input_ids = [106, 9, 10, 107, 9, 11, 107]
+    labels = [-100, 9, 10, -100, 9, 11, -100]
+    status = g4_masking._terminator_status(input_ids, labels, _SPECIAL)
+    assert status["terminators_masked"] == 2
+    assert status["terminators_trained"] == 0
+    assert status["terminator_id"] == 107
+
+
+def test_g4_terminator_trained_passes():
+    from harness.gates import g4_masking
+
+    # terminator is the last trained token of each assistant turn (correct); 50 is a
+    # masked user token separating the two assistant turns into distinct trained runs
+    input_ids = [106, 9, 10, 107, 50, 9, 11, 107]
+    labels = [-100, 9, 10, 107, -100, 9, 11, 107]
+    status = g4_masking._terminator_status(input_ids, labels, _SPECIAL)
+    assert status["terminators_masked"] == 0
+    assert status["terminators_trained"] == 2
+    assert status["terminator_id"] == 107
+
+
+def test_g4_eos_not_found_warning_regex():
+    from harness.gates import g4_masking
+
+    msg = (
+        "EOS token '<eos>' not found in chat_template. "
+        "Please check if your template/EOS token is correct."
+    )
+    assert g4_masking._EOS_NOT_FOUND_RE.search(msg)
+    assert g4_masking._EOS_NOT_FOUND_RE.search(
+        "EOT token '<x>' not found in chat_template."
+    )
+    assert not g4_masking._EOS_NOT_FOUND_RE.search("some unrelated warning")
+
+
+def test_g4_native_template_first():
+    from harness.gates import g4_masking
+
+    # native template must be preferred so family-specific terminator bugs surface
+    assert g4_masking._CHAT_TEMPLATE_CANDIDATES[0] == "tokenizer_default"
