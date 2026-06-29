@@ -40,7 +40,7 @@ Agent-specific references:
 - [docs/agents/pretraining.md](docs/agents/pretraining.md) — continual pretraining
 - [docs/agents/model_architectures.md](docs/agents/model_architectures.md) — model-specific quirks (Gemma4, Qwen3.5 MoE, etc.)
 - [docs/agents/new_model_support.md](docs/agents/new_model_support.md) — debugging and adding support for new model architectures
-- [docs/agents/sparselora.md](docs/agents/sparselora.md) — SparseLoRA contextual-sparsity LoRA acceleration (self-calibrating, Llama)
+- [docs/agents/sparselora.md](docs/agents/sparselora.md) — SparseLoRA contextual-sparsity LoRA acceleration (self-calibrating; model-agnostic: Llama/Qwen/Mistral/Gemma/Phi3/...)
 
 ## Config Pattern
 

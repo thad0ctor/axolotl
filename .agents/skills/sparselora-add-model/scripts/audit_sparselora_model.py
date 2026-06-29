@@ -110,6 +110,7 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
         get_module_mapping,
     )
     from axolotl.integrations.sparselora.arch_wiring import (
+        is_fused_qkv_attention,
         is_standard_attention,
         is_swiglu_mlp,
         register_arch_wiring,
@@ -123,12 +124,23 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
 
     f = Findings()
 
+    # Discover the attention LoRA targets from the model: fused-projection
+    # models (Phi3) expose ``qkv_proj`` rather than separate ``q/k/v_proj``, so a
+    # hardcoded q/k/v target list would attach no adapters and mis-audit them.
+    lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    for mod in model.modules():
+        if is_fused_qkv_attention(mod):
+            lora_targets = ["qkv_proj", "o_proj"]
+            break
+        if is_standard_attention(mod):
+            break
+
     model = get_peft_model(
         model,
         LoraConfig(
             r=predictor_rank,
             lora_alpha=2 * predictor_rank,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=lora_targets,
         ),
     ).eval()
 
