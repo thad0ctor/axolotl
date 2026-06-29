@@ -69,6 +69,14 @@ def is_standard_attention(module: nn.Module) -> bool:
     return all(hasattr(module, proj) for proj in _ATTN_PROJECTIONS)
 
 
+def has_partial_rotary(module: nn.Module) -> bool:
+    """True if the attention rotates only part of the head dim (StableLM/Phi/
+    GPT-NeoX style). The generic sparse attention applies RoPE to the full head
+    dim, so partial-rotary models can't be reproduced and are refused."""
+    config = getattr(module, "config", None)
+    return config is not None and getattr(config, "partial_rotary_factor", 1.0) < 1.0
+
+
 def gate_kind(module: nn.Module) -> Optional[str]:
     """Classify the SwiGLU gate activation as ``"silu"``, ``"gelu_tanh"``, or None.
 
@@ -323,6 +331,14 @@ class SparseAttention(SparseLlamaAttention):
         # Mirror SparseLlamaAttention.__init__ but build the predictor with the
         # decoupled-head_dim-tolerant creator (Qwen3 has q_out != hidden_size).
         SparseModule.__init__(self, base)
+        if has_partial_rotary(base):
+            # Guard direct register_arch_wiring() users; the plugin's _validate
+            # refuses this earlier via unsupported_reason().
+            raise ValueError(
+                f"SparseAttention: {type(base).__name__} uses partial rotary "
+                "(partial_rotary_factor < 1), unsupported by the generic sparse "
+                "attention."
+            )
         self.sparsity = sparsity
         if self.sparsity > 0:
             self.pred = _create_attn_predictor(base, cfg.predictor_rank, name, cfg)
@@ -423,6 +439,12 @@ def unsupported_reason(module: nn.Module) -> Optional[str]:
             f"{type(module).__name__} uses an unsupported gated activation "
             f"({act}); SparseLoRA's sparse MLP supports only SiLU and gelu_tanh "
             "gates. This MLP cannot be sparsified faithfully."
+        )
+    if is_standard_attention(module) and has_partial_rotary(module):
+        return (
+            f"{type(module).__name__} uses partial rotary embeddings "
+            "(partial_rotary_factor < 1, e.g. StableLM/Phi); the generic sparse "
+            "attention applies RoPE to the full head dim and can't reproduce it."
         )
     return None
 

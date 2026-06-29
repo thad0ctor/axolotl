@@ -440,10 +440,12 @@ def _tiny(config_cls, model_cls, **extra):
 
 @pytest.mark.parametrize(
     "config_cls,model_cls",
-    [("StableLmConfig", "StableLmForCausalLM"), ("CohereConfig", "CohereForCausalLM")],
+    [
+        ("CohereConfig", "CohereForCausalLM")
+    ],  # StableLM uses partial rotary; see refusal test
 )
 def test_registry_covers_silu_swiglu_families(config_cls, model_cls):
-    """StableLM / Cohere are SiLU SwiGLU + standard attention -> auto-supported."""
+    """Cohere is SiLU SwiGLU + full-RoPE standard attention -> auto-supported."""
     pytest.importorskip("transformers")
     from axolotl.integrations.sparselora.arch_wiring import (
         is_standard_attention,
@@ -475,6 +477,23 @@ def test_phi3_fused_projections_not_registered():
     assert not is_swiglu_mlp(mlp)  # fused gate_up_proj
     registered = register_arch_wiring(model)
     assert "Phi3Attention" not in registered and "Phi3MLP" not in registered
+
+
+def test_stablelm_partial_rotary_refused():
+    """StableLM rotates only part of the head dim (partial_rotary_factor < 1);
+    the generic attention applies full-head RoPE, so it must be refused cleanly
+    rather than registered and crashed at forward."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora.arch_wiring import (
+        has_partial_rotary,
+        unsupported_reason,
+    )
+
+    model = _tiny("StableLmConfig", "StableLmForCausalLM", partial_rotary_factor=0.25)
+    attn = [m for n, m in model.named_modules() if n.endswith("self_attn")][0]
+    assert has_partial_rotary(attn)
+    reason = unsupported_reason(attn)
+    assert reason and "partial rotary" in reason
 
 
 def test_gemma3_text_fully_supported():
