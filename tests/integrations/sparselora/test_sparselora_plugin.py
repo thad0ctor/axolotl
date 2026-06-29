@@ -61,20 +61,36 @@ def test_factors_load_into_vendored_predictors(num_kv_heads):
     assert mlp_pred.w1.shape == (2, 64, 8)  # (gate+up, hidden, rank)
     assert mlp_pred.w2.shape[0] == 2
 
-    # Should not raise regardless of MHA vs GQA (different predictor classes).
+    # Pin the concrete predictor buffer shapes so a wrong q/k/v load order or a
+    # missing transpose fails (not just "constructed without raising").
     attn_pred = create_attn_predictor(modules[attn_name], 8, attn_name, cfg)
-    assert attn_pred is not None
+    head_dim = 64 // 4  # hidden_size / num_attention_heads
+    kv_size = num_kv_heads * head_dim
+    if num_kv_heads == 4:  # MHA: q/k/v share an out dim -> AttentionPredictor
+        assert attn_pred.w1.shape == (3, 64, 8)  # (q,k,v, hidden, rank)
+        assert attn_pred.w2.shape == (3, 8, 64)  # (q,k,v, rank, out)
+        assert not hasattr(attn_pred, "q1")
+    else:  # GQA: q split from grouped k/v -> GQAAttentionPredictor (+ q1/q2)
+        assert attn_pred.w1.shape == (2, 64, 8)  # (k,v, hidden, rank)
+        assert attn_pred.w2.shape == (2, 8, kv_size)  # (k,v, rank, kv_out)
+        assert attn_pred.q1.shape == (8, 64)  # (rank, hidden) = q.w1 transposed
+        assert attn_pred.q2.shape == (64, 8)  # (hidden, rank) = q.w2 transposed
 
 
 def _validate_cfg(
-    predictor_rank=8, sample_packing=False, load_in_4bit=False, load_in_8bit=False
+    predictor_rank=8,
+    sample_packing=False,
+    load_in_4bit=False,
+    load_in_8bit=False,
+    fsdp=None,
+    deepspeed=None,
 ):
     return DictDefault(
         {
             "adapter": "lora",
             "sample_packing": sample_packing,
-            "fsdp": None,
-            "deepspeed": None,
+            "fsdp": fsdp,
+            "deepspeed": deepspeed,
             "load_in_4bit": load_in_4bit,
             "load_in_8bit": load_in_8bit,
             "sparselora": {"predictor_rank": predictor_rank},
@@ -117,6 +133,28 @@ class TestValidate:
         # 4-bit (QLoRA) is supported; validation should not reject it.
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
         self._run(model, _validate_cfg(load_in_4bit=True))
+
+    def test_fsdp_rejected(self):
+        model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
+        with pytest.raises(ValueError, match="FSDP"):
+            self._run(model, _validate_cfg(fsdp={"fsdp_offload_params": True}))
+
+    @pytest.mark.parametrize(
+        "deepspeed",
+        [
+            "deepspeed_configs/zero3.json",
+            {"zero_optimization": {"stage": 3}},
+        ],
+    )
+    def test_deepspeed_zero3_rejected(self, deepspeed):
+        model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
+        with pytest.raises(ValueError, match="ZeRO-3"):
+            self._run(model, _validate_cfg(deepspeed=deepspeed))
+
+    def test_deepspeed_zero2_accepted(self):
+        # ZeRO-1/2 do not shard parameters, so they must not be rejected.
+        model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
+        self._run(model, _validate_cfg(deepspeed={"zero_optimization": {"stage": 2}}))
 
 
 def _fake_trainer(model, n=4, t=16):

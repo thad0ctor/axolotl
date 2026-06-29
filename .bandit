@@ -1,3 +1,6 @@
+# The sparselora `_vendor/` tree carries local patches and runs in-process, so
+# it is NOT excluded — bandit scans it like first-party code (it is clean under
+# the skips below). Only `tests` is excluded.
 [bandit]
-exclude = tests,src/axolotl/integrations/sparselora/_vendor
+exclude = tests
 skips = B101,B615,B102,B110

@@ -132,3 +132,36 @@ def test_sparse_linear_4bit_dense_parity_and_sparse():
     sp = sparse(x, sparse_indices=idx)
     assert sp.shape == (4, 10, idx.numel())
     assert torch.isfinite(sp).all()
+
+
+def test_sparse_linear_4bit_bias_passthrough():
+    """A biased 4-bit projection (Qwen2 q/k/v) must apply its bias in every path."""
+    bnb = pytest.importorskip("bitsandbytes")
+    from axolotl.integrations.sparselora.sparse_linear_4bit import SparseLinear4bit
+
+    torch.manual_seed(0)
+    out_f, in_f = 256, 128
+    w = torch.randn(out_f, in_f, dtype=torch.bfloat16) * 0.02
+    bias = torch.randn(out_f, dtype=torch.bfloat16)
+    lin = bnb.nn.Linear4bit(
+        in_f, out_f, bias=True, compute_dtype=torch.bfloat16, quant_type="nf4"
+    )
+    lin.weight = bnb.nn.Params4bit(w.clone(), requires_grad=False, quant_type="nf4")
+    lin.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
+    lin = lin.cuda()
+
+    x = torch.randn(4, 10, in_f, dtype=torch.bfloat16, device="cuda")
+    ref = lin(x)
+
+    sparse = SparseLinear4bit(lin, mode="out")
+    # Dense path must match bnb (bias included).
+    dense_out = sparse(x)
+    assert torch.allclose(dense_out, ref, rtol=0.05, atol=0.05)
+
+    # Output-sparse path slices the bias to the kept rows.
+    idx = torch.arange(0, out_f, 2, device="cuda")
+    sp = sparse(x, sparse_indices=idx)
+    assert sp.shape == (4, 10, idx.numel())
+    weight_dense = sparse._dense_weight(x.dtype)
+    expected = torch.nn.functional.linear(x, weight_dense[idx], sparse.bias[idx])
+    assert torch.allclose(sp, expected, rtol=0.02, atol=0.02)

@@ -45,13 +45,15 @@ class MaskContext:
         return self.right > self.left
 
 
-def _compute_mask_context(labels: torch.Tensor, input_ids: torch.Tensor) -> MaskContext:
+def _compute_mask_context(
+    labels: torch.Tensor, input_ids: torch.Tensor | None = None
+) -> MaskContext:
     """Drop-in replacement for ``api._compute_output_token_mask``.
 
     Returns a :class:`MaskContext` instead of a boolean tensor. Reproduces the
     exact ``left``/``right`` the vendored function used to fill the mask, so the
-    split it implies is identical. ``input_ids`` is accepted for signature
-    parity but unused (only the shape mattered, and ``labels`` carries it).
+    split it implies is identical. ``input_ids`` is accepted (optional) for
+    backward signature parity but unused — the mask derives from ``labels``.
     """
     del input_ids
     is_ctx = labels == -100

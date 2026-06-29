@@ -27,6 +27,39 @@ _SUPPORTED_ADAPTERS = {"lora", "qlora"}
 _COMPILE_BOUNDARIES_SET = False
 
 
+def _is_deepspeed_zero3(deepspeed: Any) -> bool:
+    """True if the DeepSpeed config selects ZeRO stage 3.
+
+    ``cfg.deepspeed`` may be a path string to a JSON config, an already-parsed
+    dict, or a JSON string. Inspect the parsed ``zero_optimization.stage`` when
+    possible and fall back to a substring match on the path/string form.
+    """
+    if not deepspeed:
+        return False
+
+    config = deepspeed
+    if isinstance(deepspeed, str):
+        import json
+        import os
+
+        if os.path.isfile(deepspeed):
+            try:
+                with open(deepspeed, encoding="utf-8") as f:
+                    config = json.load(f)
+            except (OSError, ValueError):
+                return "zero3" in deepspeed
+        else:
+            try:
+                config = json.loads(deepspeed)
+            except ValueError:
+                return "zero3" in deepspeed
+
+    if isinstance(config, dict):
+        return int(config.get("zero_optimization", {}).get("stage", 0)) == 3
+
+    return "zero3" in str(deepspeed)
+
+
 def resolve_layer_sparsity(
     layer_sparsity: dict[str, float], target_names: list[str]
 ) -> dict[str, float]:
@@ -136,7 +169,7 @@ class SparseLoRAPlugin(BasePlugin):
                 "SparseLoRA's context/output token split is incompatible with "
                 "sample_packing. Set `sample_packing: false`."
             )
-        if cfg.fsdp or (cfg.deepspeed and "zero3" in str(cfg.deepspeed)):
+        if cfg.fsdp or _is_deepspeed_zero3(cfg.deepspeed):
             raise ValueError(
                 "SparseLoRA v1 supports single-GPU / DDP only; FSDP and DeepSpeed "
                 "ZeRO-3 shard parameters and are not yet supported."

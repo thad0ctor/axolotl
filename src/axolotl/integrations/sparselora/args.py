@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CalibrationMethod(str, Enum):
@@ -17,6 +17,9 @@ class CalibrationMethod(str, Enum):
 
 class CalibrationConfig(BaseModel):
     """Calibration settings. Calibration runs on a slice of the *same* dataset."""
+
+    # Reject typos in the `sparselora.calibration` block instead of dropping them.
+    model_config = ConfigDict(extra="forbid")
 
     method: CalibrationMethod = Field(
         default=CalibrationMethod.FAITHFUL,
@@ -51,6 +54,9 @@ class CalibrationConfig(BaseModel):
 
 class SparseLoRASettings(BaseModel):
     """Nested SparseLoRA configuration available under the `sparselora` key."""
+
+    # Reject typos in the `sparselora` block instead of silently dropping them.
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(
         default=True, description="Master switch for the SparseLoRA plugin."
