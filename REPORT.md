@@ -167,3 +167,65 @@ No reconciliation needed now; when the branches merge, resolve the two co-touche
 - **62 passed** on GPU idx 5 (`tests/integrations/sparselora` + `tests/test_agent_skill_layout.py`); **55 passed, 7 skipped** on CPU.
 - pre-commit (pinned ruff/ruff-format/mypy/bandit) clean on all changed non-`_vendor` files.
 - e2e on real Qwen3-0.6B (dense + 2 sparse configs) and audit-script smoke on real Qwen3-0.6B all green; `_vendor/` still untouched.
+
+---
+
+# Pass 3 (final round) — full Gemma support
+
+Two more local commits (`dd5d7c73d` + this REPORT update). **Gemma2 and Gemma3-text are now SUPPORTED**, not refused.
+
+## What was implemented
+
+The pass-2 verdict isolated the blocker to the **SiLU-hardcoded FFN predictor + sparse MLP** (Gemma gates with `gelu_pytorch_tanh`). Implemented it correctly — no silu-on-gelu approximation:
+
+- **`SparseSwiGLUMLP`** now reads the base MLP's gate activation via `gate_kind()` (a numeric probe: `"silu"` | `"gelu_tanh"` | None) and uses the matching path for **both** the predictor's channel *selection* and the gated *compute*:
+  - SiLU → fused liger `silu_mul` (Llama/Qwen/Mistral, **unchanged** — no regression);
+  - `gelu_tanh` → `_GELUFFNPredictor` (scores channels with `gelu_tanh(gate)*up`) + `_block` computing `act_fn(gate) * up` with the model's own GELU.
+  - `_create_mlp_predictor` selects the predictor class by gate kind.
+- **`SparseAttention`** already (pass 2) forwards Gemma2 `attn_logit_softcapping` and resolves each arch's own eager fallback; Gemma's `query_pre_attn_scalar` scaling flows through the inherited `self.scaling`, and `q_norm`/`k_norm` + `sliding_window` are handled generically.
+- **`unsupported_reason`** now refuses only gated activations that are **neither** SiLU **nor** `gelu_tanh` (and still skips fused-projection models like Phi3).
+
+No vendored code edited; the GELU predictor and MLP subclass the vendored classes.
+
+## Evidence
+
+- **Full Gemma2 dense-apply is logit-exact** vs the unmodified reference (max diff **0.0**) — the gelu MLP *and* softcap attention are both faithful at sparsity 0 (`test_gemma2_dense_apply_logit_exact`).
+- **e2e convergence on the real `tiny-gemma2-137m`** (gelu MLP + softcap 50 + `query_pre_attn_scalar` 64, 6 layers; 60 steps, seed 42, `start_step=0.1`, target 0.4):
+
+| phase | dense | sparse |
+|---|---|---|
+| steps 1–6 (dense warm-up) | **3.196** | **3.196** |
+| steps 7–15 | 3.386 | 3.529 |
+| steps 25–35 | 3.039 | 3.306 |
+| steps 51–60 | 3.780 | 4.065 |
+| min / NaN | 2.344 / no | **2.345** / no |
+
+During warm-up sparse equals dense **exactly**; once sparsity engages it tracks dense within ~0.2–0.3 with a **near-identical minimum (2.345 vs 2.344)** and no NaN — materially tighter than Qwen3 (gentler 0.4 sparsity, smaller model). This is genuine convergence parity, confirming the GELU path is correct, not an approximation.
+
+- **GPU apply (idx 5):** `gemma2` and `gemma3` added to the parametrized apply matrix — sparse fwd+bwd, finite loss, non-zero LoRA grads, `SparseAttention` + `SparseSwiGLUMLP` installed. All pass.
+- **CPU tests:** `test_gemma2_dense_apply_logit_exact`, `test_gate_kind_detection` (silu vs gelu_tanh numeric probe), `test_gemma2_sparse_reconstruction_and_grads_cpu` (the gelu path uses no liger, so the *full* sparse fwd+bwd runs on CPU — finite loss, sane reconstruction `rel < 1.0`, non-zero grads), `test_gemma3_text_fully_supported`, `test_gemma2_supported_and_auto_registers`, plus the retained `test_sparseattention_applies_softcap` parity test.
+
+## Real gemma-3-4b-it — not smoke-tested (documented)
+
+The local `/home/rgilbreth/Desktop/Models/Models-1/gemma-3-4b-it` is a **multimodal** `Gemma3ForConditionalGeneration` (vision tower + 262k-vocab text decoder). Instantiating even a 2-layer shell from its config timed out (huge embedding + vision modules), so it was not smoke-tested on the shared GPU. Its **text decoder is the standard Gemma3 architecture** that *is* validated here (tiny Gemma3-text: GPU apply + CPU coverage). Using that specific checkpoint with SparseLoRA is a usage detail (extract/train the text decoder), not an architecture-support gap.
+
+## Final architecture coverage matrix
+
+| Family | MLP gate | Attention specifics | Status |
+|---|---|---|---|
+| Llama | SiLU | standard | **supported** (vendored `SparseLlama*`, untouched) |
+| Qwen2 | SiLU | q/k/v **bias**, sliding_window | **supported** |
+| Qwen3 | SiLU | q/k/v **norm**, sliding_window, **decoupled head_dim** | **supported** (incl. real Qwen3-0.6B; convergence tracks dense) |
+| Mistral | SiLU | sliding_window | **supported** |
+| StableLM, Cohere | SiLU | standard | **supported** |
+| Gemma2 | **gelu_tanh** | **softcap**, query_pre_attn_scalar, sliding_window | **supported** (logit-exact dense; real tiny-gemma2-137m convergence tracks dense) |
+| Gemma3-text | **gelu_tanh** | q/k/v norm, sliding_window, no softcap | **supported** (tiny GPU apply + CPU) |
+| Phi3 | fused `gate_up_proj` | fused `qkv_proj` | **unsupported** — not auto-registered (fused projections); cleanly refused via the orphan-LoRA guard |
+| Qwen2-MoE | MoE block (experts are SiLU SwiGLU) | q/k/v/o | attention registers; MoE routing for calibration **unvalidated** (out of scope) |
+| any other gated activation | non-silu/non-gelu_tanh | — | **refused** with a precise message |
+
+## Final status
+
+- **77 passed** on GPU idx 5 (`tests/integrations/sparselora` + skill layout + schema validation); CPU green; pre-commit (pinned ruff/ruff-format/mypy/bandit) clean on all changed non-`_vendor` files; `_vendor/` still untouched.
+- e2e validated on real Qwen3-0.6B (dense + 2 sparse) and real tiny-gemma2-137m (dense + sparse).
+- Net: SparseLoRA went from **Llama-only** to **8 verified architecture families** (Llama, Qwen2, Qwen3, Mistral, StableLM, Cohere, Gemma2, Gemma3-text) with auto-detection, two real model bugs fixed (bias-drop, decoupled-head_dim predictor), full Gemma (gelu + softcap) support, a reproducible add-a-model skill, and honest refusals for the rest.
