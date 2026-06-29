@@ -77,30 +77,6 @@ deepspeed_configs/               # DeepSpeed JSON configs (zero2, zero3)
 docs/                            # Quarto documentation site
 ```
 
-## Linting & Tests (match CI)
-
-CI pins exact tool versions. **Do not run system `ruff`/`mypy`** — they drift and produce diffs CI rejects. Run pre-commit, which installs and uses the pinned versions automatically:
-
-```bash
-pre-commit install            # one-time, after setup
-pre-commit run --all-files     # ruff, ruff-format, mypy, bandit — same versions as CI
-```
-
-Shortcuts: `make lint`, `make format`, `make test` wrap these pinned commands.
-
-The exact ruff/mypy/bandit versions are pinned in `.pre-commit-config.yaml` (the same file CI's pre-commit job runs from, so they can't drift; lint runs on Python **3.11**). Don't copy version numbers elsewhere — read them there.
-
-Need ruff standalone? Pin it to the `ruff-pre-commit` rev in that file: `uvx ruff@<rev> check` / `uvx ruff@<rev> format`. Ruff config (line-length 88, `select = E,F,W,C90,B,I`) lives in `pyproject.toml`.
-
-Run tests (pytest defaults to `-m 'not slow'`). `make test` reproduces CI's gating CPU suite — the same per-directory split CI runs, excluding the GPU e2e jobs:
-
-```bash
-pytest tests/   # quick one-shot local run (not CI's exact split)
-make test       # mirror CI's CPU suite (per-directory split, no GPU e2e)
-```
-
-Full setup, CI test matrix, running e2e (GPU) tests locally, and skip-CI keywords: [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md).
-
 ## Code Conventions
 
 - Config-driven: features are toggled via YAML, not code changes
@@ -116,27 +92,6 @@ Full setup, CI test matrix, running e2e (GPU) tests locally, and skip-CI keyword
 - Don't reference the current task, PR, or callers (e.g. "added for X", "used by Y", "fixes #123"). Those belong in commit messages / PR descriptions and rot fast.
 - Prefer one short line max.
 - Don't add planning/decision/analysis markdown files unless explicitly requested.
-
-## Skills
-
-Repository-specific workflow guides ("skills") live in [`.agents/skills/`](.agents/skills/). Each subdirectory is a self-contained guide; read its `SKILL.md` for an overview and the other files on demand. Bundled scripts under a skill's `scripts/` are plain tools you run from the repo root.
-
-| Skill | What it does |
-|-------|--------------|
-| [`liger-upstream-sync`](.agents/skills/liger-upstream-sync/SKILL.md) | Audits the Liger integration (`src/axolotl/integrations/liger/plugin.py`) against `liger-kernel` to catch silent dispatch drift — hand-patches upstream now shadows with native dispatch, stale `axolotl_override_liger_fn` entries, signature drift. Also previews an un-installed liger version before bumping (`--liger-source`). |
-| [`model-verification-harness`](.agents/skills/model-verification-harness/SKILL.md) | Reproducible smoke gate for model-support PRs. Detects `model_config_type` + arch features, then runs a tiered gate ladder: config-resolution compat matrix (liger/CCE/kernel flags via the real `load_cfg`), an adaptive wired-everywhere integration checklist, preprocess + chat-template masking + sample-packing checks, and (on GPU) loss-sanity + cross-variant numerical consistency that catches silent kernel-shadowing. Emits a standardized report + manifest with a 0/1/2 exit code (`.agents/skills/model-verification-harness/scripts/verify_model.py`). |
-
-New or edited skills must adhere to [Anthropic's Skill authoring best practices](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/best-practices) (concise SKILL.md, third-person `description` covering what + when, one-level-deep progressive disclosure, forward-slash paths) and keep frontmatter within the portable [agentskills.io](https://agentskills.io/specification) core (`name` ≤64 chars matching the directory, `description` ≤1024).
-
-### Vendor-specific shortcuts
-
-Some assistants auto-discover skills from vendor-specific paths. These point at the canonical `.agents/skills/` directory:
-
-- `.claude/skills` → symlink → `.agents/skills` (for Claude Code)
-
-To add another assistant (e.g. Cursor, Gemini CLI), add a symlink pointing at `.agents/skills/`. Do not duplicate the content.
-
-On Windows the `.claude/skills` symlink resolves only with git symlinks enabled (`git config core.symlinks true`, plus Developer Mode or admin); otherwise use the canonical `.agents/skills/` path directly.
 
 ## Key Documentation
 
