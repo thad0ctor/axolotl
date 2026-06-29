@@ -29,15 +29,21 @@ ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj")
 
 
 def linear_weight(module: nn.Module) -> torch.Tensor:
-    """Return the underlying ``(out, in)`` weight of a (possibly LoRA-wrapped) Linear.
+    """Return the logical ``(out, in)`` weight of a (possibly LoRA-wrapped) Linear.
 
-    SparseLoRA v1 requires a full-precision base: the vendored ``SparseLinear``
-    channel-slices a dense weight and is only registered for ``nn.Linear``, so
-    quantized bases (``Linear4bit``/``Linear8bitLt``) are rejected up front by
-    the plugin rather than handled here.
+    Dequantizes a bitsandbytes 4-bit (QLoRA) base so callers see the real 2D
+    matrix: ``Params4bit`` stores packed data of shape ``(N, 1)``, not the
+    weight the SVD predictor and reconstruction sweep need. 8-bit bases are
+    rejected up front by the plugin and not handled here.
     """
     base = getattr(module, "base_layer", module)
-    return base.weight
+    weight = base.weight
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:  # bitsandbytes Params4bit
+        from bitsandbytes.functional import dequantize_4bit
+
+        return dequantize_4bit(weight.data, quant_state)
+    return weight
 
 
 def is_mlp_module(module: nn.Module) -> bool:

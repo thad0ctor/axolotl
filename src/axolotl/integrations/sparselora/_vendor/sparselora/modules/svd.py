@@ -1,4 +1,4 @@
-# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edit: absolute 'sparselora.*' imports relativized. Do not edit; see _vendor/PROVENANCE.md.
+# Vendored from https://github.com/z-lab/sparselora @ a2fd69de93b1168080346ec113c99501f0bb58b1 (MIT). Local edits: relativized imports; float-dtype guard for quantized (4-bit) bases. Do not edit; see _vendor/PROVENANCE.md.
 """Load SVD-based sparsity predictors from safetensors."""
 
 import os
@@ -23,9 +23,15 @@ def _load_tensors(cfg: Any, device, dtype) -> dict:
     return {k: v.to(device=device, dtype=dtype) for k, v in load_file(path).items()}
 
 
+def _float_dtype(weight) -> torch.dtype:
+    # Axolotl local edit: a quantized base (bnb Params4bit) reports a non-float
+    # storage dtype (uint8); casting the float SVD factors to it corrupts them.
+    return weight.dtype if weight.dtype.is_floating_point else torch.bfloat16
+
+
 def create_mlp_predictor(base, rank: int, layer_name: str, cfg: Any) -> FFNPredictor:
     """Load an SVD predictor for an MLP layer from safetensors."""
-    device, dtype = base.gate_proj.weight.device, base.gate_proj.weight.dtype
+    device, dtype = base.gate_proj.weight.device, _float_dtype(base.gate_proj.weight)
     tensors = _load_tensors(cfg, device, dtype)
 
     prefix = layer_name
@@ -40,7 +46,7 @@ def create_mlp_predictor(base, rank: int, layer_name: str, cfg: Any) -> FFNPredi
 
 def create_attn_predictor(base, rank: int, layer_name: str, cfg: Any):
     """Load an SVD predictor for an attention layer from safetensors."""
-    device, dtype = base.q_proj.base_layer.weight.device, base.q_proj.base_layer.weight.dtype
+    device, dtype = base.q_proj.base_layer.weight.device, _float_dtype(base.q_proj.base_layer.weight)
     tensors = _load_tensors(cfg, device, dtype)
 
     prefix = layer_name

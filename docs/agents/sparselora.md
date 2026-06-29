@@ -43,7 +43,7 @@ The SVD factors are training-free (`w1@w2 ≈ Wᵀ`, exact at full rank). z-lab 
 ## Constraints (v1)
 
 - Attention-only LoRA (`q/k/v/o_proj`); MLP must not be LoRA-wrapped — **validated at startup**.
-- Full-precision base only: `load_in_4bit`/`load_in_8bit` (QLoRA) rejected — the sparse linear needs a dense weight.
+- Base: full-precision (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`, `load_in_4bit`; via `SparseLinear4bit`). 8-bit (`load_in_8bit`) not supported.
 - `sample_packing: false`.
 - Llama architecture only (extend via `register_sparse_module`).
 - Single-GPU / DDP; no FSDP or DeepSpeed ZeRO-3.
@@ -54,7 +54,8 @@ The SVD factors are training-free (`w1@w2 ≈ Wᵀ`, exact at full rank). z-lab 
 |------|------|
 | `plugin.py` | `SparseLoRAPlugin`, hook, validation, apply |
 | `args.py` | `SparseLoRAArgs` Pydantic config |
-| `factors.py` | SVD predictor-factor computation from base weights |
+| `factors.py` | SVD predictor-factor computation from base weights (dequantizes 4-bit) |
+| `sparse_linear_4bit.py` | `SparseLinear4bit` for QLoRA bases (dequantize-then-slice) |
 | `calibration.py` | Sensitivity sweep + schedule allocation |
 | `cache.py` | Cache key/IO + opt-in telemetry stub |
 | `_vendor/sparselora/` | Vendored z-lab code (see `_vendor/PROVENANCE.md`) |

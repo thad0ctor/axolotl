@@ -63,7 +63,9 @@ def test_factors_load_into_vendored_predictors(num_kv_heads):
     assert attn_pred is not None
 
 
-def _validate_cfg(predictor_rank=8, sample_packing=False, load_in_4bit=False):
+def _validate_cfg(
+    predictor_rank=8, sample_packing=False, load_in_4bit=False, load_in_8bit=False
+):
     return DictDefault(
         {
             "adapter": "lora",
@@ -71,7 +73,7 @@ def _validate_cfg(predictor_rank=8, sample_packing=False, load_in_4bit=False):
             "fsdp": None,
             "deepspeed": None,
             "load_in_4bit": load_in_4bit,
-            "load_in_8bit": False,
+            "load_in_8bit": load_in_8bit,
             "sparselora": {"predictor_rank": predictor_rank},
         }
     )
@@ -103,10 +105,15 @@ class TestValidate:
         with pytest.raises(ValueError, match="sample_packing"):
             self._run(model, _validate_cfg(sample_packing=True))
 
-    def test_quantized_base_rejected(self):
+    def test_8bit_base_rejected(self):
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
-        with pytest.raises(ValueError, match="full-precision base"):
-            self._run(model, _validate_cfg(load_in_4bit=True))
+        with pytest.raises(ValueError, match="8-bit"):
+            self._run(model, _validate_cfg(load_in_8bit=True))
+
+    def test_4bit_base_accepted_by_validation(self):
+        # 4-bit (QLoRA) is supported; validation should not reject it.
+        model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
+        self._run(model, _validate_cfg(load_in_4bit=True))
 
 
 def _fake_trainer(model, n=4, t=16):

@@ -23,7 +23,7 @@ from .factors import compute_factor_tensors
 
 LOG = get_logger(__name__)
 
-_SUPPORTED_ADAPTERS = {"lora"}
+_SUPPORTED_ADAPTERS = {"lora", "qlora"}
 
 
 class SparseLoRAPlugin(BasePlugin):
@@ -43,15 +43,14 @@ class SparseLoRAPlugin(BasePlugin):
     ) -> None:
         if cfg.adapter not in _SUPPORTED_ADAPTERS:
             raise ValueError(
-                f"SparseLoRA composes on a full-precision LoRA adapter; got "
-                f"adapter={cfg.adapter!r}. Set `adapter: lora`."
+                f"SparseLoRA composes on a LoRA/QLoRA adapter; got "
+                f"adapter={cfg.adapter!r}. Set `adapter: lora` or `qlora`."
             )
-        if cfg.load_in_4bit or cfg.load_in_8bit:
+        if cfg.load_in_8bit:
             raise ValueError(
-                "SparseLoRA v1 requires a full-precision base model. The sparse "
-                "linear channel-slices a dense weight, which is incompatible with "
-                "a quantized (4-bit/8-bit) base. Disable load_in_4bit/load_in_8bit "
-                "and use adapter: lora."
+                "SparseLoRA does not support 8-bit bases. Use a full-precision "
+                "base (adapter: lora) or a 4-bit base (adapter: qlora, "
+                "load_in_4bit: true)."
             )
         if cfg.sample_packing:
             raise ValueError(
@@ -207,6 +206,15 @@ class SparseLoRAPlugin(BasePlugin):
         from ._vendor.sparselora.callback import SparseLoRACallback
 
         settings = cfg.sparselora
+        if cfg.load_in_4bit:
+            from .sparse_linear_4bit import register_4bit_support
+
+            if not register_4bit_support():
+                raise ImportError(
+                    "load_in_4bit is set but bitsandbytes is unavailable for "
+                    "SparseLoRA's 4-bit sparse linear."
+                )
+
         sl_config = SparseLoRAConfig(
             layer_sparsity=layer_sparsity,
             predictor_rank=rank,
@@ -223,4 +231,27 @@ class SparseLoRAPlugin(BasePlugin):
             settings.end_step,
         )
         apply_sparselora(model, sl_config)
+        if cfg.load_in_4bit:
+            self._patch_4bit_lora_forward(model)
         trainer.add_callback(SparseLoRACallback(settings.start_step, settings.end_step))
+
+    def _patch_4bit_lora_forward(self, model: nn.Module) -> None:
+        """Route sparse indices through PEFT 4-bit LoRA wrappers.
+
+        ``apply_sparselora`` patches ``peft...lora.layer.Linear.forward``, but a
+        4-bit base is wrapped by a different PEFT class (``lora...Linear4bit``)
+        that the global patch misses. Bind the vendored ``lora_forward`` to each
+        such wrapper so the predicted indices reach the sparse base layer.
+        """
+        import types
+
+        from ._vendor.sparselora.modules.linear import lora_forward
+        from .sparse_linear_4bit import SparseLinear4bit
+
+        patched = 0
+        for module in model.modules():
+            base = getattr(module, "base_layer", None)
+            if isinstance(base, SparseLinear4bit) and hasattr(module, "lora_A"):
+                module.forward = types.MethodType(lora_forward, module)
+                patched += 1
+        LOG.debug("SparseLoRA: routed indices through %d 4-bit LoRA wrappers.", patched)

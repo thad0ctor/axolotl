@@ -60,6 +60,6 @@ Calibration artifacts — the schedule (`schedule.json`) and SVD factors (`model
 - **`sample_packing: false`.** The context/output token split assumes unpacked sequences.
 - **Architecture: Llama.** Sparse module wiring is registered for Llama (`LlamaMLP`/`LlamaAttention`). Other architectures fail fast with a clear message; extend via `register_sparse_module`.
 - **Single-GPU / DDP.** FSDP and DeepSpeed ZeRO-3 (parameter sharding) are not yet supported.
-- **Full-precision base only** (`adapter: lora`). Quantized bases (`load_in_4bit`/`load_in_8bit`, i.e. QLoRA) are rejected: the sparse linear channel-slices a dense weight and cannot operate on packed `Linear4bit`/`Linear8bitLt` storage. QLoRA support would need a sparse-quantized linear (future work).
+- **Full-precision (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`, `load_in_4bit`) base.** For a 4-bit base, `SparseLinear4bit` dequantizes the frozen weight (which bitsandbytes does internally anyway at training batch sizes) and slices the matmul — a microbenchmark shows output-sparse projections (q/k/v/gate/up) land within ~5–15% of the full-precision SparseLoRA path (e.g. gate/up: 2.0×/3.2×/6.7× over dense QLoRA at sparsity 0.5/0.7/0.9). Input-sparse projections (o/down) only win at sparsity ≥0.7 — a pre-existing property of the gather-based path, not specific to 4-bit. 8-bit bases (`load_in_8bit`) are not supported.
 
 See `_vendor/PROVENANCE.md` for the vendored upstream commit and the (import-only) local edits.

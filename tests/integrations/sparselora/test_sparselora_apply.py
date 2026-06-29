@@ -68,3 +68,33 @@ def test_sparse_forward_backward_runs(tiny_lora_model):
         if p.grad is not None and "lora_" in n
     )
     assert grad_norm > 0
+
+
+def test_sparse_linear_4bit_dense_parity_and_sparse():
+    """SparseLinear4bit dense path matches bnb Linear4bit; sparse path runs."""
+    bnb = pytest.importorskip("bitsandbytes")
+    from axolotl.integrations.sparselora.sparse_linear_4bit import SparseLinear4bit
+
+    torch.manual_seed(0)
+    out_f, in_f = 256, 128
+    w = torch.randn(out_f, in_f, dtype=torch.bfloat16) * 0.02
+    lin = bnb.nn.Linear4bit(
+        in_f, out_f, bias=False, compute_dtype=torch.bfloat16, quant_type="nf4"
+    )
+    lin.weight = bnb.nn.Params4bit(w.clone(), requires_grad=False, quant_type="nf4")
+    lin = lin.cuda()
+
+    x = torch.randn(4, 10, in_f, dtype=torch.bfloat16, device="cuda")
+    ref = lin(x)
+
+    # Dense path (no indices) must match bitsandbytes within bf16 tolerance.
+    sparse = SparseLinear4bit(lin, mode="out")
+    dense_out = sparse(x)
+    assert dense_out.shape == ref.shape
+    assert torch.allclose(dense_out, ref, rtol=0.05, atol=0.05)
+
+    # Output-sparse path returns only the selected rows.
+    idx = torch.arange(0, out_f, 2, device="cuda")
+    sp = sparse(x, sparse_indices=idx)
+    assert sp.shape == (4, 10, idx.numel())
+    assert torch.isfinite(sp).all()
