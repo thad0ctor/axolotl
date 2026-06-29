@@ -27,6 +27,28 @@ _SUPPORTED_ADAPTERS = {"lora", "qlora"}
 _COMPILE_BOUNDARIES_SET = False
 
 
+def resolve_layer_sparsity(
+    layer_sparsity: dict[str, float], target_names: list[str]
+) -> dict[str, float]:
+    """Map explicit ``layer_sparsity`` keys onto discovered module names.
+
+    Keys may be a full module path or a suffix of one (e.g. ``model.layers.3.mlp``).
+    A key matching no module is an error rather than a silent drop to dense.
+    """
+    schedule: dict[str, float] = {}
+    for raw_key, val in dict(layer_sparsity).items():
+        matches = [n for n in target_names if n == raw_key or n.endswith("." + raw_key)]
+        if not matches:
+            raise ValueError(
+                f"sparselora.layer_sparsity key {raw_key!r} matches no sparsifiable "
+                "module. Use a full module path or a suffix of one "
+                "(e.g. 'model.layers.3.mlp')."
+            )
+        for n in matches:
+            schedule[n] = float(val)
+    return schedule
+
+
 def _apply_compile_boundaries() -> None:
     """Mark SparseLoRA's data-dependent code as ``torch.compiler.disable`` regions.
 
@@ -189,9 +211,7 @@ class SparseLoRAPlugin(BasePlugin):
             method = method_name(settings.calibration.method)
             all_factors: dict = {}
             if method == "none":
-                schedule = {
-                    k: float(v) for k, v in dict(settings.layer_sparsity).items()
-                }
+                schedule = resolve_layer_sparsity(settings.layer_sparsity, target_names)
             else:
                 # Factors for all targets feed the sensitivity sweep.
                 all_factors = compute_factor_tensors(model, target_names, rank)

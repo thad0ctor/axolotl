@@ -121,12 +121,18 @@ def save_cached(
 
     path = entry_dir(cfg, key)
     os.makedirs(path, exist_ok=True)
-    save_file(
-        {k: v.cpu().contiguous() for k, v in factor_tensors.items()},
-        os.path.join(path, FACTORS_FILE),
-    )
-    with open(os.path.join(path, SCHEDULE_FILE), "w") as f:
+    # Atomic writes (temp + os.replace) so concurrent DDP ranks writing the same
+    # deterministic entry can't leave a half-written file for a reader.
+    factors_path = os.path.join(path, FACTORS_FILE)
+    tmp_factors = f"{factors_path}.tmp.{os.getpid()}"
+    save_file({k: v.cpu().contiguous() for k, v in factor_tensors.items()}, tmp_factors)
+    os.replace(tmp_factors, factors_path)
+
+    schedule_path = os.path.join(path, SCHEDULE_FILE)
+    tmp_schedule = f"{schedule_path}.tmp.{os.getpid()}"
+    with open(tmp_schedule, "w") as f:
         json.dump({"layer_sparsity": layer_sparsity, "meta": meta}, f, indent=2)
+    os.replace(tmp_schedule, schedule_path)
     LOG.info("SparseLoRA: wrote calibration to %s", path)
     return path
 

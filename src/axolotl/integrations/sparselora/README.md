@@ -44,7 +44,7 @@ Before training, the plugin runs a sensitivity sweep over a slice of the **same*
 
 Calibration artifacts — the schedule (`schedule.json`) and SVD factors (`model.safetensors`) — are written to:
 
-```
+```text
 {output_dir}/sparselora_calibration/{key}/
 ```
 

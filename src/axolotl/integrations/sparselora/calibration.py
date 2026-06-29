@@ -68,6 +68,11 @@ def build_calibration_loader(
     """
     dataset = trainer.train_dataset
     n = min(num_samples, len(dataset))
+    if n <= 0:
+        raise ValueError(
+            "SparseLoRA calibration has no data: the training dataset and "
+            "calibration.num_samples must both be non-empty."
+        )
     if hasattr(dataset, "select"):
         subset = dataset.select(range(n))
     else:
@@ -256,10 +261,14 @@ def warmup_lora(
     device: torch.device,
     learning_rate: float,
     steps: int,
-) -> None:
-    """Short dense LoRA fine-tune so calibration sees realistic activations."""
+) -> bool:
+    """Short dense LoRA fine-tune so calibration sees realistic activations.
+
+    Returns True if the warm-up ran cleanly (or was a no-op), False if it raised
+    after mutating weights — the caller restores the clean snapshot in that case.
+    """
     if steps <= 0:
-        return
+        return True
     params = [
         p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n
     ]
@@ -267,11 +276,12 @@ def warmup_lora(
         LOG.warning(
             "SparseLoRA: faithful warm-up found no trainable LoRA params; skipping."
         )
-        return
+        return True
     optimizer = torch.optim.AdamW(params, lr=learning_rate)
     was_training = model.training
     model.train()
     done = 0
+    completed = True
     try:
         while done < steps:
             for batch in loader:
@@ -295,9 +305,11 @@ def warmup_lora(
         LOG.warning(
             "SparseLoRA: faithful warm-up failed (%s); proceeding without it.", exc
         )
+        completed = False
     finally:
         optimizer.zero_grad(set_to_none=True)
         model.train(was_training)
+    return completed
 
 
 def calibrate(
@@ -331,7 +343,15 @@ def calibrate(
             if p.requires_grad and "lora_" in n
         }
         warmup_lr = float(cfg.learning_rate) if cfg.learning_rate else 1e-4
-        warmup_lora(model, loader, device, warmup_lr, cal.warmup_steps)
+        completed = warmup_lora(model, loader, device, warmup_lr, cal.warmup_steps)
+        if not completed:
+            # Warm-up raised mid-way; restore clean weights so the sensitivity
+            # sweep measures a defined state, not a half-updated one.
+            with torch.no_grad():
+                params = dict(model.named_parameters())
+                for nm, val in snapshot.items():
+                    params[nm].copy_(val)
+            snapshot = None
 
     LOG.info(
         "SparseLoRA: calibrating %d target modules (method=%s, target_sparsity=%.2f).",

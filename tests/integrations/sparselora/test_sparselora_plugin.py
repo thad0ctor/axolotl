@@ -19,7 +19,10 @@ from axolotl.integrations.sparselora._vendor.sparselora.modules.svd import (
 )
 from axolotl.integrations.sparselora.calibration import discover_target_modules
 from axolotl.integrations.sparselora.factors import compute_factor_tensors, save_factors
-from axolotl.integrations.sparselora.plugin import SparseLoRAPlugin
+from axolotl.integrations.sparselora.plugin import (
+    SparseLoRAPlugin,
+    resolve_layer_sparsity,
+)
 from axolotl.utils.dict import DictDefault
 
 
@@ -194,6 +197,41 @@ def test_compile_boundaries_disable_dynamic_regions():
     assert disabled(SparseLinear4bit.forward)
 
 
+class TestResolveLayerSparsity:
+    targets = [
+        "base_model.model.model.layers.0.self_attn",
+        "base_model.model.model.layers.0.mlp",
+        "base_model.model.model.layers.10.mlp",
+    ]
+
+    def test_suffix_key_matches(self):
+        out = resolve_layer_sparsity({"model.layers.0.mlp": 0.5}, self.targets)
+        assert out == {"base_model.model.model.layers.0.mlp": 0.5}
+
+    def test_full_path_key_matches(self):
+        out = resolve_layer_sparsity({self.targets[0]: 0.7}, self.targets)
+        assert out == {self.targets[0]: 0.7}
+
+    def test_unknown_key_raises(self):
+        with pytest.raises(ValueError, match="matches no sparsifiable"):
+            resolve_layer_sparsity({"model.layers.99.mlp": 0.5}, self.targets)
+
+    def test_suffix_respects_dot_boundary(self):
+        # '0.mlp' must not match 'layers.10.mlp'
+        out = resolve_layer_sparsity({"layers.0.mlp": 0.5}, self.targets)
+        assert list(out) == ["base_model.model.model.layers.0.mlp"]
+
+
+def test_empty_calibration_data_raises():
+    from types import SimpleNamespace
+
+    from axolotl.integrations.sparselora.calibration import build_calibration_loader
+
+    trainer = SimpleNamespace(train_dataset=[], data_collator=lambda b: b)
+    with pytest.raises(ValueError, match="no data"):
+        build_calibration_loader(trainer, num_samples=8, batch_size=1)
+
+
 def test_calibration_does_not_perturb_rng():
     from axolotl.integrations.sparselora.calibration import calibrate
 
@@ -218,5 +256,11 @@ def test_calibration_does_not_perturb_rng():
     )
     torch.manual_seed(123)
     rng_before = torch.get_rng_state()
+    cuda_before = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     calibrate(cfg, model, factors, trainer)
     assert torch.equal(torch.get_rng_state(), rng_before)
+    if cuda_before is not None:  # calibrate also restores CUDA RNG
+        for before, after in zip(
+            cuda_before, torch.cuda.get_rng_state_all(), strict=True
+        ):
+            assert torch.equal(before, after)
