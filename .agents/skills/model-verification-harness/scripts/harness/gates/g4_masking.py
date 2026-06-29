@@ -195,6 +195,104 @@ def _render_mm(input_ids, labels, tokenizer, cap: int = 12) -> str:
     return "".join(out)
 
 
+def _bundled_template_name(mct: str) -> str | None:
+    """The bundled chat_template named EXACTLY for this model type, if any. Exact match only — a fuzzy family match could run the wrong template and produce false findings."""
+    try:
+        from axolotl.utils.schemas.enums import ChatTemplate
+    except Exception:  # noqa: BLE001 - enum unavailable in this env
+        return None
+    return mct if mct in {e.value for e in ChatTemplate} else None
+
+
+def _secondary_masking_pass(
+    ctx: GateContext, template_name: str, fixtures: list[Path]
+) -> dict[str, Any]:
+    """Drive axolotl's BUNDLED jinja (which G4's tokenizer_default/llama3 candidates never exercise) and re-run the universal masking invariants on it. Catches GROSS bundled-template bugs (terminator masked / prompt-in-loss), not subtle token-count offsets."""
+    last_exc: Exception | None = None
+    cfg = used_fixture = warns = None
+    for fixture in fixtures:
+        stanza = runner.chat_dataset_stanza(fixture)
+        cfg_dict = runner.base_cfg(
+            ctx.features.base_model,
+            ctx.output_dir,
+            f"g4_{template_name}",
+            datasets=[stanza],
+        )
+        cfg_dict["chat_template"] = template_name
+        cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, f"g4_{template_name}")
+        try:
+            cfg = runner.resolve_cfg(cfg_path)
+            with _capture_chat_warnings() as captured:
+                dataset_meta = runner.prepare(cfg)
+            used_fixture, warns = fixture, list(captured)
+            break
+        except Exception as exc:  # noqa: BLE001 - template/fixture may not resolve
+            last_exc = exc
+    else:
+        return {
+            "status": "could_not_run",
+            "note": f"prepare failed: {last_exc.__class__.__name__}: {last_exc}",
+        }
+
+    try:
+        from axolotl.loaders import load_tokenizer
+
+        tokenizer = load_tokenizer(cfg)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "could_not_run", "note": f"tokenizer load failed: {exc}"}
+
+    td = dataset_meta.train_dataset
+    if td.num_rows == 0:
+        return {"status": "could_not_run", "note": "0 prepared rows"}
+
+    special_ids = _special_ids(tokenizer)
+    n_scan = min(8, td.num_rows)
+    union_trained = ""
+    total_trained = term_trained = term_masked = 0
+    term_id: int | None = None
+    for i in range(n_scan):
+        row = td[i]
+        ii, ll = row["input_ids"], row["labels"]
+        union_trained += "".join(
+            tokenizer.decode(ids, skip_special_tokens=False)
+            for tr, ids in _split_spans(ii, ll)
+            if tr
+        )
+        total_trained += sum(1 for lab in ll if lab != runner.IGNORE_TOKEN_ID)
+        term = _terminator_status(ii, ll, special_ids)
+        term_trained += term["terminators_trained"]
+        term_masked += term["terminators_masked"]
+        if term["terminator_id"] is not None:
+            term_id = term["terminator_id"]
+
+    findings: list[str] = []
+    _, nonassistant = _fixture_role_contents(used_fixture)
+    if total_trained == 0:
+        findings.append("no tokens trained")
+    for needle in sorted(nonassistant):
+        if needle in union_trained:
+            findings.append(f"user/system content trained: {needle!r}")
+    eos_warn = next((m for m in (warns or []) if _EOS_NOT_FOUND_RE.search(m)), None)
+    if term_masked:
+        tok = (
+            tokenizer.decode([term_id], skip_special_tokens=False)
+            if term_id is not None
+            else "?"
+        )
+        findings.append(
+            f"turn terminator {tok!r} (id {term_id}) MASKED on {term_masked} turn(s) (#3754)"
+        )
+    elif eos_warn:
+        findings.append(f"configured EOS/EOT absent from template — {eos_warn}")
+    return {
+        "status": "checked",
+        "template": template_name,
+        "findings": findings,
+        "terminator_masked": term_masked,
+        "terminator_trained": term_trained,
+    }
+
+
 def _run_multimodal(ctx: GateContext) -> GateResult:
     """Drive the real processor + MM collate path and assert image/placeholder tokens are masked. Needs only the processor/tokenizer (not model weights), so it runs offline against any cached VLM."""
     try:
@@ -490,6 +588,21 @@ def run(ctx: GateContext) -> GateResult:
         )
     else:
         details.append("note: no turn terminator identified in trained spans")
+
+    # --- bundled jinja: exercise axolotl's own shipped template (#3725/#3728) ---
+    bundled = _bundled_template_name(ctx.model_config_type)
+    if bundled and bundled != template:
+        sec = _secondary_masking_pass(ctx, bundled, [fixture, fixture_nosys])
+        data["bundled_template"] = sec
+        if sec["status"] == "checked":
+            details.append(
+                f"bundled template '{bundled}' exercised: {len(sec['findings'])} finding(s), "
+                f"terminator masked={sec['terminator_masked']} "
+                "(catches gross masking bugs + drift, not subtle token-count offsets)"
+            )
+            findings.extend(f"bundled '{bundled}': {f}" for f in sec["findings"])
+        else:
+            details.append(f"bundled template '{bundled}': {sec['note']}")
 
     # --- snapshot diff ---------------------------------------------------------
     snap_dir = ctx.options.get("snapshot_dir")

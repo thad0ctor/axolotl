@@ -161,6 +161,30 @@ def _func_string_keys(path: Path, func_name: str) -> tuple[set[str], bool]:
     return set(), False
 
 
+def _local_var_eq_strings(
+    path: Path, func_name: str, var: str
+) -> tuple[set[str], bool]:
+    """String literals a function compares (``==``/``in``) against a LOCAL ``var`` Name — get_attention_cls_from_config branches on a local ``model_type``, which _file_model_types (attribute-only) misses."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return set(), False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            out: set[str] = set()
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Compare)
+                    and isinstance(sub.left, ast.Name)
+                    and sub.left.id == var
+                ):
+                    for op, comp in zip(sub.ops, sub.comparators, strict=False):
+                        if isinstance(op, (ast.Eq, ast.In)):
+                            out |= set(_str_constants(comp))
+            return out, True
+    return set(), False
+
+
 def _method_model_types(path: Path) -> tuple[dict[str, set[str]], bool]:
     """Per-method (``FunctionDef.name`` -> types it dispatches on) so the patch_manager lifecycle can be reported per-stage."""
     try:
@@ -702,6 +726,54 @@ def _check_cce(p: Probe) -> None:
         )
 
 
+def _check_lora_kernels(p: Probe) -> None:
+    # explicit = dedicated branch in get_attention_cls_from_config; else it relies on the
+    # dynamic transformers <Prefix>Attention naming convention = generic_fallback (may grab
+    # the wrong/no attention class for a nonstandard arch, so the lora-attn patch is inert)
+    branches, ok = _local_var_eq_strings(
+        p.src("monkeypatch/lora_kernels.py"),
+        "get_attention_cls_from_config",
+        "model_type",
+    )
+    if not ok:
+        p.warn("lora_kernels get_attention_cls_from_config dispatch unreadable")
+    explicit = ok and p.mct in branches
+    wants = bool(p.opt.get("lora_qkv_kernel") or p.opt.get("lora_o_kernel"))
+    gated = "lora_qkv/o_kernel" if wants else "lora_qkv/o_kernel (advisory)"
+    if explicit:
+        p.add(
+            HookRow(
+                "LoRA-kernel attention class",
+                "monkeypatch/lora_kernels.py",
+                gated,
+                PRESENT,
+                "dedicated branch in get_attention_cls_from_config",
+            )
+        )
+    elif wants:
+        p.add(
+            HookRow(
+                "LoRA-kernel attention class",
+                "monkeypatch/lora_kernels.py",
+                gated,
+                GENERIC,
+                "no dedicated branch; relies on the dynamic transformers "
+                "<Prefix>Attention naming convention — may import the wrong/no attention "
+                "class for a nonstandard arch (turn off lora kernels if training errors)",
+            )
+        )
+    else:
+        p.add(
+            HookRow(
+                "LoRA-kernel attention class",
+                "monkeypatch/lora_kernels.py",
+                gated,
+                NOT_EXPECTED,
+                "lora attention kernels (lora_qkv_kernel/lora_o_kernel) not requested",
+            )
+        )
+
+
 def _check_moe(p: Probe) -> None:
     is_moe = p.ctx.features.is_moe
     block, err = _safe_import("axolotl.common.architectures", "MOE_ARCH_BLOCK")
@@ -779,6 +851,46 @@ def _check_moe(p: Probe) -> None:
             else f"generic scattermoe/sonicmoe backend (dedicated adapters: {sorted(registered)})",
         )
     )
+    # experts-only MoE (experts embedded in the decoder layer, no separate SparseMoeBlock)
+    # must register its Experts class in EXPERTS_ONLY_BLOCK or the kernel can't find it
+    eob, eob_err = _safe_import(
+        "axolotl.integrations.kernels.constants", "EXPERTS_ONLY_BLOCK"
+    )
+    if eob_err is not None:
+        p.warn(f"EXPERTS_ONLY_BLOCK unreadable ({eob_err})")
+    elif p.mct in eob:
+        resolve, _ = _safe_import(
+            "axolotl.integrations.kernels.constants", "resolve_experts_class"
+        )
+        status, note = PRESENT, f"EXPERTS_ONLY_BLOCK[{p.mct}] = {eob[p.mct]!r}"
+        if resolve is not None:
+            try:
+                resolve(p.mct)
+                note += " (class resolves)"
+            except ModuleNotFoundError as exc:
+                note += f"; transformers module absent in this env ({exc}) — registration intact"
+            except Exception as exc:  # noqa: BLE001 - genuine broken registration
+                status = MISSING
+                note = f"registered {eob[p.mct]!r} but class unresolvable: {exc.__class__.__name__}: {exc}"
+        p.add(
+            HookRow(
+                "experts-only MoE block",
+                "integrations/kernels/constants.py",
+                "is_moe",
+                status,
+                note,
+            )
+        )
+    else:
+        p.add(
+            HookRow(
+                "experts-only MoE block",
+                "integrations/kernels/constants.py",
+                "is_moe",
+                NOT_EXPECTED,
+                "standard SparseMoeBlock MoE (experts not embedded in the decoder layer)",
+            )
+        )
 
 
 def _check_multimodal(p: Probe) -> None:
@@ -1208,6 +1320,7 @@ def run(ctx: GateContext) -> GateResult:
     _check_fused_attn(p)
     _check_liger(p)
     _check_cce(p)
+    _check_lora_kernels(p)
     _check_moe(p)
     _check_multimodal(p)
     _check_ssm_hybrid(p, pm_types, pm_ok)

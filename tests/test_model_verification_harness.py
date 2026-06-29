@@ -518,3 +518,64 @@ def test_detect_plain_text_not_multimodal(tmp_path):
     )
     f = detect_model(str(d), REPO_ROOT)
     assert not f.is_multimodal
+
+
+# --- G2 lora_kernels attn-class + experts-only MoE registration ----------------
+
+
+def _g2_row(res, hook):
+    for r in res.data["checklist"]:
+        if r["hook"] == hook:
+            return r["status"]
+    return None
+
+
+def test_g2_lora_kernel_explicit_branch(tmp_path):
+    from harness.gates import g2_integration
+
+    # qwen3_vl has a dedicated branch in get_attention_cls_from_config
+    res = g2_integration.run(
+        _ctx(_features("qwen3_vl", "x"), tmp_path, lora_qkv_kernel=True)
+    )
+    assert _g2_row(res, "LoRA-kernel attention class") == "present_explicit"
+
+
+def test_g2_lora_kernel_generic_when_no_branch(tmp_path):
+    from harness.gates import g2_integration
+
+    # a novel type that requests lora attn kernels but has no branch -> silently inert
+    res = g2_integration.run(
+        _ctx(_features("znovel_arch_test", "x"), tmp_path, lora_o_kernel=True)
+    )
+    assert _g2_row(res, "LoRA-kernel attention class") == "generic_fallback"
+
+
+def test_g2_lora_kernel_not_requested(tmp_path):
+    from harness.gates import g2_integration
+
+    res = g2_integration.run(_ctx(_features("llama", "x"), tmp_path))
+    assert _g2_row(res, "LoRA-kernel attention class") == "not_expected"
+
+
+def test_g2_experts_only_block_present(tmp_path):
+    from harness.gates import g2_integration
+
+    # gemma4_text registers experts-in-decoder-layer in EXPERTS_ONLY_BLOCK
+    res = g2_integration.run(_ctx(_features("gemma4_text", "x", is_moe=True), tmp_path))
+    assert _g2_row(res, "experts-only MoE block") == "present_explicit"
+
+
+def test_g2_experts_only_block_not_expected_for_standard_moe(tmp_path):
+    from harness.gates import g2_integration
+
+    res = g2_integration.run(_ctx(_features("qwen3_moe", "x", is_moe=True), tmp_path))
+    assert _g2_row(res, "experts-only MoE block") == "not_expected"
+
+
+def test_g4_bundled_template_exact_match_only():
+    from harness.gates import g4_masking
+
+    # exact enum names resolve; a non-enum family name must NOT (avoid running wrong template)
+    assert g4_masking._bundled_template_name("qwen3") == "qwen3"
+    assert g4_masking._bundled_template_name("gemma2") is None
+    assert g4_masking._bundled_template_name("znovel_arch_test") is None

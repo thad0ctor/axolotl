@@ -12,6 +12,18 @@ from . import GateResult, Verdict, exit_code
 
 _VERDICT_ICON = {v.value: v.icon for v in Verdict}
 
+# every report leads with this — the harness is a heuristic smoke gate, not an oracle
+_DISCLAIMER = [
+    "> ⚠️ **Starting point, not an authority.** This is an automated smoke gate built on "
+    "static registry checks + tiny-model probes. It flags *likely* gaps and exercises "
+    "*some* paths — it does not prove correctness, and a clean run is not a guarantee. "
+    "Treat every finding (and every PASS) as a lead to verify independently against the "
+    "model's own modeling code, the PR diff, and upstream docs before acting on it. Known "
+    "blind spots: per-arch numerical/attention correctness, transformers-version-coupled "
+    "breakage, VRAM/memory regressions, subtle tokenization offsets, and distributed-only "
+    "failures (see the gate caveats below).",
+]
+
 # G2 hook status -> checklist marker
 _HOOK_MARKER = {
     "present_explicit": "[x]",
@@ -98,6 +110,8 @@ def render_report(ctx, features, results: list[GateResult]) -> str:
     )
     lines.append(f"Profile: {ctx.profile} · seed {ctx.seed}")
     lines.append("")
+    lines.extend(_DISCLAIMER)
+    lines.append("")
 
     lines.extend(_summary_block(results))
     lines.extend(_compat_matrix(results))
@@ -119,6 +133,11 @@ def render_report(ctx, features, results: list[GateResult]) -> str:
     }
     lines.append("")
     lines.append(f"Exit code: {code} — {meaning.get(code, 'unknown')}")
+    lines.append("")
+    lines.append(
+        "_Automated starting point — verify findings against the model's own code/docs "
+        "before acting; a green run is not a guarantee of correctness (see caveats above)._"
+    )
     return "\n".join(lines) + "\n"
 
 

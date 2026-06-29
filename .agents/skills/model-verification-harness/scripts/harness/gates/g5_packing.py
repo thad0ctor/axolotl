@@ -273,8 +273,22 @@ def run(ctx: GateContext) -> GateResult:
         findings.append(collate_note)
     details.append(f"collate reset: {collate_note}")
 
-    # (e) packing must not change the math: step-0 loss packed-vs-unpacked parity. Opt-in (profile=full/pack_parity) since it spawns two train forwards
-    want_parity = ctx.profile == "full" or bool(ctx.options.get("pack_parity"))
+    # (e) packing must not change the math: step-0 loss packed-vs-unpacked parity. Opt-in
+    # (profile=full/pack_parity) since it spawns two train forwards — BUT auto-enabled when
+    # the type ships a monkeypatch/models/<type>/ custom modeling dir and a GPU is present,
+    # since that custom get_cu_seqlens/packing path is exactly what no other gate exercises
+    custom_modeling = (
+        ctx.repo_root
+        / "src"
+        / "axolotl"
+        / "monkeypatch"
+        / "models"
+        / ctx.model_config_type
+    ).is_dir()
+    auto_parity = ctx.gpu_available and custom_modeling
+    want_parity = (
+        ctx.profile == "full" or bool(ctx.options.get("pack_parity")) or auto_parity
+    )
     if not want_parity:
         parity = {
             "status": "skipped",
@@ -290,6 +304,10 @@ def run(ctx: GateContext) -> GateResult:
             "status": "skipped",
             "note": "no GPU: packing-vs-unpacked loss parity not run",
         }
+    if auto_parity:
+        details.append(
+            f"note: pack parity auto-enabled (monkeypatch/models/{ctx.model_config_type}/ + GPU)"
+        )
     if parity["status"] == "mismatch":
         findings.append(parity["note"])
     elif want_parity and parity["status"] in {"skipped", "unverified"}:
