@@ -24,7 +24,7 @@ from axolotl.utils.dict import DictDefault
 
 from .conftest import make_lora_model
 
-ARCHES = ["qwen2", "qwen3", "mistral"]
+ARCHES = ["qwen2", "qwen3", "mistral", "gemma2", "gemma3"]
 
 
 def _validate_cfg():
@@ -109,35 +109,121 @@ def _tiny_gemma2(**overrides):
     return Gemma2ForCausalLM(Gemma2Config(**kw))
 
 
-def test_gemma_mlp_activation_rejected():
-    """Gemma's gelu_pytorch_tanh MLP can't use the SiLU-hardcoded FFN path."""
-    pytest.importorskip("transformers")
+def _gemma2_lora(**overrides):
     from peft import LoraConfig, get_peft_model
 
     torch.manual_seed(0)
-    model = get_peft_model(
-        _tiny_gemma2(),
+    base = _tiny_gemma2(**overrides)
+    base.config._attn_implementation = "eager"  # Gemma2 softcap path needs eager
+    return get_peft_model(
+        base,
         LoraConfig(
             r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
         ),
+    ).eval()
+
+
+def test_gemma2_supported_and_auto_registers():
+    """Gemma2 (gelu MLP + softcap attn) is now supported, not refused."""
+    pytest.importorskip("transformers")
+    model = _gemma2_lora()
+    registered = register_arch_wiring(model)
+    assert registered.get("Gemma2MLP") == "mlp"
+    assert registered.get("Gemma2Attention") == "attention"
+    SparseLoRAPlugin()._validate(_validate_cfg(), model, discover_target_modules(model))
+
+
+def test_gemma2_dense_apply_logit_exact():
+    """Full Gemma2 dense-apply (gelu MLP + softcap attn) is logit-exact.
+
+    With sparsity 0 the gated MLP must use gelu_tanh (not SiLU) and attention must
+    apply softcap; any drop shows up as a logit divergence from the reference.
+    """
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
     )
-    with pytest.raises(ValueError, match="non-SiLU"):
-        SparseLoRAPlugin()._validate(
-            _validate_cfg(), model, discover_target_modules(model)
-        )
+
+    model = _gemma2_lora(attn_logit_softcapping=30.0)
+    ids = torch.randint(0, 128, (2, 16))
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits.clone()
+
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    d = tempfile.mkdtemp()
+    save_factors({}, d)  # dense schedule needs no factors
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.0 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+    assert any(isinstance(m, SparseSwiGLUMLP) for m in model.modules())
+    with torch.no_grad():
+        out = model(input_ids=ids).logits
+    assert torch.allclose(out, ref, atol=1e-4), (
+        "gelu MLP or softcap dropped: dense-apply diverged from reference"
+    )
 
 
-def test_is_silu_gated_detection():
-    """SiLU MLPs pass; Gemma's gelu MLP fails — numeric probe, class-agnostic."""
-    from axolotl.integrations.sparselora.arch_wiring import is_silu_gated
+def test_gate_kind_detection():
+    """gate_kind classifies SiLU vs gelu_tanh numerically (class-agnostic)."""
+    from axolotl.integrations.sparselora.arch_wiring import gate_kind, is_silu_gated
 
     qwen2 = make_lora_model("qwen2")
     mods = dict(qwen2.named_modules())
     mlp = mods[next(t for t in discover_target_modules(qwen2) if t.endswith("mlp"))]
-    assert is_silu_gated(mlp)
+    assert gate_kind(mlp) == "silu" and is_silu_gated(mlp)
 
     gemma_mlp = [m for n, m in _tiny_gemma2().named_modules() if n.endswith("mlp")][0]
-    assert not is_silu_gated(gemma_mlp)
+    assert gate_kind(gemma_mlp) == "gelu_tanh" and not is_silu_gated(gemma_mlp)
+
+
+def test_gemma2_sparse_reconstruction_and_grads_cpu():
+    """Gemma2's gelu path uses no liger, so the full sparse fwd+bwd runs on CPU.
+
+    At 0.5 sparsity the logits must stay finite and a sane reconstruction of the
+    dense model (not garbage), and LoRA params must get gradients.
+    """
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
+
+    # predictors run in bf16 (matching bf16 training), so the model must too.
+    model = _gemma2_lora(attn_logit_softcapping=30.0).to(torch.bfloat16)
+    ids = torch.randint(0, 128, (2, 16))
+    labels = ids.clone()
+    labels[:, :8] = -100
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits.clone()
+
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    factors = compute_factor_tensors(model, targets, rank=8)
+    d = tempfile.mkdtemp()
+    save_factors(factors, d)
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.5 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+    model.train()
+    out = model(input_ids=ids, labels=labels)
+    assert torch.isfinite(out.loss).item()
+    rel = (out.logits - ref).float().norm() / ref.float().norm()
+    assert rel < 1.0, f"sparse Gemma2 reconstruction implausibly far: rel={rel:.3f}"
+    out.loss.backward()
+    grad = sum(
+        p.grad.float().norm().item()
+        for n, p in model.named_parameters()
+        if p.grad is not None and "lora_" in n
+    )
+    assert grad > 0
 
 
 def test_sparseattention_applies_softcap():
@@ -391,19 +477,22 @@ def test_phi3_fused_projections_not_registered():
     assert "Phi3Attention" not in registered and "Phi3MLP" not in registered
 
 
-def test_gemma3_text_mlp_refused_attention_supported():
-    """Gemma3 has no softcap by default but a gelu MLP: attention auto-registers,
-    MLP is refused for its non-SiLU gate."""
+def test_gemma3_text_fully_supported():
+    """Gemma3-text (gelu MLP, no softcap) is fully supported: both MLP and
+    attention auto-register and neither is refused."""
     pytest.importorskip("transformers")
     from axolotl.integrations.sparselora.arch_wiring import (
+        gate_kind,
         is_standard_attention,
         is_swiglu_mlp,
         unsupported_reason,
     )
 
     model = _tiny("Gemma3TextConfig", "Gemma3ForCausalLM", head_dim=16)
-    register_arch_wiring(model)
+    registered = register_arch_wiring(model)
+    assert sorted(registered.values()) == ["attention", "mlp"]
     attn = [m for n, m in model.named_modules() if is_standard_attention(m)][0]
     mlp = [m for n, m in model.named_modules() if is_swiglu_mlp(m)][0]
-    assert unsupported_reason(attn) is None  # softcap None on Gemma3
-    assert unsupported_reason(mlp) and "non-SiLU" in unsupported_reason(mlp)
+    assert gate_kind(mlp) == "gelu_tanh"
+    assert unsupported_reason(attn) is None
+    assert unsupported_reason(mlp) is None

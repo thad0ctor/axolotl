@@ -60,6 +60,7 @@ def _apply_compile_boundaries() -> None:
         predictors.FFNPredictor,
         predictors.AttentionPredictor,
         predictors.GQAAttentionPredictor,
+        arch_wiring._GELUFFNPredictor,
     ):
         cls.predict = disable(cls.predict)  # type: ignore[method-assign]
     SparseLinear4bit.forward = disable(SparseLinear4bit.forward)  # type: ignore[method-assign]

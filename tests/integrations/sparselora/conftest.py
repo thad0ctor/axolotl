@@ -93,12 +93,51 @@ def _tiny_mistral(num_kv_heads: int = 2):
     )
 
 
+def _tiny_gemma2(num_kv_heads: int = 2):
+    from transformers import Gemma2Config, Gemma2ForCausalLM
+
+    model = Gemma2ForCausalLM(
+        Gemma2Config(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=num_kv_heads,
+            head_dim=16,
+            max_position_embeddings=64,
+            attn_logit_softcapping=30.0,
+        )
+    )
+    model.config._attn_implementation = "eager"  # softcap path needs eager
+    return model
+
+
+def _tiny_gemma3(num_kv_heads: int = 2):
+    from transformers import Gemma3ForCausalLM, Gemma3TextConfig
+
+    return Gemma3ForCausalLM(
+        Gemma3TextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=num_kv_heads,
+            head_dim=16,
+            max_position_embeddings=64,
+        )
+    )
+
+
 # Architecture registry for the parametrized cross-arch tests.
 TINY_BUILDERS = {
     "llama": _tiny_llama,
     "qwen2": _tiny_qwen2,
     "qwen3": _tiny_qwen3,
     "mistral": _tiny_mistral,
+    "gemma2": _tiny_gemma2,
+    "gemma3": _tiny_gemma3,
 }
 
 

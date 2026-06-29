@@ -42,8 +42,16 @@ from ._vendor.sparselora.modules.linear import SparseLinear
 from ._vendor.sparselora.modules.llama import SparseLlamaAttention, SparseLlamaMLP
 from ._vendor.sparselora.modules.predictors import (
     AttentionPredictor,
+    FFNPredictor,
     GQAAttentionPredictor,
 )
+
+try:
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+    _silu_mul = LigerSiLUMulFunction.apply
+except Exception:  # noqa: BLE001 - liger is CUDA-only; the gelu path doesn't need it
+    _silu_mul = None
 
 _MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
@@ -61,22 +69,31 @@ def is_standard_attention(module: nn.Module) -> bool:
     return all(hasattr(module, proj) for proj in _ATTN_PROJECTIONS)
 
 
-def is_silu_gated(module: nn.Module) -> bool:
-    """Whether the MLP's activation is SiLU (the sparse FFN path hardcodes it).
+def gate_kind(module: nn.Module) -> Optional[str]:
+    """Classify the SwiGLU gate activation as ``"silu"``, ``"gelu_tanh"``, or None.
 
-    The vendored ``FFNPredictor`` and ``SparseLlamaMLP`` both use liger's
-    ``silu_mul``; a SwiGLU MLP with a different gate (e.g. Gemma's
-    ``gelu_pytorch_tanh``) would be silently miscomputed. Activation classes vary
-    (``SiLUActivation`` vs ``nn.SiLU``), so probe numerically against ``F.silu``.
+    The sparse FFN path needs the gate's elementwise activation for both channel
+    selection (predictor) and compute. Activation classes vary (``SiLUActivation``
+    vs ``nn.SiLU``, ``GELUTanh`` vs ``PytorchGELUTanh``), so probe numerically.
+    Returns None for any other (unsupported) gate.
     """
     act = getattr(module, "act_fn", None)
     if act is None:
-        return False
+        return None
     try:
         probe = torch.linspace(-3.0, 3.0, 16)
-        return torch.allclose(act(probe), F.silu(probe), atol=1e-6)
-    except Exception:  # noqa: BLE001 - any non-elementwise activation is "not SiLU"
-        return False
+        out = act(probe)
+    except Exception:  # noqa: BLE001 - non-elementwise activation is unsupported
+        return None
+    if torch.allclose(out, F.silu(probe), atol=1e-6):
+        return "silu"
+    if torch.allclose(out, F.gelu(probe, approximate="tanh"), atol=1e-6):
+        return "gelu_tanh"
+    return None
+
+
+def is_silu_gated(module: nn.Module) -> bool:
+    return gate_kind(module) == "silu"
 
 
 class SparseLinearBias(SparseLinear):
@@ -142,14 +159,76 @@ class SparseLinearBias(SparseLinear):
         return x
 
 
-class SparseSwiGLUMLP(SparseLlamaMLP):
-    """Architecture-neutral SwiGLU MLP (Qwen2/Qwen3/Mistral/Phi3/...).
+def _gelu_tanh_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    return F.gelu(gate, approximate="tanh") * up
 
-    The vendored ``SparseLlamaMLP`` forward only touches ``gate_proj`` /
-    ``up_proj`` / ``down_proj`` and ``silu_mul``, which is the shared SwiGLU
-    contract; this alias makes that intent explicit and keeps the registry
-    keyed by the architecture's own MLP class.
+
+class _GELUFFNPredictor(FFNPredictor):
+    """FFN channel predictor scoring with ``gelu_tanh`` instead of SiLU (Gemma).
+
+    Identical to the vendored :class:`FFNPredictor` except the gated activation
+    used to score intermediate channels matches the model's ``gelu_pytorch_tanh``
+    gate, so the selection is faithful rather than a SiLU proxy.
     """
+
+    @torch.inference_mode()
+    def predict(self, x: torch.Tensor, sparsity: float) -> torch.Tensor:
+        x = x.mean(dim=1, keepdim=True).view(1, -1, x.shape[-1]).expand(2, -1, -1)
+        gate, up = torch.bmm(torch.bmm(x, self.w1), self.w2).unbind(0)
+        scores = _gelu_tanh_mul(gate, up).norm(dim=0)
+        k = int(scores.shape[-1] * (1 - sparsity))
+        return scores.topk(k).indices.flatten()
+
+
+def _create_mlp_predictor(base: nn.Module, rank: int, layer_name: str, cfg, kind: str):
+    """Like the vendored ``create_mlp_predictor`` but picks the predictor class by
+    gate activation (SiLU vs gelu_tanh)."""
+    from ._vendor.sparselora.modules import svd
+
+    device = base.gate_proj.weight.device
+    dtype = svd._float_dtype(base.gate_proj.weight)
+    tensors = svd._load_tensors(cfg, device, dtype)
+    p = layer_name
+    w1 = torch.stack([tensors[f"{p}.gate_proj.w1"], tensors[f"{p}.up_proj.w1"]])
+    w2 = torch.stack([tensors[f"{p}.gate_proj.w2"], tensors[f"{p}.up_proj.w2"]])
+
+    cls = FFNPredictor if kind == "silu" else _GELUFFNPredictor
+    pred = cls(w1.shape[1], w2.shape[2], rank)
+    pred.load_state_dict({"w1": w1, "w2": w2})
+    pred.eval()
+    return pred.to(device=device, dtype=torch.bfloat16)
+
+
+class SparseSwiGLUMLP(SparseLlamaMLP):
+    """Architecture-neutral SwiGLU MLP (Qwen2/Qwen3/Mistral/Gemma2/Gemma3/...).
+
+    The vendored ``SparseLlamaMLP`` hardcodes liger ``silu_mul`` for both the
+    predictor's channel selection and the gated compute. This subclass reads the
+    base MLP's gate activation and uses the matching path: the fused liger SiLU
+    kernel for SiLU models (Llama/Qwen/Mistral, unchanged), or ``gelu_tanh`` for
+    Gemma. The token split/join and sparse projection machinery are reused as-is.
+    """
+
+    inherited_attributes = SparseLlamaMLP.inherited_attributes + ["act_fn"]
+
+    def __init__(
+        self, base: nn.Module, *, name: str, idx: int, sparsity: float, cfg
+    ) -> None:
+        SparseModule.__init__(self, base)
+        self.sparsity = sparsity
+        self._gate_kind = gate_kind(base)
+        if self.sparsity > 0:
+            self.pred = _create_mlp_predictor(
+                base, cfg.predictor_rank, name, cfg, self._gate_kind or "silu"
+            )
+
+    def _block(self, x: torch.Tensor, **kw: Any) -> torch.Tensor:
+        gate, up = self.gate_proj(x, **kw), self.up_proj(x, **kw)
+        if self._gate_kind == "silu" and _silu_mul is not None:
+            gated = _silu_mul(gate, up)
+        else:
+            gated = self.act_fn(gate) * up
+        return self.down_proj(gated, **kw)
 
 
 class _GQAAttentionPredictorHD(GQAAttentionPredictor):
@@ -323,19 +402,18 @@ class SparseAttention(SparseLlamaAttention):
 def unsupported_reason(module: nn.Module) -> Optional[str]:
     """Why a target module can't be sparsified safely, or ``None``.
 
-    The binding constraint for Gemma2/Gemma3 is the MLP gate: their SwiGLU uses
-    ``gelu_pytorch_tanh``, but the vendored FFN predictor and sparse MLP kernel
-    hardcode SiLU, so sparsifying that MLP would silently miscompute it. (Gemma2
-    attention-logit softcapping *is* now reproduced — forwarded to the attention
-    interface in :class:`SparseAttention` — so it is no longer a blocker.)
+    The sparse MLP path supports SiLU (Llama/Qwen/Mistral) and ``gelu_tanh``
+    (Gemma2/Gemma3) gates — both the predictor's channel selection and the gated
+    compute follow the model's activation. Any other gated activation is refused
+    rather than silently miscomputed. (Gemma2 attention-logit softcapping is
+    reproduced in :class:`SparseAttention`, so it is not a blocker.)
     """
-    if is_swiglu_mlp(module) and not is_silu_gated(module):
+    if is_swiglu_mlp(module) and gate_kind(module) is None:
         act = type(getattr(module, "act_fn", None)).__name__
         return (
-            f"{type(module).__name__} uses a non-SiLU gated activation ({act}); "
-            "SparseLoRA's FFN predictor and sparse MLP kernel hardcode SiLU, so "
-            "this MLP cannot be sparsified faithfully. This architecture is not "
-            "supported."
+            f"{type(module).__name__} uses an unsupported gated activation "
+            f"({act}); SparseLoRA's sparse MLP supports only SiLU and gelu_tanh "
+            "gates. This MLP cannot be sparsified faithfully."
         )
     return None
 
