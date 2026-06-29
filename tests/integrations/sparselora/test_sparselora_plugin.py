@@ -171,6 +171,29 @@ def test_faithful_warmup_restores_lora_weights():
         assert torch.equal(after[name], val), f"warm-up left {name} unrestored"
 
 
+def test_compile_boundaries_disable_dynamic_regions():
+    from axolotl.integrations.sparselora._vendor.sparselora import api
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import (
+        llama,
+        predictors,
+    )
+    from axolotl.integrations.sparselora.plugin import _apply_compile_boundaries
+    from axolotl.integrations.sparselora.sparse_linear_4bit import SparseLinear4bit
+
+    _apply_compile_boundaries()
+
+    def disabled(fn):
+        return getattr(fn, "_torchdynamo_disable", False)
+
+    assert disabled(llama.SparseLlamaMLP.forward)
+    assert disabled(llama.SparseLlamaAttention.forward)
+    assert disabled(api._compute_output_token_mask)
+    assert disabled(predictors.FFNPredictor.predict)
+    assert disabled(predictors.AttentionPredictor.predict)
+    assert disabled(predictors.GQAAttentionPredictor.predict)
+    assert disabled(SparseLinear4bit.forward)
+
+
 def test_calibration_does_not_perturb_rng():
     from axolotl.integrations.sparselora.calibration import calibrate
 

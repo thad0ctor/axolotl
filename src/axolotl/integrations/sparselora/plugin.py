@@ -24,6 +24,42 @@ from .factors import compute_factor_tensors
 LOG = get_logger(__name__)
 
 _SUPPORTED_ADAPTERS = {"lora", "qlora"}
+_COMPILE_BOUNDARIES_SET = False
+
+
+def _apply_compile_boundaries() -> None:
+    """Mark SparseLoRA's data-dependent code as ``torch.compiler.disable`` regions.
+
+    Contextual sparsity (top-k channel selection, boolean-mask token splits,
+    quantized dequant) cannot be captured in a static graph — under ``torch
+    .compile`` it raises a backend failure. Disabling Dynamo on these entry
+    points makes the compiler graph-break around them (running them eagerly,
+    which is already fast) and compile the rest of the model. No-op at eager
+    runtime. Applied once at the class level.
+    """
+    global _COMPILE_BOUNDARIES_SET
+    if _COMPILE_BOUNDARIES_SET:
+        return
+
+    import torch
+
+    from ._vendor.sparselora import api
+    from ._vendor.sparselora.modules import llama, predictors
+    from .sparse_linear_4bit import SparseLinear4bit
+
+    disable = torch.compiler.disable
+    llama.SparseLlamaMLP.forward = disable(llama.SparseLlamaMLP.forward)  # type: ignore[method-assign]
+    llama.SparseLlamaAttention.forward = disable(llama.SparseLlamaAttention.forward)  # type: ignore[method-assign]
+    api._compute_output_token_mask = disable(api._compute_output_token_mask)
+    for cls in (
+        predictors.FFNPredictor,
+        predictors.AttentionPredictor,
+        predictors.GQAAttentionPredictor,
+    ):
+        cls.predict = disable(cls.predict)  # type: ignore[method-assign]
+    SparseLinear4bit.forward = disable(SparseLinear4bit.forward)  # type: ignore[method-assign]
+
+    _COMPILE_BOUNDARIES_SET = True
 
 
 class SparseLoRAPlugin(BasePlugin):
@@ -206,6 +242,7 @@ class SparseLoRAPlugin(BasePlugin):
         from ._vendor.sparselora.callback import SparseLoRACallback
 
         settings = cfg.sparselora
+        _apply_compile_boundaries()
         if cfg.load_in_4bit:
             from .sparse_linear_4bit import register_4bit_support
 

@@ -47,6 +47,7 @@ The SVD factors are training-free (`w1@w2 ≈ Wᵀ`, exact at full rank). z-lab 
 - `sample_packing: false`.
 - Llama architecture only (extend via `register_sparse_module`).
 - Single-GPU / DDP; no FSDP or DeepSpeed ZeRO-3.
+- `torch_compile: true` works — the dynamic sparse regions are `torch.compiler.disable` boundaries (graph-break + eager), the rest compiles.
 
 ## Source map
 
