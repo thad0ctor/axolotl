@@ -30,14 +30,15 @@ def _skill_dirs() -> list[str]:
 
 
 def _frontmatter(text: str) -> dict[str, str]:
+    import yaml
+
     assert text.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
     _, block, _ = text.split("---\n", 2)
-    fields: dict[str, str] = {}
-    for line in block.splitlines():
-        if ":" in line and not line.startswith((" ", "\t")):
-            key, value = line.split(":", 1)
-            fields[key.strip()] = value.strip().strip('"').strip("'")
-    return fields
+    # Parse with a real YAML loader so malformed frontmatter actually fails the
+    # test instead of silently passing the hand-split key:value heuristic.
+    data = yaml.safe_load(block)
+    assert isinstance(data, dict), "SKILL.md frontmatter must be a YAML mapping"
+    return {str(k): str(v) for k, v in data.items()}
 
 
 def test_at_least_one_skill() -> None:

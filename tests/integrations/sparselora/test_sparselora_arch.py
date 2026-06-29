@@ -177,7 +177,7 @@ def test_gate_kind_detection():
     mlp = mods[next(t for t in discover_target_modules(qwen2) if t.endswith("mlp"))]
     assert gate_kind(mlp) == "silu" and is_silu_gated(mlp)
 
-    gemma_mlp = [m for n, m in _tiny_gemma2().named_modules() if n.endswith("mlp")][0]
+    gemma_mlp = next(m for n, m in _tiny_gemma2().named_modules() if n.endswith("mlp"))
     assert gate_kind(gemma_mlp) == "gelu_tanh" and not is_silu_gated(gemma_mlp)
 
 
@@ -482,8 +482,8 @@ def test_phi3_fused_projections_detected_and_registered():
     from .conftest import _tiny_phi3
 
     model = _tiny_phi3()
-    attn = [m for n, m in model.named_modules() if n.endswith("self_attn")][0]
-    mlp = [m for n, m in model.named_modules() if n.endswith("mlp")][0]
+    attn = next(m for n, m in model.named_modules() if n.endswith("self_attn"))
+    mlp = next(m for n, m in model.named_modules() if n.endswith("mlp"))
     assert not is_standard_attention(attn) and is_fused_qkv_attention(attn)
     assert not is_swiglu_mlp(mlp) and is_fused_gate_up_mlp(mlp)
 
@@ -680,7 +680,7 @@ def test_stablelm_partial_rotary_supported():
     )
 
     model = _stablelm_lora()
-    attn = [m for n, m in model.named_modules() if n.endswith("self_attn")][0]
+    attn = next(m for n, m in model.named_modules() if n.endswith("self_attn"))
     head_dim = attn.config.hidden_size // attn.config.num_attention_heads
     assert has_partial_rotary(attn)
     assert unsupported_reason(attn) is None  # no longer refused
@@ -694,7 +694,7 @@ def test_stablelm_partial_rotary_supported():
             layer_sparsity={t: 0.0 for t in targets}, predictor_rank=8, path=d
         ),
     )
-    sa = [m for m in model.modules() if isinstance(m, SparseAttention)][0]
+    sa = next(m for m in model.modules() if isinstance(m, SparseAttention))
     assert sa._rotary_dim == int(0.25 * head_dim)
 
 
@@ -742,8 +742,8 @@ def test_gemma3_text_fully_supported():
     model = _tiny("Gemma3TextConfig", "Gemma3ForCausalLM", head_dim=16)
     registered = register_arch_wiring(model)
     assert sorted(registered.values()) == ["attention", "mlp"]
-    attn = [m for n, m in model.named_modules() if is_standard_attention(m)][0]
-    mlp = [m for n, m in model.named_modules() if is_swiglu_mlp(m)][0]
+    attn = next(m for n, m in model.named_modules() if is_standard_attention(m))
+    mlp = next(m for n, m in model.named_modules() if is_swiglu_mlp(m))
     assert gate_kind(mlp) == "gelu_tanh"
     assert unsupported_reason(attn) is None
     assert unsupported_reason(mlp) is None

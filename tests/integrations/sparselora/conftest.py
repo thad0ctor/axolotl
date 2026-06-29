@@ -183,17 +183,20 @@ _LORA_TARGETS = {
 
 def make_lora_model(arch: str, num_kv_heads: int = 2):
     """Tiny model of ``arch`` with attention-only LoRA (the SparseLoRA recipe)."""
-    torch.manual_seed(0)
-    model = get_peft_model(
-        TINY_BUILDERS[arch](num_kv_heads),
-        LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=_LORA_TARGETS.get(
-                arch, ["q_proj", "k_proj", "v_proj", "o_proj"]
+    # fork_rng so seeding for reproducible weights does not mutate the global RNG
+    # and couple later tests to call order.
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = get_peft_model(
+            TINY_BUILDERS[arch](num_kv_heads),
+            LoraConfig(
+                r=8,
+                lora_alpha=16,
+                target_modules=_LORA_TARGETS.get(
+                    arch, ["q_proj", "k_proj", "v_proj", "o_proj"]
+                ),
             ),
-        ),
-    )
+        )
     model.eval()
     return model
 
@@ -206,10 +209,11 @@ def tiny_lora_model():
 
 @pytest.fixture
 def calib_batches():
-    torch.manual_seed(1)
+    # Local generator so the fixture doesn't perturb the process-wide RNG.
+    gen = torch.Generator().manual_seed(1)
 
     def make(n=2, t=16):
-        ids = torch.randint(0, 128, (n, t))
+        ids = torch.randint(0, 128, (n, t), generator=gen)
         labels = ids.clone()
         labels[:, : t // 2] = -100
         return {
