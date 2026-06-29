@@ -331,14 +331,12 @@ class SparseAttention(SparseLlamaAttention):
         # Mirror SparseLlamaAttention.__init__ but build the predictor with the
         # decoupled-head_dim-tolerant creator (Qwen3 has q_out != hidden_size).
         SparseModule.__init__(self, base)
-        if has_partial_rotary(base):
-            # Guard direct register_arch_wiring() users; the plugin's _validate
-            # refuses this earlier via unsupported_reason().
-            raise ValueError(
-                f"SparseAttention: {type(base).__name__} uses partial rotary "
-                "(partial_rotary_factor < 1), unsupported by the generic sparse "
-                "attention."
-            )
+        # Partial rotary (StableLM etc.): RoPE rotates only the first
+        # rotary_dim of each head; the rest passes through. The model's
+        # rotary_emb sizes cos/sin to rotary_dim, so we split Q/K accordingly.
+        config = getattr(base, "config", None)
+        prf = getattr(config, "partial_rotary_factor", 1.0) if config else 1.0
+        self._rotary_dim = int(prf * self.head_dim) if prf < 1.0 else None
         self.sparsity = sparsity
         if self.sparsity > 0:
             self.pred = _create_attn_predictor(base, cfg.predictor_rank, name, cfg)
@@ -390,7 +388,16 @@ class SparseAttention(SparseLlamaAttention):
 
         assert position_embeddings is not None
         cos, sin = position_embeddings
-        Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
+        if self._rotary_dim is None:
+            Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
+        else:
+            # Rotate only the leading rotary_dim of each head; pass the rest through.
+            r = self._rotary_dim
+            q_rot, q_pass = Q[..., :r], Q[..., r:]
+            k_rot, k_pass = K[..., :r], K[..., r:]
+            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+            Q = torch.cat([q_rot, q_pass], dim=-1)
+            K = torch.cat([k_rot, k_pass], dim=-1)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -439,12 +446,6 @@ def unsupported_reason(module: nn.Module) -> Optional[str]:
             f"{type(module).__name__} uses an unsupported gated activation "
             f"({act}); SparseLoRA's sparse MLP supports only SiLU and gelu_tanh "
             "gates. This MLP cannot be sparsified faithfully."
-        )
-    if is_standard_attention(module) and has_partial_rotary(module):
-        return (
-            f"{type(module).__name__} uses partial rotary embeddings "
-            "(partial_rotary_factor < 1, e.g. StableLM/Phi); the generic sparse "
-            "attention applies RoPE to the full head dim and can't reproduce it."
         )
     return None
 

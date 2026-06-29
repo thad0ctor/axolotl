@@ -441,11 +441,12 @@ def _tiny(config_cls, model_cls, **extra):
 @pytest.mark.parametrize(
     "config_cls,model_cls",
     [
-        ("CohereConfig", "CohereForCausalLM")
-    ],  # StableLM uses partial rotary; see refusal test
+        ("CohereConfig", "CohereForCausalLM"),
+        ("StableLmConfig", "StableLmForCausalLM"),  # partial rotary, now supported
+    ],
 )
 def test_registry_covers_silu_swiglu_families(config_cls, model_cls):
-    """Cohere is SiLU SwiGLU + full-RoPE standard attention -> auto-supported."""
+    """Cohere / StableLM are SiLU SwiGLU + standard attention -> auto-supported."""
     pytest.importorskip("transformers")
     from axolotl.integrations.sparselora.arch_wiring import (
         is_standard_attention,
@@ -479,21 +480,80 @@ def test_phi3_fused_projections_not_registered():
     assert "Phi3Attention" not in registered and "Phi3MLP" not in registered
 
 
-def test_stablelm_partial_rotary_refused():
-    """StableLM rotates only part of the head dim (partial_rotary_factor < 1);
-    the generic attention applies full-head RoPE, so it must be refused cleanly
-    rather than registered and crashed at forward."""
+def _stablelm_lora():
+    from peft import LoraConfig, get_peft_model
+
+    torch.manual_seed(0)
+    base = _tiny("StableLmConfig", "StableLmForCausalLM", partial_rotary_factor=0.25)
+    return get_peft_model(
+        base,
+        LoraConfig(
+            r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+        ),
+    ).eval()
+
+
+def test_stablelm_partial_rotary_supported():
+    """StableLM uses partial rotary; SparseAttention splits RoPE to the rotary dim
+    (rest passes through) instead of refusing. It registers, isn't refused, and
+    the sparse attention computes the right rotary_dim."""
     pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
     from axolotl.integrations.sparselora.arch_wiring import (
         has_partial_rotary,
         unsupported_reason,
     )
 
-    model = _tiny("StableLmConfig", "StableLmForCausalLM", partial_rotary_factor=0.25)
+    model = _stablelm_lora()
     attn = [m for n, m in model.named_modules() if n.endswith("self_attn")][0]
+    head_dim = attn.config.hidden_size // attn.config.num_attention_heads
     assert has_partial_rotary(attn)
-    reason = unsupported_reason(attn)
-    assert reason and "partial rotary" in reason
+    assert unsupported_reason(attn) is None  # no longer refused
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    d = tempfile.mkdtemp()
+    save_factors({}, d)
+    apply_sparselora(  # sparsity 0 -> no predictor/forward, CPU-safe
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.0 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+    sa = [m for m in model.modules() if isinstance(m, SparseAttention)][0]
+    assert sa._rotary_dim == int(0.25 * head_dim)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="SiLU MLP predictor needs CUDA"
+)
+def test_stablelm_partial_rotary_logit_exact():
+    """Dense-apply on StableLM reproduces the model's own attention (split RoPE)."""
+    pytest.importorskip("transformers")
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
+
+    model = _stablelm_lora().to("cuda").to(torch.bfloat16)
+    ids = torch.randint(0, 256, (2, 16), device="cuda")
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits.clone()
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    d = tempfile.mkdtemp()
+    save_factors({}, d)
+    apply_sparselora(
+        model,
+        SparseLoRAConfig(
+            layer_sparsity={t: 0.0 for t in targets}, predictor_rank=8, path=d
+        ),
+    )
+    with torch.no_grad():
+        out = model(input_ids=ids).logits
+    assert torch.allclose(out, ref, atol=5e-3), "partial RoPE diverged from reference"
 
 
 def test_gemma3_text_fully_supported():
