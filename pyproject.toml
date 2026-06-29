@@ -185,6 +185,8 @@ version = { file = "VERSION" }
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+# Vendored third-party code is kept verbatim; do not lint/reformat it.
+extend-exclude = ["src/axolotl/integrations/sparselora/_vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "C90", "B", "I"]
