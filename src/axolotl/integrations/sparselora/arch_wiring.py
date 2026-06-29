@@ -269,7 +269,7 @@ class SparseSwiGLUMLP(SparseLlamaMLP):
     Gemma. The token split/join and sparse projection machinery are reused as-is.
     """
 
-    inherited_attributes = SparseLlamaMLP.inherited_attributes + ["act_fn"]
+    inherited_attributes = SparseLlamaMLP.inherited_attributes
 
     def __init__(
         self, base: nn.Module, *, name: str, idx: int, sparsity: float, cfg
@@ -286,6 +286,9 @@ class SparseSwiGLUMLP(SparseLlamaMLP):
                 f"{type(base).__name__}; only SiLU and gelu_tanh gated MLPs are "
                 "supported."
             )
+        # Resolve via the helper so a module exposing its gate as `activation_fn`
+        # (Phi3) rather than `act_fn` still has a callable for the non-liger path.
+        self.act_fn = gate_activation(base)
         if self.sparsity > 0:
             self.pred = _create_mlp_predictor(
                 base, cfg.predictor_rank, name, cfg, self._gate_kind
