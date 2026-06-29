@@ -43,6 +43,7 @@ def _apply_compile_boundaries() -> None:
 
     import torch
 
+    from . import arch_wiring
     from ._vendor.sparselora import api
     from ._vendor.sparselora.modules import llama, predictors
     from .sparse_linear_4bit import SparseLinear4bit
@@ -50,6 +51,10 @@ def _apply_compile_boundaries() -> None:
     disable = torch.compiler.disable
     llama.SparseLlamaMLP.forward = disable(llama.SparseLlamaMLP.forward)  # type: ignore[method-assign]
     llama.SparseLlamaAttention.forward = disable(llama.SparseLlamaAttention.forward)  # type: ignore[method-assign]
+    # Generic attention has its own forward; the MLP/linear paths inherit the
+    # (already-disabled) vendored functions, so only the override needs marking.
+    arch_wiring.SparseAttention.forward = disable(arch_wiring.SparseAttention.forward)  # type: ignore[method-assign]
+    arch_wiring.SparseLinearBias.forward = disable(arch_wiring.SparseLinearBias.forward)  # type: ignore[method-assign]
     api._compute_output_token_mask = disable(api._compute_output_token_mask)
     for cls in (
         predictors.FFNPredictor,
@@ -99,12 +104,33 @@ class SparseLoRAPlugin(BasePlugin):
                 "ZeRO-3 shard parameters and are not yet supported."
             )
 
-        # Architecture support: the parent MLP/attention module type must have
-        # registered sparse wiring (Llama in v1).
+        # Architecture support: auto-register sparse wiring for the loaded
+        # model's MLP/attention classes (Llama is pre-registered; Qwen2/Qwen3/
+        # Mistral/... are introspected and mapped to the generic wiring), then
+        # confirm every target is covered and has supported semantics.
         from ._vendor.sparselora.modules import get_module_mapping
+        from .arch_wiring import register_arch_wiring, unsupported_reason
+
+        registered = register_arch_wiring(model)
+        if registered:
+            LOG.info(
+                "SparseLoRA: registered generic sparse wiring for %s.",
+                ", ".join(
+                    f"{cls} ({role})" for cls, role in sorted(registered.items())
+                ),
+            )
 
         module_map = get_module_mapping()
         modules = dict(model.named_modules())
+
+        reasons = sorted(
+            {r for n in target_names if (r := unsupported_reason(modules[n]))}
+        )
+        if reasons:
+            raise ValueError(
+                "SparseLoRA cannot sparsify this model: " + "; ".join(reasons)
+            )
+
         unsupported = {
             type(modules[n]).__name__
             for n in target_names
@@ -113,7 +139,8 @@ class SparseLoRAPlugin(BasePlugin):
         if unsupported:
             raise ValueError(
                 f"SparseLoRA wiring not available for module type(s) {sorted(unsupported)}. "
-                "Supported architectures: Llama. Register sparse modules via "
+                "Supported: Llama + any SwiGLU-MLP / standard-attention architecture "
+                "(Qwen2, Qwen3, Mistral, ...). Register custom wiring via "
                 "`register_sparse_module` to extend support."
             )
 
