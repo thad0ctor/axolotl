@@ -90,6 +90,39 @@ def is_fused_qkv_attention(module: nn.Module) -> bool:
     return hasattr(module, "qkv_proj") and hasattr(module, "o_proj")
 
 
+def _proj_out_features(proj: Any) -> Optional[int]:
+    n = getattr(proj, "out_features", None)
+    if n is not None:
+        return int(n)
+    w = getattr(proj, "weight", None)
+    return None if w is None else int(w.shape[0])
+
+
+def _proj_in_features(proj: Any) -> Optional[int]:
+    n = getattr(proj, "in_features", None)
+    if n is not None:
+        return int(n)
+    w = getattr(proj, "weight", None)
+    return None if w is None else int(w.shape[1])
+
+
+def is_gated_attention(module: nn.Module) -> bool:
+    """Qwen3-Next / Qwen3.5 style *gated* attention.
+
+    ``q_proj`` emits ``[query | gate]`` interleaved per head (out =
+    ``2 * num_heads * head_dim``), and the attention output is multiplied by
+    ``sigmoid(gate)`` before ``o_proj``. Detected structurally: ``q_proj`` out is
+    twice ``o_proj`` in (``o_proj`` in is the un-gated attention width
+    ``num_heads * head_dim``). A plain attention has ``q_proj`` out == ``o_proj``
+    in, so this never matches it.
+    """
+    if not is_standard_attention(module):
+        return False
+    q_out = _proj_out_features(getattr(module, "q_proj", None))
+    o_in = _proj_in_features(getattr(module, "o_proj", None))
+    return q_out is not None and o_in is not None and q_out == 2 * o_in
+
+
 def gate_activation(module: nn.Module):
     """The MLP's gate activation, under either the ``act_fn`` (Llama/Qwen/Gemma)
     or ``activation_fn`` (Phi3) attribute name. None if neither is present."""
@@ -504,6 +537,11 @@ class SparseAttention(SparseLlamaAttention):
         """Sliding window when the module carries none. No fallback by default."""
         return None
 
+    def _gate_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        """Hook to gate the attention output before ``o_proj``. Identity for
+        standard attention; :class:`SparseGatedAttention` applies the gate."""
+        return attn_output
+
     def _qkv(self, hidden_states: torch.Tensor, masks, sparse: bool):
         """Project to flat ``(Q, K, V, v_i)``; override point for fused qkv_proj.
 
@@ -584,6 +622,7 @@ class SparseAttention(SparseLlamaAttention):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self._gate_output(attn_output)
         attn_output = (
             self._proj_o(attn_output, masks, v_i)
             if sparse
@@ -656,6 +695,59 @@ class SparseFusedQKVAttention(SparseAttention):
         return (*self._split_qkv(fused), v_i)
 
 
+class SparseGatedAttention(SparseAttention):
+    """Sparse attention for Qwen3-Next / Qwen3.5 *gated* attention.
+
+    ``q_proj`` emits ``[query | gate]`` interleaved per head; the reference
+    (``modeling_qwen3_5.py``) views it as ``(.., num_heads, 2*head_dim)``, chunks
+    the last dim into ``query`` and ``gate``, runs attention on ``query``, then
+    multiplies the attention output by ``sigmoid(gate)`` before ``o_proj``.
+
+    Because the gate is half of ``q_proj``'s output, ``q_proj`` is computed
+    **densely** (full channels, all tokens) so the gate stays intact — only
+    ``k_proj``/``v_proj`` (and the input-sparse ``o_proj``) are channel/token
+    sparsified. The per-head split, ``q_norm``, partial RoPE, sliding window and
+    softcap all come from :class:`SparseAttention` unchanged; this class only
+    splits the gate off ``q_proj`` and re-applies it via :meth:`_gate_output`.
+    With sparsity disabled this is bit-exact to the reference forward.
+    """
+
+    _gate: Optional[torch.Tensor] = None
+
+    def _split_query_gate(self, q_full: torch.Tensor):
+        *prefix, _ = q_full.shape
+        q4 = q_full.reshape(*prefix, -1, self.head_dim * 2)
+        query, gate = torch.chunk(q4, 2, dim=-1)
+        return query.reshape(*prefix, -1), gate.reshape(*prefix, -1)
+
+    def _qkv(self, hidden_states: torch.Tensor, masks, sparse: bool):
+        # q_proj carries the gate, so compute it densely and split; only k/v are
+        # channel-sparsified. The gate is stashed for _gate_output (consumed once,
+        # after the attention interface, before o_proj).
+        query, gate = self._split_query_gate(self.q_proj(hidden_states))
+        self._gate = gate
+        if not sparse:
+            return query, self.k_proj(hidden_states), self.v_proj(hidden_states), None
+
+        _, k_i, v_i = self.pred.predict(hidden_states, self.sparsity)
+        if masks is None:
+            return (
+                query,
+                self.k_proj(hidden_states, k_i),
+                self.v_proj(hidden_states, v_i),
+                v_i,
+            )
+        sparse_x, dense_x = self.token_splits(hidden_states, masks)
+        K = self._sparse_proj(self.k_proj, sparse_x, dense_x, k_i, masks)
+        V = self._sparse_proj(self.v_proj, sparse_x, dense_x, v_i, masks)
+        return query, K, V, v_i
+
+    def _gate_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        gate = self._gate
+        self._gate = None
+        return attn_output * torch.sigmoid(gate)
+
+
 def unsupported_reason(module: nn.Module) -> Optional[str]:
     """Why a target module can't be sparsified safely, or ``None``.
 
@@ -708,6 +800,10 @@ def register_arch_wiring(model: nn.Module) -> dict[str, str]:
             register_sparse_module(cls, SparseFusedGateUpMLP)
             mapping[cls] = SparseFusedGateUpMLP
             registered[cls.__name__] = "mlp"
+        elif is_gated_attention(module):
+            register_sparse_module(cls, SparseGatedAttention)
+            mapping[cls] = SparseGatedAttention
+            registered[cls.__name__] = "attention"
         elif is_standard_attention(module):
             register_sparse_module(cls, SparseAttention)
             mapping[cls] = SparseAttention

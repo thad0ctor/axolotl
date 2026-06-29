@@ -495,6 +495,90 @@ def test_phi3_fused_projections_detected_and_registered():
     assert mapping[type(mlp)] is SparseFusedGateUpMLP
 
 
+# ---------------------------------------------------------------------------
+# Gated attention (Qwen3-Next / Qwen3.5): q_proj emits [query | gate] per head
+# ---------------------------------------------------------------------------
+
+
+def test_gated_attention_detected_and_registered():
+    """Qwen3.5 full-attention layers are gated: q_proj out = 2 * o_proj in. They
+    must register as SparseGatedAttention, and the interleaved linear-attention
+    (GatedDeltaNet) layers must stay unregistered (no q/k/v/o to sparsify)."""
+    pytest.importorskip("transformers")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Qwen3_5TextConfig"):
+        pytest.skip("transformers lacks Qwen3.5")
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import (
+        get_module_mapping,
+    )
+    from axolotl.integrations.sparselora.arch_wiring import (
+        SparseGatedAttention,
+        is_gated_attention,
+        is_standard_attention,
+    )
+
+    # 4 layers -> default hybrid pattern places a full_attention layer at idx 3.
+    model = Qwen3_5ForCausalLM(
+        Qwen3_5TextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,  # decoupled; gated q_out = 2*4*32 = 256, o_in = 4*32 = 128
+            max_position_embeddings=64,
+            pad_token_id=0,
+            eos_token_id=1,
+            bos_token_id=2,
+        )
+    ).eval()
+
+    attn = next(m for n, m in model.named_modules() if n.endswith("self_attn"))
+    assert is_standard_attention(attn) and is_gated_attention(attn)
+    assert attn.q_proj.out_features == 2 * attn.o_proj.in_features
+
+    registered = register_arch_wiring(model)
+    assert get_module_mapping()[type(attn)] is SparseGatedAttention
+    assert registered.get("Qwen3_5Attention") == "attention"
+    # The linear-attention block has no q/k/v/o, so it is never wired as attention.
+    assert "Qwen3_5GatedDeltaNet" not in registered
+
+
+def test_plain_attention_is_not_gated():
+    """A standard q_proj (out == o_proj in) must not be misdetected as gated."""
+    from axolotl.integrations.sparselora.arch_wiring import is_gated_attention
+
+    model = make_lora_model("qwen3")
+    attn = next(m for n, m in model.named_modules() if n.endswith("self_attn"))
+    assert not is_gated_attention(attn)
+
+
+def test_gated_split_and_gate_math():
+    """SparseGatedAttention reproduces the reference per-head [query|gate] split
+    and sigmoid gating bit-for-bit (this is the dense-apply parity guarantee)."""
+    from axolotl.integrations.sparselora.arch_wiring import SparseGatedAttention
+
+    obj = SparseGatedAttention.__new__(SparseGatedAttention)
+    obj.head_dim = 8
+    b, t, h, d = 2, 3, 4, 8
+    q_full = torch.randn(b, t, h * d * 2)
+
+    query, gate = obj._split_query_gate(q_full)
+    # Reference: modeling_qwen3_5 views as (.., n_heads, 2*head_dim) then chunks.
+    ref_q, ref_g = torch.chunk(q_full.view(b, t, -1, d * 2), 2, dim=-1)
+    assert torch.equal(query, ref_q.reshape(b, t, -1))
+    assert torch.equal(gate, ref_g.reshape(b, t, -1))
+
+    obj._gate = gate
+    attn_out = torch.randn(b, t, h * d)
+    out = obj._gate_output(attn_out)
+    assert torch.allclose(out, attn_out * torch.sigmoid(gate))
+    assert obj._gate is None  # consumed once
+
+
 @pytest.mark.parametrize("num_kv_heads", [2, 4], ids=["gqa", "mha"])
 def test_phi3_factor_keys_and_validation(num_kv_heads):
     """Fused qkv_proj/gate_up_proj slice into the same q/k/v + gate/up factor keys
