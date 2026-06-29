@@ -419,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
             "gpus": args.gpus,
             # so the report's exit-code line matches the process's actual exit code
             "on_unavailable": args.on_unavailable,
+            # MM gate forwards this to processor/tokenizer load for remote-code VLMs
+            "trust_remote_code": args.trust_remote_code,
             **_parse_features(args.features),
         },
     )

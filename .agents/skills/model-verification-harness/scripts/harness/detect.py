@@ -145,6 +145,33 @@ def _multimodal_types(warnings: list[str]) -> set[str]:
         return set()
 
 
+# VLM wrappers nest modality config under a backbone sub-config (Qwen-Omni -> thinker_config);
+# scan these containers, not just the top level, so nested vision/audio models aren't missed
+_MM_SUBCONFIG_CONTAINERS = ("text_config", "thinker_config", "talker_config")
+_MM_CONFIG_KEYS = ("vision_config", "audio_config", "img_processor")
+_MM_TOKEN_KEYS = (
+    "image_token_index",
+    "audio_token_index",
+    "image_token_id",
+    "audio_token_id",
+)
+
+
+def _has_modality_signal(config: dict[str, Any]) -> bool:
+    """True if the config (or a known backbone sub-config) carries a vision/audio signal — catches VLMs that axolotl's registry doesn't list and that have no top-level vision_config (Phi3V's img_processor, Qwen-Omni's nested thinker_config)."""
+    scopes = [config]
+    for k in _MM_SUBCONFIG_CONTAINERS:
+        sub = config.get(k)
+        if isinstance(sub, dict):
+            scopes.append(sub)
+    for scope in scopes:
+        if any(isinstance(scope.get(k), dict) for k in _MM_CONFIG_KEYS):
+            return True
+        if any(k in scope for k in _MM_TOKEN_KEYS):
+            return True
+    return False
+
+
 def _embed_layers(model_config_type: str, warnings: list[str]) -> list[str]:
     try:
         from axolotl.loaders.utils import get_linear_embedding_layers
@@ -188,12 +215,13 @@ def detect_model(
     if expert_count is not None:
         extra["num_experts"] = expert_count
 
-    # multimodal: image-text-to-text routing, pixtral name heuristic, or nested vision config
+    # multimodal: axolotl MM registry, pixtral name heuristic, or a vision/audio config
+    # signal (incl. nested under thinker_config/text_config and Phi3V's img_processor)
     mm_types = _multimodal_types(warnings)
     is_multimodal = (
         model_config_type in mm_types
         or "pixtral" in base_model.lower()
-        or isinstance(config.get("vision_config"), dict)
+        or _has_modality_signal(config)
     )
 
     is_ssm_hybrid = model_config_type in _ssm_hybrid_types(repo_root, warnings)

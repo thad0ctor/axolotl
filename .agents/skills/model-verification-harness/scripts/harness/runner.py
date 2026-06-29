@@ -84,7 +84,9 @@ def multimodal_chat_sample(image_px: int = 64) -> tuple[dict[str, Any], str]:
     return sample, assistant_text
 
 
-def mm_base_cfg(base_model: str, output_dir: Path, name: str) -> dict[str, Any]:
+def mm_base_cfg(
+    base_model: str, output_dir: Path, name: str, trust_remote_code: bool = False
+) -> dict[str, Any]:
     """Minimal multimodal cfg; mirrors the example VLM configs (processor + collate-time tokenize, so on-disk prepare is skipped)."""
     cfg = base_cfg(
         base_model,
@@ -100,6 +102,7 @@ def mm_base_cfg(base_model: str, output_dir: Path, name: str) -> dict[str, Any]:
             "skip_prepare_dataset": True,
             "remove_unused_columns": False,
             "sample_packing": False,
+            "trust_remote_code": trust_remote_code,
         }
     )
     return cfg

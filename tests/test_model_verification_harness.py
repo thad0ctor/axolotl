@@ -459,3 +459,62 @@ def test_g4_native_template_first():
 
     # native template must be preferred so family-specific terminator bugs surface
     assert g4_masking._CHAT_TEMPLATE_CANDIDATES[0] == "tokenizer_default"
+
+
+# --- multimodal detection: nested vision/audio + Phi3V img_processor ------------
+
+
+def test_detect_phi3v_img_processor_is_multimodal(tmp_path):
+    from harness.detect import detect_model
+
+    # Phi-3.5-vision has no vision_config; the signal is img_processor + Phi3V arch
+    d = _write_config(
+        tmp_path,
+        "phi3v",
+        {
+            "model_type": "phi3_v",
+            "architectures": ["Phi3VForCausalLM"],
+            "img_processor": {"name": "clip_vision_model"},
+        },
+    )
+    f = detect_model(str(d), REPO_ROOT)
+    assert f.is_multimodal  # must route to the MM gate, not the text path
+
+
+def test_detect_qwen_omni_nested_modality_is_multimodal(tmp_path):
+    from harness.detect import detect_model
+
+    # Qwen2.5-Omni nests vision/audio under thinker_config; nothing at top level
+    d = _write_config(
+        tmp_path,
+        "omni",
+        {
+            "model_type": "qwen2_5_omni",
+            "architectures": ["Qwen2_5OmniForConditionalGeneration"],
+            "thinker_config": {
+                "audio_config": {"d_model": 1},
+                "image_token_index": 1,
+                "audio_token_index": 2,
+            },
+        },
+    )
+    f = detect_model(str(d), REPO_ROOT)
+    # without this, the omni model silently validates as text-only (false PASS)
+    assert f.is_multimodal
+
+
+def test_detect_plain_text_not_multimodal(tmp_path):
+    from harness.detect import detect_model
+
+    # a nested dict that is not a modality container must not trip the heuristic
+    d = _write_config(
+        tmp_path,
+        "plain",
+        {
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"],
+            "rope_scaling": {"type": "linear", "factor": 2.0},
+        },
+    )
+    f = detect_model(str(d), REPO_ROOT)
+    assert not f.is_multimodal

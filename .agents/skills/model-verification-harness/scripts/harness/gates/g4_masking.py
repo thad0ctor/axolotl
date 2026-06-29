@@ -209,7 +209,12 @@ def _run_multimodal(ctx: GateContext) -> GateResult:
             f"multimodal modules unavailable: {exc.__class__.__name__}: {exc}",
         )
 
-    cfg_dict = runner.mm_base_cfg(ctx.features.base_model, ctx.output_dir, "g4_mm")
+    cfg_dict = runner.mm_base_cfg(
+        ctx.features.base_model,
+        ctx.output_dir,
+        "g4_mm",
+        trust_remote_code=bool(ctx.options.get("trust_remote_code")),
+    )
     cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, "g4_mm")
     try:
         cfg = runner.resolve_cfg(cfg_path)
