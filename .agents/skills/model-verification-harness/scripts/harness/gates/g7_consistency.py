@@ -366,7 +366,7 @@ def run(ctx: GateContext) -> GateResult:
         status = GateStatus.PASS
         summary = (
             f"{compared} kernel variant(s) vs baseline step0={base_fp32:.4f}; "
-            "all engaged + within tol"
+            "all within tol; engagement verified where fingerprintable"
         )
     return GateResult(
         GATE_ID, GATE_NAME, status, summary=summary, details=details, data=data

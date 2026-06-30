@@ -177,7 +177,7 @@ _FAMILY_SUFFIXES = ("_moe_text", "_unified_text", "_text", "_moe", "_unified", "
 # tokens that are never a model_config_type but match the literal shapes
 _STOPWORDS = {"true", "false", "none", "auto", "default", "model_type", "self", "cfg"}
 
-_TOKEN = r"[A-Za-z][\w.\-]*"  # nosec B105 - a regex, not a secret
+_TOKEN = r"[A-Za-z][\w.\-]*"  # nosec B105  # noqa: S105 - regex fragment
 _RE_MEMBER = re.compile(rf"^['\"]({_TOKEN})['\"]\s*,?\s*$")
 _RE_DICTKEY = re.compile(rf"^['\"]({_TOKEN})['\"]\s*:")
 _RE_ENUM = re.compile(rf"^[A-Za-z_]\w*\s*=\s*['\"]({_TOKEN})['\"]")

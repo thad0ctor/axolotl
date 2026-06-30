@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -139,6 +140,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="how to resolve the model the gates exercise: 'path' (use --base-model "
         "as-is), 'checkpoint' (auto-match a tiny-* checkpoint by arch), 'shrink' "
         "(build a 2-layer model from --base-model's own config)",
+    )
+    p.add_argument(
+        "--model-config-type",
+        default="",
+        help="model_config_type for --tiny-strategy checkpoint when --base-model is omitted",
     )
     p.add_argument(
         "--gpus",
@@ -302,7 +308,7 @@ def _run_discovery(args, repo_root: Path | None) -> int:
             print(f"  ! {w}")
 
     top = candidates[0]
-    target = top["base_model"] or top["model_config_type"]
+    target = shlex.quote(str(top["base_model"] or top["model_config_type"]))
     print("\nSuggested follow-up (check out the PR, pick GPUs, then run the gates):")
     print(
         f"  verify_model.py --base-model {target} "
@@ -324,7 +330,10 @@ def main(argv: list[str] | None = None) -> int:
         repo_root = args.repo_root or _find_repo_root(Path.cwd())
         return _run_discovery(args, repo_root)
 
-    if not args.base_model:
+    # checkpoint strategy can resolve a tiny model by arch alone; other strategies need a base_model
+    if not args.base_model and not (
+        args.tiny_strategy == "checkpoint" and args.model_config_type
+    ):
         print("--base-model is required (or use --from-pr/--from-diff for discovery).")
         return 2
 
@@ -384,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         effective_base = tiny.resolve_base_model(
             args.base_model,
-            "",
+            args.model_config_type,
             strategy=args.tiny_strategy,
             output_dir=output_dir,
             trust_remote_code=args.trust_remote_code,

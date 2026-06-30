@@ -155,7 +155,9 @@ def _run_cfg(
     with _capture() as records:
         try:
             resolved = dict(load_cfg(str(cfg_path)))
-        except BaseException as err:  # noqa: BLE001 - any raise is a REJECTED verdict
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as err:  # noqa: BLE001 - any raise is a REJECTED verdict
             exc = err
     return resolved, exc, list(records)
 
@@ -584,7 +586,9 @@ def _bisect(ctx: GateContext, cell: _Cell) -> list[str]:
 def run(ctx: GateContext) -> GateResult:
     try:
         import axolotl.cli.config  # noqa: F401
-    except BaseException as err:  # noqa: BLE001
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as err:  # noqa: BLE001
         return GateResult.could_not_run(
             GATE_ID, GATE_NAME, f"axolotl import failed: {type(err).__name__}: {err}"
         )
