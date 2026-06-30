@@ -55,12 +55,12 @@ MLP sparsity is near-universal: the gated SwiGLU forward (`down(act(gate(x)) * u
 | Gemma3 (text) | **supported** — same `gelu_tanh` MLP path; `q_norm`/`k_norm`, `sliding_window`, no softcap by default |
 | Phi3 | **fused projections** — `qkv_proj`/`gate_up_proj` sliced into logical q/k/v + gate/up sub-blocks (`SparseFusedQKVAttention`/`SparseFusedGateUpMLP`); LoRA targets `[qkv_proj, o_proj]`. Dense-apply logit-exact |
 | Gemma4 | **supported** — same `gelu_tanh` MLP path as Gemma2/3; standard sliding/full attention |
-| Qwen3.5 / 3.6 | **gated attention** (Qwen3-Next-style): `q_proj` emits `[query \| gate]` per head, output × `sigmoid(gate)` before `o_proj`. `SparseGatedAttention` computes `q_proj` dense and splits the gate off (so it stays intact); k/v/o still sparsified. Detected structurally (`q_proj` out = 2× `o_proj` in). Hybrid: the linear-attention (GatedDeltaNet) layers have no q/k/v/o and are left dense; real 500-step training ~1.47× faster than dense LoRA at 9B (s=0.9) |
-| Qwen3.5-MoE / 3.6-MoE (and Qwen2-MoE …) | **trains** — the routed experts are a batched grouped-matmul (3-D `gate_up_proj`/`down_proj` weights), detected and **left dense** (contextual sparsity over grouped experts is out of scope; MoE already routes sparsely). The shared-expert SwiGLU and the gated/standard attention are sparsified normally |
+| Qwen3.5 / 3.6 | **gated attention** (Qwen3-Next): `q_proj` = `[query \| gate]`, output × `sigmoid(gate)`. `SparseGatedAttention` keeps `q_proj` dense (gate intact), sparsifies k/v/o (detected via `q_proj` out = 2× `o_proj` in). Hybrid linear-attn (GatedDeltaNet) layers left dense. ~1.47× vs dense LoRA at 9B |
+| MoE (Qwen3.5/3.6-MoE, Qwen2-MoE …) | **trains** — routed experts (batched 3-D grouped-matmul) left dense; shared-expert SwiGLU + attention sparsified |
 
 Registration is automatic at apply time; no per-arch user config. The generic attention forwards Gemma2's `attn_logit_softcapping` and uses each architecture's own eager-attention fallback, so arch-specific attention terms are applied. Only **gated MLP activations other than SiLU/`gelu_tanh`** are unsupported. To extend further, register a custom sparse class via `register_sparse_module` — see the [`sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md) skill.
 
-**Fused q/k-norm+RoPE (opt-in).** For gated-attention models, `fused_attn_kernel: true` (axolotl's existing flag) fuses the full-attention layers' q/k-norm + RoPE into one Triton kernel — full-rotary only (partial-rotary Qwen3.6 and CPU fall back to the bit-exact eager path), algorithmically identical (fp32 ~1e-6), ~1% whole-model win on top of the sparsity. Off by default.
+**Fused q/k-norm+RoPE (opt-in).** `fused_attn_kernel: true` fuses gated models' full-attention q/k-norm+RoPE into one Triton kernel (full-rotary only; partial-rotary/CPU fall back). fp32-identical, ~1% extra. Off by default.
 
 ## Constraints (v1)
 

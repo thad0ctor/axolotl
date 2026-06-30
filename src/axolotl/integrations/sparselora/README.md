@@ -1,67 +1,49 @@
 # SparseLoRA
 
-Contextual-sparsity acceleration for LoRA fine-tuning, integrated as an Axolotl plugin. Wraps [z-lab/sparselora](https://github.com/z-lab/sparselora) (ICML 2025, MIT; vendored under `_vendor/`) and adds **self-calibration** (the per-layer sparsity schedule and the SVD predictor factors are derived from *your* base model and *your* dataset, rather than z-lab's Llama-2/3-only published presets) and **model-agnostic wiring** (Llama, Qwen2/3, Mistral, Gemma, Phi3, Qwen3.5/3.6 gated attention, MoE, and any other SwiGLU-MLP / standard-or-gated-attention transformer, auto-detected at apply time rather than the upstream Llama-only hardcoding).
+Faster LoRA fine-tuning via contextual sparsity: a training-free SVD predictor skips redundant frozen-base neurons each step, while the LoRA adapter stays dense. Wraps [z-lab/sparselora](https://github.com/z-lab/sparselora) (ICML 2025, MIT; vendored under `_vendor/`) with **self-calibration** so it works on *your* model and dataset (not just z-lab's Llama-2/3 presets), and auto-wiring for most modern architectures. The paper reports ~1.6× wall-clock / ~2.2× compute with no accuracy loss; we measure ~1.47× on Qwen3.5-9B (s=0.9).
 
-## What it does
-
-Each training step, a training-free rank-8 SVD predictor selects which base-model neurons matter for the current context and skips the rest in the frozen-weight forward/backward path (the LoRA adapter stays dense). The paper reports up to ~2.2× compute and ~1.6× wall-clock reduction without accuracy loss.
-
-## Usage
+## Quickstart
 
 ```yaml
 plugins:
   - axolotl.integrations.sparselora.SparseLoRAPlugin
 
-base_model: meta-llama/Llama-3.1-8B-Instruct
 adapter: lora
-lora_target_modules: [q_proj, k_proj, v_proj, o_proj]   # attention-only (required, see below)
-sample_packing: false                                   # required (see below)
-
-datasets:
-  - path: tatsu-lab/alpaca
-    type: alpaca
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]   # attention-only (required)
+sample_packing: false                                   # required
 
 sparselora:
-  target_sparsity: 0.9      # overall base-path sparsity to aim for
-  predictor_rank: 8
-  start_step: 0.1           # first 10% of training stays dense (gradient stability)
-  calibration:
-    method: faithful        # faithful (default) | proxy | none
-    num_samples: 128
-    warmup_steps: 50        # faithful only
-    loss_budget: 0.01       # max per-layer reconstruction error when raising sparsity
+  target_sparsity: 0.9      # higher = faster, more loss
+  start_step: 0.1           # first 10% of training stays dense
 ```
 
-## Calibration
+Calibration runs automatically before training and caches its result — nothing else to set up.
 
-Before training, the plugin runs a sensitivity sweep over a slice of the **same** tokenized dataset and config the run will train on, and allocates per-layer sparsity to approach `target_sparsity` while keeping each layer's reconstruction error within `loss_budget`. Sensitive layers (often the earliest) stay dense automatically.
+## Config
 
-- **`faithful`** (default) — a short dense LoRA warm-up first, so the sweep sees realistic activations (the paper's "start from a fine-tuned reference"). The warm-up's weight updates are rolled back so real training starts clean.
-- **`proxy`** — forward-only sweep, no warm-up. Fast; works on any model.
-- **`none`** — skip the sweep and use an explicit `sparselora.layer_sparsity` map (keyed by full module path, e.g. `model.layers.3.mlp`).
+| Key | Default | What |
+|---|---|---|
+| `target_sparsity` | `0.9` | how aggressively to sparsify — lower it if loss matters more than speed |
+| `predictor_rank` | `8` | SVD predictor rank |
+| `start_step` | `0.1` | fraction of training kept dense up front (gradient stability) |
+| `calibration.method` | `faithful` | `faithful` (accurate) · `proxy` (fast, forward-only) · `none` (supply your own `layer_sparsity`) |
 
-## Cache (where it lives)
+`fused_attn_kernel: true` adds a small extra speedup on gated models (Qwen3.5/3.6).
 
-Calibration artifacts — the schedule (`schedule.json`) and SVD factors (`model.safetensors`) — are written to:
+## Supported models
 
-```text
-{output_dir}/sparselora_calibration/{key}/
-```
+Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistral, Cohere, StableLM, Gemma2/3/4, Phi3**, and most SwiGLU-MLP transformers. Only gated MLPs with an activation other than SiLU/`gelu_tanh` are unsupported (refused with a clear error). Full matrix and how to add a model: [`docs/agents/sparselora.md`](../../../../docs/agents/sparselora.md).
 
-(or `sparselora.cache_dir/{key}/` if set). `key` is a hash of the base model, adapter, dataset signature, target sparsity, predictor rank, and calibration params. A matching key reuses the artifacts; **the resolved path is logged at INFO on every run**. To force recalibration, delete that directory or change any input.
+## Limitations (v1)
 
-### Optional upstream sharing (off by default)
+- Attention-only LoRA (`q/k/v/o_proj`, or `qkv_proj/o_proj` for Phi3) — don't LoRA the MLP.
+- `sample_packing: false`.
+- Single-GPU or DDP — no FSDP / DeepSpeed ZeRO-3.
+- bf16 (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`); 8-bit not supported.
+- `torch_compile: true` works (the sparse path runs eager, the rest compiles).
 
-`sparselora.share_calibration: true` assembles an anonymous payload — model id and sparsity params and the resulting schedule **only, never any dataset content** — intended for an authors' calibration database. No endpoint is wired yet, so v1 only assembles and logs the payload; nothing is transmitted. Leave it `false` (default) and nothing leaves your machine.
+## Calibration & cache
 
-## Requirements & limitations (v1)
+Before training, a sensitivity sweep over a slice of *your* dataset sets per-layer sparsity to approach `target_sparsity` while keeping each layer within `loss_budget`; sensitive layers stay dense automatically. Results cache to `{output_dir}/sparselora_calibration/{key}/` (path logged at INFO) — delete that directory or change any input to recalibrate. `share_calibration` (off by default) would upload only the schedule + model id, never dataset content; no endpoint is wired, so nothing leaves your machine.
 
-- **Attention-only LoRA.** `lora_target_modules` must be attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`; or `qkv_proj`, `o_proj` for fused-projection models like Phi3). MLP projections must not be LoRA-wrapped — the MLP sparse path is incompatible with a LoRA-wrapped MLP linear. Validated at startup.
-- **`sample_packing: false`.** The context/output token split assumes unpacked sequences.
-- **Architecture: model-agnostic.** Gated SwiGLU-MLP (SiLU or `gelu_tanh`) + standard-attention transformers are supported and auto-detected at apply time (`arch_wiring.register_arch_wiring`): `SparseSwiGLUMLP` reads the model's gate activation (fused liger SiLU kernel, or a `gelu_tanh` predictor + compute for Gemma), and a generic `SparseAttention` handles per-arch differences it introspects — projection bias (Qwen2), `q_norm`/`k_norm` on the head dim (Qwen3/Gemma3), `sliding_window` (Qwen2/Qwen3/Mistral/Gemma), decoupled `head_dim` (Qwen3: q_out ≠ hidden, via a fixed GQA predictor), `query_pre_attn_scalar` scaling (Gemma), partial rotary (StableLM/Phi/GPT-NeoX-style: RoPE split to the rotary dim, rest passed through), Gemma2 attention-logit softcapping (forwarded to the attention interface; each arch's own eager fallback is used), **gated attention** (Qwen3-Next / Qwen3.5 / Qwen3.6: `q_proj` emits `[query | gate]` per head and the attention output is multiplied by `sigmoid(gate)` before `o_proj` — `SparseGatedAttention` computes `q_proj` dense and splits the gate off so it stays intact, while k/v/o are still sparsified), and **fused projections** (Phi3's `qkv_proj`/`gate_up_proj` are sliced into their logical q/k/v and gate/up sub-blocks via `SparseFusedQKVAttention`/`SparseFusedGateUpMLP`; for these models set `lora_target_modules: [qkv_proj, o_proj]`). **MoE** models (Qwen3.5-MoE / Qwen3.6-MoE, Qwen2-MoE, …) train too: the routed experts are a single batched grouped-matmul (3-D weights) that is left dense — contextual sparsity over grouped experts is out of scope, and MoE already routes sparsely — while the shared-expert SwiGLU and the (gated/standard) attention are sparsified normally. Verified on Llama, Qwen2, Qwen3 (incl. real Qwen3-0.6B/1.7B), Mistral, Cohere, StableLM (partial rotary), Gemma2 (convergence tracks dense), Gemma3-text, Gemma4 (gelu_tanh), Phi3 (fused, logit-exact), and Qwen3.5/3.6 (gated; real 500-step training ~1.47× faster than dense LoRA at 9B, s=0.9). **Rejected:** gated MLP activations other than SiLU/`gelu_tanh`. Extend custom wiring via `register_sparse_module`. Adding a new architecture is documented in the [`sparselora-add-model`](../../../../.agents/skills/sparselora-add-model/SKILL.md) agent skill.
-- **Fused q/k-norm+RoPE (opt-in).** For gated-attention models, setting `fused_attn_kernel: true` (axolotl's existing flag) fuses the q/k-norm + RoPE of the full-attention layers into one Triton kernel (`SparseGatedAttention`, full-rotary only; partial-rotary Qwen3.6 and CPU fall back to the bit-exact eager path). Algorithmically identical (fp32 ~1e-6; bf16 within fusion tolerance); a small (~1%) whole-model win on top of the sparsity. Off by default, so the eager path stays bit-exact unless you opt in.
-- **Single-GPU / DDP.** FSDP and DeepSpeed ZeRO-3 (parameter sharding) are not yet supported.
-- **`torch_compile` compatible.** The plugin marks its data-dependent regions (top-k channel prediction, boolean-mask token splits, 4-bit dequant) as `torch.compiler.disable` boundaries, so `torch_compile: true` runs without error — Dynamo graph-breaks around the sparse path (which executes eagerly and is already fast) and compiles the rest of the model. Contextual sparsity is inherently dynamic, so the sparse matmuls themselves are not captured in the compiled graph.
-- **Full-precision (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`, `load_in_4bit`) base.** For a 4-bit base, `SparseLinear4bit` dequantizes the frozen weight (which bitsandbytes does internally anyway at training batch sizes) and slices the matmul — a microbenchmark shows output-sparse projections (q/k/v/gate/up) land within ~5–15% of the full-precision SparseLoRA path (e.g. gate/up: 2.0×/3.2×/6.7× over dense QLoRA at sparsity 0.5/0.7/0.9). Input-sparse projections (o/down) only win at sparsity ≥0.7 — a pre-existing property of the gather-based path, not specific to 4-bit. 8-bit bases (`load_in_8bit`) are not supported.
-
-See `_vendor/PROVENANCE.md` for the vendored upstream commit and the (import-only) local edits.
+See `_vendor/PROVENANCE.md` for the vendored upstream commit and local edits.
