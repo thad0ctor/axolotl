@@ -41,11 +41,13 @@ The SVD predictors register everything as **buffers**, not parameters (`_vendor/
 
 Both survive. `_patch_forward` (`api.py:59-70`) patches the **top-level** `model.forward`; FSDP's root wrapper calls `self._fsdp_wrapped_module(...)` which dispatches to that patched bound method. Inside it, the per-step mask is bound onto each `SparseModule.forward` via `functools.partial` (`api.py:67`). Because the sparse submodules are *inside* an FSDP unit (not themselves separate FSDP wrappers under `TRANSFORMER_BASED_WRAP` at the decoder-layer granularity), `self.mlp`/`self.self_attn` are still the raw sparse modules and the instance-level `.forward` override is honored by `nn.Module.__call__`. The global `peft.tuners.lora.layer.Linear.forward = lora_forward` patch is a class-level patch applied pre-wrap and is unaffected by wrapping.
 
-### 5. Calibration under multi-GPU (a real subtlety — but safe as-is)
+### 5. Calibration under multi-GPU — base path is safe; broadcast hardening is PARKED
 
-The default `faithful`/`proxy` calibration runs inside `post_trainer_create`, i.e. on the **unwrapped, replicated** model on every rank, with **no distributed collectives** (no `all_reduce`/`barrier`/`DistributedSampler`). The calibration DataLoader uses `shuffle=False` over the first `num_samples` examples (`calibration.py:99-104`), factors come from the (identical) base weights, and the faithful warmup does identical LoRA steps on identical data per rank. So every rank deterministically computes the **same schedule** → the same module swap → matching FSDP flat-param structure across ranks. Verified: a non-empty calibrated schedule (16/16 modules, mean sparsity 0.50) applied consistently and trained to completion under FSDP2 with no cross-rank flat-param mismatch.
+The default `faithful`/`proxy` calibration runs inside `post_trainer_create`, i.e. on the **unwrapped, replicated** model on every rank. The calibration DataLoader uses `shuffle=False` over the first `num_samples` examples (`calibration.py:99-104`), factors come from the (identical) base weights, and the faithful warm-up does identical local LoRA steps on identical data per rank. So every rank deterministically computes the **same schedule** → the same module swap → matching FSDP flat-param structure across ranks. This is the path that was **verified in round 1**: a non-empty calibrated schedule (16/16 modules, mean sparsity 0.50) applied consistently and trained to completion under FSDP2, with all ranks calibrating in lockstep. **The base FSDP support (committed) ships without any calibration hardening and is safe** on this determinism argument plus the round-1 evidence.
 
-> Residual risk (not observed): bf16 reduction nondeterminism could in principle flip a single top-k/budget decision differently across ranks, which would desync the module swap. If that is ever seen in the wild, the robust hardening is *calibrate on rank 0 and broadcast the schedule*. It was not needed for any run here.
+> **Optional hardening — implemented + unit-tested, but PARKED (e2e deadlocked twice).** The residual risk is bf16-reduction nondeterminism flipping a single top-k / loss-budget decision differently across ranks, desyncing the swap. A first attempt — *calibrate on rank 0 only, then broadcast* — is asymmetric and deadlocks (non-zero ranks issue collectives rank 0 never reaches). It was rewritten to a **symmetric** design: every rank runs the full calibration (collectives stay matched), then a single `broadcast_object_list` that **all ranks issue** overwrites every rank's `layer_sparsity` with rank 0's, followed by a `barrier`; only the disk write (`save_cached` / `maybe_share`) is rank-0-gated. Helpers: `plugin.py::_broadcast_rank0_schedule`, `_calibrate_distributed`, `_compute_calibration`; the rank-gating logic is unit-tested (`TestRank0Broadcast`, with a `dist` double).
+>
+> **Status: not e2e-verified.** Both 2-GPU verification runs hit the 600 s hard timeout (`ACCEL_EXIT=124`) and were aborted — no 3-hour hang, the timeout did its job. Critically, the second run's log froze at `"[RANK:1] Loading raw datasets"`, i.e. **during distributed dataset preparation, *before* `post_trainer_create` (and therefore before any of the broadcast code) runs**. That points at the probe harness / FSDP dataset-prep path, not necessarily the hardening logic. Because the committed base path does not need this change, the hardening is **left uncommitted on `feat/sparselora-fsdp` and parked pending a clean e2e repro** (a minimal 2-GPU run that reaches `post_trainer_create` without hanging in dataset prep, e.g. with a pre-tokenized dataset and no monkeypatch harness).
 
 ## What was tested (2× RTX 3090, idx 1,2)
 
@@ -58,8 +60,11 @@ The default `faithful`/`proxy` calibration runs inside `post_trainer_create`, i.
 | full-precision LoRA | FSDP2 | lora | **faithful** (16/16 sparse) | trained, cross-rank consistent |
 | QLoRA 4-bit | FSDP1 | qlora | none | trained, `SparseLinear4bit` dequant-slice OK |
 | isolated probe | FSDP1 | — | — | confirmed full weight in forward |
+| full-precision LoRA | FSDP2 | lora | **faithful + broadcast hardening** | ⚠️ NOT verified — both 2-GPU runs hit the 600 s timeout; froze in distributed dataset prep, before `post_trainer_create`. Parked. |
 
 ## Implementation (branch `feat/sparselora-fsdp`)
+
+### Committed (`836849a1e`) — base FSDP support, e2e-verified
 
 Minimal, behavior-preserving:
 
@@ -69,8 +74,14 @@ Minimal, behavior-preserving:
 4. `docs/agents/sparselora.md` — constraints: "Single-GPU / DDP / FSDP (FSDP1 and FSDP2); no DeepSpeed ZeRO-3."
 5. `examples/llama-3/lora-sparselora-fsdp.yml` — new example config.
 
-All **90 sparselora tests pass** (17 skipped), pinned pre-commit (ruff/ruff-format/mypy/bandit) **clean**.
+This commit is **90 sparselora tests passing** (17 skipped), pinned pre-commit clean, and verified end-to-end on 2 GPUs (the matrix above, rows 1-7).
+
+### Uncommitted / PARKED — multi-GPU calibration broadcast hardening (NOT e2e-verified)
+
+Left in the working tree, **not committed**, pending a clean e2e repro (see §5):
+
+6. `plugin.py` — split out the pure `_compute_calibration` (runs on all ranks, no I/O), added the `_calibrate_distributed` dispatch and the testable `_broadcast_rank0_schedule` helper (all ranks calibrate; all ranks broadcast; rank 0 writes; barrier). `test_sparselora_plugin.py::TestRank0Broadcast` covers the rank-gating with a `dist` double (no process group needed) — unit tests pass (92 total with these), pre-commit clean. **The two 2-GPU e2e verification runs both deadlocked and were timeout-aborted; the hang occurred in distributed dataset prep, before this code runs.**
 
 ## Recommended next step
 
-Land the guard drop. Optional follow-ups, in priority order: (a) a small e2e multi-GPU smoke test in CI mirroring the FSDP2 faithful run; (b) only if cross-rank schedule desync is ever observed, add rank-0-calibrate + `broadcast_object_list` of the schedule in `post_trainer_create`. DeepSpeed ZeRO-3 remains out of scope (would need an FSDP-style in-forward gather hook around the sparse slice).
+Land the committed base FSDP support. For the parked hardening: build a minimal e2e repro that reaches `post_trainer_create` cleanly (pre-tokenized dataset, no monkeypatch harness, short NCCL timeout) to determine whether the dataset-prep hang is harness-specific; only then verify the broadcast and land it. Optional: a small e2e multi-GPU smoke test in CI mirroring the FSDP2 faithful run. DeepSpeed ZeRO-3 remains out of scope (would need an FSDP-style in-forward gather hook around the sparse slice).

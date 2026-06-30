@@ -21,6 +21,7 @@ from axolotl.integrations.sparselora.calibration import discover_target_modules
 from axolotl.integrations.sparselora.factors import compute_factor_tensors, save_factors
 from axolotl.integrations.sparselora.plugin import (
     SparseLoRAPlugin,
+    _broadcast_rank0_schedule,
     resolve_layer_sparsity,
 )
 from axolotl.utils.dict import DictDefault
@@ -165,6 +166,124 @@ class TestValidate:
         # crash on .get("stage") and must not be rejected.
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
         self._run(model, _validate_cfg(deepspeed={"zero_optimization": zero}))
+
+
+class _FakeDist:
+    """Minimal torch.distributed stand-in exercising the rank-0 broadcast helper.
+
+    ``broadcast_object_list`` publishes the source rank's payload (rank 0) and
+    overwrites it on receivers, mirroring the real collective without a process
+    group.
+    """
+
+    def __init__(self, rank, on_wire=None):
+        self.rank = rank
+        self.on_wire = on_wire
+        self.barriered = False
+
+    def get_rank(self):
+        return self.rank
+
+    def broadcast_object_list(self, obj_list, src=0):
+        if self.rank == src:
+            self.on_wire = obj_list[0]
+        else:
+            obj_list[0] = self.on_wire
+
+    def barrier(self):
+        self.barriered = True
+
+
+class TestRank0Broadcast:
+    def test_rank0_writes_and_publishes(self):
+        schedule = {"model.layers.0.self_attn": 0.5}
+        writes = []
+
+        dist = _FakeDist(rank=0)
+        out = _broadcast_rank0_schedule(dist, schedule, lambda: writes.append(1))
+        assert out == schedule
+        assert writes == [1]  # only rank 0 wrote the shared cache, exactly once
+        assert dist.on_wire == schedule
+        assert dist.barriered
+
+    def test_nonzero_rank_skips_write_and_adopts_rank0_schedule(self):
+        rank0_schedule = {"model.layers.0.self_attn": 0.25}
+        local_schedule = {"model.layers.0.self_attn": 0.30}  # bf16-diverged
+
+        def write():
+            raise AssertionError("only rank 0 may write the cache")
+
+        # Non-zero rank still computed its own (possibly diverged) schedule, but
+        # must adopt rank 0's via the broadcast and must not touch the cache.
+        dist = _FakeDist(rank=1, on_wire=rank0_schedule)
+        out = _broadcast_rank0_schedule(dist, local_schedule, write)
+        assert out == rank0_schedule
+        assert dist.barriered
+
+    def test_single_gpu_takes_plain_path_no_broadcast(self, monkeypatch):
+        # No process group (the single-GPU / non-distributed case): the schedule
+        # is written and returned directly, and the broadcast is never invoked —
+        # so single-GPU behavior is unchanged by the FSDP hardening.
+        plugin = SparseLoRAPlugin()
+        sched = {"model.layers.0.self_attn": 0.5}
+        monkeypatch.setattr(
+            plugin, "_compute_calibration", lambda *a, **k: (sched, {}, {})
+        )
+        writes, bcasts = [], []
+        monkeypatch.setattr(
+            "axolotl.integrations.sparselora.plugin.save_cached",
+            lambda *a, **k: writes.append(1),
+        )
+        monkeypatch.setattr(
+            "axolotl.integrations.sparselora.plugin.maybe_share", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "axolotl.integrations.sparselora.plugin._broadcast_rank0_schedule",
+            lambda *a, **k: bcasts.append(1),
+        )
+        out = plugin._calibrate_distributed(
+            DictDefault({}), None, None, [], 8, "key", None
+        )
+        assert out == sched
+        assert writes == [1]  # cache written directly, exactly once
+        assert bcasts == []  # broadcast NOT invoked without a process group
+
+    def test_multirank_routes_through_broadcast(self, monkeypatch):
+        # world_size > 1: all ranks compute, then route through the broadcast
+        # (which adopts rank 0's schedule and gates the cache write to rank 0).
+        plugin = SparseLoRAPlugin()
+        local = {"model.layers.0.self_attn": 0.5}
+        monkeypatch.setattr(
+            plugin, "_compute_calibration", lambda *a, **k: (local, {}, {})
+        )
+        monkeypatch.setattr("torch.distributed.is_available", lambda: True)
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+        monkeypatch.setattr("torch.distributed.get_world_size", lambda: 2)
+        seen = {}
+
+        def fake_bcast(dist, layer_sparsity, write_cache):
+            seen["in"] = layer_sparsity
+            write_cache()  # exercise the rank-0 write closure
+            return {"adopted": 1.0}
+
+        writes = []
+        monkeypatch.setattr(
+            "axolotl.integrations.sparselora.plugin.save_cached",
+            lambda *a, **k: writes.append(1),
+        )
+        monkeypatch.setattr(
+            "axolotl.integrations.sparselora.plugin.maybe_share", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "axolotl.integrations.sparselora.plugin._broadcast_rank0_schedule",
+            fake_bcast,
+        )
+        out = plugin._calibrate_distributed(
+            DictDefault({}), None, None, [], 8, "key", None
+        )
+        assert out == {"adopted": 1.0}  # adopted the broadcast result
+        assert seen["in"] == local  # passed the locally-computed schedule in
+        assert writes == [1]  # the write_cache closure still wrote once
 
 
 def _fake_trainer(model, n=4, t=16):

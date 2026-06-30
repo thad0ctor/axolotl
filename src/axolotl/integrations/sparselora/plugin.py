@@ -142,6 +142,40 @@ def _apply_compile_boundaries() -> None:
     _COMPILE_BOUNDARIES_SET = True
 
 
+def _broadcast_rank0_schedule(
+    dist: Any, layer_sparsity: dict, write_cache: Any
+) -> dict:
+    """Enforce rank 0's schedule on every rank and rank-gate the cache write.
+
+    **Every rank must call this with its own already-computed ``layer_sparsity``**
+    — calibration runs in lockstep on all ranks so its collectives (and the
+    ``faithful`` dense warm-up) match. Isolating calibration to a single rank
+    deadlocks (the other ranks issue collectives rank 0 never reaches), so the
+    only thing gated to rank 0 here is the disk write, not the compute.
+
+    bf16-reduction nondeterminism could in principle flip a single top-k /
+    loss-budget decision differently across ranks, desyncing the sparse-module
+    swap and corrupting the FSDP flat-param structure. The ``broadcast_object_list``
+    (a single collective all ranks issue) overwrites every rank's schedule with
+    rank 0's, making the swap bit-identical. Only rank 0 runs ``write_cache`` (the
+    ``save_cached`` / ``maybe_share`` I/O) to avoid a concurrent-write race; the
+    ``barrier`` after guarantees non-zero ranks do not read the factor files
+    before rank 0 has finished writing them.
+
+    Caller guarantees a process group with ``world_size > 1``. ``dist`` is
+    ``torch.distributed`` (or a test double exposing ``get_rank`` /
+    ``broadcast_object_list`` / ``barrier``).
+    """
+    is_rank0 = dist.get_rank() == 0
+    if is_rank0:
+        write_cache()
+    payload: list[Any] = [layer_sparsity if is_rank0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    dist.barrier()
+    schedule: dict = payload[0]
+    return schedule
+
+
 class SparseLoRAPlugin(BasePlugin):
     """Enable SparseLoRA contextual sparsity for full-precision LoRA fine-tuning."""
 
@@ -288,49 +322,94 @@ class SparseLoRAPlugin(BasePlugin):
         cached = load_cached(cfg, key)
 
         if cached is not None:
+            # Every rank loads the same deterministic cached schedule.
             layer_sparsity = {k: float(v) for k, v in cached["layer_sparsity"].items()}
-            cache_dir = entry_dir(cfg, key)
         else:
-            method = method_name(settings.calibration.method)
-            all_factors: dict = {}
-            if method == "none":
-                schedule = resolve_layer_sparsity(settings.layer_sparsity, target_names)
-            else:
-                # Factors for all targets feed the sensitivity sweep.
-                all_factors = compute_factor_tensors(model, target_names, rank)
-                schedule = calibrate(cfg, model, all_factors, trainer)
+            layer_sparsity = self._calibrate_distributed(
+                cfg, model, trainer, target_names, rank, key, settings
+            )
 
-            # Cover every target module so the global LoRA patch stays safe;
-            # calibration-dense modules are explicit 0.0.
-            layer_sparsity = {n: float(schedule.get(n, 0.0)) for n in target_names}
-            positive = [n for n, s in layer_sparsity.items() if s > 0.0]
-            # Reuse sweep factors where available; only compute the rest.
-            missing = [
-                n
-                for n in positive
-                if f"{n}.gate_proj.w1" not in all_factors
-                and f"{n}.q_proj.w1" not in all_factors
-            ]
-            factor_tensors = {
-                k: v
-                for k, v in all_factors.items()
-                if k.rsplit(".", 2)[0] in set(positive)
-            }
-            factor_tensors.update(compute_factor_tensors(model, missing, rank))
+        cache_dir = entry_dir(cfg, key)
+        self._apply(cfg, model, trainer, layer_sparsity, cache_dir, rank)
 
-            meta = {
-                "base_model": cfg.base_model,
-                "model_type": type(model).__name__,
-                "predictor_rank": rank,
-                "target_sparsity": settings.target_sparsity,
-                "calibration_method": method_name(settings.calibration.method),
-                "num_sparsified": len(positive),
-            }
+    def _calibrate_distributed(
+        self,
+        cfg: DictDefault,
+        model: nn.Module,
+        trainer: Any,
+        target_names: list[str],
+        rank: int,
+        key: str,
+        settings: Any,
+    ) -> dict[str, float]:
+        """Calibrate on a cache miss; deadlock-free under multi-rank.
+
+        **Every rank runs the full calibration** so the ``faithful`` warm-up and
+        any other collectives stay matched across ranks (isolating it to rank 0
+        deadlocks). With ``world_size > 1`` the schedule is then made bit-identical
+        via a broadcast all ranks issue, and only rank 0 writes the shared cache.
+        Single-GPU / no-process-group runs take the plain compute-and-write path,
+        unchanged.
+        """
+        layer_sparsity, meta, factor_tensors = self._compute_calibration(
+            cfg, model, trainer, target_names, rank, settings
+        )
+
+        def write_cache() -> None:
             save_cached(cfg, key, layer_sparsity, meta, factor_tensors)
             maybe_share(cfg, layer_sparsity, meta)
-            cache_dir = entry_dir(cfg, key)
 
-        self._apply(cfg, model, trainer, layer_sparsity, cache_dir, rank)
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            return _broadcast_rank0_schedule(dist, layer_sparsity, write_cache)
+        write_cache()
+        return layer_sparsity
+
+    def _compute_calibration(
+        self,
+        cfg: DictDefault,
+        model: nn.Module,
+        trainer: Any,
+        target_names: list[str],
+        rank: int,
+        settings: Any,
+    ) -> tuple[dict[str, float], dict, dict]:
+        """Compute the schedule + SVD factors without any I/O (runs on all ranks)."""
+        method = method_name(settings.calibration.method)
+        all_factors: dict = {}
+        if method == "none":
+            schedule = resolve_layer_sparsity(settings.layer_sparsity, target_names)
+        else:
+            # Factors for all targets feed the sensitivity sweep.
+            all_factors = compute_factor_tensors(model, target_names, rank)
+            schedule = calibrate(cfg, model, all_factors, trainer)
+
+        # Cover every target module so the global LoRA patch stays safe;
+        # calibration-dense modules are explicit 0.0.
+        layer_sparsity = {n: float(schedule.get(n, 0.0)) for n in target_names}
+        positive = [n for n, s in layer_sparsity.items() if s > 0.0]
+        # Reuse sweep factors where available; only compute the rest.
+        missing = [
+            n
+            for n in positive
+            if f"{n}.gate_proj.w1" not in all_factors
+            and f"{n}.q_proj.w1" not in all_factors
+        ]
+        factor_tensors = {
+            k: v for k, v in all_factors.items() if k.rsplit(".", 2)[0] in set(positive)
+        }
+        factor_tensors.update(compute_factor_tensors(model, missing, rank))
+
+        meta = {
+            "base_model": cfg.base_model,
+            "model_type": type(model).__name__,
+            "predictor_rank": rank,
+            "target_sparsity": settings.target_sparsity,
+            "calibration_method": method_name(settings.calibration.method),
+            "num_sparsified": len(positive),
+        }
+        return layer_sparsity, meta, factor_tensors
 
     def _apply(
         self,
