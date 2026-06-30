@@ -625,3 +625,21 @@ def test_parse_features_cannot_override_control_keys():
     feats = verify_model._parse_features("on_unavailable")
     merged = {**feats, "on_unavailable": "fail"}
     assert merged["on_unavailable"] == "fail"
+
+
+def test_g4_snapshot_slug_rejects_path_separators():
+    from harness.gates import g4_masking
+
+    # a model_config_type with separators must not escape the snapshot dir
+    assert g4_masking._snapshot_slug("../../etc/passwd") == "etc_passwd"
+    assert g4_masking._snapshot_slug("/abs/path") == "abs_path"
+    assert g4_masking._snapshot_slug("") == "unknown_model"
+    assert g4_masking._snapshot_slug("llama") == "llama"
+
+
+def test_resolve_base_model_checkpoint_by_arch_without_base():
+    from harness import tiny
+
+    # checkpoint strategy resolves a tiny-* checkpoint from model_config_type alone
+    resolved = tiny.resolve_base_model(None, "qwen3_moe", strategy="checkpoint")
+    assert resolved == tiny.TINY_CHECKPOINTS["qwen3"]

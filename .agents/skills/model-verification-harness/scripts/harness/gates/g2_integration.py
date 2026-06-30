@@ -858,6 +858,15 @@ def _check_moe(p: Probe) -> None:
     )
     if eob_err is not None:
         p.warn(f"EXPERTS_ONLY_BLOCK unreadable ({eob_err})")
+        p.add(
+            HookRow(
+                "experts-only MoE block",
+                "integrations/kernels/constants.py",
+                "is_moe",
+                MISSING,
+                f"is_moe but EXPERTS_ONLY_BLOCK unreadable: {eob_err}",
+            )
+        )
     elif p.mct in eob:
         resolve, _ = _safe_import(
             "axolotl.integrations.kernels.constants", "resolve_experts_class"
@@ -899,6 +908,9 @@ def _check_multimodal(p: Probe) -> None:
     keys, ok = _func_string_keys(
         p.src("processing_strategies.py"), "get_processing_strategy"
     )
+    chat_template_type = str(
+        p.opt.get("chat_template_type") or p.opt.get("chat_template") or p.mct
+    )
     if not ok:
         p.warn("get_processing_strategy keys unreadable")
     if not is_mm:
@@ -922,14 +934,14 @@ def _check_multimodal(p: Probe) -> None:
                 "is_multimodal but get_processing_strategy unreadable",
             )
         )
-    elif p.mct in keys:
+    elif chat_template_type in keys:
         p.add(
             HookRow(
                 "MM processing strategy",
                 "processing_strategies.py",
                 "is_multimodal (via chat_template_type)",
                 PRESENT,
-                f"model_config_type {p.mct!r} matches a get_processing_strategy key; "
+                f"chat_template_type {chat_template_type!r} matches a get_processing_strategy key; "
                 "note: selection is keyed on chat_template_type, not model_type",
             )
         )
@@ -940,7 +952,7 @@ def _check_multimodal(p: Probe) -> None:
                 "processing_strategies.py",
                 "is_multimodal (via chat_template_type)",
                 GENERIC,
-                f"model_config_type {p.mct!r} not among get_processing_strategy keys "
+                f"chat_template_type {chat_template_type!r} not among get_processing_strategy keys "
                 "(best-effort: strategy is keyed on chat_template_type, not model_type); "
                 "generic image-token masking may mislabel for this arch",
             )

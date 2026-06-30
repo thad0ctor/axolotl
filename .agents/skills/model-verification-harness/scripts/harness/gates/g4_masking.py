@@ -28,6 +28,12 @@ def applies(ctx: GateContext) -> bool:  # noqa: ARG001 - always applies (text + 
     return True
 
 
+def _snapshot_slug(name: str) -> str:
+    # model_config_type comes from model metadata; keep it from escaping snap_dir
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
+    return slug or "unknown_model"
+
+
 class _ListHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
@@ -54,15 +60,19 @@ def _prepare_with_template(ctx: GateContext, fixtures: list[Path]):
     last_exc: Exception | None = None
     for template in _CHAT_TEMPLATE_CANDIDATES:
         for fixture in fixtures:
+            # distinct run name per fixture: base_cfg derives output_dir + dataset_prepared_path
+            # from it, so a shared name lets a failed prepare's stale artifacts feed the fallback
+            fixture_tag = "nosys" if fixture.name.endswith("_nosys.jsonl") else "sys"
+            run_name = f"g4_{template}_{fixture_tag}"
             stanza = runner.chat_dataset_stanza(fixture)
             cfg_dict = runner.base_cfg(
                 ctx.features.base_model,
                 ctx.output_dir,
-                f"g4_{template}",
+                run_name,
                 datasets=[stanza],
             )
             cfg_dict["chat_template"] = template
-            cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, f"g4_{template}")
+            cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, run_name)
             try:
                 cfg = runner.resolve_cfg(cfg_path)
                 with _capture_chat_warnings() as warnings:
@@ -211,15 +221,17 @@ def _secondary_masking_pass(
     last_exc: Exception | None = None
     cfg = used_fixture = warns = None
     for fixture in fixtures:
+        fixture_tag = "nosys" if fixture.name.endswith("_nosys.jsonl") else "sys"
+        run_name = f"g4_{template_name}_{fixture_tag}"
         stanza = runner.chat_dataset_stanza(fixture)
         cfg_dict = runner.base_cfg(
             ctx.features.base_model,
             ctx.output_dir,
-            f"g4_{template_name}",
+            run_name,
             datasets=[stanza],
         )
         cfg_dict["chat_template"] = template_name
-        cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, f"g4_{template_name}")
+        cfg_path = runner.write_cfg(ctx.output_dir, cfg_dict, run_name)
         try:
             cfg = runner.resolve_cfg(cfg_path)
             with _capture_chat_warnings() as captured:
@@ -621,7 +633,7 @@ def run(ctx: GateContext) -> GateResult:
             ),
             key=lambda r: json.dumps(r, ensure_ascii=False),
         )
-        snap_path = Path(snap_dir) / f"{ctx.model_config_type}.json"
+        snap_path = Path(snap_dir) / f"{_snapshot_slug(ctx.model_config_type)}.json"
         data["snapshot_path"] = str(snap_path)
         if not snap_path.exists():
             snap_path.parent.mkdir(parents=True, exist_ok=True)
