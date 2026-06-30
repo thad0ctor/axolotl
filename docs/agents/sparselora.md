@@ -68,7 +68,7 @@ Registration is automatic at apply time; no per-arch user config. The generic at
 - Base: full-precision (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`, `load_in_4bit`; via `SparseLinear4bit`). 8-bit (`load_in_8bit`) not supported.
 - `sample_packing: false`.
 - SwiGLU-MLP (SiLU- or `gelu_tanh`-gated) + standard/gated/fused-attention architectures (Llama, Qwen2/3, Mistral, Cohere, StableLM, Gemma2/3/4, Phi3, Qwen3.5/3.6 gated + MoE, ...), incl. partial rotary, fused projections, gated attention, and MoE (experts dense), auto-detected. Other gated MLP activations are rejected/skipped; extend custom wiring via `register_sparse_module`.
-- Single-GPU / DDP; no FSDP or DeepSpeed ZeRO-3.
+- Single-GPU / DDP / FSDP (FSDP1 and FSDP2); no DeepSpeed ZeRO-3.
 - `torch_compile: true` works — the dynamic sparse regions are `torch.compiler.disable` boundaries (graph-break + eager), the rest compiles.
 
 ## Source map

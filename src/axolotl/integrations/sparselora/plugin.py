@@ -173,10 +173,10 @@ class SparseLoRAPlugin(BasePlugin):
                 "SparseLoRA's context/output token split is incompatible with "
                 "sample_packing. Set `sample_packing: false`."
             )
-        if cfg.fsdp or _is_deepspeed_zero3(cfg.deepspeed):
+        if _is_deepspeed_zero3(cfg.deepspeed):
             raise ValueError(
-                "SparseLoRA v1 supports single-GPU / DDP only; FSDP and DeepSpeed "
-                "ZeRO-3 shard parameters and are not yet supported."
+                "SparseLoRA v1 supports single-GPU / DDP / FSDP only; DeepSpeed "
+                "ZeRO-3 shards parameters and is not yet supported."
             )
 
         # Architecture support: auto-register sparse wiring for the loaded

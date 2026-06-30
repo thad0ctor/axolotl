@@ -45,7 +45,7 @@ Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistra
 | LoRA on MLP | ❌ | don't LoRA the MLP projections |
 | Single GPU | ✅ | |
 | DDP (multi-GPU) | ✅ | |
-| FSDP | ❌ | in-place sparse-module swap conflicts with FSDP sharding |
+| FSDP | ✅ | FSDP1 + FSDP2; swap runs before wrapping, weight is all-gathered in forward |
 | DeepSpeed ZeRO-1/2 | ✅ | |
 | DeepSpeed ZeRO-3 | ❌ | parameter sharding |
 | `sample_packing` | ❌ | needs unpacked sequences |

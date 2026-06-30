@@ -134,10 +134,13 @@ class TestValidate:
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
         self._run(model, _validate_cfg(load_in_4bit=True))
 
-    def test_fsdp_rejected(self):
+    def test_fsdp_accepted(self):
+        # The sparse-module swap runs before FSDP wraps the model, and the base
+        # weight is all-gathered in the FSDP forward pre-hook, so the output/input
+        # row/column slicing operates on the full materialized tensor. Validation
+        # must not reject FSDP (verified end-to-end on FSDP1 and FSDP2).
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
-        with pytest.raises(ValueError, match="FSDP"):
-            self._run(model, _validate_cfg(fsdp={"fsdp_offload_params": True}))
+        self._run(model, _validate_cfg(fsdp={"fsdp_offload_params": True}))
 
     @pytest.mark.parametrize(
         "deepspeed",
