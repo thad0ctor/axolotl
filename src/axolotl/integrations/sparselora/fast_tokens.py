@@ -27,6 +27,39 @@ import torch
 __all__ = ["MaskContext", "install_fast_tokens"]
 
 
+def _compute_packed_output_token_mask(
+    labels: torch.Tensor, input_ids: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Packing-aware output-token mask: a boolean ``[batch, seq]`` tensor.
+
+    Sample packing concatenates several sub-sequences into one row, so output
+    tokens form *multiple* disjoint segments per row rather than one contiguous
+    ``[left:right)`` block. The contiguous builder
+    (:func:`_compute_mask_context`) would have to grow its single block to the
+    whole envelope spanning all segments, sparsifying almost nothing. This keeps
+    every output token (``labels != -100``) dense and leaves the inter-segment
+    context tokens sparse.
+
+    The boolean ``SparseModule.token_splits`` reshapes the gathered tokens to
+    ``[batch, -1, hidden]``, which needs the same dense-token count in every
+    row. Output-token counts differ per packed row, so each short row is topped
+    up to the batch-wide maximum by marking its *leading* context tokens dense
+    (always safe — extra dense tokens only cost a little speed, never
+    correctness). The result is a uniform-count multi-segment mask the vendored
+    boolean split/join handle exactly.
+    """
+    del input_ids
+    is_out = labels != -100
+    dense_count = is_out.sum(dim=1)
+    max_dense = int(dense_count.max().item())
+    is_ctx = ~is_out
+    # cumsum over context positions is 1-indexed among them; keep the first
+    # ``need`` per row so every row reaches ``max_dense`` dense tokens.
+    need = (max_dense - dense_count).unsqueeze(1)
+    pad = is_ctx & (is_ctx.cumsum(dim=1) <= need)
+    return is_out | pad
+
+
 @dataclass(frozen=True)
 class MaskContext:
     """Boundaries of the dense (output-token) block ``[left:right)``.
@@ -92,12 +125,24 @@ def _fast_token_join(
 _INSTALLED = False
 
 
-def install_fast_tokens() -> None:
-    """Rebind the vendored token split/join + mask builder to the fast path.
+def install_fast_tokens(packing: bool = False) -> None:
+    """Rebind the vendored mask builder (and, unpacked, the token split/join).
 
-    Idempotent and behaviour-preserving (bit-identical). Call **before** the
-    ``torch.compiler.disable`` boundaries are applied so the disable wraps the
-    fast ``_compute_mask_context`` (it carries the per-step ``.item()`` syncs).
+    Idempotent. Call **before** the ``torch.compiler.disable`` boundaries are
+    applied so the disable wraps the installed mask builder (it carries the
+    per-step ``.item()`` syncs).
+
+    Unpacked (``packing=False``): install the contiguous-block fast path
+    (:func:`_compute_mask_context` + slice/cat split/join), which is
+    bit-identical to the boolean path for the single ``[left:right)`` block the
+    contiguous builder produces.
+
+    Packed (``packing=True``): a packed row holds several output segments, so the
+    single-block fast path cannot represent it (its slice/cat assumes one block
+    shared by every row, and packed rows have different per-row boundaries).
+    Install :func:`_compute_packed_output_token_mask` and keep the vendored
+    boolean ``token_splits`` / ``token_join``, which gather/scatter an arbitrary
+    multi-segment mask correctly.
     """
     global _INSTALLED
     if _INSTALLED:
@@ -106,7 +151,10 @@ def install_fast_tokens() -> None:
     from ._vendor.sparselora import api
     from ._vendor.sparselora.modules.base import SparseModule
 
-    api._compute_output_token_mask = _compute_mask_context
-    SparseModule.token_splits = _fast_token_splits  # type: ignore[method-assign]
-    SparseModule.token_join = staticmethod(_fast_token_join)  # type: ignore[assignment]
+    if packing:
+        api._compute_output_token_mask = _compute_packed_output_token_mask
+    else:
+        api._compute_output_token_mask = _compute_mask_context
+        SparseModule.token_splits = _fast_token_splits  # type: ignore[method-assign]
+        SparseModule.token_join = staticmethod(_fast_token_join)  # type: ignore[assignment]
     _INSTALLED = True

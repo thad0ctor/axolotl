@@ -10,7 +10,6 @@ plugins:
 
 adapter: lora
 lora_target_modules: [q_proj, k_proj, v_proj, o_proj]   # attention-only (required)
-sample_packing: false                                   # required
 
 sparselora:
   target_sparsity: 0.9      # higher = faster, more loss
@@ -48,7 +47,7 @@ Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistra
 | FSDP | ✅ | FSDP1 + FSDP2; swap runs before wrapping, weight is all-gathered in forward |
 | DeepSpeed ZeRO-1/2 | ✅ | |
 | DeepSpeed ZeRO-3 | ❌ | parameter sharding |
-| `sample_packing` | ❌ | needs unpacked sequences |
+| `sample_packing` | ✅ | multi-segment output mask; sparsity is diluted (shorter per-doc contexts) |
 | `torch_compile` | ✅ | sparse path runs eager, the rest compiles |
 
 ## Calibration & cache

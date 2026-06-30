@@ -152,6 +152,85 @@ def test_applied_model_logits_bit_identical(tiny_lora_model):
         fast_tokens._INSTALLED = False
 
 
+def test_packed_mask_keeps_outputs_dense_and_counts_uniform():
+    """A packed row holds several output segments; the packing mask keeps every
+    one dense and tops each row up to a uniform dense-token count."""
+    labels = torch.full((2, 16), -100)
+    # row 0: outputs at [3,5) and [9,12) -> 5 output tokens
+    labels[0, 3:5] = 1
+    labels[0, 9:12] = 1
+    # row 1: outputs at [2,3) and [13,16) -> 4 output tokens
+    labels[1, 2:3] = 1
+    labels[1, 13:16] = 1
+
+    mask = fast_tokens._compute_packed_output_token_mask(labels)
+    assert mask.dtype == torch.bool
+    assert mask.shape == labels.shape
+
+    # Every output token is dense (never sparsified) -- the correctness invariant.
+    assert torch.all(mask[labels != -100])
+    # Multi-segment: row 0 must have >1 disjoint True run (not one contiguous block).
+    row0 = mask[0].int()
+    transitions = (row0[1:] != row0[:-1]).sum().item()
+    assert transitions >= 3  # at least two separate True runs
+    # Uniform dense-token count across rows (required by the boolean view reshape).
+    counts = mask.sum(dim=1)
+    assert counts[0] == counts[1] == 5  # max output count, both rows topped up
+
+
+def test_packed_split_join_bit_identical_and_preserves_outputs():
+    """The vendored boolean split/join used under packing round-trips the packed
+    multi-segment mask exactly, and a sparse transform never touches outputs."""
+    torch.manual_seed(0)
+    dummy = SparseModule.__new__(SparseModule)
+
+    labels = torch.full((3, 20), -100)
+    labels[0, 2:4] = 1
+    labels[0, 10:13] = 1
+    labels[1, 5:6] = 1
+    labels[1, 15:19] = 1
+    labels[2, 1:2] = 1  # short row -> gets padded up with leading context
+    mask = fast_tokens._compute_packed_output_token_mask(labels)
+
+    x = torch.randn(3, 20, 8)
+    # Vendored boolean path (what packing installs).
+    sparse, dense = SparseModule.token_splits(dummy, x, mask)
+    assert torch.equal(_orig_split(x, mask)[0], sparse)
+    assert torch.equal(_orig_split(x, mask)[1], dense)
+
+    # Round-trip identity.
+    rejoined = SparseModule.token_join(sparse, dense, mask)
+    assert torch.equal(rejoined, x)
+
+    # Sparsifying context must leave every output token bit-identical.
+    sparse_t = sparse + 123.0  # "approximate" the context tokens
+    joined = SparseModule.token_join(sparse_t, dense, mask)
+    assert torch.equal(joined[labels != -100], x[labels != -100])
+
+
+def test_packing_install_keeps_boolean_split_join():
+    """With packing, install must set the multi-segment mask builder but leave the
+    boolean (not contiguous-slice) token split/join in place."""
+    from axolotl.integrations.sparselora._vendor.sparselora import api
+
+    orig_mask = api._compute_output_token_mask
+    orig_split = SparseModule.token_splits
+    orig_join = SparseModule.__dict__["token_join"]
+    try:
+        fast_tokens._INSTALLED = False
+        fast_tokens.install_fast_tokens(packing=True)
+        assert api._compute_output_token_mask is (
+            fast_tokens._compute_packed_output_token_mask
+        )
+        # Boolean split/join must NOT be replaced by the contiguous fast path.
+        assert SparseModule.token_splits is not fast_tokens._fast_token_splits
+    finally:
+        api._compute_output_token_mask = orig_mask
+        SparseModule.token_splits = orig_split
+        SparseModule.token_join = orig_join
+        fast_tokens._INSTALLED = False
+
+
 def test_install_is_idempotent_and_rebinds():
     orig_split = SparseModule.token_splits
     try:

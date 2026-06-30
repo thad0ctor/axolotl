@@ -120,10 +120,11 @@ class TestValidate:
         with pytest.raises(ValueError, match="predictor_rank"):
             self._run(model, _validate_cfg(predictor_rank=40))
 
-    def test_sample_packing_rejected(self):
+    def test_sample_packing_accepted(self):
+        # Packing is supported via the multi-segment output-token mask; validation
+        # must not reject it.
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])
-        with pytest.raises(ValueError, match="sample_packing"):
-            self._run(model, _validate_cfg(sample_packing=True))
+        self._run(model, _validate_cfg(sample_packing=True))
 
     def test_8bit_base_rejected(self):
         model = _lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"])

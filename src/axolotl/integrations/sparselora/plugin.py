@@ -86,7 +86,7 @@ def resolve_layer_sparsity(
     return schedule
 
 
-def _apply_compile_boundaries() -> None:
+def _apply_compile_boundaries(packing: bool = False) -> None:
     """Mark SparseLoRA's data-dependent code as ``torch.compiler.disable`` regions.
 
     Contextual sparsity (top-k channel selection, boolean-mask token splits,
@@ -108,9 +108,10 @@ def _apply_compile_boundaries() -> None:
     from .fast_tokens import install_fast_tokens
     from .sparse_linear_4bit import SparseLinear4bit
 
-    # Install the contiguous-block token split/join before wrapping the mask
-    # builder, so the torch.compiler.disable below wraps the fast version.
-    install_fast_tokens()
+    # Install the mask builder (and, unpacked, the contiguous-block token
+    # split/join) before wrapping it, so the torch.compiler.disable below wraps
+    # the installed version. Packing needs the multi-segment boolean mask.
+    install_fast_tokens(packing=packing)
 
     disable = torch.compiler.disable
     llama.SparseLlamaMLP.forward = disable(llama.SparseLlamaMLP.forward)  # type: ignore[method-assign]
@@ -201,11 +202,6 @@ class SparseLoRAPlugin(BasePlugin):
                 "SparseLoRA does not support 8-bit bases. Use a full-precision "
                 "base (adapter: lora) or a 4-bit base (adapter: qlora, "
                 "load_in_4bit: true)."
-            )
-        if cfg.sample_packing:
-            raise ValueError(
-                "SparseLoRA's context/output token split is incompatible with "
-                "sample_packing. Set `sample_packing: false`."
             )
         if _is_deepspeed_zero3(cfg.deepspeed):
             raise ValueError(
@@ -424,7 +420,7 @@ class SparseLoRAPlugin(BasePlugin):
         from ._vendor.sparselora.callback import SparseLoRACallback
 
         settings = cfg.sparselora
-        _apply_compile_boundaries()
+        _apply_compile_boundaries(packing=bool(cfg.sample_packing))
         if cfg.load_in_4bit:
             from .sparse_linear_4bit import register_4bit_support
 
