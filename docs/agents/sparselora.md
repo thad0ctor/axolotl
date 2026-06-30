@@ -1,6 +1,6 @@
 # SparseLoRA — Agent Reference
 
-Contextual-sparsity acceleration for LoRA fine-tuning. A training-free rank-8 SVD predictor skips redundant base-model neurons each step (LoRA stays dense). Vendored from [z-lab/sparselora](https://github.com/z-lab/sparselora) (ICML 2025) with **self-calibration** (so it works on any model + dataset, not just z-lab's published presets) and **model-agnostic wiring** (Llama, Qwen2, Qwen3, Mistral, and any other SwiGLU-MLP / standard-attention architecture, auto-detected at apply time). Full usage: [src/axolotl/integrations/sparselora/README.md](../../src/axolotl/integrations/sparselora/README.md). Adding a new architecture's wiring: skill [`.agents/skills/sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md).
+Contextual-sparsity acceleration for LoRA fine-tuning. A training-free rank-8 SVD predictor skips redundant base-model neurons each step (LoRA stays dense). Vendored from [z-lab/sparselora](https://github.com/z-lab/sparselora) (ICML 2025) with **self-calibration** (so it works on any model + dataset, not just z-lab's published presets) and **model-agnostic wiring** (Llama, Qwen2/3, Mistral, Gemma, Phi3, Qwen3.5/3.6 gated attention, MoE, and any other SwiGLU-MLP / standard-or-gated-attention architecture, auto-detected at apply time). Full usage: [src/axolotl/integrations/sparselora/README.md](../../src/axolotl/integrations/sparselora/README.md). Adding a new architecture's wiring: skill [`.agents/skills/sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md).
 
 ## Enable
 
@@ -54,15 +54,20 @@ MLP sparsity is near-universal: the gated SwiGLU forward (`down(act(gate(x)) * u
 | Gemma2 | **supported** — `gelu_tanh` gated MLP (`SparseSwiGLUMLP` + `_GELUFFNPredictor`), attention-logit **softcapping** forwarded to the attention interface, `query_pre_attn_scalar` scaling and `sliding_window` inherited. Dense-apply is logit-exact; convergence tracks dense |
 | Gemma3 (text) | **supported** — same `gelu_tanh` MLP path; `q_norm`/`k_norm`, `sliding_window`, no softcap by default |
 | Phi3 | **fused projections** — `qkv_proj`/`gate_up_proj` sliced into logical q/k/v + gate/up sub-blocks (`SparseFusedQKVAttention`/`SparseFusedGateUpMLP`); LoRA targets `[qkv_proj, o_proj]`. Dense-apply logit-exact |
+| Gemma4 | **supported** — same `gelu_tanh` MLP path as Gemma2/3; standard sliding/full attention |
+| Qwen3.5 / 3.6 | **gated attention** (Qwen3-Next-style): `q_proj` emits `[query \| gate]` per head, output × `sigmoid(gate)` before `o_proj`. `SparseGatedAttention` computes `q_proj` dense and splits the gate off (so it stays intact); k/v/o still sparsified. Detected structurally (`q_proj` out = 2× `o_proj` in). Hybrid: the linear-attention (GatedDeltaNet) layers have no q/k/v/o and are left dense; real 500-step training ~1.47× faster than dense LoRA at 9B (s=0.9) |
+| Qwen3.5-MoE / 3.6-MoE (and Qwen2-MoE …) | **trains** — the routed experts are a batched grouped-matmul (3-D `gate_up_proj`/`down_proj` weights), detected and **left dense** (contextual sparsity over grouped experts is out of scope; MoE already routes sparsely). The shared-expert SwiGLU and the gated/standard attention are sparsified normally |
 
-Registration is automatic at apply time; no per-arch user config. The generic attention forwards Gemma2's `attn_logit_softcapping` and uses each architecture's own eager-attention fallback, so arch-specific attention terms are applied. Only **gated activations other than SiLU/`gelu_tanh`** are unsupported. To extend further, register a custom sparse class via `register_sparse_module` — see the [`sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md) skill.
+Registration is automatic at apply time; no per-arch user config. The generic attention forwards Gemma2's `attn_logit_softcapping` and uses each architecture's own eager-attention fallback, so arch-specific attention terms are applied. Only **gated MLP activations other than SiLU/`gelu_tanh`** are unsupported. To extend further, register a custom sparse class via `register_sparse_module` — see the [`sparselora-add-model`](../../.agents/skills/sparselora-add-model/SKILL.md) skill.
+
+**Fused q/k-norm+RoPE (opt-in).** For gated-attention models, `fused_attn_kernel: true` (axolotl's existing flag) fuses the full-attention layers' q/k-norm + RoPE into one Triton kernel — full-rotary only (partial-rotary Qwen3.6 and CPU fall back to the bit-exact eager path), algorithmically identical (fp32 ~1e-6), ~1% whole-model win on top of the sparsity. Off by default.
 
 ## Constraints (v1)
 
 - Attention-only LoRA (`q/k/v/o_proj`); MLP must not be LoRA-wrapped — **validated at startup**.
 - Base: full-precision (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`, `load_in_4bit`; via `SparseLinear4bit`). 8-bit (`load_in_8bit`) not supported.
 - `sample_packing: false`.
-- SwiGLU-MLP (SiLU- or `gelu_tanh`-gated) + standard-attention architectures (Llama, Qwen2, Qwen3, Mistral, Cohere, StableLM, Gemma2, Gemma3-text, Phi3, ...), incl. partial rotary and fused projections, auto-detected. Other gated activations are rejected/skipped; extend custom wiring via `register_sparse_module`.
+- SwiGLU-MLP (SiLU- or `gelu_tanh`-gated) + standard/gated/fused-attention architectures (Llama, Qwen2/3, Mistral, Cohere, StableLM, Gemma2/3/4, Phi3, Qwen3.5/3.6 gated + MoE, ...), incl. partial rotary, fused projections, gated attention, and MoE (experts dense), auto-detected. Other gated MLP activations are rejected/skipped; extend custom wiring via `register_sparse_module`.
 - Single-GPU / DDP; no FSDP or DeepSpeed ZeRO-3.
 - `torch_compile: true` works — the dynamic sparse regions are `torch.compiler.disable` boundaries (graph-break + eager), the rest compiles.
 
