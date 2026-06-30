@@ -275,8 +275,8 @@ def run(ctx: GateContext) -> GateResult:
 
     # (e) packing must not change the math: step-0 loss packed-vs-unpacked parity. Opt-in
     # (profile=full/pack_parity) since it spawns two train forwards — BUT auto-enabled when
-    # the type ships a monkeypatch/models/<type>/ custom modeling dir and a GPU is present,
-    # since that custom get_cu_seqlens/packing path is exactly what no other gate exercises
+    # the type ships a monkeypatch/models/<type>/ custom modeling dir AND the user pinned
+    # --gpus, since that custom get_cu_seqlens/packing path is what no other gate exercises
     custom_modeling = (
         ctx.repo_root
         / "src"
@@ -285,7 +285,9 @@ def run(ctx: GateContext) -> GateResult:
         / "models"
         / ctx.model_config_type
     ).is_dir()
-    auto_parity = ctx.gpu_available and custom_modeling
+    # require an explicit --gpus allocation, not mere GPU presence: an unpinned auto-run
+    # would default to cuda:0, a device the user may have meant to leave untouched
+    auto_parity = custom_modeling and bool(ctx.options.get("gpus"))
     want_parity = (
         ctx.profile == "full" or bool(ctx.options.get("pack_parity")) or auto_parity
     )
@@ -306,7 +308,7 @@ def run(ctx: GateContext) -> GateResult:
         }
     if auto_parity:
         details.append(
-            f"note: pack parity auto-enabled (monkeypatch/models/{ctx.model_config_type}/ + GPU)"
+            f"note: pack parity auto-enabled (monkeypatch/models/{ctx.model_config_type}/ + pinned --gpus)"
         )
     if parity["status"] == "mismatch":
         findings.append(parity["note"])
