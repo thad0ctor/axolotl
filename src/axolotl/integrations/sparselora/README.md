@@ -34,13 +34,22 @@ Calibration runs automatically before training and caches its result — nothing
 
 Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistral, Cohere, StableLM, Gemma2/3/4, Phi3**, and most SwiGLU-MLP transformers. Only gated MLPs with an activation other than SiLU/`gelu_tanh` are unsupported (refused with a clear error). Full matrix and how to add a model: [`docs/agents/sparselora.md`](../../../../docs/agents/sparselora.md).
 
-## Limitations (v1)
+## Compatibility (v1)
 
-- Attention-only LoRA (`q/k/v/o_proj`, or `qkv_proj/o_proj` for Phi3) — don't LoRA the MLP.
-- `sample_packing: false`.
-- Single-GPU or DDP — no FSDP / DeepSpeed ZeRO-3.
-- bf16 (`adapter: lora`) or 4-bit QLoRA (`adapter: qlora`); 8-bit not supported.
-- `torch_compile: true` works (the sparse path runs eager, the rest compiles).
+| | Status | Notes |
+|---|:---:|---|
+| LoRA (bf16) | ✅ | `adapter: lora` |
+| QLoRA (4-bit) | ✅ | `adapter: qlora` + `load_in_4bit` |
+| 8-bit base | ❌ | |
+| Attention-only LoRA | ✅ | `q/k/v/o_proj` (or `qkv_proj/o_proj` for Phi3) — **required** |
+| LoRA on MLP | ❌ | don't LoRA the MLP projections |
+| Single GPU | ✅ | |
+| DDP (multi-GPU) | ✅ | |
+| FSDP | ❌ | in-place sparse-module swap conflicts with FSDP sharding |
+| DeepSpeed ZeRO-1/2 | ✅ | |
+| DeepSpeed ZeRO-3 | ❌ | parameter sharding |
+| `sample_packing` | ❌ | needs unpacked sequences |
+| `torch_compile` | ✅ | sparse path runs eager, the rest compiles |
 
 ## Calibration & cache
 
