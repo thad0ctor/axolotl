@@ -556,6 +556,71 @@ def test_plain_attention_is_not_gated():
     assert not is_gated_attention(attn)
 
 
+def _gated_attn_stub(head_dim, device="cpu"):
+    """Bare SparseGatedAttention with just the attrs _qk_norm_rope reads."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+
+    from axolotl.integrations.sparselora.arch_wiring import SparseGatedAttention
+
+    obj = SparseGatedAttention.__new__(SparseGatedAttention)
+    torch.nn.Module.__init__(obj)  # set up _modules so submodules can be assigned
+    obj.q_norm = Qwen3_5RMSNorm(head_dim).to(device)
+    obj.k_norm = Qwen3_5RMSNorm(head_dim).to(device)
+    obj.q_norm.weight.data.normal_(0, 0.1)
+    obj.k_norm.weight.data.normal_(0, 0.1)
+    obj._rotary_dim = None
+    return obj
+
+
+def test_fused_qk_norm_rope_off_by_default_and_falls_back_off_cuda():
+    """The fused kernel is opt-in (default off) and, when enabled off-CUDA, falls
+    back to the eager path bit-identically (never crashes)."""
+    from axolotl.integrations.sparselora.arch_wiring import SparseGatedAttention
+
+    assert SparseGatedAttention._use_fused_qk_norm_rope is False
+
+    obj = _gated_attn_stub(32)
+    b, t, nh, nkv, hd = 1, 8, 4, 2, 32
+    q = torch.randn(b, t, nh, hd)
+    k = torch.randn(b, t, nkv, hd)
+    ang = torch.randn(b, t, hd)
+    pos = (ang.cos(), ang.sin())
+
+    obj._use_fused_qk_norm_rope = False
+    q_sep, k_sep = obj._qk_norm_rope(q, k, pos)
+    obj._use_fused_qk_norm_rope = True  # on, but CPU -> must fall back identically
+    q_fb, k_fb = obj._qk_norm_rope(q, k, pos)
+    assert torch.equal(q_fb, q_sep) and torch.equal(k_fb, k_sep)
+
+
+@cuda_only
+def test_fused_qk_norm_rope_matches_separate_on_cuda():
+    """On CUDA the fused q/k-norm+RoPE kernel matches the eager path within bf16
+    fusion tolerance (algorithmically identical; verified ~1e-6 in fp32)."""
+    from axolotl.integrations.sparselora.arch_wiring import _fused_rms_norm_rope
+
+    if _fused_rms_norm_rope is None:
+        pytest.skip("fused_rms_norm_rope kernel unavailable")
+
+    torch.manual_seed(0)
+    hd = 256
+    obj = _gated_attn_stub(hd, device="cuda")
+    obj.q_norm = obj.q_norm.to(torch.bfloat16)
+    obj.k_norm = obj.k_norm.to(torch.bfloat16)
+    b, t, nh, nkv = 1, 64, 4, 2
+    q = torch.randn(b, t, nh, hd, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(b, t, nkv, hd, device="cuda", dtype=torch.bfloat16)
+    ang = torch.randn(b, t, hd, device="cuda", dtype=torch.bfloat16)
+    pos = (ang.cos(), ang.sin())  # bounded, like real RoPE
+
+    obj._use_fused_qk_norm_rope = False
+    q_sep, k_sep = obj._qk_norm_rope(q, k, pos)
+    obj._use_fused_qk_norm_rope = True
+    q_fus, k_fus = obj._qk_norm_rope(q, k, pos)
+    assert torch.allclose(q_fus.float(), q_sep.float(), atol=6e-2, rtol=1e-2)
+    assert torch.allclose(k_fus.float(), k_sep.float(), atol=6e-2, rtol=1e-2)
+
+
 def test_batched_moe_experts_not_detected_as_mlp():
     """A batched 3-D expert weight (MoE, e.g. Qwen3_5MoeExperts) exposes
     gate_up_proj/down_proj as Parameters, not Linears. It must NOT be detected as

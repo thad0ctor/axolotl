@@ -373,7 +373,28 @@ class SparseLoRAPlugin(BasePlugin):
         apply_sparselora(model, sl_config)
         if cfg.load_in_4bit:
             self._patch_4bit_lora_forward(model)
+        if cfg.fused_attn_kernel:
+            self._enable_fused_qk_norm_rope(model)
         trainer.add_callback(SparseLoRACallback(settings.start_step, settings.end_step))
+
+    def _enable_fused_qk_norm_rope(self, model: nn.Module) -> None:
+        """Honor ``fused_attn_kernel`` on SparseLoRA's gated attention: axolotl's
+        class-level fused-attn patch is shadowed once the module is re-wired to
+        SparseGatedAttention, so enable the fused q/k-norm+RoPE kernel on the
+        sparse modules directly."""
+        from .arch_wiring import SparseGatedAttention
+
+        enabled = 0
+        for module in model.modules():
+            if isinstance(module, SparseGatedAttention):
+                module._use_fused_qk_norm_rope = True
+                enabled += 1
+        if enabled:
+            LOG.info(
+                "SparseLoRA: fused q/k-norm+RoPE kernel enabled on %d gated "
+                "attention layer(s).",
+                enabled,
+            )
 
     def _patch_4bit_lora_forward(self, model: nn.Module) -> None:
         """Route sparse indices through PEFT 4-bit LoRA wrappers.

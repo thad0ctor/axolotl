@@ -62,6 +62,14 @@ try:
 except Exception:  # noqa: BLE001 - liger is CUDA-only; the gelu path doesn't need it
     _silu_mul = None
 
+_fused_rms_norm_rope: Any
+try:
+    from axolotl.kernels.gemma4_fused_rope import fused_rms_norm_rope
+
+    _fused_rms_norm_rope = fused_rms_norm_rope
+except Exception:  # noqa: BLE001 - Triton kernel; absent off-CUDA. Falls back to eager.
+    _fused_rms_norm_rope = None
+
 _MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 # Optional per-arch attention attributes carried onto the sparse module.
@@ -562,6 +570,25 @@ class SparseAttention(SparseLlamaAttention):
         standard attention; :class:`SparseGatedAttention` applies the gate."""
         return attn_output
 
+    def _qk_norm_rope(self, Q: torch.Tensor, K: torch.Tensor, position_embeddings):
+        """Apply optional q/k-norm then RoPE to ``(B, T, H, D)`` Q/K, returning
+        ``(B, H, T, D)``. Override point for a fused norm+RoPE kernel."""
+        if self.q_norm is not None:
+            Q = self.q_norm(Q)
+        if self.k_norm is not None:
+            K = self.k_norm(K)
+        Q = Q.transpose(1, 2)
+        K = K.transpose(1, 2)
+        cos, sin = position_embeddings
+        if self._rotary_dim is None:
+            return apply_rotary_pos_emb(Q, K, cos, sin)
+        # Rotate only the leading rotary_dim of each head; pass the rest through.
+        r = self._rotary_dim
+        q_rot, q_pass = Q[..., :r], Q[..., r:]
+        k_rot, k_pass = K[..., :r], K[..., r:]
+        q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+        return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
+
     def _qkv(self, hidden_states: torch.Tensor, masks, sparse: bool):
         """Project to flat ``(Q, K, V, v_i)``; override point for fused qkv_proj.
 
@@ -598,25 +625,9 @@ class SparseAttention(SparseLlamaAttention):
         Q = Q.view(hidden_shape)
         K = K.view(hidden_shape)
         V = V.view(hidden_shape).transpose(1, 2)
-        if self.q_norm is not None:
-            Q = self.q_norm(Q)
-        if self.k_norm is not None:
-            K = self.k_norm(K)
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-
         assert position_embeddings is not None
+        Q, K = self._qk_norm_rope(Q, K, position_embeddings)
         cos, sin = position_embeddings
-        if self._rotary_dim is None:
-            Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
-        else:
-            # Rotate only the leading rotary_dim of each head; pass the rest through.
-            r = self._rotary_dim
-            q_rot, q_pass = Q[..., :r], Q[..., r:]
-            k_rot, k_pass = K[..., :r], K[..., r:]
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
-            Q = torch.cat([q_rot, q_pass], dim=-1)
-            K = torch.cat([k_rot, k_pass], dim=-1)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -733,6 +744,35 @@ class SparseGatedAttention(SparseAttention):
     """
 
     _gate: Optional[torch.Tensor] = None
+    # Opt-in (set by the plugin when cfg.fused_attn_kernel): fuse q/k-norm + RoPE
+    # into one Triton kernel. Off by default (the separate path is bit-exact).
+    _use_fused_qk_norm_rope: bool = False
+
+    def _qk_norm_rope(self, Q: torch.Tensor, K: torch.Tensor, position_embeddings):
+        # Fuse q/k RMSNorm + RoPE when enabled. Qwen3.5/3.6 RMSNorm scales by
+        # (1 + weight) -> unit_offset=True. Restricted to full rotary (the kernel
+        # supports partial via cos width, but only full is parity-verified here);
+        # partial-rotary (Qwen3.6) and CPU/no-kernel fall back to the eager path.
+        if not (
+            self._use_fused_qk_norm_rope
+            and _fused_rms_norm_rope is not None
+            and Q.is_cuda
+            and self.q_norm is not None
+            and self.k_norm is not None
+            and self._rotary_dim is None
+        ):
+            return super()._qk_norm_rope(Q, K, position_embeddings)
+        cos, sin = position_embeddings
+        eps = getattr(self.q_norm, "eps", None)
+        if eps is None:
+            eps = getattr(self.q_norm, "variance_epsilon", 1e-6)
+        Q = _fused_rms_norm_rope(
+            Q, self.q_norm.weight, cos, sin, eps=eps, unit_offset=True
+        ).transpose(1, 2)
+        K = _fused_rms_norm_rope(
+            K, self.k_norm.weight, cos, sin, eps=eps, unit_offset=True
+        ).transpose(1, 2)
+        return Q, K
 
     def _split_query_gate(self, q_full: torch.Tensor):
         *prefix, _ = q_full.shape
