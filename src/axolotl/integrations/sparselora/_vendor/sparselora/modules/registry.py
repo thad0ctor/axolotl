@@ -48,7 +48,8 @@ def get_sparsity_mode(sub_name: str):
     """
     if "lora_" in sub_name:
         return None
-    proj = sub_name.split(".")[0]
+    parts = sub_name.split(".")
+    proj = parts[-2] if len(parts) > 1 and parts[-1] == "base_layer" else parts[-1]
     is_base_layer = ".base_layer" in sub_name
     if proj in _OUT_PROJS:
         return "out_scatter" if is_base_layer else "out"

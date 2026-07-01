@@ -394,7 +394,9 @@ def warmup_lora(
     """Short dense LoRA fine-tune so calibration sees realistic activations.
 
     Returns True if the warm-up ran cleanly (or was a no-op), False if it raised
-    after mutating weights — the caller restores the clean snapshot in that case.
+    after mutating weights. Either way the caller restores the clean LoRA snapshot
+    in its ``finally`` block (calibration is side-effect-free by design); the False
+    return only signals that the warm-up mutated weights before failing.
     """
     if steps <= 0:
         return True
