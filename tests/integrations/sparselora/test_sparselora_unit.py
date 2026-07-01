@@ -12,14 +12,33 @@ from axolotl.integrations.sparselora import (
 )
 from axolotl.integrations.sparselora.calibration import (
     SPARSITY_GRID,
-    allocate_schedule,
+    allocate_structural,
     discover_target_modules,
+    load_preset_schedule,
+    refine_with_sensitivity,
+    resolve_attn_sparsity,
     run_sensitivity,
 )
 from axolotl.integrations.sparselora.factors import (
     compute_factor_tensors,
     svd_factor,
 )
+
+
+def _multi_layer_llama(num_hidden_layers: int = 8):
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    return LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+        )
+    )
 
 
 class TestSVDFactors:
@@ -75,27 +94,136 @@ class TestCalibration:
             assert all(grid[s] >= 0.0 for s in SPARSITY_GRID)
             assert grid[SPARSITY_GRID[-1]] >= grid[SPARSITY_GRID[0]] - 1e-4
 
-    def test_allocate_respects_budget_and_targets(self):
-        # Two layers: one low-error (sparsifiable), one high-error (stays dense).
-        errors = {
-            "a": {s: 0.001 for s in SPARSITY_GRID},
-            "b": {s: 0.9 for s in SPARSITY_GRID},
-        }
-        sched = allocate_schedule(errors, target_sparsity=0.4, loss_budget=0.01)
-        assert "b" not in sched  # over budget at every sparsity -> dense
-        assert sched.get("a", 0.0) > 0.0
+    def test_resolve_attn_sparsity(self):
+        # Default caps attention below the MLP level (z-lab: 0.75 attn vs 0.99 MLP).
+        assert resolve_attn_sparsity(0.99, None) == 0.75
+        assert resolve_attn_sparsity(0.5, None) == 0.5
+        assert resolve_attn_sparsity(0.9, 0.3) == 0.3
 
-    def test_allocate_empty_when_all_over_budget(self):
-        errors = {"a": {s: 0.5 for s in SPARSITY_GRID}}
-        assert allocate_schedule(errors, 0.9, loss_budget=0.01) == {}
+    def test_structural_is_nonempty_and_zlab_shaped(self):
+        # The bug being fixed: the default schedule was empty (0/N sparse). The
+        # structural profile must sparsify a deep band while keeping shallow +
+        # final layers dense, MLP more aggressively than attention.
+        model = _multi_layer_llama(8)
+        targets = discover_target_modules(model)
+        sched = allocate_structural(
+            model,
+            targets,
+            target_sparsity=0.9,
+            attn_sparsity=0.75,
+            dense_prefix=0.1,
+            attn_dense_prefix=0.45,
+        )
+        assert sched, "structural schedule must never be empty for a normal model"
+
+        def idx(name):
+            return int(name.split(".layers.")[1].split(".")[0])
+
+        mlp = {idx(n): v for n, v in sched.items() if n.endswith("mlp")}
+        attn = {idx(n): v for n, v in sched.items() if n.endswith("self_attn")}
+        assert set(mlp.values()) == {0.9} and set(attn.values()) == {0.75}
+        # Shallow (layer 0) and final (layer 7) layers stay dense in both groups.
+        assert 0 not in mlp and 7 not in mlp
+        assert 0 not in attn and 7 not in attn
+        # Deep layers are sparsified; attention starts deeper than the MLP.
+        assert 6 in mlp and 6 in attn
+        assert min(attn) > min(mlp)
+
+    def test_structural_keeps_final_layer_dense(self):
+        model = _multi_layer_llama(4)
+        targets = discover_target_modules(model)
+        sched = allocate_structural(
+            model, targets, 0.9, 0.75, dense_prefix=0.0, attn_dense_prefix=0.0
+        )
+        # Even with no dense prefix, the final layer is never sparsified.
+        assert not any(n.endswith(".layers.3.mlp") for n in sched)
+        assert not any(n.endswith(".layers.3.self_attn") for n in sched)
+
+    def test_refine_demotes_most_sensitive_band_layer(self):
+        model = _multi_layer_llama(8)
+        targets = discover_target_modules(model)
+        base = allocate_structural(model, targets, 0.9, 0.75, 0.1, 0.45)
+        mlp_band = sorted(
+            (n for n in base if n.endswith("mlp")),
+            key=lambda n: int(n.split(".layers.")[1].split(".")[0]),
+        )
+        # Give the deepest MLP band layer a huge reconstruction error; refine
+        # (demote_frac 0.25 -> one per group) must drop exactly it.
+        worst = mlp_band[-1]
+        errors = {n: {0.9: 0.1} for n in base}
+        errors[worst] = {0.9: 5.0}
+        refined = refine_with_sensitivity(model, base, errors, demote_frac=0.25)
+        assert worst not in refined
+        assert all(n in refined for n in mlp_band[:-1])
+
+    def test_refine_noop_when_frac_zero(self):
+        model = _multi_layer_llama(8)
+        targets = discover_target_modules(model)
+        base = allocate_structural(model, targets, 0.9, 0.75, 0.1, 0.45)
+        assert refine_with_sensitivity(model, base, {}, demote_frac=0.0) == base
+
+    def test_preset_loads_local_config_and_maps_keys(self, tmp_path):
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "predictor_rank": 8,
+                    "modes": {
+                        "o2": {
+                            "layer_sparsity": {
+                                "model.layers.0.mlp": 0.0,  # dense entries skipped
+                                "model.layers.1.mlp": 0.99,
+                                "model.layers.1.self_attn": 0.75,
+                            }
+                        }
+                    },
+                }
+            )
+        )
+        targets = [
+            "base_model.model.model.layers.0.mlp",
+            "base_model.model.model.layers.1.mlp",
+            "base_model.model.model.layers.1.self_attn",
+        ]
+        sched = load_preset_schedule(str(tmp_path), "o2", targets)
+        assert sched == {
+            "base_model.model.model.layers.1.mlp": 0.99,
+            "base_model.model.model.layers.1.self_attn": 0.75,
+        }
+
+    def test_preset_all_unmatched_raises(self, tmp_path):
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {"modes": {"o2": {"layer_sparsity": {"model.layers.9.mlp": 0.9}}}}
+            )
+        )
+        with pytest.raises(ValueError, match="matched no sparsifiable"):
+            load_preset_schedule(str(tmp_path), "o2", ["model.layers.0.mlp"])
 
 
 class TestArgsValidation:
     def test_defaults(self):
         s = SparseLoRASettings()
         assert s.enabled is True
-        assert s.calibration.method == CalibrationMethod.FAITHFUL
+        assert s.calibration.method == CalibrationMethod.STRUCTURAL
         assert 0 < s.target_sparsity < 1
+
+    def test_preset_method_requires_preset(self):
+        with pytest.raises(ValidationError, match="preset requires"):
+            SparseLoRASettings(calibration={"method": "preset"})
+        ok = SparseLoRASettings(
+            calibration={"method": "preset"},
+            preset="z-lab/Meta-Llama-3-8B-Instruct-SparseLoRA",
+        )
+        assert ok.preset and ok.preset_mode == "o2"
+
+    def test_attn_sparsity_range_checked(self):
+        with pytest.raises(ValidationError):
+            SparseLoRASettings(attn_sparsity=1.2)
+        assert SparseLoRASettings(attn_sparsity=0.5).attn_sparsity == 0.5
 
     def test_method_none_requires_layer_sparsity(self):
         with pytest.raises(ValidationError):

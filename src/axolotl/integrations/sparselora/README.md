@@ -25,7 +25,18 @@ Calibration runs automatically before training and caches its result — nothing
 | `target_sparsity` | `0.9` | how aggressively to sparsify — lower it if loss matters more than speed |
 | `predictor_rank` | `8` | SVD predictor rank |
 | `start_step` | `0.1` | fraction of training kept dense up front (gradient stability) |
-| `calibration.method` | `faithful` | `faithful` (accurate) · `proxy` (fast, forward-only) · `none` (supply your own `layer_sparsity`) |
+| `attn_sparsity` | `min(target, 0.75)` | attention band sparsity (attention tolerates far less than the MLP) |
+| `calibration.method` | `structural` | `structural` (default, no forward pass) · `preset` (load a published z-lab schedule) · `faithful`/`proxy` (structural + a sensitivity sweep that demotes the most sensitive layers) · `none` (supply your own `layer_sparsity`) |
+
+To reproduce z-lab's downstream-validated schedule on the Llama models they calibrated:
+
+```yaml
+sparselora:
+  calibration:
+    method: preset
+  preset: z-lab/Meta-Llama-3-8B-Instruct-SparseLoRA
+  preset_mode: o2   # o1 = conservative, o2 = aggressive
+```
 
 `fused_attn_kernel: true` adds a small extra speedup on gated models (Qwen3.5/3.6).
 
@@ -52,6 +63,6 @@ Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistra
 
 ## Calibration & cache
 
-Before training, a sensitivity sweep over a slice of *your* dataset sets per-layer sparsity to approach `target_sparsity` while keeping each layer within `loss_budget`; sensitive layers stay dense automatically. Results cache to `{output_dir}/sparselora_calibration/{key}/` (path logged at INFO) — delete that directory or change any input to recalibrate. `share_calibration` (off by default) would upload only the schedule + model id, never dataset content; no endpoint is wired, so nothing leaves your machine.
+z-lab derive their published schedules from an offline *downstream-task* sensitivity analysis (progressively sparsifying each layer and measuring task accuracy) — their schedules run MLP layers at 0.97–0.99 sparsity, so an absolute per-block reconstruction-error budget cannot recover them (it returns near-zero sparsity). Calibration here therefore follows z-lab's *empirical structure* rather than reconstruction error: the default `structural` method applies their profile — dense shallow + final layers, aggressive deep MLP (`target_sparsity`), milder attention (`attn_sparsity`) over a still-deeper band — from the model's layer layout alone (no forward pass). On Llama-3-8B this lands at ~45/64 modules, mean sparsity ~0.59, matching z-lab's o2 (42/64, 0.597); `preset` reproduces o2 exactly. `faithful`/`proxy` additionally run a sweep over a slice of *your* dataset to demote the most sensitive band layers back to dense. Results cache to `{output_dir}/sparselora_calibration/{key}/` (path logged at INFO) — delete that directory or change any input to recalibrate. `share_calibration` (off by default) would upload only the schedule + model id, never dataset content; no endpoint is wired, so nothing leaves your machine.
 
 See `_vendor/PROVENANCE.md` for the vendored upstream commit and local edits.

@@ -1,21 +1,30 @@
 """Self-calibration of the SparseLoRA per-layer sparsity schedule.
 
-Calibration runs on a small slice of the *same* dataset and config the run will
-train on, so the schedule is tailored to the actual model + data instead of
-relying on z-lab's pre-published Llama-only presets.
+z-lab derive their published schedules from an offline *downstream-task*
+sensitivity analysis (progressively sparsifying each layer and measuring task
+accuracy). That process is expensive and not reproducible from a cheap forward
+pass; crucially, their schedules run MLP layers at 0.97-0.99 sparsity, whose
+per-block reconstruction error is ~0.9 -- so an absolute reconstruction-error
+budget cannot recover their schedule (and empirically returns near-zero
+sparsity, which is the bug this module fixes). Reconstruction error also
+*anti-correlates* with their layer choice: shallow layers reconstruct better yet
+z-lab keep them dense.
 
-Method (``faithful`` / ``proxy``):
+The methods here therefore key off z-lab's *empirical structural findings* rather
+than reconstruction error:
 
-1. (``faithful`` only) a short dense LoRA warm-up so captured activations reflect
-   a partially-trained model -- the paper's "start from a fine-tuned reference".
-2. A per-layer sensitivity sweep: for each target MLP/attention module and a grid
-   of candidate sparsities, measure the relative reconstruction error of skipping
-   the predictor-selected channels.
-3. Greedy allocation: each layer takes the highest sparsity whose error stays
-   within ``loss_budget``; the schedule is then capped toward ``target_sparsity``.
+- ``preset``: load z-lab's downstream-validated published schedule
+  (``SparseLoRAConfig.from_pretrained(mode="o1"|"o2")``). The recommended path
+  for the Llama models z-lab calibrated.
+- ``structural`` (default): apply z-lab's profile from layer structure alone --
+  dense shallow + final layers, aggressive deep MLP (``target_sparsity``), milder
+  attention (``attn_sparsity``) over a still-deeper band. No forward pass.
+- ``faithful`` / ``proxy``: start from the ``structural`` band and use a
+  reconstruction-sensitivity sweep to *demote* the most sensitive band layers
+  (per group) back to dense; ``faithful`` adds a short dense LoRA warm-up first.
 
-The selection math here mirrors the vendored predictors but is reimplemented in
-plain torch (no Triton/liger dependency) so calibration runs on CPU or GPU. The
+The sweep math mirrors the vendored predictors but is reimplemented in plain
+torch (no Triton/liger dependency) so calibration runs on CPU or GPU. The
 *train-time* predictors are still the vendored liger kernels applied via
 ``apply_sparselora``.
 """
@@ -220,53 +229,159 @@ def run_sensitivity(
     }
 
 
-def allocate_schedule(
-    errors: dict[str, dict[float, float]],
-    target_sparsity: float,
-    loss_budget: float,
-) -> dict[str, float]:
-    """Per-layer sparsity: highest grid value within budget, capped toward target.
+def resolve_attn_sparsity(target_sparsity: float, attn_sparsity: float | None) -> float:
+    """Attention base-path sparsity: explicit override, else min(target, 0.75).
 
-    A layer whose smallest grid sparsity already exceeds ``loss_budget`` stays
-    dense (omitted from the schedule), which naturally keeps the most sensitive
-    layers (often the earliest) at full precision.
+    Attention tolerates far less sparsity than the MLP -- z-lab's o2 schedule runs
+    attention at 0.75 while the MLP runs at 0.99 -- so the default caps it at 0.75.
     """
-    within_budget: dict[str, float] = {}
-    for name, grid in errors.items():
-        ok = [s for s in SPARSITY_GRID if grid[s] <= loss_budget]
-        if ok:
-            within_budget[name] = max(ok)
+    if attn_sparsity is not None:
+        return float(attn_sparsity)
+    return min(float(target_sparsity), 0.75)
 
-    if not within_budget:
+
+def _layer_index(name: str) -> int | None:
+    """First integer path component (e.g. ``...layers.3.mlp`` -> 3), or None."""
+    for part in name.split("."):
+        if part.isdigit():
+            return int(part)
+    return None
+
+
+def _dense_prefix_count(prefix: float, n_layers: int) -> int:
+    """A fraction (<=1) of depth or an absolute leading-layer count."""
+    if prefix <= 1.0:
+        return round(prefix * n_layers)
+    return int(prefix)
+
+
+def allocate_structural(
+    model: nn.Module,
+    target_names: list[str],
+    target_sparsity: float,
+    attn_sparsity: float,
+    dense_prefix: float,
+    attn_dense_prefix: float,
+) -> dict[str, float]:
+    """z-lab-shaped positional schedule from layer structure alone (no forward pass).
+
+    Mirrors the empirical structure of z-lab's published Llama schedules rather
+    than a per-layer reconstruction budget (which was found not to track
+    downstream task sensitivity -- z-lab runs MLP layers at 0.97-0.99 sparsity,
+    whose block reconstruction error is ~0.9). The profile keeps shallow layers
+    and the final layer dense (least amenable to sparsification), sparsifies the
+    MLP aggressively across the deep band, and sparsifies attention more mildly
+    over a still-deeper band.
+    """
+    modules = dict(model.named_modules())
+    indices = [i for n in target_names if (i := _layer_index(n)) is not None]
+    if not indices:
         LOG.warning(
-            "SparseLoRA: no layer met loss_budget=%s; schedule is empty (dense training). "
-            "Raise calibration.loss_budget or lower target_sparsity.",
-            loss_budget,
+            "SparseLoRA: no numeric layer index found on any target module; the "
+            "structural profile needs `model.layers.N....`-style names. Schedule empty."
         )
         return {}
+    n_layers = max(indices) + 1
+    last = n_layers - 1
+    mlp_prefix = _dense_prefix_count(dense_prefix, n_layers)
+    attn_prefix = _dense_prefix_count(attn_dense_prefix, n_layers)
 
-    total = len(errors)
-    mean = sum(within_budget.values()) / total
-    if mean <= target_sparsity:
-        if mean < target_sparsity:
-            LOG.warning(
-                "SparseLoRA: target_sparsity=%.3f unreachable within loss_budget=%s; "
-                "using the budget-respecting schedule (mean sparsity %.3f).",
-                target_sparsity,
-                loss_budget,
-                mean,
-            )
-        return within_budget
+    schedule: dict[str, float] = {}
+    for name in target_names:
+        idx = _layer_index(name)
+        if idx is None or idx == last:
+            continue
+        module = modules[name]
+        is_mlp = is_mlp_module(module) or is_fused_mlp_module(module)
+        prefix = mlp_prefix if is_mlp else attn_prefix
+        if idx < prefix:
+            continue
+        sparsity = target_sparsity if is_mlp else attn_sparsity
+        if sparsity > 0.0:
+            schedule[name] = float(sparsity)
+    return schedule
 
-    # Mean exceeds target: cap layers so the average lands near target.
-    best, best_gap = within_budget, abs(mean - target_sparsity)
-    for cap in sorted(SPARSITY_GRID):
-        capped = {n: min(s, cap) for n, s in within_budget.items() if min(s, cap) > 0}
-        capped_mean = sum(capped.values()) / total
-        gap = abs(capped_mean - target_sparsity)
-        if gap < best_gap:
-            best, best_gap = capped, gap
-    return best
+
+def refine_with_sensitivity(
+    model: nn.Module,
+    base_schedule: dict[str, float],
+    errors: dict[str, dict[float, float]],
+    demote_frac: float,
+) -> dict[str, float]:
+    """Demote the most sensitive band layers (per group) back to dense.
+
+    The structural profile decides the band; the reconstruction sweep is used
+    only as a *relative* within-group signal to drop the most sensitive layers
+    (highest error at their assigned sparsity) to dense. This keeps the schedule
+    non-empty and z-lab-shaped while letting the data trim genuine outliers.
+    """
+    if demote_frac <= 0.0 or not base_schedule:
+        return base_schedule
+    modules = dict(model.named_modules())
+    groups: dict[bool, list[str]] = {True: [], False: []}
+    for name in base_schedule:
+        module = modules[name]
+        is_mlp = is_mlp_module(module) or is_fused_mlp_module(module)
+        groups[is_mlp].append(name)
+
+    def _err_at(name: str) -> float:
+        grid = errors.get(name, {})
+        if not grid:
+            return 0.0
+        assigned = base_schedule[name]
+        nearest = min(grid, key=lambda s: abs(s - assigned))
+        return grid[nearest]
+
+    demoted: set[str] = set()
+    for names in groups.values():
+        if len(names) <= 1:
+            continue
+        n_demote = min(len(names) - 1, int(len(names) * demote_frac))
+        if n_demote <= 0:
+            continue
+        ranked = sorted(names, key=_err_at, reverse=True)
+        demoted.update(ranked[:n_demote])
+    return {n: s for n, s in base_schedule.items() if n not in demoted}
+
+
+def load_preset_schedule(
+    preset: str, mode: str, target_names: list[str]
+) -> dict[str, float]:
+    """Load a published z-lab schedule and map its keys onto discovered modules.
+
+    ``preset`` is a z-lab-format SparseLoRA repo id or local dir whose
+    ``config.json`` holds ``modes`` (``o1``/``o2``). This is z-lab's
+    downstream-validated path for the Llama models they calibrated.
+    """
+    from ._vendor.sparselora import SparseLoRAConfig
+
+    config = SparseLoRAConfig.from_pretrained(preset, mode=mode)
+    schedule: dict[str, float] = {}
+    unmatched: list[str] = []
+    for key, val in config.layer_sparsity.items():
+        if not val or float(val) <= 0.0:
+            continue
+        matches = [n for n in target_names if n == key or n.endswith("." + key)]
+        if not matches:
+            unmatched.append(key)
+        for n in matches:
+            schedule[n] = float(val)
+    if unmatched:
+        LOG.warning(
+            "SparseLoRA: preset %s (mode=%s) has %d sparse keys with no matching "
+            "module in this model (e.g. %s); they were skipped. Is the preset for a "
+            "different architecture?",
+            preset,
+            mode,
+            len(unmatched),
+            unmatched[:3],
+        )
+    if not schedule:
+        raise ValueError(
+            f"SparseLoRA preset {preset!r} (mode={mode!r}) matched no sparsifiable "
+            "module in this model. The preset is likely for a different architecture."
+        )
+    return schedule
 
 
 def warmup_lora(
@@ -337,17 +452,54 @@ def calibrate(
     cal = settings.calibration
     device = next(model.parameters()).device
 
+    target_names = discover_target_modules(model)
+    method = method_name(cal.method)
+    attn_sparsity = resolve_attn_sparsity(
+        settings.target_sparsity, settings.attn_sparsity
+    )
+
+    if method == "preset":
+        schedule = load_preset_schedule(
+            settings.preset, settings.preset_mode, target_names
+        )
+        LOG.info(
+            "SparseLoRA: loaded preset %s (mode=%s): %d/%d modules sparse.",
+            settings.preset,
+            settings.preset_mode,
+            len(schedule),
+            len(target_names),
+        )
+        return schedule
+
+    # Fall back to the schema defaults for partially-specified (non-pydantic) configs.
+    dense_prefix = cal.dense_prefix if cal.dense_prefix is not None else 0.1
+    attn_dense_prefix = (
+        cal.attn_dense_prefix if cal.attn_dense_prefix is not None else 0.45
+    )
+    demote_frac = cal.sensitivity_demote if cal.sensitivity_demote is not None else 0.25
+
+    base = allocate_structural(
+        model,
+        target_names,
+        settings.target_sparsity,
+        attn_sparsity,
+        dense_prefix,
+        attn_dense_prefix,
+    )
+
+    if method == "structural":
+        _log_schedule(base, target_names, "structural")
+        return base
+
+    # faithful / proxy: refine the structural band with a data-driven sweep that
+    # demotes the most sensitive layers per group back to dense.
     # Calibration must be side-effect-free on the training run's RNG so the
     # subsequent data order / init is identical with or without the plugin.
-    # Capture before any loader/forward work consumes randomness.
     rng_state = torch.get_rng_state()
     cuda_rng_state = (
         torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     )
-
-    target_names = discover_target_modules(model)
     loader = build_calibration_loader(trainer, cal.num_samples, cal.batch_size)
-    method = method_name(cal.method)
 
     snapshot = None
     if method == "faithful" and cal.warmup_steps > 0:
@@ -373,10 +525,12 @@ def calibrate(
         method,
         settings.target_sparsity,
     )
+    # Only the band layers need a sensitivity score; sweep those to keep it cheap.
+    band = list(base)
     max_batches = -(-cal.num_samples // cal.batch_size)  # ceil
     try:
         errors = run_sensitivity(
-            model, target_names, factors, loader, device, max_batches=max_batches
+            model, band, factors, loader, device, max_batches=max_batches
         )
     finally:
         if snapshot is not None:
@@ -391,12 +545,20 @@ def calibrate(
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state_all(cuda_rng_state)
 
-    schedule = allocate_schedule(errors, settings.target_sparsity, cal.loss_budget)
-    mean = sum(schedule.values()) / max(1, len(target_names))
+    schedule = refine_with_sensitivity(model, base, errors, demote_frac)
+    _log_schedule(schedule, target_names, method)
+    return schedule
+
+
+def _log_schedule(
+    schedule: dict[str, float], target_names: list[str], method: str
+) -> None:
+    total = max(1, len(target_names))
+    mean = sum(schedule.values()) / total
     LOG.info(
-        "SparseLoRA: calibrated schedule covers %d/%d modules, mean sparsity %.3f.",
+        "SparseLoRA: %s schedule covers %d/%d modules, mean sparsity %.3f.",
+        method,
         len(schedule),
         len(target_names),
         mean,
     )
-    return schedule

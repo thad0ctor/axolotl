@@ -10,8 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class CalibrationMethod(str, Enum):
     """How the per-layer sparsity schedule is determined before training."""
 
-    FAITHFUL = "faithful"  # short dense warm-up reference, then per-layer sweep
-    PROXY = "proxy"  # forward-only block-reconstruction sweep, no warm-up
+    STRUCTURAL = (
+        "structural"  # z-lab-shaped positional profile (default, no forward pass)
+    )
+    PRESET = "preset"  # load a published z-lab schedule (from_pretrained mode=o1/o2)
+    FAITHFUL = "faithful"  # structural profile refined by a warm-up sensitivity sweep
+    PROXY = "proxy"  # structural profile refined by a forward-only sensitivity sweep
     NONE = "none"  # use the explicit `layer_sparsity` map verbatim
 
 
@@ -22,17 +26,22 @@ class CalibrationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     method: CalibrationMethod = Field(
-        default=CalibrationMethod.FAITHFUL,
+        default=CalibrationMethod.STRUCTURAL,
         description=(
-            "Schedule source: `faithful` (default, paper-style sensitivity sweep "
-            "after a short dense warm-up), `proxy` (forward-only sweep, no warm-up, "
-            "fast), or `none` (use the explicit `layer_sparsity` override)."
+            "Schedule source: `structural` (default) applies z-lab's empirical "
+            "profile -- dense shallow + final layers, aggressive deep MLP, milder "
+            "attention -- from the model's layer structure alone (no forward pass); "
+            "`preset` loads a published z-lab schedule via `preset`/`preset_mode`; "
+            "`faithful`/`proxy` start from the structural profile and use a "
+            "sensitivity sweep to demote the most sensitive band layers back to "
+            "dense (`faithful` adds a short dense LoRA warm-up first); `none` uses "
+            "the explicit `layer_sparsity` override."
         ),
     )
     num_samples: int = Field(
         default=128,
         gt=0,
-        description="Number of examples drawn from the configured dataset for calibration.",
+        description="`faithful`/`proxy`: examples drawn from the dataset for the sweep.",
     )
     batch_size: int = Field(
         default=1, gt=0, description="Micro-batch size for the calibration passes."
@@ -42,12 +51,43 @@ class CalibrationConfig(BaseModel):
         ge=0,
         description="`faithful` only: dense LoRA reference-training steps before the sweep.",
     )
+    dense_prefix: float = Field(
+        default=0.1,
+        ge=0.0,
+        description=(
+            "MLP: keep this many leading (shallow) layers dense -- a fraction of "
+            "depth when <=1, else an absolute layer count. Shallow layers are the "
+            "least amenable to sparsification (z-lab)."
+        ),
+    )
+    attn_dense_prefix: float = Field(
+        default=0.45,
+        ge=0.0,
+        description=(
+            "Attention: keep this many leading layers dense (fraction when <=1). "
+            "z-lab sparsifies attention only in deeper layers, so this is larger "
+            "than `dense_prefix`."
+        ),
+    )
+    sensitivity_demote: float = Field(
+        default=0.25,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "`faithful`/`proxy` only: fraction of each group's sparsifiable band "
+            "(the most sensitive layers by the reconstruction sweep) demoted back "
+            "to dense."
+        ),
+    )
     loss_budget: float = Field(
         default=0.01,
         gt=0,
         description=(
-            "Max per-layer relative reconstruction error tolerated when raising a "
-            "layer's sparsity during the sweep."
+            "Deprecated and ignored. Absolute per-block reconstruction error was "
+            "found not to track downstream task sensitivity (z-lab's published "
+            "schedules run MLP layers at 0.97-0.99 sparsity, whose block "
+            "reconstruction error is ~0.9); it is retained only for config/cache "
+            "compatibility."
         ),
     )
 
@@ -65,7 +105,31 @@ class SparseLoRASettings(BaseModel):
         default=0.9,
         gt=0.0,
         lt=1.0,
-        description="Overall base-path sparsity the calibrated schedule aims to reach.",
+        description=(
+            "Base-path sparsity applied to MLP layers inside the sparsifiable band "
+            "(z-lab's published schedules use 0.97-0.99 here)."
+        ),
+    )
+    attn_sparsity: float | None = Field(
+        default=None,
+        description=(
+            "Base-path sparsity for attention layers in the band. Defaults to "
+            "min(target_sparsity, 0.75) -- attention tolerates far less sparsity "
+            "than the MLP (z-lab o2 uses 0.75 attention vs 0.99 MLP)."
+        ),
+    )
+    preset: str | None = Field(
+        default=None,
+        description=(
+            "`preset` method: a z-lab-format SparseLoRA repo id or local dir whose "
+            "`config.json` holds published `modes` (e.g. "
+            "'z-lab/Meta-Llama-3-8B-Instruct-SparseLoRA'). This is z-lab's "
+            "downstream-validated path for the Llama models they calibrated."
+        ),
+    )
+    preset_mode: str = Field(
+        default="o2",
+        description="`preset` method: which published mode to load (`o1` conservative, `o2` aggressive).",
     )
     predictor_rank: int = Field(
         default=8, gt=0, description="Rank of the training-free SVD sparsity predictor."
@@ -123,6 +187,16 @@ class SparseLoRASettings(BaseModel):
             raise ValueError(
                 "sparselora.calibration.method: none requires an explicit "
                 "`sparselora.layer_sparsity` map."
+            )
+        if self.calibration.method == CalibrationMethod.PRESET and not self.preset:
+            raise ValueError(
+                "sparselora.calibration.method: preset requires `sparselora.preset` "
+                "(a z-lab-format SparseLoRA repo id or local dir, e.g. "
+                "'z-lab/Meta-Llama-3-8B-Instruct-SparseLoRA')."
+            )
+        if self.attn_sparsity is not None and not 0.0 <= self.attn_sparsity < 1.0:
+            raise ValueError(
+                f"sparselora.attn_sparsity must be in [0, 1); got {self.attn_sparsity}."
             )
         if self.layer_sparsity:
             for name, val in self.layer_sparsity.items():

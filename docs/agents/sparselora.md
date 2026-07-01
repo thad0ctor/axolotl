@@ -12,7 +12,16 @@ lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 sample_packing: false
 sparselora:
   target_sparsity: 0.9
-  calibration: {method: faithful}
+  calibration: {method: structural}   # default; no forward pass
+```
+
+For the Llama models z-lab published (downstream-validated), load their schedule directly:
+
+```yaml
+sparselora:
+  calibration: {method: preset}
+  preset: z-lab/Meta-Llama-3-8B-Instruct-SparseLoRA
+  preset_mode: o2
 ```
 
 ## Config keys (`sparselora:`)
@@ -20,14 +29,19 @@ sparselora:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `enabled` | `true` | Master switch |
-| `target_sparsity` | `0.9` | Overall base-path sparsity to aim for |
+| `target_sparsity` | `0.9` | MLP band base-path sparsity (z-lab's schedules use 0.97–0.99) |
+| `attn_sparsity` | `min(target, 0.75)` | Attention band sparsity (attention tolerates less than MLP) |
 | `predictor_rank` | `8` | SVD predictor rank |
 | `start_step` / `end_step` | `0.1` / `1.0` | Fraction (≤1) or absolute step; sparsity active in `[start, end)` |
 | `layer_sparsity` | `null` | Explicit `{module_path: ratio}`; required for `method: none` |
-| `calibration.method` | `faithful` | `faithful` \| `proxy` \| `none` |
-| `calibration.num_samples` | `128` | Calibration examples from the same dataset |
+| `preset` / `preset_mode` | `null` / `o2` | `method: preset` only; z-lab-format repo/dir + published mode (`o1`/`o2`) |
+| `calibration.method` | `structural` | `structural` \| `preset` \| `faithful` \| `proxy` \| `none` |
+| `calibration.dense_prefix` | `0.1` | MLP leading layers kept dense (fraction ≤1 or count) |
+| `calibration.attn_dense_prefix` | `0.45` | Attention leading layers kept dense (attention sparsifies deeper) |
+| `calibration.sensitivity_demote` | `0.25` | `faithful`/`proxy`; fraction of each band demoted to dense by the sweep |
+| `calibration.num_samples` | `128` | `faithful`/`proxy` sweep examples from the same dataset |
 | `calibration.warmup_steps` | `50` | `faithful` only; dense reference steps (rolled back) |
-| `calibration.loss_budget` | `0.01` | Max per-layer reconstruction error when raising sparsity |
+| `calibration.loss_budget` | `0.01` | **Deprecated/ignored** (per-block reconstruction error doesn't track task sensitivity) |
 | `cache_dir` | `{output_dir}/sparselora_calibration` | Calibration artifacts location (logged at INFO) |
 | `share_calibration` | `false` | Opt-in anonymous schedule sharing (schedule only, never data) |
 
@@ -35,7 +49,7 @@ sparselora:
 
 1. Hook: `post_trainer_create` (model + LoRA built, trainer created, before training / DDP wrap).
 2. Cache lookup by hash of (model, adapter, dataset signature, target sparsity, rank, calibration params). Hit → reuse `schedule.json` + `model.safetensors`.
-3. Miss → compute SVD predictor factors from base weights (`factors.py`), run the sensitivity sweep on a slice of the same dataset (`calibration.py`), allocate per-layer sparsity within `loss_budget`, cache it.
+3. Miss → derive the schedule (`calibration.py`): `structural`/`preset` need no forward pass; `faithful`/`proxy` run a sensitivity sweep to demote the most sensitive band layers. Compute SVD predictor factors from base weights for the sparsified modules (`factors.py`), cache both. Calibration follows z-lab's empirical structure (dense shallow + final, aggressive deep MLP, milder attention), not per-block reconstruction error — z-lab's MLP sparsity is 0.97–0.99, whose block reconstruction error is ~0.9, so an absolute error budget cannot recover it.
 4. `register_arch_wiring` introspects the loaded model and maps each MLP/attention class to the generic sparse wiring (Llama is pre-registered); `apply_sparselora` swaps in the sparse modules; a `SparseLoRACallback` gates sparsity by `start_step`/`end_step`.
 
 The SVD factors are training-free (`w1@w2 ≈ Wᵀ`, exact at full rank). z-lab ships factors only for Llama-2/3; computing them here is what makes the plugin model-agnostic.

@@ -376,10 +376,14 @@ class SparseLoRAPlugin(BasePlugin):
         all_factors: dict = {}
         if method == "none":
             schedule = resolve_layer_sparsity(settings.layer_sparsity, target_names)
-        else:
-            # Factors for all targets feed the sensitivity sweep.
+        elif method in ("faithful", "proxy"):
+            # The sensitivity sweep needs factors for every candidate module.
             all_factors = compute_factor_tensors(model, target_names, rank)
             schedule = calibrate(cfg, model, all_factors, trainer)
+        else:
+            # structural / preset derive the schedule without a forward sweep, so
+            # only the sparsified modules (computed below) need SVD factors.
+            schedule = calibrate(cfg, model, {}, trainer)
 
         # Cover every target module so the global LoRA patch stays safe;
         # calibration-dense modules are explicit 0.0.
