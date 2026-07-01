@@ -227,6 +227,10 @@ class TestRank0Broadcast:
         # so single-GPU behavior is unchanged by the FSDP hardening.
         plugin = SparseLoRAPlugin()
         sched = {"model.layers.0.self_attn": 0.5}
+        # Pin the non-distributed branch — don't inherit a process group another
+        # test may have initialized (which would take the broadcast path instead).
+        monkeypatch.setattr("torch.distributed.is_available", lambda: True)
+        monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
         monkeypatch.setattr(
             plugin, "_compute_calibration", lambda *a, **k: (sched, {}, {})
         )
