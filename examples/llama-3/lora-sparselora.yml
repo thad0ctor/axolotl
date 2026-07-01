@@ -18,7 +18,7 @@ val_set_size: 0.05
 output_dir: ./outputs/lora-sparselora-out
 
 sequence_len: 4096
-sample_packing: false          # required by SparseLoRA (context/output token split)
+sample_packing: false          # supported; leave off for maximum sparsity (packing dilutes it)
 
 adapter: lora
 lora_model_dir:
@@ -35,14 +35,18 @@ lora_target_modules:
 # SparseLoRA configuration.
 sparselora:
   target_sparsity: 0.9
+  # attn_sparsity:             # attention base sparsity; defaults to min(target_sparsity, 0.75)
   predictor_rank: 8
   start_step: 0.1              # keep the first 10% of training dense
   end_step: 1.0
   calibration:
-    method: faithful           # faithful (default) | proxy | none
-    num_samples: 128
-    warmup_steps: 50
-    loss_budget: 0.01
+    # structural (default): z-lab positional profile from layer structure, no forward pass.
+    # faithful/proxy: refine the structural band with a sensitivity sweep (faithful adds a warm-up).
+    # preset: load a published z-lab schedule (requires `preset`/`preset_mode`).
+    # none: use an explicit `layer_sparsity` map verbatim.
+    method: structural         # structural (default) | faithful | proxy | preset | none
+    # num_samples: 128         # faithful/proxy: examples drawn for the sweep
+    # warmup_steps: 50         # faithful: dense LoRA warm-up steps before the sweep
   # cache_dir:                 # defaults to {output_dir}/sparselora_calibration
   # share_calibration: false   # opt-in anonymous schedule sharing (off by default)
 

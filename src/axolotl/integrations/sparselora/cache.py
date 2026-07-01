@@ -68,13 +68,21 @@ def compute_cache_key(cfg: Any) -> str:
             "learning_rate": cfg.learning_rate,
         },
         "target_sparsity": settings.target_sparsity,
+        "attn_sparsity": settings.attn_sparsity,
         "predictor_rank": settings.predictor_rank,
         "layer_sparsity": settings.layer_sparsity,
+        "preset": settings.preset,
+        "preset_mode": settings.preset_mode,
         "calibration": {
             "method": method_name(cal.method),
             "num_samples": cal.num_samples,
             "batch_size": cal.batch_size,
             "warmup_steps": cal.warmup_steps,
+            "dense_prefix": cal.dense_prefix,
+            "attn_dense_prefix": cal.attn_dense_prefix,
+            "sensitivity_demote": cal.sensitivity_demote,
+            # `loss_budget` is deprecated/ignored but kept in the key for
+            # backward compatibility with entries written before it was retired.
             "loss_budget": cal.loss_budget,
         },
     }

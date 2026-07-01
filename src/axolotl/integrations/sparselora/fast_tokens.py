@@ -21,6 +21,7 @@ asserts this against the original implementations.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -122,15 +123,25 @@ def _fast_token_join(
     return torch.cat([sparse[:, : ctx.left], dense, sparse[:, ctx.left :]], dim=1)
 
 
-_INSTALLED = False
+# The packing mode the hooks are currently installed for (``None`` = not yet
+# installed). Keyed by ``packing`` so a mode change reinstalls: the two modes
+# swap in mutually-incompatible token split/join semantics, so remembering only
+# *that* something was installed would leave the wrong path active after a flip.
+_INSTALLED_PACKING: bool | None = None
+# Vendored split/join captured on first install so a flip back to packing can
+# restore the boolean path the unpacked install replaces.
+_ORIG_TOKEN_SPLITS: Any = None
+_ORIG_TOKEN_JOIN: Any = None
 
 
 def install_fast_tokens(packing: bool = False) -> None:
     """Rebind the vendored mask builder (and, unpacked, the token split/join).
 
-    Idempotent. Call **before** the ``torch.compiler.disable`` boundaries are
-    applied so the disable wraps the installed mask builder (it carries the
-    per-step ``.item()`` syncs).
+    Idempotent **per mode**: a repeat call with the same ``packing`` is a no-op,
+    but a call with a different ``packing`` reinstalls the correct hooks (the two
+    modes are not interchangeable). Call **before** the ``torch.compiler.disable``
+    boundaries are applied so the disable wraps the installed mask builder (it
+    carries the per-step ``.item()`` syncs).
 
     Unpacked (``packing=False``): install the contiguous-block fast path
     (:func:`_compute_mask_context` + slice/cat split/join), which is
@@ -144,17 +155,25 @@ def install_fast_tokens(packing: bool = False) -> None:
     boolean ``token_splits`` / ``token_join``, which gather/scatter an arbitrary
     multi-segment mask correctly.
     """
-    global _INSTALLED
-    if _INSTALLED:
+    global _INSTALLED_PACKING, _ORIG_TOKEN_SPLITS, _ORIG_TOKEN_JOIN
+    if _INSTALLED_PACKING == packing:
         return
 
     from ._vendor.sparselora import api
     from ._vendor.sparselora.modules.base import SparseModule
 
+    if _ORIG_TOKEN_SPLITS is None:
+        _ORIG_TOKEN_SPLITS = SparseModule.token_splits
+        _ORIG_TOKEN_JOIN = SparseModule.__dict__["token_join"]
+
     if packing:
         api._compute_output_token_mask = _compute_packed_output_token_mask
+        # Restore the vendored boolean split/join in case an earlier unpacked
+        # install replaced them with the contiguous fast path.
+        SparseModule.token_splits = _ORIG_TOKEN_SPLITS  # type: ignore[method-assign]
+        SparseModule.token_join = _ORIG_TOKEN_JOIN  # type: ignore[assignment]
     else:
         api._compute_output_token_mask = _compute_mask_context
         SparseModule.token_splits = _fast_token_splits  # type: ignore[method-assign]
         SparseModule.token_join = staticmethod(_fast_token_join)  # type: ignore[assignment]
-    _INSTALLED = True
+    _INSTALLED_PACKING = packing

@@ -25,6 +25,11 @@ LOG = get_logger(__name__)
 
 _SUPPORTED_ADAPTERS = {"lora", "qlora"}
 _COMPILE_BOUNDARIES_SET = False
+# The packing mode the mask-builder boundary is installed for (``None`` = not
+# yet installed). Tracked separately from ``_COMPILE_BOUNDARIES_SET`` because the
+# mask builder / token split-join is packing-dependent and must reinstall on a
+# mode flip, whereas the vendored forward/predictor disable-wrapping is one-time.
+_MASK_BOUNDARY_PACKING: bool | None = None
 
 
 def _is_deepspeed_zero3(deepspeed: Any) -> bool:
@@ -86,6 +91,36 @@ def resolve_layer_sparsity(
     return schedule
 
 
+def _install_token_boundary(packing: bool) -> None:
+    """Install the packing-dependent mask builder and wrap it as a disable region.
+
+    Split out from :func:`_apply_compile_boundaries` because the mask builder and
+    token split/join are packing-dependent: a run that switches ``sample_packing``
+    within the same interpreter must reinstall the correct hooks, or a packed run
+    would silently reuse the unpacked contiguous single-block path (wrong packed
+    semantics, not merely a missed optimization). ``install_fast_tokens`` is keyed
+    by ``packing`` so it reinstalls on a flip; this wrapper re-applies the
+    ``torch.compiler.disable`` boundary to the freshly-installed mask builder.
+    """
+    global _MASK_BOUNDARY_PACKING
+    if _MASK_BOUNDARY_PACKING == packing:
+        return
+
+    import torch
+
+    from ._vendor.sparselora import api
+    from .fast_tokens import install_fast_tokens
+
+    # Install the mask builder (and, unpacked, the contiguous-block token
+    # split/join) before wrapping it, so the torch.compiler.disable below wraps
+    # the installed version. Packing needs the multi-segment boolean mask.
+    install_fast_tokens(packing=packing)
+    api._compute_output_token_mask = torch.compiler.disable(
+        api._compute_output_token_mask
+    )
+    _MASK_BOUNDARY_PACKING = packing
+
+
 def _apply_compile_boundaries(packing: bool = False) -> None:
     """Mark SparseLoRA's data-dependent code as ``torch.compiler.disable`` regions.
 
@@ -94,8 +129,14 @@ def _apply_compile_boundaries(packing: bool = False) -> None:
     .compile`` it raises a backend failure. Disabling Dynamo on these entry
     points makes the compiler graph-break around them (running them eagerly,
     which is already fast) and compile the rest of the model. No-op at eager
-    runtime. Applied once at the class level.
+    runtime.
+
+    The packing-dependent mask-builder boundary is (re)installed every call via
+    :func:`_install_token_boundary`; the packing-independent forward/predictor
+    disable-wrapping below is applied once.
     """
+    _install_token_boundary(packing)
+
     global _COMPILE_BOUNDARIES_SET
     if _COMPILE_BOUNDARIES_SET:
         return
@@ -103,15 +144,8 @@ def _apply_compile_boundaries(packing: bool = False) -> None:
     import torch
 
     from . import arch_wiring
-    from ._vendor.sparselora import api
     from ._vendor.sparselora.modules import llama, predictors
-    from .fast_tokens import install_fast_tokens
     from .sparse_linear_4bit import SparseLinear4bit
-
-    # Install the mask builder (and, unpacked, the contiguous-block token
-    # split/join) before wrapping it, so the torch.compiler.disable below wraps
-    # the installed version. Packing needs the multi-segment boolean mask.
-    install_fast_tokens(packing=packing)
 
     disable = torch.compiler.disable
     llama.SparseLlamaMLP.forward = disable(llama.SparseLlamaMLP.forward)  # type: ignore[method-assign]
@@ -130,7 +164,6 @@ def _apply_compile_boundaries(packing: bool = False) -> None:
         arch_wiring.SparseFusedGateUpMLP.forward
     )
     arch_wiring.SparseLinearBias.forward = disable(arch_wiring.SparseLinearBias.forward)  # type: ignore[method-assign]
-    api._compute_output_token_mask = disable(api._compute_output_token_mask)
     for cls in (
         predictors.FFNPredictor,
         predictors.AttentionPredictor,
@@ -159,21 +192,43 @@ def _broadcast_rank0_schedule(
     swap and corrupting the FSDP flat-param structure. The ``broadcast_object_list``
     (a single collective all ranks issue) overwrites every rank's schedule with
     rank 0's, making the swap bit-identical. Only rank 0 runs ``write_cache`` (the
-    ``save_cached`` / ``maybe_share`` I/O) to avoid a concurrent-write race; the
-    ``barrier`` after guarantees non-zero ranks do not read the factor files
-    before rank 0 has finished writing them.
+    ``save_cached`` / ``maybe_share`` I/O) to avoid a concurrent-write race.
+
+    The schedule is broadcast **before** the rank-0 write so a write exception can
+    never strand the other ranks: if rank 0 raised inside ``write_cache`` before
+    the first collective, every other rank would block forever in
+    ``broadcast_object_list``. Instead rank 0 broadcasts the schedule first, then
+    catches any write error and broadcasts an error flag, so all ranks reach the
+    ``barrier`` and raise (or proceed) together. The ``barrier`` also guarantees
+    non-zero ranks do not read the factor files before rank 0 finished writing.
 
     Caller guarantees a process group with ``world_size > 1``. ``dist`` is
     ``torch.distributed`` (or a test double exposing ``get_rank`` /
     ``broadcast_object_list`` / ``barrier``).
     """
     is_rank0 = dist.get_rank() == 0
-    if is_rank0:
-        write_cache()
+
+    # Broadcast rank 0's schedule first so no rank can be left blocking in a
+    # collective if the subsequent write raises.
     payload: list[Any] = [layer_sparsity if is_rank0 else None]
     dist.broadcast_object_list(payload, src=0)
-    dist.barrier()
     schedule: dict = payload[0]
+
+    # Only rank 0 writes; propagate success/failure so every rank raises together
+    # instead of some hanging at the barrier while rank 0 has already exited.
+    error: list[Any] = [None]
+    if is_rank0:
+        try:
+            write_cache()
+        except Exception as exc:  # noqa: BLE001 - re-raised on every rank below
+            error[0] = repr(exc)
+    dist.broadcast_object_list(error, src=0)
+    dist.barrier()
+    if error[0] is not None:
+        raise RuntimeError(
+            "SparseLoRA: rank 0 failed to write the calibration cache "
+            f"({error[0]}); all ranks abort together."
+        )
     return schedule
 
 

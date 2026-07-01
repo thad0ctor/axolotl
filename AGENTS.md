@@ -92,7 +92,7 @@ Repo-specific workflow guides (plus scripts) under `.agents/skills/`, auto-disco
 
 | Skill | What it does |
 |-------|--------------|
-| [`sparselora-add-model`](.agents/skills/sparselora-add-model/SKILL.md) | Adds or verifies a model architecture's SparseLoRA sparse wiring (`integrations/sparselora/arch_wiring.py`); introspects MLP/attention classes, runs a smoke apply+forward, and guides custom wiring for non-standard attention. |
+| [`sparselora-add-model`](.agents/skills/sparselora-add-model/SKILL.md) | Adds or verifies a model architecture's SparseLoRA sparse wiring (`src/axolotl/integrations/sparselora/arch_wiring.py`); introspects MLP/attention classes, runs a smoke apply+forward, and guides custom wiring for non-standard attention. |
 
 ## Comment Style
 

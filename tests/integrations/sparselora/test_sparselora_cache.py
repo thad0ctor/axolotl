@@ -40,6 +40,29 @@ def test_key_is_stable_and_input_sensitive(tmp_path):
     assert a != c
 
 
+def test_key_tracks_all_schedule_inputs(tmp_path):
+    """Every knob that changes the produced schedule must change the cache key,
+    or a stale schedule/factors from an incompatible run gets reused."""
+    base = cache_mod.compute_cache_key(_cfg(tmp_path))
+
+    def _mutate(**overrides):
+        cfg = _cfg(tmp_path)
+        for key, val in overrides.items():
+            if key in ("attn_sparsity", "preset", "preset_mode"):
+                cfg.sparselora[key] = val
+            else:  # calibration structural-band knobs
+                cfg.sparselora.calibration[key] = val
+        return cache_mod.compute_cache_key(cfg)
+
+    # Each of these influences the calibrated schedule and must move the key.
+    assert _mutate(attn_sparsity=0.5) != base
+    assert _mutate(preset="z-lab/some-repo") != base
+    assert _mutate(preset_mode="o1") != base
+    assert _mutate(dense_prefix=0.2) != base
+    assert _mutate(attn_dense_prefix=0.6) != base
+    assert _mutate(sensitivity_demote=0.4) != base
+
+
 def test_default_cache_root_under_output_dir(tmp_path):
     cfg = _cfg(tmp_path)
     root = cache_mod.resolve_cache_root(cfg)

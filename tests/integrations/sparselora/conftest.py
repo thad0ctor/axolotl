@@ -12,7 +12,7 @@ def _restore_global_sparselora_patches():
     import peft.tuners.lora.layer as lora_layer
     import transformers
 
-    from axolotl.integrations.sparselora import fast_tokens
+    from axolotl.integrations.sparselora import fast_tokens, plugin
     from axolotl.integrations.sparselora._vendor.sparselora import api
     from axolotl.integrations.sparselora._vendor.sparselora.modules import registry
     from axolotl.integrations.sparselora._vendor.sparselora.modules.base import (
@@ -29,7 +29,6 @@ def _restore_global_sparselora_patches():
     orig_mask = api._compute_output_token_mask
     orig_split = SparseModule.__dict__["token_splits"]
     orig_join = SparseModule.__dict__["token_join"]
-    orig_fast_flag = fast_tokens._INSTALLED
     try:
         yield
     finally:
@@ -41,7 +40,12 @@ def _restore_global_sparselora_patches():
         api._compute_output_token_mask = orig_mask
         SparseModule.token_splits = orig_split
         SparseModule.token_join = orig_join
-        fast_tokens._INSTALLED = orig_fast_flag
+        # The mask builder / token hooks are back to the vendored originals, so
+        # reset the install trackers to match (keyed by packing mode; None =
+        # not installed) — otherwise a later install would early-return and skip
+        # rebinding the just-restored hooks.
+        fast_tokens._INSTALLED_PACKING = None
+        plugin._MASK_BOUNDARY_PACKING = None
 
 
 def _tiny_llama(num_kv_heads: int = 2):

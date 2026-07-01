@@ -32,11 +32,11 @@ apply + a sparse forward/backward (on CUDA) or structural-only (on CPU):
 
 ```bash
 # synthetic tiny model, no download (llama|qwen2|qwen3|mistral|gemma2)
-python .agents/skills/sparselora-add-model/scripts/audit_sparselora_model.py --arch qwen3
+PYTHONPATH=src python .agents/skills/sparselora-add-model/scripts/audit_sparselora_model.py --arch qwen3
 
 # any HuggingFace id — built from its config (random weights, no checkpoint),
 # capped to --layers layers; run on a GPU for the sparse smoke test
-python .agents/skills/sparselora-add-model/scripts/audit_sparselora_model.py \
+PYTHONPATH=src python .agents/skills/sparselora-add-model/scripts/audit_sparselora_model.py \
   --base-model Qwen/Qwen2.5-0.5B
 ```
 
@@ -109,7 +109,7 @@ softcapping** (Gemma2), and the **gated MLP activation** for SiLU and `gelu_tanh
 
 ```bash
 # structural + sparse smoke for the new arch (GPU for the real predictor path)
-python .agents/skills/sparselora-add-model/scripts/audit_sparselora_model.py --arch <arch>
+PYTHONPATH=src python .agents/skills/sparselora-add-model/scripts/audit_sparselora_model.py --arch <arch>
 
 # unit + apply tests (GPU exercises the liger/Triton sparse forward/backward)
 PYTHONPATH=src pytest tests/integrations/sparselora -q

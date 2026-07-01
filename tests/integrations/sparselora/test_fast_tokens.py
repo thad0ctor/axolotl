@@ -14,6 +14,31 @@ from axolotl.integrations.sparselora import fast_tokens
 from axolotl.integrations.sparselora._vendor.sparselora.modules.base import SparseModule
 
 
+@pytest.fixture
+def restore_token_hooks():
+    """Snapshot and restore every global ``install_fast_tokens`` patches.
+
+    ``install_fast_tokens`` rewires three things — ``api._compute_output_token_mask``,
+    ``SparseModule.token_splits`` and ``SparseModule.token_join`` — plus the
+    module's installed-mode flag. Restoring only ``token_splits`` (as an earlier
+    teardown did) leaks the mask builder and ``token_join`` into later tests.
+    """
+    from axolotl.integrations.sparselora._vendor.sparselora import api
+
+    orig_mask = api._compute_output_token_mask
+    orig_split = SparseModule.token_splits
+    orig_join = SparseModule.__dict__["token_join"]  # keep the staticmethod descriptor
+    orig_installed = fast_tokens._INSTALLED_PACKING
+    fast_tokens._INSTALLED_PACKING = None
+    try:
+        yield
+    finally:
+        api._compute_output_token_mask = orig_mask
+        SparseModule.token_splits = orig_split
+        SparseModule.token_join = orig_join
+        fast_tokens._INSTALLED_PACKING = orig_installed
+
+
 def _bool_mask(left, right, total):
     m = torch.zeros(1, total, dtype=torch.bool)
     if right > left:
@@ -103,13 +128,12 @@ def test_split_join_bit_identical_to_boolean():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="predictors require CUDA")
-def test_applied_model_logits_bit_identical(tiny_lora_model):
+def test_applied_model_logits_bit_identical(tiny_lora_model, restore_token_hooks):
     """A real sparse-applied model gives identical logits under fast vs boolean."""
     import tempfile
 
     from axolotl.integrations.sparselora._vendor.sparselora import (
         SparseLoRAConfig,
-        api,
         apply_sparselora,
     )
     from axolotl.integrations.sparselora.calibration import discover_target_modules
@@ -134,22 +158,12 @@ def test_applied_model_logits_bit_identical(tiny_lora_model):
     labels = ids.clone()
     labels[:, :10] = -100
 
-    orig_mask = api._compute_output_token_mask
-    orig_split = SparseModule.token_splits
-    orig_join = SparseModule.__dict__["token_join"]  # keep the staticmethod descriptor
-    try:
-        with torch.no_grad():
-            ref = model(input_ids=ids, labels=labels).logits.clone()
-        fast_tokens._INSTALLED = False
-        fast_tokens.install_fast_tokens()
-        with torch.no_grad():
-            out = model(input_ids=ids, labels=labels).logits
-        assert torch.equal(out, ref)
-    finally:
-        api._compute_output_token_mask = orig_mask
-        SparseModule.token_splits = orig_split
-        SparseModule.token_join = orig_join
-        fast_tokens._INSTALLED = False
+    with torch.no_grad():
+        ref = model(input_ids=ids, labels=labels).logits.clone()
+    fast_tokens.install_fast_tokens()
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels).logits
+    assert torch.equal(out, ref)
 
 
 def test_packed_mask_keeps_outputs_dense_and_counts_uniform():
@@ -208,36 +222,45 @@ def test_packed_split_join_bit_identical_and_preserves_outputs():
     assert torch.equal(joined[labels != -100], x[labels != -100])
 
 
-def test_packing_install_keeps_boolean_split_join():
+def test_packing_install_keeps_boolean_split_join(restore_token_hooks):
     """With packing, install must set the multi-segment mask builder but leave the
     boolean (not contiguous-slice) token split/join in place."""
     from axolotl.integrations.sparselora._vendor.sparselora import api
 
-    orig_mask = api._compute_output_token_mask
-    orig_split = SparseModule.token_splits
-    orig_join = SparseModule.__dict__["token_join"]
-    try:
-        fast_tokens._INSTALLED = False
-        fast_tokens.install_fast_tokens(packing=True)
-        assert api._compute_output_token_mask is (
-            fast_tokens._compute_packed_output_token_mask
-        )
-        # Boolean split/join must NOT be replaced by the contiguous fast path.
-        assert SparseModule.token_splits is not fast_tokens._fast_token_splits
-    finally:
-        api._compute_output_token_mask = orig_mask
-        SparseModule.token_splits = orig_split
-        SparseModule.token_join = orig_join
-        fast_tokens._INSTALLED = False
+    fast_tokens.install_fast_tokens(packing=True)
+    assert api._compute_output_token_mask is (
+        fast_tokens._compute_packed_output_token_mask
+    )
+    # Boolean split/join must NOT be replaced by the contiguous fast path.
+    assert SparseModule.token_splits is not fast_tokens._fast_token_splits
 
 
-def test_install_is_idempotent_and_rebinds():
-    orig_split = SparseModule.token_splits
-    try:
-        fast_tokens._INSTALLED = False
-        fast_tokens.install_fast_tokens()
-        fast_tokens.install_fast_tokens()  # idempotent
-        assert SparseModule.token_splits is fast_tokens._fast_token_splits
-    finally:
-        SparseModule.token_splits = orig_split
-        fast_tokens._INSTALLED = False
+def test_install_is_idempotent_and_rebinds(restore_token_hooks):
+    fast_tokens.install_fast_tokens()
+    fast_tokens.install_fast_tokens()  # same mode -> idempotent
+    assert SparseModule.token_splits is fast_tokens._fast_token_splits
+
+
+def test_install_reinstalls_on_packing_mode_flip(restore_token_hooks):
+    """A packing-mode flip in the same interpreter must reinstall the correct
+    hooks: the guard is keyed by ``packing``, not a bare "installed" flag, so a
+    packed run never silently keeps the unpacked contiguous single-block path."""
+    from axolotl.integrations.sparselora._vendor.sparselora import api
+
+    # Unpacked first: contiguous fast split/join + contiguous mask builder.
+    fast_tokens.install_fast_tokens(packing=False)
+    assert SparseModule.token_splits is fast_tokens._fast_token_splits
+    assert api._compute_output_token_mask is fast_tokens._compute_mask_context
+
+    # Flip to packed: must swap back to the vendored boolean split/join and the
+    # multi-segment mask builder, not reuse the unpacked path.
+    fast_tokens.install_fast_tokens(packing=True)
+    assert SparseModule.token_splits is not fast_tokens._fast_token_splits
+    assert api._compute_output_token_mask is (
+        fast_tokens._compute_packed_output_token_mask
+    )
+
+    # Flip back to unpacked: contiguous fast path restored.
+    fast_tokens.install_fast_tokens(packing=False)
+    assert SparseModule.token_splits is fast_tokens._fast_token_splits
+    assert api._compute_output_token_mask is fast_tokens._compute_mask_context

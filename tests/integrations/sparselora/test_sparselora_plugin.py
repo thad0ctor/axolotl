@@ -172,14 +172,16 @@ class TestValidate:
 class _FakeDist:
     """Minimal torch.distributed stand-in exercising the rank-0 broadcast helper.
 
-    ``broadcast_object_list`` publishes the source rank's payload (rank 0) and
-    overwrites it on receivers, mirroring the real collective without a process
-    group.
+    ``broadcast_object_list`` publishes the source rank's payload (rank 0) into
+    ``published`` and, on receivers, pops the next queued payload from
+    ``incoming`` -- mirroring the real collective across the *two* broadcasts the
+    helper now issues (schedule, then error flag) without a process group.
     """
 
-    def __init__(self, rank, on_wire=None):
+    def __init__(self, rank, incoming=None):
         self.rank = rank
-        self.on_wire = on_wire
+        self.incoming = list(incoming or [])
+        self.published = []
         self.barriered = False
 
     def get_rank(self):
@@ -187,9 +189,9 @@ class _FakeDist:
 
     def broadcast_object_list(self, obj_list, src=0):
         if self.rank == src:
-            self.on_wire = obj_list[0]
+            self.published.append(obj_list[0])
         else:
-            obj_list[0] = self.on_wire
+            obj_list[0] = self.incoming.pop(0)
 
     def barrier(self):
         self.barriered = True
@@ -204,7 +206,8 @@ class TestRank0Broadcast:
         out = _broadcast_rank0_schedule(dist, schedule, lambda: writes.append(1))
         assert out == schedule
         assert writes == [1]  # only rank 0 wrote the shared cache, exactly once
-        assert dist.on_wire == schedule
+        # Schedule is broadcast first, then a success (None) error flag.
+        assert dist.published == [schedule, None]
         assert dist.barriered
 
     def test_nonzero_rank_skips_write_and_adopts_rank0_schedule(self):
@@ -216,9 +219,34 @@ class TestRank0Broadcast:
 
         # Non-zero rank still computed its own (possibly diverged) schedule, but
         # must adopt rank 0's via the broadcast and must not touch the cache.
-        dist = _FakeDist(rank=1, on_wire=rank0_schedule)
+        # Receives: rank 0's schedule, then a success (None) error flag.
+        dist = _FakeDist(rank=1, incoming=[rank0_schedule, None])
         out = _broadcast_rank0_schedule(dist, local_schedule, write)
         assert out == rank0_schedule
+        assert dist.barriered
+
+    def test_rank0_write_failure_raises_after_broadcasting(self):
+        # A rank-0 write failure must not strand other ranks: the schedule is
+        # still broadcast first, the barrier is reached, then every rank raises.
+        schedule = {"model.layers.0.self_attn": 0.5}
+
+        def boom():
+            raise OSError("disk full")
+
+        dist = _FakeDist(rank=0)
+        with pytest.raises(RuntimeError, match="rank 0 failed to write"):
+            _broadcast_rank0_schedule(dist, schedule, boom)
+        assert dist.published[0] == schedule  # schedule broadcast before the failure
+        assert dist.published[1] is not None  # error flag broadcast to receivers
+        assert dist.barriered  # barrier reached before raising
+
+    def test_nonzero_rank_raises_on_rank0_write_failure(self):
+        # The receiver adopts rank 0's schedule, sees the error flag, reaches the
+        # barrier, then raises together with rank 0 -- never hangs.
+        rank0_schedule = {"model.layers.0.self_attn": 0.25}
+        dist = _FakeDist(rank=1, incoming=[rank0_schedule, "OSError('disk full')"])
+        with pytest.raises(RuntimeError, match="rank 0 failed to write"):
+            _broadcast_rank0_schedule(dist, rank0_schedule, lambda: None)
         assert dist.barriered
 
     def test_single_gpu_takes_plain_path_no_broadcast(self, monkeypatch):
