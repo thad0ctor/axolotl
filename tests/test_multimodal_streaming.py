@@ -520,11 +520,7 @@ def test_tokens_per_second_callback_restores_checkpoint_token_state(tmp_path):
     (checkpoint / TOKENS_STATE_FILE).write_text(
         json.dumps({"total": 123, "trainable": 45})
     )
-    callback = TokensPerSecondCallback(
-        tensor_parallel_size=None,
-        context_parallel_size=None,
-        resume_from_checkpoint=str(checkpoint),
-    )
+    callback = TokensPerSecondCallback(resume_from_checkpoint=str(checkpoint))
     state = TrainerState()
 
     callback.on_train_begin(
