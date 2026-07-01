@@ -202,7 +202,8 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
         sparse_mods = [m for m in sm.modules() if isinstance(m, SparseModule)]
         assert sparse_mods, "no sparse modules were installed"
 
-        ids = torch.randint(0, _TINY_KW["vocab_size"], (2, 24), device="cuda")
+        vocab = int(getattr(sm.config, "vocab_size", _TINY_KW["vocab_size"]))
+        ids = torch.randint(0, max(1, vocab), (2, 24), device="cuda")
         labels = ids.clone()
         labels[:, :10] = -100
         out = sm(input_ids=ids, labels=labels)
