@@ -10,10 +10,16 @@ import tempfile
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from axolotl.integrations.sparselora.arch_wiring import (
     SparseAttention,
+    SparseFusedGateUpMLP,
+    SparseGemma4VisionAttention,
     SparseLinearBias,
+    SparseNonGatedMLP,
+    SparseNoRoPEAttention,
+    SparseQwen3VLVisionAttention,
     SparseSwiGLUMLP,
     register_arch_wiring,
 )
@@ -179,6 +185,436 @@ def test_gate_kind_detection():
 
     gemma_mlp = next(m for n, m in _tiny_gemma2().named_modules() if n.endswith("mlp"))
     assert gate_kind(gemma_mlp) == "gelu_tanh" and not is_silu_gated(gemma_mlp)
+
+
+class _VisionAttentionOnly(nn.Module):
+    def __init__(self, attn: nn.Module) -> None:
+        super().__init__()
+        block = nn.Module()
+        block.attn = attn
+        self.visual = nn.Module()
+        self.visual.blocks = nn.ModuleList([block])
+
+    def forward(self, x):
+        return x
+
+
+class _VisionMLPOnly(nn.Module):
+    def __init__(self, mlp: nn.Module) -> None:
+        super().__init__()
+        block = nn.Module()
+        block.mlp = mlp
+        self.visual = nn.Module()
+        self.visual.blocks = nn.ModuleList([block])
+
+    def forward(self, x):
+        return x
+
+
+def _tiny_qwen3_vl_vision_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+        Qwen3VLVisionConfig,
+    )
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionAttention
+
+    attn = Qwen3VLVisionAttention(
+        Qwen3VLVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_heads=4,
+            depth=1,
+            out_hidden_size=64,
+        )
+    )
+    return get_peft_model(
+        _VisionAttentionOnly(attn),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["qkv", "proj"]),
+    )
+
+
+def _tiny_gemma4_vision_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionAttention
+
+    cfg = Gemma4VisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+    )
+    return get_peft_model(
+        _VisionAttentionOnly(Gemma4VisionAttention(cfg, layer_idx=0)),
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=[
+                "q_proj.linear",
+                "k_proj.linear",
+                "v_proj.linear",
+                "o_proj.linear",
+            ],
+        ),
+    )
+
+
+def _tiny_siglip_vision_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.siglip.modeling_siglip")
+    from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+    from transformers.models.siglip.modeling_siglip import SiglipAttention
+
+    attn = SiglipAttention(
+        SiglipVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+        )
+    )
+    return get_peft_model(
+        _VisionAttentionOnly(attn),
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        ),
+    )
+
+
+def _tiny_internvl_vision_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.internvl.modeling_internvl")
+    from transformers.models.internvl.configuration_internvl import InternVLVisionConfig
+    from transformers.models.internvl.modeling_internvl import InternVLVisionAttention
+
+    attn = InternVLVisionAttention(
+        InternVLVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            use_qk_norm=True,
+        )
+    )
+    return get_peft_model(
+        _VisionAttentionOnly(attn),
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=["q_proj", "k_proj", "v_proj", "projection_layer"],
+        ),
+    )
+
+
+def _tiny_qwen3_vl_vision_mlp_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+        Qwen3VLVisionConfig,
+    )
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionMLP
+
+    mlp = Qwen3VLVisionMLP(
+        Qwen3VLVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_heads=4,
+            depth=1,
+            out_hidden_size=64,
+        )
+    )
+    return get_peft_model(
+        _VisionMLPOnly(mlp),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["linear_fc1", "linear_fc2"]),
+    )
+
+
+def _tiny_gemma4_vision_mlp_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionMLP
+
+    cfg = Gemma4VisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+    )
+    return get_peft_model(
+        _VisionMLPOnly(Gemma4VisionMLP(cfg)),
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=[
+                "gate_proj.linear",
+                "up_proj.linear",
+                "down_proj.linear",
+            ],
+        ),
+    )
+
+
+def _tiny_siglip_vision_mlp_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.siglip.modeling_siglip")
+    from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+    from transformers.models.siglip.modeling_siglip import SiglipMLP
+
+    mlp = SiglipMLP(
+        SiglipVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+        )
+    )
+    return get_peft_model(
+        _VisionMLPOnly(mlp),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["fc1", "fc2"]),
+    )
+
+
+def _tiny_internvl_vision_mlp_lora():
+    from peft import LoraConfig, get_peft_model
+
+    pytest.importorskip("transformers.models.internvl.modeling_internvl")
+    from transformers.models.internvl.configuration_internvl import InternVLVisionConfig
+    from transformers.models.internvl.modeling_internvl import InternVLVisionMLP
+
+    mlp = InternVLVisionMLP(
+        InternVLVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+        )
+    )
+    return get_peft_model(
+        _VisionMLPOnly(mlp),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["fc1", "fc2"]),
+    )
+
+
+@pytest.mark.parametrize(
+    "builder,sparse_cls",
+    [
+        (_tiny_qwen3_vl_vision_lora, SparseQwen3VLVisionAttention),
+        (_tiny_gemma4_vision_lora, SparseGemma4VisionAttention),
+        (_tiny_siglip_vision_lora, SparseNoRoPEAttention),
+        (_tiny_internvl_vision_lora, SparseNoRoPEAttention),
+    ],
+    ids=["qwen3vl", "gemma4", "siglip", "internvl"],
+)
+def test_vision_attention_discovery_registration_and_validation(builder, sparse_cls):
+    model = builder()
+    targets = discover_target_modules(model)
+    assert targets == ["base_model.model.visual.blocks.0.attn"]
+
+    factors = compute_factor_tensors(model, targets, rank=4)
+    target = targets[0]
+    assert f"{target}.q_proj.w1" in factors
+    assert f"{target}.k_proj.w2" in factors
+    assert f"{target}.v_proj.w1" in factors
+
+    register_arch_wiring(model)
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import (
+        get_module_mapping,
+    )
+
+    attn = dict(model.named_modules())[target]
+    assert get_module_mapping()[type(attn)] is sparse_cls
+    SparseLoRAPlugin()._validate(_validate_cfg(), model, targets)
+
+
+@pytest.mark.parametrize(
+    "builder,proj",
+    [
+        (_tiny_qwen3_vl_vision_mlp_lora, "linear_fc1"),
+        (_tiny_siglip_vision_mlp_lora, "fc1"),
+        (_tiny_internvl_vision_mlp_lora, "fc1"),
+    ],
+    ids=["qwen3vl", "siglip", "internvl"],
+)
+def test_vision_non_gated_mlp_discovery_registration_and_validation(builder, proj):
+    model = builder()
+    targets = discover_target_modules(model)
+    assert targets == ["base_model.model.visual.blocks.0.mlp"]
+
+    factors = compute_factor_tensors(model, targets, rank=4)
+    target = targets[0]
+    assert f"{target}.{proj}.w1" in factors
+    assert f"{target}.{proj}.w2" in factors
+
+    register_arch_wiring(model)
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import (
+        get_module_mapping,
+    )
+
+    mlp = dict(model.named_modules())[target]
+    assert get_module_mapping()[type(mlp)] is SparseNonGatedMLP
+    SparseLoRAPlugin()._validate(_validate_cfg(), model, targets)
+
+
+def test_gemma4_vision_gated_mlp_discovery_registration_and_validation():
+    model = _tiny_gemma4_vision_mlp_lora()
+    targets = discover_target_modules(model)
+    assert targets == ["base_model.model.visual.blocks.0.mlp"]
+
+    factors = compute_factor_tensors(model, targets, rank=4)
+    target = targets[0]
+    assert f"{target}.gate_proj.w1" in factors
+    assert f"{target}.up_proj.w2" in factors
+
+    register_arch_wiring(model)
+    from axolotl.integrations.sparselora._vendor.sparselora.modules import (
+        get_module_mapping,
+    )
+
+    mlp = dict(model.named_modules())[target]
+    assert get_module_mapping()[type(mlp)] is SparseSwiGLUMLP
+    SparseLoRAPlugin()._validate(_validate_cfg(), model, targets)
+
+
+def test_sparse_linear_bias_supports_flat_vision_tokens():
+    base = nn.Linear(8, 12, bias=True)
+    sparse = SparseLinearBias(base, mode="out_scatter")
+    x = torch.randn(5, 8)
+    idx = torch.tensor([1, 4, 7])
+    out = sparse(x, idx)
+    expected = torch.zeros(5, 12)
+    expected[:, idx] = F.linear(x, base.weight[idx], base.bias[idx])
+    assert torch.allclose(out, expected)
+
+
+def _apply_sparse_to_target(model, target):
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
+
+    module = dict(model.named_modules())[target]
+    config = getattr(module, "config", None)
+    if config is not None:
+        config._attn_implementation = "eager"
+    register_arch_wiring(model)
+    factors = compute_factor_tensors(model, [target], rank=4)
+    with tempfile.TemporaryDirectory() as d:
+        save_factors(factors, d)
+        apply_sparselora(
+            model,
+            SparseLoRAConfig(
+                layer_sparsity={target: 0.5},
+                predictor_rank=4,
+                path=d,
+            ),
+        )
+    return dict(model.named_modules())[target]
+
+
+def test_qwen3vl_vision_attention_sparse_apply_forward_cpu():
+    model = _tiny_qwen3_vl_vision_lora().to(torch.bfloat16)
+    target = discover_target_modules(model)[0]
+    attn = _apply_sparse_to_target(model, target)
+
+    assert isinstance(attn, SparseQwen3VLVisionAttention)
+    x = torch.randn(6, 32, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 6], dtype=torch.int32)
+    cos = torch.ones(6, 8, dtype=torch.bfloat16)
+    sin = torch.zeros(6, 8, dtype=torch.bfloat16)
+    out = attn(x, cu_seqlens=cu_seqlens, position_embeddings=(cos, sin))
+    assert out.shape == x.shape
+    assert torch.isfinite(out.float()).all()
+
+
+def test_gemma4_vision_attention_sparse_apply_forward_cpu():
+    model = _tiny_gemma4_vision_lora().to(torch.bfloat16)
+    target = discover_target_modules(model)[0]
+    attn = _apply_sparse_to_target(model, target)
+
+    assert isinstance(attn, SparseGemma4VisionAttention)
+    x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+    cos = torch.ones(1, 6, 8, dtype=torch.bfloat16)
+    sin = torch.zeros(1, 6, 8, dtype=torch.bfloat16)
+    position_ids = torch.zeros(1, 6, 2, dtype=torch.long)
+    out, weights = attn(x, position_embeddings=(cos, sin), position_ids=position_ids)
+    assert out.shape == x.shape
+    assert weights is None or torch.isfinite(weights.float()).all()
+    assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [_tiny_siglip_vision_lora, _tiny_internvl_vision_lora],
+    ids=["siglip", "internvl"],
+)
+def test_no_rope_vision_attention_sparse_apply_forward_cpu(builder):
+    model = builder().to(torch.bfloat16)
+    target = discover_target_modules(model)[0]
+    attn = _apply_sparse_to_target(model, target)
+
+    assert isinstance(attn, SparseNoRoPEAttention)
+    x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+    out, weights = attn(x)
+    assert out.shape == x.shape
+    assert weights is None or torch.isfinite(weights.float()).all()
+    assert torch.isfinite(out.float()).all()
+
+
+def test_qwen3vl_vision_mlp_sparse_apply_forward_cpu():
+    model = _tiny_qwen3_vl_vision_mlp_lora().to(torch.bfloat16)
+    target = discover_target_modules(model)[0]
+    mlp = _apply_sparse_to_target(model, target)
+
+    assert isinstance(mlp, SparseNonGatedMLP)
+    x = torch.randn(6, 32, dtype=torch.bfloat16)
+    out = mlp(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out.float()).all()
+
+
+def test_gemma4_vision_gated_mlp_sparse_apply_forward_cpu():
+    model = _tiny_gemma4_vision_mlp_lora().to(torch.bfloat16)
+    target = discover_target_modules(model)[0]
+    mlp = _apply_sparse_to_target(model, target)
+
+    assert isinstance(mlp, SparseSwiGLUMLP)
+    x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+    out = mlp(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [_tiny_siglip_vision_mlp_lora, _tiny_internvl_vision_mlp_lora],
+    ids=["siglip", "internvl"],
+)
+def test_vision_non_gated_mlp_sparse_apply_forward_cpu(builder):
+    model = builder().to(torch.bfloat16)
+    target = discover_target_modules(model)[0]
+    mlp = _apply_sparse_to_target(model, target)
+
+    assert isinstance(mlp, SparseNonGatedMLP)
+    x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+    out = mlp(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out.float()).all()
 
 
 def test_gemma2_sparse_reconstruction_and_grads_cpu():
@@ -716,28 +1152,54 @@ def test_phi3_factor_keys_and_validation(num_kv_heads):
     SparseLoRAPlugin()._validate(_validate_cfg(), model, targets)
 
 
-def test_phi3_rejects_mlp_lora():
-    """A LoRA adapter on the fused gate_up_proj (or down_proj) is rejected: the
-    SparseLoRA recipe is attention-only."""
+@cuda_only
+def test_phi3_accepts_fused_mlp_lora_sparse_apply_forward_cuda():
     pytest.importorskip("transformers")
     from peft import LoraConfig, get_peft_model
+
+    from axolotl.integrations.sparselora._vendor.sparselora import (
+        SparseLoRAConfig,
+        apply_sparselora,
+    )
 
     from .conftest import _tiny_phi3
 
     torch.manual_seed(0)
-    model = get_peft_model(
-        _tiny_phi3(),
-        LoraConfig(
-            r=8,
-            lora_alpha=16,
-            target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
-        ),
-    ).eval()
-    register_arch_wiring(model)
-    with pytest.raises(ValueError, match="attention-only LoRA"):
-        SparseLoRAPlugin()._validate(
-            _validate_cfg(), model, discover_target_modules(model)
+    model = (
+        get_peft_model(
+            _tiny_phi3(),
+            LoraConfig(
+                r=8,
+                lora_alpha=16,
+                target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
+            ),
         )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    register_arch_wiring(model)
+    targets = discover_target_modules(model)
+    SparseLoRAPlugin()._validate(_validate_cfg(), model, targets)
+
+    target = next(t for t in targets if t.endswith("mlp"))
+    factors = compute_factor_tensors(model, [target], rank=8)
+    with tempfile.TemporaryDirectory() as d:
+        save_factors(factors, d)
+        apply_sparselora(
+            model,
+            SparseLoRAConfig(
+                layer_sparsity={target: 0.5},
+                predictor_rank=8,
+                path=d,
+            ),
+        )
+
+        mlp = dict(model.named_modules())[target]
+        assert isinstance(mlp, SparseFusedGateUpMLP)
+        x = torch.randn(2, 4, 64, device="cuda", dtype=torch.bfloat16)
+        out = mlp(x)
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
 
 
 @cuda_only

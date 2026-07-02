@@ -109,10 +109,9 @@ class TestValidate:
         self._run(_lora_model(2, ["q_proj", "k_proj", "v_proj", "o_proj"]))
 
     @pytest.mark.parametrize("proj", ["gate_proj", "up_proj", "down_proj"])
-    def test_mlp_lora_rejected(self, proj):
+    def test_mlp_lora_accepted(self, proj):
         model = _lora_model(2, ["q_proj", "v_proj", proj])
-        with pytest.raises(ValueError, match="attention-only"):
-            self._run(model)
+        self._run(model)
 
     def test_predictor_rank_too_large_rejected(self):
         # GQA k/v projections have min dim = kv_size = 2*16 = 32.

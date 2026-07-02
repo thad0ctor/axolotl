@@ -153,6 +153,18 @@ def _apply_compile_boundaries(packing: bool = False) -> None:
     # Generic attention has its own forward; the MLP/linear paths inherit the
     # (already-disabled) vendored functions, so only the override needs marking.
     arch_wiring.SparseAttention.forward = disable(arch_wiring.SparseAttention.forward)  # type: ignore[method-assign]
+    arch_wiring.SparseQwen3VLVisionAttention.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseQwen3VLVisionAttention.forward
+    )
+    arch_wiring.SparseNoRoPEAttention.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseNoRoPEAttention.forward
+    )
+    arch_wiring.SparseGemma4VisionAttention.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseGemma4VisionAttention.forward
+    )
+    arch_wiring.SparseNonGatedMLP.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseNonGatedMLP.forward
+    )
     # Phi3 fused attention overrides forward indirectly via _qkv (data-dependent
     # combined-index slicing); the fused MLP overrides the (already-disabled)
     # SwiGLU _block. Disable their forwards explicitly so Dynamo graph-breaks
@@ -304,24 +316,6 @@ class SparseLoRAPlugin(BasePlugin):
                 "`register_sparse_module` to extend support."
             )
 
-        # The vendored MLP sparse path passes indices as a kwarg that only a
-        # plain SparseLinear accepts; a LoRA-wrapped MLP projection (gate/up/down,
-        # or the fused gate_up_proj) collides with the patched lora_forward.
-        # z-lab's recipe is attention-only.
-        mlp_proj_names = {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
-        mlp_lora = [
-            name
-            for name, module in model.named_modules()
-            if name.rsplit(".", 1)[-1] in mlp_proj_names
-            and hasattr(module, "base_layer")
-        ]
-        if mlp_lora:
-            raise ValueError(
-                "SparseLoRA v1 requires attention-only LoRA; found LoRA adapters on "
-                f"MLP projections: {mlp_lora}. Remove gate_proj/up_proj/down_proj from "
-                "`lora_target_modules` (e.g. use q_proj,k_proj,v_proj,o_proj)."
-            )
-
         # The vendored predictor buffers are sized with the configured rank, so a
         # projection smaller than predictor_rank fails at load_state_dict after
         # calibration has already run. Fail early with the offending projection.
@@ -355,8 +349,9 @@ class SparseLoRAPlugin(BasePlugin):
         if orphan_lora:
             raise ValueError(
                 "SparseLoRA requires every LoRA-adapted module to sit inside a "
-                f"sparsifiable attention block; found adapters outside: {orphan_lora}. "
-                "Restrict `lora_target_modules` to attention projections."
+                f"sparsifiable block; found adapters outside: {orphan_lora}. "
+                "Restrict `lora_target_modules` to supported attention or non-gated "
+                "vision MLP projections."
             )
 
     def post_trainer_create(self, cfg: DictDefault, trainer: Any) -> None:
@@ -444,12 +439,17 @@ class SparseLoRAPlugin(BasePlugin):
         # calibration-dense modules are explicit 0.0.
         layer_sparsity = {n: float(schedule.get(n, 0.0)) for n in target_names}
         positive = [n for n, s in layer_sparsity.items() if s > 0.0]
+        from .factors import output_sparse_weights
+
+        modules = dict(model.named_modules())
         # Reuse sweep factors where available; only compute the rest.
         missing = [
             n
             for n in positive
-            if f"{n}.gate_proj.w1" not in all_factors
-            and f"{n}.q_proj.w1" not in all_factors
+            if any(
+                f"{n}.{proj}.w1" not in all_factors
+                for proj in output_sparse_weights(modules[n])
+            )
         ]
         factor_tensors = {
             k: v for k, v in all_factors.items() if k.rsplit(".", 2)[0] in set(positive)
