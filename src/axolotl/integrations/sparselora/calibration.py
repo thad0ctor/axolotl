@@ -46,7 +46,10 @@ from .factors import (
     is_fused_attn_module,
     is_fused_mlp_module,
     is_mlp_module,
+    is_non_gated_mlp_module,
     mlp_projection_weights,
+    non_gated_mlp_projection_names,
+    non_gated_mlp_projection_weights,
 )
 
 LOG = get_logger(__name__)
@@ -63,6 +66,7 @@ def method_name(method: Any) -> str:
 def _is_sparsifiable(module: nn.Module) -> bool:
     return (
         is_mlp_module(module)
+        or is_non_gated_mlp_module(module)
         or is_attn_module(module)
         or is_fused_mlp_module(module)
         or is_fused_attn_module(module)
@@ -118,6 +122,17 @@ def _topk_indices(scores: torch.Tensor, sparsity: float) -> torch.Tensor:
     return scores.topk(k).indices
 
 
+def _linear_bias(module: nn.Module) -> torch.Tensor | None:
+    base = getattr(module, "base_layer", module)
+    base = getattr(base, "linear", base)
+    bias = getattr(base, "bias", None)
+    return bias if isinstance(bias, torch.Tensor) else None
+
+
+def _mlp_activation(module: nn.Module):
+    return getattr(module, "activation_fn", getattr(module, "act_fn", F.gelu))
+
+
 @torch.no_grad()
 def _ffn_recon_error(
     x: torch.Tensor,
@@ -127,6 +142,32 @@ def _ffn_recon_error(
     sparsity: float,
 ) -> float:
     """Relative L2 error of the MLP block when only predicted channels are kept."""
+    if is_non_gated_mlp_module(module):
+        names = non_gated_mlp_projection_names(module)
+        if names is None:
+            raise ValueError(f"{type(module).__name__} is not a non-gated MLP")
+        in_name, out_name = names
+        weights = non_gated_mlp_projection_weights(module)
+        wi, wo = weights[in_name], weights[out_name]
+        b1 = _linear_bias(getattr(module, in_name))
+        b2 = _linear_bias(getattr(module, out_name))
+        activation = _mlp_activation(module)
+
+        xm = x.reshape(-1, x.shape[-1]).mean(dim=0, keepdim=True).to(wi.dtype)
+        pre = (xm @ factors[f"{name}.{in_name}.w1"]) @ factors[f"{name}.{in_name}.w2"]
+        scores = activation(pre).norm(dim=0)
+        idx = _topk_indices(scores, sparsity)
+
+        dense = F.linear(activation(F.linear(x, wi, b1)), wo, b2)
+        sparse = F.linear(
+            activation(F.linear(x, wi[idx], None if b1 is None else b1[idx])),
+            wo[:, idx],
+            b2,
+        )
+        return (sparse - dense).float().norm().item() / (
+            dense.float().norm().item() + _EPS
+        )
+
     weights = mlp_projection_weights(module)
     wg, wu, wd = weights["gate_proj"], weights["up_proj"], weights["down_proj"]
 
@@ -210,7 +251,11 @@ def run_sensitivity(
                 x = captured.get(name)
                 if x is None:
                     continue
-                is_mlp = is_mlp_module(module) or is_fused_mlp_module(module)
+                is_mlp = (
+                    is_mlp_module(module)
+                    or is_non_gated_mlp_module(module)
+                    or is_fused_mlp_module(module)
+                )
                 for s in SPARSITY_GRID:
                     if is_mlp:
                         err = _ffn_recon_error(x, module, factors, name, s)
@@ -292,7 +337,11 @@ def allocate_structural(
         if idx is None or idx == last:
             continue
         module = modules[name]
-        is_mlp = is_mlp_module(module) or is_fused_mlp_module(module)
+        is_mlp = (
+            is_mlp_module(module)
+            or is_non_gated_mlp_module(module)
+            or is_fused_mlp_module(module)
+        )
         prefix = mlp_prefix if is_mlp else attn_prefix
         if idx < prefix:
             continue
@@ -321,7 +370,11 @@ def refine_with_sensitivity(
     groups: dict[bool, list[str]] = {True: [], False: []}
     for name in base_schedule:
         module = modules[name]
-        is_mlp = is_mlp_module(module) or is_fused_mlp_module(module)
+        is_mlp = (
+            is_mlp_module(module)
+            or is_non_gated_mlp_module(module)
+            or is_fused_mlp_module(module)
+        )
         groups[is_mlp].append(name)
 
     def _err_at(name: str) -> float:
