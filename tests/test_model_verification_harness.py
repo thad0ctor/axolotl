@@ -195,6 +195,46 @@ def test_g2_bogus_type_findings(tmp_path):
     assert res.data["counts"]["missing"] >= 1
 
 
+def _guard_placement_row(res):
+    for r in res.data["checklist"]:
+        if r["hook"] == "feature-incompat guard placement":
+            return r
+    return None
+
+
+def test_g2_guard_placement_flags_central_config_raise(tmp_path):
+    from harness.gates import g2_integration
+
+    cfg_dir = tmp_path / "src" / "axolotl" / "utils" / "config"
+    cfg_dir.mkdir(parents=True)
+    # the exact anti-pattern the PaddleOCR review relocated: a model-type-gated
+    # raise living in central config instead of the owning plugin.
+    (cfg_dir / "__init__.py").write_text(
+        "def _check_model_config_constraints(cfg):\n"
+        "    if cfg.model_config_type != 'paddleocr_vl':\n"
+        "        return\n"
+        "    if cfg.sample_packing:\n"
+        "        raise ValueError('sample_packing not supported for paddleocr_vl')\n",
+        encoding="utf-8",
+    )
+
+    def _run(mct):
+        ctx = GateContext(
+            features=_features(mct, "x"),
+            repo_root=tmp_path,
+            output_dir=tmp_path / "out",
+            selected_gates={"G2"},
+            options={},
+        )
+        return g2_integration.run(ctx)
+
+    hit = _guard_placement_row(_run("paddleocr_vl"))
+    assert hit is not None and hit["status"] == "generic_fallback"
+
+    miss = _guard_placement_row(_run("llama"))
+    assert miss is not None and miss["status"] == "not_expected"
+
+
 # --- G1 config matrix (resolution-only; needs a local config + axolotl) ---------
 
 

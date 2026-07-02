@@ -126,6 +126,32 @@ def _file_model_types(path: Path) -> tuple[set[str], bool]:
     return out, True
 
 
+def _config_guard_raise_types(path: Path) -> tuple[set[str], bool]:
+    """Model types named by a model-type comparison inside a function of ``path``
+    that also ``raise``s — the shape of a feature-incompat guard (``== X ...:
+    raise`` or the ``!= X: return`` early-guard, any operator). readable=False on
+    a missing/unparseable file."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, SyntaxError):
+        return set(), False
+    out: set[str] = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any(isinstance(n, ast.Raise) for n in ast.walk(fn)):
+            continue
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Compare)
+                and isinstance(node.left, ast.Attribute)
+                and node.left.attr in _TYPE_ATTRS
+            ):
+                for comp in node.comparators:
+                    out.update(_str_constants(comp))
+    return out, True
+
+
 def _named_set(path: Path, name: str) -> tuple[set[str], bool]:
     """String members of a literal set/tuple/list assigned to ``name``."""
     try:
@@ -1326,6 +1352,41 @@ def _check_example(p: Probe) -> None:
     )
 
 
+def _check_guard_placement(p: Probe) -> None:
+    """Model-specific feature-incompat guards belong in the owning subsystem
+    (LigerPlugin / CutCrossEntropyPlugin / PatchManager / processing_strategies),
+    not a central ``raise`` in ``utils/config``. A model-type-gated raise in
+    ``utils/config/__init__.py`` is a placement smell — advisory only, since G1
+    already surfaces the reject at runtime wherever the guard lives."""
+    types, ok = _config_guard_raise_types(p.src("utils/config/__init__.py"))
+    if not ok:
+        p.warn("utils/config/__init__.py guard-placement scan unreadable")
+        return
+    if p.mct in types:
+        p.add(
+            HookRow(
+                "feature-incompat guard placement",
+                "utils/config/__init__.py",
+                "model-type-gated raise",
+                GENERIC,
+                f"{p.mct!r} gated by a raise in central config — relocate the "
+                "incompat guard to its owning subsystem (LigerPlugin / "
+                "CutCrossEntropyPlugin / PatchManager / processing_strategies); "
+                "G1 surfaces the reject regardless of where the guard lives",
+            )
+        )
+    else:
+        p.add(
+            HookRow(
+                "feature-incompat guard placement",
+                "utils/config/__init__.py",
+                "model-type-gated raise",
+                NOT_EXPECTED,
+                "no central-config incompat guard for this type",
+            )
+        )
+
+
 def run(ctx: GateContext) -> GateResult:
     p = Probe(ctx)
 
@@ -1336,6 +1397,7 @@ def run(ctx: GateContext) -> GateResult:
     _check_fused_attn(p)
     _check_liger(p)
     _check_cce(p)
+    _check_guard_placement(p)
     _check_lora_kernels(p)
     _check_moe(p)
     _check_multimodal(p)
