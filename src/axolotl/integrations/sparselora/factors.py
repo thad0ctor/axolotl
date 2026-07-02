@@ -167,6 +167,12 @@ def fused_qkv_sizes(module: nn.Module) -> tuple[int, int]:
     num_kv_heads = getattr(module, "num_key_value_heads", None)
     if num_kv_heads is None and config is not None:
         num_kv_heads = getattr(config, "num_key_value_heads", None)
+    if num_kv_heads is None and num_heads is not None:
+        groups = getattr(module, "num_key_value_groups", None)
+        if groups is None and config is not None:
+            groups = getattr(config, "num_key_value_groups", None)
+        if groups:
+            num_kv_heads = int(num_heads) // int(groups)
     if num_kv_heads is None:
         num_kv_heads = num_heads
 

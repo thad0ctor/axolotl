@@ -499,7 +499,7 @@ class SparseFusedGateUpMLP(SparseSwiGLUMLP):
     — selecting exactly the channels the separate-projection path would.
     """
 
-    inherited_attributes = ["gate_up_proj", "down_proj"]
+    inherited_attributes: Any = ("gate_up_proj", "down_proj")
 
     def _init_extra(self, base: nn.Module) -> None:
         self.act_fn = gate_activation(base)
@@ -531,7 +531,7 @@ class SparseFusedGateUpMLP(SparseSwiGLUMLP):
 class SparseNonGatedMLP(SparseModule):
     """Sparse ``activation(fc1(x)) -> fc2`` MLP used by ViT vision towers."""
 
-    inherited_attributes: list[str] = []
+    inherited_attributes: Any = ()
 
     def __init__(
         self, base: nn.Module, *, name: str, idx: int, sparsity: float, cfg
@@ -886,7 +886,7 @@ class SparseFusedQKVAttention(SparseAttention):
     is handled by the predictor and the per-sub-block offsets.
     """
 
-    inherited_attributes = [
+    inherited_attributes: Any = (
         "qkv_proj",
         "o_proj",
         "config",
@@ -896,7 +896,7 @@ class SparseFusedQKVAttention(SparseAttention):
         "scaling",
         "attention_dropout",
         "is_causal",
-    ]
+    )
 
     def _init_extra(self, base: nn.Module, config: Any) -> None:
         self._q_size, self._kv_size = fused_qkv_sizes(base)
@@ -946,7 +946,7 @@ def _module_attr(base: nn.Module, name: str, default: Any = None) -> Any:
 class SparseQwen3VLVisionAttention(SparseModule):
     """Sparse Qwen3-VL vision attention with fused ``qkv`` and output ``proj``."""
 
-    inherited_attributes = [
+    inherited_attributes: Any = (
         "qkv",
         "proj",
         "config",
@@ -957,7 +957,7 @@ class SparseQwen3VLVisionAttention(SparseModule):
         "scaling",
         "attention_dropout",
         "is_causal",
-    ]
+    )
 
     def __init__(
         self, base: nn.Module, *, name: str, idx: int, sparsity: float = 0, cfg
@@ -1015,9 +1015,9 @@ class SparseQwen3VLVisionAttention(SparseModule):
         seq_length = hidden_states.shape[0]
         sparse = self.enabled and self.sparsity > 0
         query_states, key_states, value_states, v_i = self._qkv(hidden_states, sparse)
-        query_states = query_states.reshape(seq_length, self.num_heads, -1)
-        key_states = key_states.reshape(seq_length, self.num_heads, -1)
-        value_states = value_states.reshape(seq_length, self.num_heads, -1)
+        query_states = query_states.reshape(seq_length, -1, self.head_dim)
+        key_states = key_states.reshape(seq_length, -1, self.head_dim)
+        value_states = value_states.reshape(seq_length, -1, self.head_dim)
 
         if position_embeddings is None:
             raise ValueError(
@@ -1085,14 +1085,14 @@ class SparseNoRoPEAttention(SparseAttention):
     hidden dimension before the head reshape.
     """
 
-    inherited_attributes = [
+    inherited_attributes: Any = (
         "q_proj",
         "k_proj",
         "v_proj",
         "config",
         "head_dim",
         "is_causal",
-    ]
+    )
 
     def _init_extra(self, base: nn.Module, config: Any) -> None:
         out_name = attention_output_projection_name(base)
@@ -1166,7 +1166,7 @@ class SparseNoRoPEAttention(SparseAttention):
 class SparseGemma4VisionAttention(SparseAttention):
     """Sparse Gemma4 vision attention with multidimensional RoPE and v-norm."""
 
-    inherited_attributes = [
+    inherited_attributes: Any = (
         "q_proj",
         "k_proj",
         "v_proj",
@@ -1179,7 +1179,7 @@ class SparseGemma4VisionAttention(SparseAttention):
         "attention_dropout",
         "is_causal",
         "v_norm",
-    ]
+    )
 
     def _init_extra(self, base: nn.Module, config: Any) -> None:
         self._apply_multidimensional_rope = _module_attr(

@@ -350,8 +350,9 @@ class SparseLoRAPlugin(BasePlugin):
             raise ValueError(
                 "SparseLoRA requires every LoRA-adapted module to sit inside a "
                 f"sparsifiable block; found adapters outside: {orphan_lora}. "
-                "Restrict `lora_target_modules` to supported attention or non-gated "
-                "vision MLP projections."
+                "Restrict `lora_target_modules` to supported attention, gated MLP "
+                "(gate/up/down or fused gate_up), or non-gated vision MLP "
+                "projections."
             )
 
     def post_trainer_create(self, cfg: DictDefault, trainer: Any) -> None:

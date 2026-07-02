@@ -385,16 +385,16 @@ def audit(
     if smoke_fn is not None:
         try:
             sm = model.to(torch.bfloat16).eval()
-            d = tempfile.mkdtemp()
-            save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
-            apply_sparselora(
-                sm,
-                SparseLoRAConfig(
-                    layer_sparsity={t: sparsity for t in targets},
-                    predictor_rank=predictor_rank,
-                    path=d,
-                ),
-            )
+            with tempfile.TemporaryDirectory() as d:
+                save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
+                apply_sparselora(
+                    sm,
+                    SparseLoRAConfig(
+                        layer_sparsity={t: sparsity for t in targets},
+                        predictor_rank=predictor_rank,
+                        path=d,
+                    ),
+                )
             sparse_mods = [m for m in sm.modules() if isinstance(m, SparseModule)]
             assert sparse_mods, "no sparse modules were installed"
             note = smoke_fn(sm, targets)
@@ -417,16 +417,16 @@ def audit(
 
     try:
         sm = model.to("cuda").to(torch.bfloat16).train()
-        d = tempfile.mkdtemp()
-        save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
-        apply_sparselora(
-            sm,
-            SparseLoRAConfig(
-                layer_sparsity={t: sparsity for t in targets},
-                predictor_rank=predictor_rank,
-                path=d,
-            ),
-        )
+        with tempfile.TemporaryDirectory() as d:
+            save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
+            apply_sparselora(
+                sm,
+                SparseLoRAConfig(
+                    layer_sparsity={t: sparsity for t in targets},
+                    predictor_rank=predictor_rank,
+                    path=d,
+                ),
+            )
         sparse_mods = [m for m in sm.modules() if isinstance(m, SparseModule)]
         assert sparse_mods, "no sparse modules were installed"
 

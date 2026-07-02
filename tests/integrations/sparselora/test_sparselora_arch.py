@@ -1116,6 +1116,30 @@ def test_gated_split_and_gate_math():
     assert obj._gate is None  # consumed once
 
 
+def test_fused_qkv_sizes_uses_num_key_value_groups_without_kv_heads():
+    from axolotl.integrations.sparselora.factors import (
+        attn_projection_weights,
+        fused_qkv_sizes,
+    )
+
+    class GroupedFusedAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads = 8
+            self.num_key_value_groups = 4
+            self.head_dim = 9
+            self.qkv_proj = nn.Linear(72, 108, bias=False)
+            self.o_proj = nn.Linear(72, 72, bias=False)
+
+    attn = GroupedFusedAttention()
+
+    assert fused_qkv_sizes(attn) == (72, 18)
+    weights = attn_projection_weights(attn)
+    assert weights["q_proj"].shape == (72, 72)
+    assert weights["k_proj"].shape == (18, 72)
+    assert weights["v_proj"].shape == (18, 72)
+
+
 @pytest.mark.parametrize("num_kv_heads", [2, 4], ids=["gqa", "mha"])
 def test_phi3_factor_keys_and_validation(num_kv_heads):
     """Fused qkv_proj/gate_up_proj slice into the same q/k/v + gate/up factor keys
