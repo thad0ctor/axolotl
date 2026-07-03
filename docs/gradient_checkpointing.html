@@ -795,6 +795,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <li><a href="#enabling-gradient-checkpointing" id="toc-enabling-gradient-checkpointing" class="nav-link active" data-scroll-target="#enabling-gradient-checkpointing">Enabling Gradient Checkpointing</a></li>
   <li><a href="#enabling-activation-offloading" id="toc-enabling-activation-offloading" class="nav-link" data-scroll-target="#enabling-activation-offloading">Enabling Activation Offloading</a></li>
   <li><a href="#choosing-a-mode" id="toc-choosing-a-mode" class="nav-link" data-scroll-target="#choosing-a-mode">Choosing a mode</a></li>
+  <li><a href="#selective-activation-checkpointing-sac" id="toc-selective-activation-checkpointing-sac" class="nav-link" data-scroll-target="#selective-activation-checkpointing-sac">Selective Activation Checkpointing (SAC)</a></li>
   <li><a href="#enabling-layer-offloading" id="toc-enabling-layer-offloading" class="nav-link" data-scroll-target="#enabling-layer-offloading">Enabling Layer Offloading</a></li>
   </ul>
 </nav>
@@ -837,11 +838,14 @@ to overlap the communications and computations when offloading.</p>
 <p>The <code>activation_offloading: legacy</code> naively offloads activations to CPU and without additional optimizations.</p>
 <p>For resource constrained environments with limited CPU memory, <code>activation_offloading: disk</code> offloads
 activations to disk instead of CPU RAM so that much larger context lengths can be trained with minimal memory.</p>
-<p>The <code>activation_offloading: hidden_states</code> mode (ALST-style) is gradient checkpointing that offloads only
-the per-layer input (the checkpoint’s <code>hidden_states</code>) to CPU — one tensor per layer rather than every
-activation — overlapped with compute on a side CUDA stream. It replaces torch’s reentrant checkpoint
-(so <code>gradient_checkpointing_kwargs.use_reentrant</code> is forced to <code>true</code>) and is framework-agnostic
-(works under FSDP2, DTensor-aware for sequence/context parallelism).</p>
+<p>The <code>activation_offloading: hidden_states</code> mode keeps gradient checkpointing enabled and moves only
+the decoder-layer checkpoint input (<code>hidden_states</code>) to CPU. With the default
+<code>gradient_checkpointing_kwargs.use_reentrant: false</code>, Axolotl uses Transformers’ non-reentrant
+checkpointing plus a saved-tensor hook that only offloads marked hidden-state tensors. Other saved
+tensors stay on GPU, which avoids the CPU memory and bandwidth cost of full activation offload.</p>
+<p>Set <code>gradient_checkpointing_kwargs.use_reentrant: true</code> to use the older ALST-style implementation.
+That path patches torch’s reentrant <code>CheckpointFunction</code> and is DTensor-aware for sequence/context
+parallelism.</p>
 </section>
 <section id="choosing-a-mode" class="level3">
 <h3 class="anchored" data-anchor-id="choosing-a-mode">Choosing a mode</h3>
@@ -876,17 +880,57 @@ activation — overlapped with compute on a side CUDA stream. It replaces torch�
 </tr>
 <tr class="even">
 <td><code>hidden_states</code></td>
-<td>Per-layer input only → CPU, stream-overlapped</td>
-<td>Long-context <strong>full-parameter</strong> finetuning; reaches contexts where plain gradient checkpointing OOMs</td>
+<td>Per-layer checkpoint input only → CPU, stream-overlapped</td>
+<td>Long-context training where full activation offload is CPU-memory or bandwidth-bound</td>
 </tr>
 </tbody>
 </table>
-<p><code>hidden_states</code> is designed for full-parameter training. With LoRA/QLoRA the frozen base can break reentrant
-checkpointing, so prefer <code>activation_offloading: true</code> for adapters.</p>
+<p><code>hidden_states</code> uses gradient checkpointing and recomputes each layer during backward. With LoRA/QLoRA,
+<code>activation_offloading: true</code> can still be faster because adapter activations are smaller and pure offload
+avoids the recompute cost.</p>
+</section>
+<section id="selective-activation-checkpointing-sac" class="level3">
+<h3 class="anchored" data-anchor-id="selective-activation-checkpointing-sac">Selective Activation Checkpointing (SAC)</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gradient_checkpointing</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">selective_checkpointing</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Plain gradient checkpointing recomputes every op in a decoder layer during backward. Selective
+checkpointing keeps the recompute for cheap ops but <em>saves</em> the outputs of expensive ones — by
+default the attention op — so backward skips re-running them. At long context, attention dominates
+the recompute cost, so this recovers most of the checkpointing slowdown for one extra
+hidden-state-sized tensor per layer.</p>
+<p>This runs eagerly (no <code>torch.compile</code>) via torch’s selective-checkpoint policy API. Ops are matched
+at the dispatcher level: SDPA and flash-attention are matched out of the box, and custom kernels
+that are not registered as torch ops are simply recomputed as usual — nothing breaks.</p>
+<p>The explicit form lets you save additional ops, matched as substrings of the qualified op name:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">selective_checkpointing</span><span class="kw">:</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">save</span><span class="kw">:</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> attention</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> aten::mm</span><span class="co">        # example: also save all matmuls</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>For hybrid models mixing full attention and sliding-window attention (SWA), only full-attention
+calls are saved by default — SWA is cheap to recompute and not worth the memory. Hybrid layers are
+detected two ways: the flash-attention window arguments, and the model’s <code>layer_types</code> (published
+per-layer via hooks, which also covers SDPA where the window lives inside the attention mask).
+Set <code>selective_checkpointing.save_sliding_window: true</code> to save SWA calls too, or override which
+layer types recompute with <code>selective_checkpointing.recompute_layer_types</code> (default
+<code>[sliding_attention, chunked_attention]</code>; linear-attention layers never dispatch a matchable
+attention op, so they need no entry).</p>
+<p>To offload the saved tensors to pinned CPU memory instead of keeping them on GPU — asynchronous
+side-stream copies during forward, prefetched back one region ahead during backward — set:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">selective_checkpointing</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">save</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">attention</span><span class="kw">]</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">offload</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>This makes the saved attention outputs cost ~zero GPU memory at the price of CPU RAM and PCIe
+traffic, and stacks with <code>activation_offloading: hidden_states</code>.</p>
+<p>Requires non-reentrant checkpointing (the default). Composes with
+<code>activation_offloading: hidden_states</code>: layer inputs go to CPU while attention outputs are saved
+(on GPU, or on CPU with <code>offload: true</code>). It is incompatible with the TRL-offloader modes
+(<code>true</code>/<code>legacy</code>/<code>disk</code>), which replace gradient checkpointing instead of running inside it.
+Saving matmul ops (e.g.&nbsp;<code>aten::mm</code>) is rejected for LoRA/QLoRA runs: PEFT mutates the base linear
+output in-place, which invalidates cached tensors.</p>
 </section>
 <section id="enabling-layer-offloading" class="level3">
 <h3 class="anchored" data-anchor-id="enabling-layer-offloading">Enabling Layer Offloading</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">layer_offloading</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">layer_offloading</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Layer offloading reduces GPU memory usage by moving frozen (non-trainable) decoder layer parameters to CPU
 and streaming them back to GPU one layer at a time during the forward and backward passes. This is
 particularly useful for LoRA/QLoRA training where most of the model’s parameters are frozen — only the
