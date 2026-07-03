@@ -137,6 +137,15 @@ def test_detect_llama(tmp_path):
     assert f.needs_patch  # llama has a flash-attn branch in patch_manager
 
 
+def test_detect_local_dir_without_config_raises_clear_error(tmp_path):
+    from harness.detect import detect_model
+
+    empty = tmp_path / "no_config_here"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="no config.json"):
+        detect_model(str(empty), REPO_ROOT)
+
+
 def test_detect_moe_and_multimodal(tmp_path):
     from harness.detect import detect_model
 
@@ -207,8 +216,7 @@ def test_g2_guard_placement_flags_central_config_raise(tmp_path):
 
     cfg_dir = tmp_path / "src" / "axolotl" / "utils" / "config"
     cfg_dir.mkdir(parents=True)
-    # the exact anti-pattern the PaddleOCR review relocated: a model-type-gated
-    # raise living in central config instead of the owning plugin.
+    # a model-type-gated raise in central config instead of the owning plugin
     (cfg_dir / "__init__.py").write_text(
         "def _check_model_config_constraints(cfg):\n"
         "    if cfg.model_config_type != 'paddleocr_vl':\n"
@@ -448,7 +456,7 @@ def test_discover_dynamic_only_warns():
     assert any("transformers" in w for w in res["warnings"])
 
 
-# --- G4 terminator masking (#3754), pure-function offline ----------------------
+# --- G4 assistant turn-terminator masking, pure-function offline ----------------
 
 # tiny token map: 1=<eos> (special, never in chat), 107=<end_of_turn> (real terminator),
 # 9/10/11 = content, -100 = IGNORE
@@ -621,7 +629,7 @@ def test_g4_bundled_template_exact_match_only():
     assert g4_masking._bundled_template_name("znovel_arch_test") is None
 
 
-# --- CodeRabbit-round regressions ----------------------------------------------
+# --- regression cases ----------------------------------------------------------
 
 
 def test_g1_oserror_subclass_is_environment_error():

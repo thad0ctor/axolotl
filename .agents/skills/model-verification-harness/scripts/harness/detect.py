@@ -31,6 +31,8 @@ def _load_config_dict(
         return json.loads(local_cfg.read_text(encoding="utf-8"))
     if local.is_file() and local.name == "config.json":
         return json.loads(local.read_text(encoding="utf-8"))
+    if local.is_dir():
+        raise ValueError(f"{local} exists but has no config.json")
 
     from transformers import AutoConfig
 
