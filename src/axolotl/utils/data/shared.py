@@ -710,6 +710,7 @@ def generate_pretraining_dataset_hash(
         "image_token",
         "multimodal",
         "skip",
+        "skip_bad_images",
     )
     ds_fingerprint = "|".join(f"{k}={pretraining_config.get(k)!r}" for k in keys)
     config_str = (

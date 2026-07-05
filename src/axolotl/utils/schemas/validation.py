@@ -1446,9 +1446,9 @@ class PretrainingValidationMixin:
             if all(mm_flags) and not train_is_mm:
                 raise ValueError(
                     "Multimodal `test_datasets` require multimodal CPT "
-                    "training (set `pretraining_dataset[0].type` or "
-                    "`datasets[0].type` to "
-                    "'multimodal_pretrain' or `multimodal: true`)."
+                    "training (set `pretraining_dataset[0].type` to "
+                    "'multimodal_pretrain' or `multimodal: true`, or set "
+                    "`datasets[0].type: multimodal_pretrain`)."
                 )
             if not any(mm_flags) and train_is_mm:
                 raise ValueError(

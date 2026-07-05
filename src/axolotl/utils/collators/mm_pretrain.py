@@ -159,8 +159,10 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
             # Accept the encoder's `_mm_text` or the raw `text` column; they're
             # identical and the processor re-tokenizes below regardless.
             mm_text = ex.get("_mm_text")
+            source_field = "_mm_text"
             if mm_text is None:
                 mm_text = ex.get("text")
+                source_field = "text"
             if mm_text is None or "images" not in ex:
                 raise KeyError(
                     f"MultiModalPretrainDataCollator: row {i} is missing "
@@ -170,7 +172,7 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
                 )
             if not isinstance(mm_text, str):
                 raise TypeError(
-                    f"Row {i}: `_mm_text` must be str, got "
+                    f"Row {i}: `{source_field}` must be str, got "
                     f"{type(mm_text).__name__}. Check dataset encoding "
                     f"(Parquet BINARY columns may surface as bytes)."
                 )

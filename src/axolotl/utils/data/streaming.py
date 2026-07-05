@@ -409,6 +409,7 @@ def wrap_streaming_dataset(
         batched=True,
         batch_size=cfg.streaming_multipack_buffer_size,
         remove_columns=remove_columns,
+        num_proc=cfg.dataset_num_proc if cache_prep else None,
     )
     return dataset
 
