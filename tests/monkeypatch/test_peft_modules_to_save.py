@@ -6,6 +6,11 @@ import torch.nn as nn
 
 pytest.importorskip("peft")
 
+from peft.utils.other import AuxiliaryTrainingWrapper as _AuxWrapper
+
+# Captured at import, before the module-scoped `patched` fixture applies the patch.
+_PRISTINE_FORWARD = _AuxWrapper.forward
+
 
 @pytest.fixture(scope="module")
 def patched():
@@ -146,3 +151,48 @@ def test_patch_is_idempotent():
     patch_peft_modules_to_save_kwargs()
     second = AuxiliaryTrainingWrapper.forward
     assert first is second, "patch must be idempotent"
+
+
+def test_forward_requires_positional_probe():
+    """The conditional-apply guard: True only when a positional arg is required."""
+    from axolotl.monkeypatch.peft_modules_to_save import _forward_requires_positional
+
+    def buggy(self, x, *args, **kwargs):  # PEFT today
+        return x
+
+    def fixed_varargs(self, *args, **kwargs):  # hypothetical upstream fix
+        return args
+
+    def fixed_default(self, x=None, *args, **kwargs):  # or x made optional
+        return x
+
+    assert _forward_requires_positional(buggy) is True
+    assert _forward_requires_positional(fixed_varargs) is False
+    assert _forward_requires_positional(fixed_default) is False
+
+
+def test_canary_patch_still_needed(wrap_module):
+    """Retire signal — fails loudly the day PEFT accepts kwargs-only forward upstream.
+
+    Probe-independent: calls the *pristine* forward (captured pre-patch) with kwargs
+    only and asserts it still raises. If PEFT is fixed this stops raising and the test
+    fails, flagging that patch_peft_modules_to_save_kwargs() is redundant and can go.
+    """
+    from axolotl.monkeypatch.peft_modules_to_save import _forward_requires_positional
+
+    class KwargsOnly(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(8, 8)
+
+        def forward(self, *, pixel_values):
+            return self.lin(pixel_values)
+
+    w = wrap_module(KwargsOnly())
+    with pytest.raises(TypeError):
+        _PRISTINE_FORWARD(w, pixel_values=torch.randn(2, 8))
+    assert _forward_requires_positional(_PRISTINE_FORWARD), (
+        "peft.AuxiliaryTrainingWrapper.forward no longer requires a positional arg — "
+        "the axolotl kwargs monkeypatch is likely redundant; verify against the "
+        "installed PEFT and remove patch_peft_modules_to_save_kwargs()."
+    )

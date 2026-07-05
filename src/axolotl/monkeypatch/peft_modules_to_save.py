@@ -1,11 +1,32 @@
 """Patch PEFT's AuxiliaryTrainingWrapper / ModulesToSaveWrapper so kwargs-only
 forward calls work (e.g. Gemma 4 vision_tower / embed_vision in lora_modules_to_save)."""
 
+import inspect
+
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 
 _PATCHED_ATTR = "_axolotl_modules_to_save_kwargs_patched"
+
+
+def _forward_requires_positional(func) -> bool:
+    """True if ``func`` (a wrapper ``forward``) still needs a positional arg after
+    ``self`` — i.e. PEFT can't be called kwargs-only and this patch is needed. Lets
+    the patch skip itself (and the canary test flag it) once PEFT fixes forward upstream."""
+    for param in list(inspect.signature(func).parameters.values())[1:]:  # skip self
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            return False
+        if (
+            param.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            and param.default is inspect.Parameter.empty
+        ):
+            return True
+    return False
 
 
 def _patched_forward(self, *args, **kwargs):
@@ -41,6 +62,15 @@ def patch_peft_modules_to_save_kwargs() -> None:
     from peft.utils.other import AuxiliaryTrainingWrapper, ModulesToSaveWrapper
 
     if getattr(AuxiliaryTrainingWrapper, _PATCHED_ATTR, False):
+        return
+
+    # Don't shadow a PEFT that already handles kwargs-only forward — avoids silently
+    # overriding a fixed upstream implementation. See test_canary_patch_still_needed.
+    if not _forward_requires_positional(AuxiliaryTrainingWrapper.forward):
+        LOG.info(
+            "peft.AuxiliaryTrainingWrapper.forward already accepts kwargs-only calls; "
+            "skipping axolotl modules_to_save patch (likely retirable)."
+        )
         return
 
     AuxiliaryTrainingWrapper.forward = _patched_forward
