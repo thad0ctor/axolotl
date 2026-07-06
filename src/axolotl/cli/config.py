@@ -224,6 +224,8 @@ def prepare_plugins(cfg: DictDefault):
 
 def plugin_set_cfg(cfg: DictDefault):
     if cfg.get("plugins"):
+        from axolotl.integrations.base import PluginManager
+
         plugin_manager = PluginManager.get_instance()
         plugin_manager.cfg = cfg
 
