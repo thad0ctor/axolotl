@@ -173,6 +173,19 @@ def run(ctx: GateContext) -> GateResult:
         cfg = runner.resolve_cfg(cfg_path)
         dataset_meta = runner.prepare(cfg)
     except Exception as exc:  # noqa: BLE001 - env / load failure
+        if "sample_packing is not supported" in str(exc):
+            return GateResult(
+                GATE_ID,
+                GATE_NAME,
+                GateStatus.PASS,
+                summary=f"packing explicitly unsupported: {exc}",
+                details=[f"model guard rejected sample_packing: {exc}"],
+                data={
+                    "model_config_type": ctx.model_config_type,
+                    "packable": False,
+                    "explicitly_unsupported": True,
+                },
+            )
         return GateResult.could_not_run(
             GATE_ID,
             GATE_NAME,

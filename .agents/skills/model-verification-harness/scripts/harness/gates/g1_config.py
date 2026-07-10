@@ -19,6 +19,10 @@ _LIGER_PLUGIN = "axolotl.integrations.liger.LigerPlugin"
 _CCE_PLUGIN = "axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin"
 _KERNELS_PLUGIN = "axolotl.integrations.kernels.KernelsPlugin"
 
+_PACKING_UNSUPPORTED_MODEL_TYPES = {"paddleocr_vl"}
+_CCE_UNSUPPORTED_MODEL_TYPES = {"paddleocr_vl"}
+_LIGER_UNSUPPORTED_MODEL_TYPES = {"paddleocr_vl"}
+
 # flag key -> warning substrings, so incidental warnings (FSDP1/bf16) don't falsely paint a cell WARNED_NO_OP
 _FLAG_WARN_TOKENS = {
     "sample_packing": ("sample_packing",),
@@ -231,6 +235,8 @@ def _classify(
         note = f"{type(exc).__name__}: {exc}".split("\n")[0]
         if cell.expect == "reject":
             note = f"expected reject — {note}"
+        elif cell.expect == "unsupported":
+            note = f"expected unsupported — {note}"
         else:
             note = f"UNEXPECTED reject — {note}"
         return _Outcome(cell, Verdict.REJECTED, note, warnings=rel)
@@ -257,25 +263,52 @@ def _classify(
 def _composites(ctx: GateContext) -> list[_Cell]:
     """One maximal-compatible composite per cross-entropy option, then oracle probes."""
     is_moe = ctx.features.is_moe
+    packing_expected = (
+        "unsupported"
+        if ctx.model_config_type in _PACKING_UNSUPPORTED_MODEL_TYPES
+        else "resolve"
+    )
+    cce_expected = (
+        "unsupported"
+        if ctx.model_config_type in _CCE_UNSUPPORTED_MODEL_TYPES
+        else "resolve"
+    )
+    liger_expected = (
+        "unsupported"
+        if ctx.model_config_type in _LIGER_UNSUPPORTED_MODEL_TYPES
+        else "resolve"
+    )
     cells: list[_Cell] = []
 
     cells.append(
         _Cell(
-            "c0_none_packing",
+            "c0_basic_sft",
+            {
+                "attn_implementation": "sdpa",
+                "gradient_checkpointing": True,
+            },
+            "resolve",
+            "baseline SFT config without optional cross-entropy or packing paths",
+        )
+    )
+
+    cells.append(
+        _Cell(
+            "c1_none_packing",
             {
                 "attn_implementation": "flash_attention_2",
                 "sample_packing": True,
                 "gradient_checkpointing": True,
                 "activation_offloading": True,
             },
-            "resolve",
+            packing_expected,
             "CE=none; exercises sample_packing, gradient_checkpointing, activation_offloading",
         )
     )
 
     cells.append(
         _Cell(
-            "c1_liger_ce_batchflatten",
+            "c2_liger_ce_batchflatten",
             {
                 "plugins": [_LIGER_PLUGIN],
                 "liger_cross_entropy": True,
@@ -284,14 +317,14 @@ def _composites(ctx: GateContext) -> list[_Cell]:
                 "attn_implementation": "flash_attention_2",
                 "batch_flattening": True,
             },
-            "resolve",
+            liger_expected,
             "CE=liger_cross_entropy; exercises batch_flattening, liger_glu_activation, liger_rms_norm",
         )
     )
 
     cells.append(
         _Cell(
-            "c2_flce_flex_softmax",
+            "c3_flce_flex_softmax",
             {
                 "plugins": [_LIGER_PLUGIN],
                 "liger_fused_linear_cross_entropy": True,
@@ -299,14 +332,14 @@ def _composites(ctx: GateContext) -> list[_Cell]:
                 "attn_implementation": "flex_attention",
                 "scaling_softmax": True,
             },
-            "resolve",
+            liger_expected,
             "CE=FLCE; exercises liger_use_token_scaling, scaling_softmax, flex_attention",
         )
     )
 
     cells.append(
         _Cell(
-            "c3_cce_bf16",
+            "c4_cce_bf16",
             {
                 "plugins": [_CCE_PLUGIN],
                 "cut_cross_entropy": True,
@@ -314,7 +347,7 @@ def _composites(ctx: GateContext) -> list[_Cell]:
                 "attn_implementation": "flash_attention_2",
                 "gradient_checkpointing": True,
             },
-            "resolve",
+            cce_expected,
             "CE=cut_cross_entropy; exercises cut_cross_entropy + bf16 co-requisite",
         )
     )
@@ -322,13 +355,13 @@ def _composites(ctx: GateContext) -> list[_Cell]:
     # oracle probe for the WARNED_NO_OP channel (expect="warn"): firing is EXPECTED, not a model finding
     cells.append(
         _Cell(
-            "c4_chunked_packing_sdpa",
+            "c5_chunked_packing_sdpa",
             {
                 "chunked_cross_entropy": True,
                 "attn_implementation": "sdpa",
                 "sample_packing": True,
             },
-            "warn",
+            "unsupported" if packing_expected == "unsupported" else "warn",
             "CE=chunked; sample_packing without varlen attn -> oracle probe for WARNED_NO_OP",
         )
     )
@@ -337,7 +370,7 @@ def _composites(ctx: GateContext) -> list[_Cell]:
         # expert_backend canonicalizes onto use_scattermoe -> NORMALIZED probe
         cells.append(
             _Cell(
-                "c5_moe_expert_backend",
+                "c6_moe_expert_backend",
                 {
                     "plugins": [_KERNELS_PLUGIN],
                     "use_kernels": True,
@@ -434,7 +467,9 @@ def _quant_composites(ctx: GateContext) -> list[_Cell]:
                 "sample_packing": True,
                 "attn_implementation": "flash_attention_2",
             },
-            "resolve",
+            "unsupported"
+            if ctx.model_config_type in _PACKING_UNSUPPORTED_MODEL_TYPES
+            else "resolve",
             "qlora + sample_packing + flash_attention_2 (common quantized-LoRA path)",
         ),
         # oracle: quant without an adapter is rejected (peft.validate_adapter)
@@ -709,8 +744,15 @@ def _assemble(
                     f"  !! {cell.composite_id} was built to warn/no-op but resolved "
                     "clean (oracle gap — the warn path may have regressed)"
                 )
-        else:  # expect reject
-            if o.verdict != Verdict.REJECTED:
+        else:
+            if cell.expect == "unsupported":
+                if o.verdict != Verdict.REJECTED:
+                    findings += 1
+                    details.append(
+                        f"  !! {cell.composite_id} was built unsupported but RESOLVED "
+                        "(model-specific guard missing)"
+                    )
+            elif o.verdict != Verdict.REJECTED:
                 # the oracle did NOT fire on a combo built to be invalid
                 findings += 1
                 details.append(

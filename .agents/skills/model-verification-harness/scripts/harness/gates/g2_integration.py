@@ -660,6 +660,17 @@ def _check_fused_attn(p: Probe) -> None:
 
 def _check_liger(p: Probe) -> None:
     # explicit = dedicated elif branch OR native MODEL_TYPE_TO_APPLY_LIGER_FN; generic_fallback = neither (only experimental patch_lce_forward FLCE)
+    if p.mct in {"paddleocr_vl"}:
+        p.add(
+            HookRow(
+                "liger routing",
+                "integrations/liger/plugin.py",
+                "liger (opt-in)",
+                NOT_EXPECTED,
+                "model-specific config guard rejects Liger for this type",
+            )
+        )
+        return
     native, nerr = _safe_import(
         "liger_kernel.transformers.monkey_patch", "MODEL_TYPE_TO_APPLY_LIGER_FN"
     )
@@ -716,6 +727,17 @@ def _check_liger(p: Probe) -> None:
 
 def _check_cce(p: Probe) -> None:
     # explicit = an upstream PATCH_FNS entry; else patch_llama_like installs a generic llama-shaped patch = generic_fallback
+    if p.mct in {"paddleocr_vl"}:
+        p.add(
+            HookRow(
+                "CCE routing",
+                "integrations/cut_cross_entropy/__init__.py",
+                "cut_cross_entropy (opt-in)",
+                NOT_EXPECTED,
+                "model-specific config guard rejects CCE for this type",
+            )
+        )
+        return
     patch_fns, err = _safe_import("cut_cross_entropy.transformers.patch", "PATCH_FNS")
     if err is not None:
         p.warn(f"CCE PATCH_FNS not importable ({err}); routing classification degraded")
