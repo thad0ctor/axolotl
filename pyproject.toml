@@ -15,6 +15,7 @@ dependencies = [
     "torch>=2.11.0,<=2.12.1",
     "packaging==26.0",
     "huggingface_hub==1.17.0",
+    "safetensors",
     "peft==0.19.1",
     "tokenizers==0.22.2",
     "transformers==5.12.1",
@@ -189,6 +190,8 @@ version = { file = "VERSION" }
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+# Vendored third-party code is kept verbatim; do not lint/reformat it.
+extend-exclude = ["src/axolotl/integrations/sparselora/_vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "C90", "B", "I"]

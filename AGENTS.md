@@ -40,6 +40,7 @@ Agent-specific references:
 - [docs/agents/pretraining.md](docs/agents/pretraining.md) — continual pretraining
 - [docs/agents/model_architectures.md](docs/agents/model_architectures.md) — model-specific quirks (Gemma4, Qwen3.5 MoE, etc.)
 - [docs/agents/new_model_support.md](docs/agents/new_model_support.md) — debugging and adding support for new model architectures
+- [docs/agents/sparselora.md](docs/agents/sparselora.md) — SparseLoRA contextual-sparsity LoRA acceleration (self-calibrating; model-agnostic: Llama/Qwen/Mistral/Gemma/Phi3/...)
 
 ## Config Pattern
 
@@ -94,6 +95,14 @@ Setup, CI matrix, GPU e2e, skip-CI keywords: [.github/CONTRIBUTING.md](.github/C
 - Plugin system: `plugins:` list in config loads integration modules
 - Trainer mixins: `core/trainers/mixins/` for composable trainer behaviors
 - Schemas: all config validation via Pydantic in `utils/schemas/`
+
+## Agent Skills
+
+Repo-specific workflow guides (plus scripts) under `.agents/skills/`, auto-discovered by Claude Code (via the `.claude/skills` → `.agents/skills` symlink) and read natively by Codex/Gemini. See [`.agents/skills/README.md`](.agents/skills/README.md); layout is enforced by `tests/test_agent_skill_layout.py`.
+
+| Skill | What it does |
+|-------|--------------|
+| [`sparselora-add-model`](.agents/skills/sparselora-add-model/SKILL.md) | Adds or verifies a model architecture's SparseLoRA sparse wiring (`src/axolotl/integrations/sparselora/arch_wiring.py`); introspects MLP/attention classes, runs a smoke apply+forward, and guides custom wiring for non-standard attention. |
 
 ## Comment Style
 
