@@ -59,7 +59,7 @@ class PatchManager:
         run_model_support_hooks(
             support,
             ModelHookPhase.BEFORE_CONFIG_LOAD,
-            ModelHookContext(cfg=cfg),
+            ModelHookContext(cfg=cfg, inference=getattr(cfg, "inference", None)),
         )
 
     @staticmethod
@@ -76,7 +76,7 @@ class PatchManager:
         run_model_support_hooks(
             support,
             ModelHookPhase.BEFORE_TOKENIZER_LOAD,
-            ModelHookContext(cfg=cfg),
+            ModelHookContext(cfg=cfg, inference=getattr(cfg, "inference", None)),
         )
 
     def __init__(
