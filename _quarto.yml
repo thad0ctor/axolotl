@@ -200,6 +200,8 @@ quartodoc:
         - monkeypatch.models.gemma4_unified.fused_attn
         - monkeypatch.models.granitemoehybrid.modeling
         - model_support.base
+        - model_support.profile
+        - model_support.templates
         - model_support.kimi_linear.patch_kimi_linear
         - model_support.registry
         - monkeypatch.models.llama4.modeling
@@ -334,11 +336,8 @@ quartodoc:
         - integrations.liger.models.base
         - integrations.liger.models.deepseekv2
         - integrations.liger.models.jamba
-        - integrations.liger.models.llama4
-        - integrations.liger.models.qwen3
         - integrations.liger.models.qwen3_5
         - integrations.liger.models.qwen3_5_moe
-        - integrations.liger.models.qwen3_moe
         - integrations.llm_compressor.args
         - integrations.llm_compressor.plugin
         - integrations.llm_compressor.utils
