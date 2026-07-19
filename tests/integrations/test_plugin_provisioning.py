@@ -1,25 +1,40 @@
-"""Tests for external plugin source provisioning."""
+"""Tests for the `axolotl plugins install` provisioning backend.
 
+Nothing here reaches the network: git sources are real repositories created in
+`tmp_path`, and pip is always mocked.
+"""
+
+import os
 import shutil
 import subprocess  # nosec
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from axolotl.integrations import provisioning
+from axolotl.integrations.plugin_manifest import (
+    entries,
+    record_install,
+    resolve_cache_dir,
+)
 from axolotl.integrations.provisioning import (
+    ProvisionAborted,
+    _clone_target,
     _looks_like_git,
     _pip_install,
-    provision_plugins,
+    _pip_install_requirements,
+    is_git_source,
+    provision,
+    resolve_install_spec,
 )
-from axolotl.utils.schemas.config import PluginSpec
 
 
 def _git(args, cwd):
     git_bin = shutil.which("git")
     if not git_bin:
         pytest.skip("git executable not found in PATH")
-    subprocess.run(  # nosec
+    return subprocess.run(  # nosec
         [git_bin, *args],
         cwd=str(cwd),
         check=True,
@@ -32,7 +47,7 @@ def _git(args, cwd):
             "GIT_COMMITTER_NAME": "t",
             "GIT_COMMITTER_EMAIL": "t@t",
             "HOME": str(cwd),
-            "PATH": __import__("os").environ.get("PATH", ""),
+            "PATH": os.environ.get("PATH", ""),
         },
     )
 
@@ -57,20 +72,6 @@ def _make_plugin_package(root, pkg="disc_plugin", cls="DiscPlugin"):
     return f"{pkg}.{cls}"
 
 
-_TEST_MODULE_PREFIXES = {
-    "ext_plugin",
-    "nested_plugin",
-    "git_plugin",
-    "utils_ext_plugin",
-    "disc_plugin",
-    "disc_plugin2",
-    "sub_disc_plugin",
-    "empty_pkg",
-    "marker",
-    "multi_pkg",
-}
-
-
 def _make_multi_plugin_package(root, pkg="multi_pkg", classes=("Alpha", "Beta")):
     pkgdir = root / pkg
     pkgdir.mkdir(parents=True, exist_ok=True)
@@ -79,6 +80,36 @@ def _make_multi_plugin_package(root, pkg="multi_pkg", classes=("Alpha", "Beta"))
         body += f"class {cls}(BasePlugin):\n    pass\n"
     (pkgdir / "__init__.py").write_text(body)
     return [f"{pkg}.{c}" for c in classes]
+
+
+def _make_package_source(root, name="pkg_plugin"):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text(f"[project]\nname='{name}'\nversion='0'\n")
+    return root
+
+
+def _isolate_default_cache(tmp_path, monkeypatch):
+    """Point the per-user default cache inside tmp_path, without creating it."""
+    monkeypatch.delenv("AXOLOTL_PLUGIN_CACHE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    return tmp_path / "xdg" / "axolotl" / "plugins"
+
+
+_TEST_MODULE_PREFIXES = {
+    "ext_plugin",
+    "nested_plugin",
+    "git_plugin",
+    "disc_plugin",
+    "disc_plugin2",
+    "sub_disc_plugin",
+    "empty_pkg",
+    "marker",
+    "multi_pkg",
+    "pkg_plugin",
+    "req_plugin",
+    "srclayout_plugin",
+}
 
 
 @pytest.fixture
@@ -92,6 +123,26 @@ def cleanup_syspath():
             sys.modules.pop(name, None)
 
 
+@pytest.fixture
+def no_pip(monkeypatch):
+    """Record every pip entry point instead of running pip."""
+    calls = SimpleNamespace(packages=[], requirements=[])
+    monkeypatch.setattr(
+        provisioning,
+        "_pip_install",
+        lambda package_root, editable: calls.packages.append((package_root, editable)),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_pip_install_requirements",
+        calls.requirements.append,
+    )
+    return calls
+
+
+# --- source resolution ------------------------------------------------------
+
+
 def test_looks_like_git():
     assert _looks_like_git("https://github.com/a/b.git")
     assert _looks_like_git("git@github.com:a/b.git")
@@ -100,268 +151,347 @@ def test_looks_like_git():
     assert not _looks_like_git("./relative/dir")
 
 
-def test_pip_install_normalization():
-    assert PluginSpec(cls="a.B", pip_install=True).pip_install == "editable"
-    assert PluginSpec(cls="a.B", pip_install=False).pip_install is False
-    assert (
-        PluginSpec(cls="a.B", pip_install="requirements").pip_install == "requirements"
+def test_is_git_source_is_the_public_view_of_looks_like_git():
+    # The CLI gates its moving-ref warning on this, so it must stay in step.
+    for source in ("https://github.com/a/b.git", "git@h:a/b.git", "./dir", "/tmp/x"):
+        assert is_git_source(source) == _looks_like_git(source)
+
+
+def test_resolve_install_spec_git_url():
+    spec = resolve_install_spec(
+        "https://github.com/org/repo.git", ref="v1.0.0", subdir="src", cls="a.B"
     )
-    assert PluginSpec(cls="a.B").pip_install is False
+    assert spec.source == "https://github.com/org/repo.git"
+    assert spec.ref == "v1.0.0"
+    assert spec.subdir == "src"
+    assert spec.cls == "a.B"
 
 
-def test_string_entries_are_noop():
-    cfg = {"plugins": ["pkg.A", "pkg.B"]}
-    provision_plugins(cfg)
-    assert cfg["plugins"] == ["pkg.A", "pkg.B"]
+def test_resolve_install_spec_local_path(tmp_path):
+    src = tmp_path / "plugin_src"
+    src.mkdir()
+    assert resolve_install_spec(str(src)).source == str(src)
+    # A path-shaped source resolves even when it does not exist yet.
+    assert resolve_install_spec("./nope/plugin").source == "./nope/plugin"
 
 
-def test_empty_plugins_noop():
-    cfg = {"plugins": None}
-    provision_plugins(cfg)
-    assert cfg["plugins"] is None
+def test_resolve_install_spec_bare_name_raises():
+    with pytest.raises(ValueError, match="expected a git URL or a local path"):
+        resolve_install_spec("definitely-not-a-path")
 
 
-def test_local_source_path_injection(tmp_path, monkeypatch, cleanup_syspath):
+# --- install mode selection -------------------------------------------------
+
+
+def test_bare_module_dir_uses_syspath_mode(tmp_path, no_pip, cleanup_syspath):
     src = tmp_path / "plugin_src"
     cls = _make_plugin_module(src)
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": cls, "source": str(src)}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == [cls]
+    spec = resolve_install_spec(str(src), cls=cls)
+
+    result = provision(spec, cache_dir=tmp_path / "cache")
+
+    assert result.mode == "syspath"
+    assert result.syspath_entry == str(src)
+    assert result.cls == [cls]
+    assert not no_pip.packages
     assert str(src) in sys.path
     import ext_plugin  # noqa: F401  importable now
 
     assert ext_plugin.ExtPlugin.name == "ExtPlugin"
 
 
-def test_local_source_with_subdir(tmp_path, monkeypatch, cleanup_syspath):
+def test_package_dir_uses_pip_mode(tmp_path, no_pip, cleanup_syspath):
+    src = _make_package_source(tmp_path / "repo")
+    spec = resolve_install_spec(str(src), cls="pkg_plugin.PkgPlugin")
+
+    result = provision(spec, cache_dir=tmp_path / "cache")
+
+    assert result.mode == "pip"
+    assert result.syspath_entry is None
+    # A local source is someone's working tree, so it installs editable.
+    assert no_pip.packages == [(src, True)]
+
+
+def test_git_package_source_is_not_editable(tmp_path, no_pip, cleanup_syspath):
+    work = tmp_path / "work"
+    _make_package_source(work)
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "init"], cwd=work)
+    bare = tmp_path / "repo.git"
+    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+
+    spec = resolve_install_spec(str(bare), cls="pkg_plugin.PkgPlugin")
+    result = provision(spec, cache_dir=tmp_path / "cache")
+
+    assert result.mode == "pip"
+    assert no_pip.packages and no_pip.packages[0][1] is False
+
+
+def test_mode_syspath_skips_pip_for_a_package(tmp_path, no_pip, cleanup_syspath):
+    src = _make_package_source(tmp_path / "repo")
+    spec = resolve_install_spec(str(src), cls="pkg_plugin.PkgPlugin")
+
+    result = provision(spec, cache_dir=tmp_path / "cache", mode="syspath")
+
+    assert result.mode == "syspath"
+    assert result.syspath_entry == str(src)
+    assert not no_pip.packages
+
+
+def test_mode_pip_on_non_package_raises(tmp_path, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src)
+    spec = resolve_install_spec(str(src), cls=cls)
+
+    with pytest.raises(ValueError, match="cannot be pip"):
+        provision(spec, cache_dir=tmp_path / "cache", mode="pip")
+
+
+def test_pip_install_command_editable(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(provisioning, "_run", lambda cmd, **kwargs: calls.append(cmd))
+    repo = _make_package_source(tmp_path / "repo")
+
+    _pip_install(repo, editable=True)
+
+    assert calls == [[sys.executable, "-m", "pip", "install", "-e", str(repo)]]
+
+
+def test_syspath_mode_installs_requirements(tmp_path, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src, modname="req_plugin", cls="ReqPlugin")
+    (src / "requirements.txt").write_text("# none\n")
+    plans = []
+
+    def _accept(plan):
+        plans.append(plan)
+        return True
+
+    result = provision(
+        resolve_install_spec(str(src), cls=cls),
+        cache_dir=tmp_path / "cache",
+        confirm=_accept,
+    )
+
+    assert result.mode == "syspath"
+    assert plans[0].requirements == src / "requirements.txt"
+    assert no_pip.requirements == [src / "requirements.txt"]
+    assert not no_pip.packages
+
+
+def test_pip_mode_does_not_install_requirements(tmp_path, no_pip, cleanup_syspath):
+    # pip resolves the package's own dependency metadata; a stray requirements.txt
+    # next to it is not a second dependency list to apply.
+    src = _make_package_source(tmp_path / "repo")
+    (src / "requirements.txt").write_text("# none\n")
+
+    provision(
+        resolve_install_spec(str(src), cls="pkg_plugin.PkgPlugin"),
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert not no_pip.requirements
+
+
+def test_pip_install_requirements_command(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(provisioning, "_run", lambda cmd, **kwargs: calls.append(cmd))
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("# none\n")
+
+    _pip_install_requirements(requirements)
+
+    assert calls == [[sys.executable, "-m", "pip", "install", "-r", str(requirements)]]
+
+
+def test_pip_install_command_non_editable(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(provisioning, "_run", lambda cmd, **kwargs: calls.append(cmd))
+    repo = _make_package_source(tmp_path / "repo")
+
+    _pip_install(repo, editable=False)
+
+    assert "-e" not in calls[0]
+    assert calls[0][-1] == str(repo)
+
+
+# --- subdir handling --------------------------------------------------------
+
+
+def test_local_source_with_subdir(tmp_path, no_pip, cleanup_syspath):
     root = tmp_path / "repo"
-    sub = root / "src"
-    cls = _make_plugin_module(sub, modname="nested_plugin", cls="Nested")
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": cls, "source": str(root), "subdir": "src"}],
-    }
-    provision_plugins(cfg)
-    assert str(sub) in sys.path
+    cls = _make_plugin_module(root / "src", modname="nested_plugin", cls="Nested")
+    spec = resolve_install_spec(str(root), subdir="src", cls=cls)
+
+    result = provision(spec, cache_dir=tmp_path / "cache")
+
+    assert result.search_path == root / "src"
+    assert str(root / "src") in sys.path
     assert str(root) not in sys.path
 
 
-def test_discovery_no_cls(tmp_path, monkeypatch, cleanup_syspath):
+def test_subdir_escape_raises(tmp_path, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    _make_plugin_module(src)
+    spec = resolve_install_spec(str(src), subdir="../../etc", cls="x.Y")
+
+    with pytest.raises(ValueError, match="escapes the plugin source root"):
+        provision(spec, cache_dir=tmp_path / "cache")
+
+
+def test_absolute_subdir_escape_raises(tmp_path, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    _make_plugin_module(src)
+    spec = resolve_install_spec(str(src), subdir="/etc", cls="x.Y")
+
+    with pytest.raises(ValueError, match="escapes the plugin source root"):
+        provision(spec, cache_dir=tmp_path / "cache")
+
+
+def test_missing_local_source_raises(tmp_path, monkeypatch, no_pip):
+    monkeypatch.chdir(tmp_path)
+    spec = resolve_install_spec("./does-not-exist", cls="x.Y")
+
+    with pytest.raises(FileNotFoundError):
+        provision(spec, cache_dir=tmp_path / "cache")
+
+
+# --- class discovery --------------------------------------------------------
+
+
+def test_discovery_no_cls(tmp_path, no_pip, cleanup_syspath):
     src = tmp_path / "repo"
     expected = _make_plugin_package(src, pkg="disc_plugin", cls="DiscPlugin")
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(src)}],  # no cls -> auto-discover
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == [expected]
+
+    result = provision(resolve_install_spec(str(src)), cache_dir=tmp_path / "cache")
+
+    assert result.cls == [expected]
 
 
-def test_discovery_with_subdir_no_cls(tmp_path, monkeypatch, cleanup_syspath):
+def test_discovery_with_subdir_no_cls(tmp_path, no_pip, cleanup_syspath):
     root = tmp_path / "repo"
     expected = _make_plugin_package(root / "src", pkg="sub_disc_plugin", cls="SubDisc")
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(root), "subdir": "src"}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == [expected]
+    spec = resolve_install_spec(str(root), subdir="src")
+
+    result = provision(spec, cache_dir=tmp_path / "cache")
+
+    assert result.cls == [expected]
 
 
-def test_discovery_multiple_classes_raises(tmp_path, monkeypatch, cleanup_syspath):
+def test_discovery_multiple_classes_raises(tmp_path, no_pip, cleanup_syspath):
     src = tmp_path / "repo"
     _make_plugin_package(src, pkg="disc_plugin", cls="DiscA")
     _make_plugin_package(src, pkg="disc_plugin2", cls="DiscB")
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(src)}],
-    }
+
     with pytest.raises(ValueError, match="Multiple plugin classes"):
-        provision_plugins(cfg)
+        provision(resolve_install_spec(str(src)), cache_dir=tmp_path / "cache")
 
 
-def test_discovery_no_class_raises(tmp_path, monkeypatch, cleanup_syspath):
+def test_discovery_no_class_raises(tmp_path, no_pip, cleanup_syspath):
     src = tmp_path / "repo"
     pkg = src / "empty_pkg"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("X = 1\n")
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(src)}],
-    }
+
     with pytest.raises(ValueError, match="No BasePlugin subclass"):
-        provision_plugins(cfg)
+        provision(resolve_install_spec(str(src)), cache_dir=tmp_path / "cache")
 
 
-def test_discovery_skips_tests_dir(tmp_path, monkeypatch, cleanup_syspath):
+def test_discovery_skips_tests_dir(tmp_path, no_pip, cleanup_syspath):
     # A top-level `tests` package (even one with its own BasePlugin subclass) must be
     # skipped, so discovery still resolves the single real plugin rather than erroring.
     src = tmp_path / "repo"
     expected = _make_plugin_package(src, pkg="disc_plugin", cls="DiscPlugin")
     _make_plugin_package(src, pkg="tests", cls="TestHelperPlugin")  # must be ignored
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(src)}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == [expected]
+
+    result = provision(resolve_install_spec(str(src)), cache_dir=tmp_path / "cache")
+
+    assert result.cls == [expected]
 
 
-def test_cls_list_one_source(tmp_path, monkeypatch, cleanup_syspath):
-    # A list of cls loads several plugins from one source block.
+def test_discovery_descends_into_src_layout(tmp_path, monkeypatch, cleanup_syspath):
+    # `pyproject.toml` at the root, package under `src/`: the root itself holds no
+    # importable name, so discovery has to look one level down.
     root = tmp_path / "repo"
-    expected = _make_multi_plugin_package(
-        root, pkg="multi_pkg", classes=("Alpha", "Beta")
+    _make_package_source(root)
+    expected = _make_plugin_package(
+        root / "src", pkg="srclayout_plugin", cls="SrcLayoutPlugin"
     )
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(root), "cls": expected}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == expected
-
-
-def test_cls_list_mixed_with_string_entries(tmp_path, monkeypatch, cleanup_syspath):
-    root = tmp_path / "repo"
-    expected = _make_multi_plugin_package(
-        root, pkg="multi_pkg", classes=("Alpha", "Beta")
+    # Stand in for the real pip install, which is what makes the package importable.
+    monkeypatch.setattr(
+        provisioning,
+        "_pip_install",
+        lambda package_root, editable: sys.path.insert(0, str(root / "src")),
     )
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": ["builtin.Plugin", {"source": str(root), "cls": expected}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == ["builtin.Plugin", *expected]
+
+    result = provision(resolve_install_spec(str(root)), cache_dir=tmp_path / "cache")
+
+    assert result.mode == "pip"
+    assert result.cls == [expected]
 
 
-def test_empty_cls_list_falls_back_to_discovery(tmp_path, monkeypatch, cleanup_syspath):
-    # cls: [] behaves like an omitted cls -> discover the single plugin.
-    src = tmp_path / "repo"
-    expected = _make_plugin_package(src, pkg="disc_plugin", cls="DiscPlugin")
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"source": str(src), "cls": []}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == [expected]
-
-
-def test_pluginspec_requires_cls_or_source():
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        PluginSpec()
-    assert PluginSpec(cls="a.B").cls == "a.B"
-    assert PluginSpec(cls=["a.B", "c.D"]).cls == ["a.B", "c.D"]
-    assert PluginSpec(source="/x").source == "/x"
-
-
-def test_subdir_escape_raises(tmp_path, monkeypatch, cleanup_syspath):
-    src = tmp_path / "plugin_src"
-    _make_plugin_module(src)
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": "x.Y", "source": str(src), "subdir": "../../etc"}],
-    }
-    with pytest.raises(ValueError):
-        provision_plugins(cfg)
-
-
-def test_absolute_subdir_escape_raises(tmp_path, monkeypatch, cleanup_syspath):
-    src = tmp_path / "plugin_src"
-    _make_plugin_module(src)
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": "x.Y", "source": str(src), "subdir": "/etc"}],
-    }
-    with pytest.raises(ValueError):
-        provision_plugins(cfg)
-
-
-def test_utils_config_prepare_plugins_provisions(
-    tmp_path, monkeypatch, cleanup_syspath
+def test_discovery_after_pip_install_says_the_package_was_installed(
+    tmp_path, no_pip, cleanup_syspath
 ):
-    # The `axolotl.utils.config` entry point (used by tests/docs) must provision
-    # external sources too, not just `axolotl.cli.config`.
-    from axolotl.utils.config import prepare_plugins as utils_prepare_plugins
-    from axolotl.utils.dict import DictDefault
+    src = _make_package_source(tmp_path / "repo")
 
-    src = tmp_path / "plugin_src"
-    cls = _make_plugin_module(src, modname="utils_ext_plugin", cls="UtilsPlugin")
-    monkeypatch.chdir(tmp_path)
-    cfg = DictDefault(
-        {
-            "plugin_cache_dir": str(tmp_path / "cache"),
-            "plugins": [{"cls": cls, "source": str(src)}],
-        }
-    )
-    utils_prepare_plugins(cfg)
-    assert cfg["plugins"] == [cls]
+    with pytest.raises(ValueError, match="was installed, but no BasePlugin subclass"):
+        provision(resolve_install_spec(str(src)), cache_dir=tmp_path / "cache")
 
 
-def test_relative_local_source_missing_raises(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": "x.Y", "source": "./does-not-exist"}],
-    }
-    with pytest.raises(FileNotFoundError):
-        provision_plugins(cfg)
+def test_cls_list_from_one_source(tmp_path, no_pip, cleanup_syspath):
+    root = tmp_path / "repo"
+    expected = _make_multi_plugin_package(root, classes=("Alpha", "Beta"))
+    spec = resolve_install_spec(str(root), cls=expected)
+
+    result = provision(spec, cache_dir=tmp_path / "cache")
+
+    assert result.cls == expected
 
 
-def test_mixed_string_and_dict_entries(tmp_path, monkeypatch, cleanup_syspath):
-    src = tmp_path / "plugin_src"
-    cls = _make_plugin_module(src)
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": ["builtin.Plugin", {"cls": cls, "source": str(src)}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == ["builtin.Plugin", cls]
+# --- git sources ------------------------------------------------------------
 
 
-def test_cache_dir_self_ignores(tmp_path, monkeypatch, cleanup_syspath):
-    src = tmp_path / "plugin_src"
-    cls = _make_plugin_module(src)
-    monkeypatch.chdir(tmp_path)
+def test_git_clone_records_resolved_sha(tmp_path, no_pip, cleanup_syspath):
+    work = tmp_path / "work"
+    _make_plugin_module(work, modname="git_plugin", cls="GitPlugin")
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "init"], cwd=work)
+    _git(["tag", "v1"], cwd=work)
+    expected_sha = _git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
+
+    bare = tmp_path / "repo.git"  # .git suffix -> treated as a git source
+    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+
     cache = tmp_path / "cache"
-    cfg = {
-        "plugin_cache_dir": str(cache),
-        "plugins": [{"cls": cls, "source": str(src)}],
-    }
-    provision_plugins(cfg)
-    assert (cache / ".gitignore").read_text().strip().endswith("*")
+    spec = resolve_install_spec(str(bare), ref="v1", cls="git_plugin.GitPlugin")
+    result = provision(spec, cache_dir=cache)
+
+    assert result.resolved_sha == expected_sha
+    import git_plugin  # noqa: F401
+
+    assert git_plugin.GitPlugin.name == "GitPlugin"
+
+    record_install(
+        source=result.source,
+        ref=result.ref,
+        resolved_sha=result.resolved_sha,
+        subdir=result.subdir,
+        mode=result.mode,
+        syspath_entry=result.syspath_entry,
+        cls=result.cls,
+        cache_dir=cache,
+    )
+    recorded = entries(cache)
+    assert [row["key"] for row in recorded] == ["git_plugin.GitPlugin"]
+    assert recorded[0]["resolved_sha"] == expected_sha
+    assert recorded[0]["ref"] == "v1"
+    assert recorded[0]["mode"] == "syspath"
 
 
-def test_env_overrides_cache_dir(tmp_path, monkeypatch, cleanup_syspath):
-    src = tmp_path / "plugin_src"
-    cls = _make_plugin_module(src)
-    env_cache = tmp_path / "env_cache"
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("AXOLOTL_PLUGIN_CACHE_DIR", str(env_cache))
-    cfg = {"plugins": [{"cls": cls, "source": str(src)}]}
-    provision_plugins(cfg)
-    assert env_cache.exists()
-
-
-def test_git_clone_and_checkout(tmp_path, monkeypatch, cleanup_syspath):
-    # Build a real local git repo (no network), then clone it via provisioning.
+def test_git_clone_reuses_cache(tmp_path, monkeypatch, no_pip, cleanup_syspath):
     work = tmp_path / "work"
     _make_plugin_module(work, modname="git_plugin", cls="GitPlugin")
     _git(["init", "-q"], cwd=work)
@@ -369,84 +499,32 @@ def test_git_clone_and_checkout(tmp_path, monkeypatch, cleanup_syspath):
     _git(["commit", "-q", "-m", "init"], cwd=work)
     _git(["tag", "v1"], cwd=work)
 
-    bare = tmp_path / "repo.git"  # .git suffix -> treated as a git source
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
-
-    monkeypatch.chdir(tmp_path)
-    cfg = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": "git_plugin.GitPlugin", "source": str(bare), "ref": "v1"}],
-    }
-    provision_plugins(cfg)
-    assert cfg["plugins"] == ["git_plugin.GitPlugin"]
-    import git_plugin  # noqa: F401
-
-    assert git_plugin.GitPlugin.name == "GitPlugin"
-
-    # Second call reuses the cache (idempotent) without error.
-    cfg2 = {
-        "plugin_cache_dir": str(tmp_path / "cache"),
-        "plugins": [{"cls": "git_plugin.GitPlugin", "source": str(bare), "ref": "v1"}],
-    }
-    provision_plugins(cfg2)
-    assert cfg2["plugins"] == ["git_plugin.GitPlugin"]
-
-
-def test_git_update_fast_forwards_default_branch(
-    tmp_path, monkeypatch, cleanup_syspath
-):
-    # update: true must advance the cached clone to the latest commit on the
-    # (moving) default branch — not silently stay at the originally cloned commit.
-    work = tmp_path / "work"
-    work.mkdir()
-    (work / "marker.txt").write_text("v1\n")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "v1"], cwd=work)
-
     bare = tmp_path / "repo.git"
     _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
-    monkeypatch.chdir(tmp_path)
     cache = tmp_path / "cache"
-    cfg = {
-        "plugin_cache_dir": str(cache),
-        "plugins": [
-            {"cls": "marker.X", "source": str(bare)}
-        ],  # no ref -> default branch
-    }
-    provision_plugins(cfg)
-    clone = next(
-        p for p in cache.iterdir() if p.is_dir() and p.name.startswith("repo-")
+    spec = resolve_install_spec(str(bare), ref="v1", cls="git_plugin.GitPlugin")
+    first = provision(spec, cache_dir=cache)
+
+    commands = []
+    real_run = provisioning._run
+    monkeypatch.setattr(
+        provisioning,
+        "_run",
+        lambda cmd, **kwargs: (commands.append(cmd), real_run(cmd, **kwargs))[1],
     )
-    assert (clone / "marker.txt").read_text().strip() == "v1"
+    second = provision(spec, cache_dir=cache)
 
-    # advance the upstream default branch
-    (work / "marker.txt").write_text("v2\n")
-    _git(["commit", "-q", "-am", "v2"], cwd=work)
-    _git(["push", "-q", str(bare), "HEAD"], cwd=work)
-
-    # without update: still the old commit (cache reuse)
-    provision_plugins(dict(cfg))
-    assert (clone / "marker.txt").read_text().strip() == "v1"
-
-    # with update: fast-forwards to the new commit
-    cfg_update = {
-        "plugin_cache_dir": str(cache),
-        "plugins": [{"cls": "marker.X", "source": str(bare), "update": True}],
-    }
-    provision_plugins(cfg_update)
-    assert (clone / "marker.txt").read_text().strip() == "v2"
+    assert second.root == first.root
+    assert not any("clone" in cmd for cmd in commands)
 
 
 def test_cached_clone_interrupted_before_checkout_heals(
-    tmp_path, monkeypatch, cleanup_syspath
+    tmp_path, no_pip, cleanup_syspath
 ):
-    # A provisioning run killed between `git clone` and `git checkout ref` leaves a
-    # cached clone on the default branch; the next run must check out the ref rather
-    # than reuse the wrong commit forever.
-    from axolotl.integrations.provisioning import _clone_target
-
+    # A run killed between `git clone` and `git checkout ref` leaves a cached clone on
+    # the default branch; the next run must check out the ref rather than reuse the
+    # wrong commit forever.
     work = tmp_path / "work"
     work.mkdir()
     (work / "marker.txt").write_text("v1\n")
@@ -460,26 +538,50 @@ def test_cached_clone_interrupted_before_checkout_heals(
     bare = tmp_path / "repo.git"
     _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
-    monkeypatch.chdir(tmp_path)
     cache = tmp_path / "cache"
     cache.mkdir()
-    # Simulate the interrupted run: clone exists at the ref-keyed target, but the
-    # `git checkout rel1` never happened (HEAD is the default branch at v2).
     clone = _clone_target(cache, str(bare), "rel1")
     _git(["clone", "-q", str(bare), str(clone)], cwd=tmp_path)
     assert (clone / "marker.txt").read_text().strip() == "v2"
 
-    cfg = {
-        "plugin_cache_dir": str(cache),
-        "plugins": [{"cls": "marker.X", "source": str(bare), "ref": "rel1"}],
-    }
-    provision_plugins(cfg)
+    spec = resolve_install_spec(str(bare), ref="rel1", cls="marker.X")
+    provision(spec, cache_dir=cache)
+
     assert (clone / "marker.txt").read_text().strip() == "v1"
 
 
-def test_git_update_with_tag_ref_stays_pinned(tmp_path, monkeypatch, cleanup_syspath):
-    # update: true with an immutable tag ref leaves HEAD detached; provisioning
-    # must not error and must stay pinned even as the branch advances past it.
+def test_git_update_fast_forwards_default_branch(tmp_path, no_pip, cleanup_syspath):
+    # --update must advance the cached clone to the latest commit on the (moving)
+    # default branch, not silently stay at the originally cloned commit.
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "marker.txt").write_text("v1\n")
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "v1"], cwd=work)
+
+    bare = tmp_path / "repo.git"
+    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+
+    cache = tmp_path / "cache"
+    spec = resolve_install_spec(str(bare), cls="marker.X")  # no ref -> default branch
+    clone = provision(spec, cache_dir=cache).root
+    assert (clone / "marker.txt").read_text().strip() == "v1"
+
+    (work / "marker.txt").write_text("v2\n")
+    _git(["commit", "-q", "-am", "v2"], cwd=work)
+    _git(["push", "-q", str(bare), "HEAD"], cwd=work)
+
+    provision(spec, cache_dir=cache)
+    assert (clone / "marker.txt").read_text().strip() == "v1"
+
+    provision(spec, cache_dir=cache, update=True)
+    assert (clone / "marker.txt").read_text().strip() == "v2"
+
+
+def test_git_update_with_tag_ref_stays_pinned(tmp_path, no_pip, cleanup_syspath):
+    # --update with an immutable tag ref leaves HEAD detached; provisioning must not
+    # error and must stay pinned even as the branch advances past it.
     work = tmp_path / "work"
     work.mkdir()
     (work / "marker.txt").write_text("v1\n")
@@ -491,53 +593,136 @@ def test_git_update_with_tag_ref_stays_pinned(tmp_path, monkeypatch, cleanup_sys
     bare = tmp_path / "repo.git"
     _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
-    # advance the default branch past the tag
     (work / "marker.txt").write_text("v2\n")
     _git(["commit", "-q", "-am", "v2"], cwd=work)
     _git(["push", "-q", str(bare), "HEAD"], cwd=work)
 
-    monkeypatch.chdir(tmp_path)
-    cache = tmp_path / "cache"
-    cfg = {
-        "plugin_cache_dir": str(cache),
-        "plugins": [
-            {"cls": "marker.X", "source": str(bare), "ref": "rel1", "update": True}
-        ],
-    }
-    provision_plugins(cfg)  # must not raise despite detached HEAD + update
-    clone = next(
-        p for p in cache.iterdir() if p.is_dir() and p.name.startswith("repo-")
-    )
+    spec = resolve_install_spec(str(bare), ref="rel1", cls="marker.X")
+    clone = provision(spec, cache_dir=tmp_path / "cache", update=True).root
+
     assert (clone / "marker.txt").read_text().strip() == "v1"
 
 
-def test_pip_install_requirements_dispatch(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(provisioning, "_run", lambda cmd, cwd=None: calls.append(cmd))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "requirements.txt").write_text("# none\n")
-    _pip_install("requirements", repo)
-    assert calls and calls[0][1:4] == ["-m", "pip", "install"]
-    assert "-r" in calls[0]
+def test_local_dir_has_no_resolved_sha(tmp_path, no_pip, cleanup_syspath):
+    # A plain directory must not report the SHA of an enclosing repository.
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src)
+
+    result = provision(
+        resolve_install_spec(str(src), cls=cls), cache_dir=tmp_path / "cache"
+    )
+
+    assert result.resolved_sha is None
 
 
-def test_pip_install_editable_falls_back_without_package(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(provisioning, "_run", lambda cmd, cwd=None: calls.append(cmd))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "requirements.txt").write_text("# none\n")
-    # No pyproject/setup.* -> editable falls back to requirements.
-    _pip_install("editable", repo)
-    assert calls and "-r" in calls[0]
+def test_editable_install_reports_no_sha(tmp_path, no_pip, cleanup_syspath):
+    # The working tree is a local git checkout, but an editable install tracks
+    # whatever it becomes, so no commit describes what is installed.
+    work = _make_package_source(tmp_path / "work")
+    _git(["init", "-q"], cwd=work)
+    _git(["add", "."], cwd=work)
+    _git(["commit", "-q", "-m", "init"], cwd=work)
+    plans = []
+
+    def _accept(plan):
+        plans.append(plan)
+        return True
+
+    result = provision(
+        resolve_install_spec(str(work), cls="pkg_plugin.PkgPlugin"),
+        cache_dir=tmp_path / "cache",
+        confirm=_accept,
+    )
+
+    assert plans[0].editable is True
+    assert plans[0].resolved_sha is None
+    assert result.resolved_sha is None
+    assert no_pip.packages == [(work, True)]
 
 
-def test_pip_install_editable_uses_package(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(provisioning, "_run", lambda cmd, cwd=None: calls.append(cmd))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n")
-    _pip_install("editable", repo)
-    assert calls and "-e" in calls[0]
+# --- confirmation and cache -------------------------------------------------
+
+
+def test_confirmation_receives_plan_and_can_abort(tmp_path, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src)
+    plans = []
+    spec = resolve_install_spec(str(src), cls=cls)
+
+    def _decline(plan):
+        plans.append(plan)
+        return False
+
+    with pytest.raises(ProvisionAborted):
+        provision(spec, cache_dir=tmp_path / "cache", confirm=_decline)
+
+    assert len(plans) == 1
+    assert plans[0].source == str(src)
+    assert plans[0].mode == "syspath"
+    assert plans[0].package_root is None
+    assert plans[0].editable is False
+    assert plans[0].requirements is None
+    assert str(src) not in sys.path
+
+
+def test_confirmation_runs_before_pip(tmp_path, no_pip, cleanup_syspath):
+    src = _make_package_source(tmp_path / "repo")
+    spec = resolve_install_spec(str(src), cls="pkg_plugin.PkgPlugin")
+
+    with pytest.raises(ProvisionAborted):
+        provision(spec, cache_dir=tmp_path / "cache", confirm=lambda plan: False)
+
+    assert not no_pip.packages
+
+
+def test_cache_dir_self_ignores(tmp_path, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src)
+    cache = tmp_path / "cache"
+
+    provision(resolve_install_spec(str(src), cls=cls), cache_dir=cache)
+
+    assert (cache / ".gitignore").read_text().strip().endswith("*")
+
+
+def test_env_overrides_cache_dir(tmp_path, monkeypatch, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src)
+    env_cache = tmp_path / "env_cache"
+    default_cache = _isolate_default_cache(tmp_path, monkeypatch)
+    monkeypatch.setenv("AXOLOTL_PLUGIN_CACHE_DIR", str(env_cache))
+
+    provision(resolve_install_spec(str(src), cls=cls))
+
+    assert env_cache.is_dir()
+    assert not default_cache.exists()
+
+
+def test_cache_dir_precedence(tmp_path, monkeypatch, no_pip, cleanup_syspath):
+    src = tmp_path / "plugin_src"
+    cls = _make_plugin_module(src)
+    env_cache = tmp_path / "env_cache"
+    explicit = tmp_path / "explicit_cache"
+    default_cache = _isolate_default_cache(tmp_path, monkeypatch)
+    monkeypatch.setenv("AXOLOTL_PLUGIN_CACHE_DIR", str(env_cache))
+
+    provision(resolve_install_spec(str(src), cls=cls), cache_dir=explicit)
+
+    assert explicit.is_dir()
+    assert not env_cache.exists()
+    assert not default_cache.exists()
+
+
+def test_default_cache_dir_is_per_user_not_per_project(tmp_path, monkeypatch):
+    # A plugin is installed once and has to resolve from wherever training is
+    # later launched, so the default must not depend on the current directory.
+    default_cache = _isolate_default_cache(tmp_path, monkeypatch)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path)
+    from_tmp = resolve_cache_dir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+
+    assert resolve_cache_dir() == from_tmp == default_cache
+
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    assert resolve_cache_dir() == tmp_path / "home" / ".cache" / "axolotl" / "plugins"

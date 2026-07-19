@@ -73,53 +73,56 @@ from axolotl.utils.schemas.vllm import VllmConfig
 LOG = get_logger(__name__)
 
 
+_PLUGIN_INSTALL_ONLY_KEYS = {
+    "pip_install": "`axolotl plugins install --mode pip`",
+    "update": "`axolotl plugins install --update`",
+}
+
+
 class PluginSpec(BaseModel):
-    """External plugin source: clone/resolve a plugin and load it without modifying
-    the axolotl install."""
+    """Reference to an externally installed plugin, recording where it came from.
+
+    Loading a config only verifies that the class is importable; install it first
+    with `axolotl plugins install <source>`.
+    """
 
     cls: str | list[str] | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Dotted path(s) to the plugin class(es): a string, or a list to load several classes from one `source`. Optional when `source` is given: the single BasePlugin subclass exported by the source is auto-discovered."
+            "description": "Dotted path(s) to the plugin class(es): a string, or a list to load several classes from one `source`. Optional when `source` is given and the plugin was installed with `axolotl plugins install`, which records the classes it provides."
         },
     )
     source: str | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Git URL or local path to the plugin source. Omit if the class is already importable."
+            "description": "Git URL or local path the plugin was installed from. Documents provenance and tells the loader which install command to suggest; it is never fetched at config load."
         },
     )
     ref: str | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Git branch, tag, or commit to check out (a commit SHA is recommended for reproducibility)."
+            "description": "Git branch, tag, or commit the plugin was installed at (a commit SHA is recommended for reproducibility)."
         },
     )
     subdir: str | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Subdirectory within the source to add to sys.path."
-        },
-    )
-    pip_install: bool | Literal["editable", "requirements"] = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Install the plugin/deps into the active env: 'editable' (pip install -e), 'requirements' (pip install -r requirements.txt), or false for path injection only. Never modifies the axolotl install."
-        },
-    )
-    update: bool = Field(
-        default=False,
-        json_schema_extra={
-            "description": "Re-fetch and re-checkout a git source even if it is already cached."
+            "description": "Subdirectory within the source that holds the plugin package."
         },
     )
 
-    @field_validator("pip_install")
+    @model_validator(mode="before")
     @classmethod
-    def _normalize_pip_install(cls, value):
-        if value is True:
-            return "editable"
-        return value
+    def _reject_install_only_keys(cls, data):
+        if not isinstance(data, dict):
+            return data
+        for key, replacement in _PLUGIN_INSTALL_ONLY_KEYS.items():
+            if key in data:
+                raise ValueError(
+                    f"`{key}` is no longer a config option: configs never install "
+                    f"plugins. Install the plugin with {replacement} instead."
+                )
+        return data
 
     @model_validator(mode="after")
     def _require_cls_or_source(self):
@@ -1478,13 +1481,7 @@ class AxolotlInputConfig(
     plugins: list[str | PluginSpec] | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping with `cls` plus an external `source` (git URL / local path). See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html"
-        },
-    )
-    plugin_cache_dir: str | None = Field(
-        default=None,
-        json_schema_extra={
-            "description": "Directory for cloned external plugin sources (default ./.axolotl_plugins/). Overridable via the AXOLOTL_PLUGIN_CACHE_DIR env var."
+            "description": "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping referencing an externally installed plugin (`cls` plus the `source`/`ref` it was installed from). External plugins must be installed first with `axolotl plugins install`. See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html"
         },
     )
     generate_samples: bool | None = Field(

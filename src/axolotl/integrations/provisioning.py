@@ -1,64 +1,87 @@
-"""Provision external plugin sources declared in an axolotl config.
+"""Fetch and install external axolotl plugins.
 
-A ``plugins:`` entry may be either a dotted class path (the original behaviour) or
-a mapping describing where the plugin lives:
+This is the backend for ``axolotl plugins install`` and is only ever reached from
+that command: it clones git sources, runs pip, and writes to the plugin cache.
+Config load never touches this module -- it only verifies (see
+``axolotl.integrations.verification``) that a declared plugin is already importable.
 
-    plugins:
-      - axolotl.integrations.liger.LigerPlugin          # dotted path, unchanged
-      - cls: my_plugin.MyPlugin                          # external source
-        source: https://github.com/org/repo.git          # git URL or local path
-        ref: v1.2.0                                       # branch / tag / commit
-        subdir: src                                       # dir within source on sys.path
-        pip_install: editable                             # false | editable | requirements
-
-Git/local sources are cloned (or resolved) into a self-ignoring cache directory and
-added to ``sys.path`` so the axolotl checkout stays untouched. ``pip_install``
-optionally installs the plugin and its dependencies into the active environment; the
-axolotl install itself is never modified.
-
-``provision_plugins`` rewrites ``cfg["plugins"]`` in place to a flat list of dotted
-class paths, so every downstream consumer keeps seeing ``list[str]``.
+Resolution and provisioning are separate steps. ``resolve_install_spec`` turns
+whatever the user typed into a concrete ``PluginSpec``; ``provision`` acts on that
+spec and reports back what was installed, including the resolved commit SHA that
+gets recorded in the manifest.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib
-import os
 import subprocess  # nosec
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Literal
 from urllib.parse import urlparse
 
 from filelock import FileLock
 
+from axolotl.integrations.plugin_manifest import ensure_cache_dir
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 
-DEFAULT_CACHE_DIRNAME = ".axolotl_plugins"
-CACHE_DIR_ENV = "AXOLOTL_PLUGIN_CACHE_DIR"
+InstallMode = Literal["auto", "pip", "syspath"]
+
 _GIT_PREFIXES = ("http://", "https://", "git://", "ssh://", "git@")
+_PACKAGE_MARKERS = ("pyproject.toml", "setup.py", "setup.cfg")
+
+
+class ProvisionAborted(RuntimeError):
+    """The confirmation callback declined the install."""
+
+
+@dataclass
+class ProvisionPlan:
+    """What ``provision`` is about to do, once the source has been fetched.
+
+    Handed to the confirmation callback: everything below is known before any plugin
+    code is executed (pip install, class discovery), so a caller can show the exact
+    commit it resolved and let the user back out.
+    """
+
+    source: str
+    ref: str | None
+    subdir: str | None
+    root: Path
+    search_path: Path
+    resolved_sha: str | None
+    mode: Literal["pip", "syspath"]
+    package_root: Path | None
+    editable: bool
+    requirements: Path | None
+
+
+@dataclass
+class ProvisionResult:
+    """What ``provision`` actually did, in the shape the manifest needs."""
+
+    source: str
+    ref: str | None
+    subdir: str | None
+    root: Path
+    search_path: Path
+    resolved_sha: str | None
+    mode: Literal["pip", "syspath"]
+    syspath_entry: str | None
+    cls: list[str]
 
 
 def _looks_like_git(source: str) -> bool:
     return source.startswith(_GIT_PREFIXES) or source.endswith(".git")
 
 
-def _resolve_cache_dir(cfg) -> Path:
-    raw = os.environ.get(CACHE_DIR_ENV) or (
-        cfg.get("plugin_cache_dir") if cfg else None
-    )
-    cache_dir = Path(raw).expanduser() if raw else Path.cwd() / DEFAULT_CACHE_DIRNAME
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    # A self-contained ignore keeps a vanilla axolotl checkout clean without
-    # touching the repo's root .gitignore.
-    gitignore = cache_dir / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text(
-            "# Created by axolotl for cloned third-party plugins.\n*\n"
-        )
-    return cache_dir
+def is_git_source(source: str) -> bool:
+    """Whether a source is fetched with git, and so carries a moving-ref risk."""
+    return _looks_like_git(source)
 
 
 def _source_key(source: str, ref: str | None) -> str:
@@ -121,6 +144,21 @@ def _on_branch(target: Path) -> bool:
     return result.returncode == 0
 
 
+def _head_sha(target: Path) -> str | None:
+    # Guarded so a plain directory does not report the SHA of an enclosing repo.
+    if not (target / ".git").exists():
+        return None
+    result = subprocess.run(  # nosec
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(target),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() or None if result.returncode == 0 else None
+
+
 def _resolve_local(source: str, base_dir: Path) -> Path:
     if source.startswith("file://"):
         source = urlparse(source).path
@@ -130,27 +168,6 @@ def _resolve_local(source: str, base_dir: Path) -> Path:
     if not path.exists():
         raise FileNotFoundError(f"Plugin source path does not exist: {path}")
     return path
-
-
-def _pip_install(mode: str, repo: Path) -> None:
-    if mode == "editable":
-        if any(
-            (repo / f).exists() for f in ("pyproject.toml", "setup.py", "setup.cfg")
-        ):
-            LOG.info("Installing plugin (editable): %s", repo)
-            _run([sys.executable, "-m", "pip", "install", "-e", str(repo)])
-            return
-        LOG.warning(
-            "%s is not a Python package; falling back to requirements install", repo
-        )
-        mode = "requirements"
-    if mode == "requirements":
-        req = repo / "requirements.txt"
-        if req.exists():
-            LOG.info("Installing plugin requirements: %s", req)
-            _run([sys.executable, "-m", "pip", "install", "-r", str(req)])
-        else:
-            LOG.warning("No requirements.txt found in %s; nothing to install", repo)
 
 
 def _resolve_subdir(root: Path, subdir: str | None) -> Path:
@@ -163,39 +180,153 @@ def _resolve_subdir(root: Path, subdir: str | None) -> Path:
     return path
 
 
+def _package_root(root: Path, search_path: Path) -> Path | None:
+    """The directory pip should install, or None if this is not a Python package."""
+    for candidate in (search_path, root):
+        if any((candidate / marker).exists() for marker in _PACKAGE_MARKERS):
+            return candidate
+    return None
+
+
+def _pip_install(package_root: Path, editable: bool) -> None:
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if editable:
+        cmd.append("-e")
+    cmd.append(str(package_root))
+    LOG.info("Installing plugin: %s", " ".join(cmd))
+    _run(cmd)
+
+
+def _pip_install_requirements(requirements: Path) -> None:
+    LOG.info("Installing plugin requirements: %s", requirements)
+    _run([sys.executable, "-m", "pip", "install", "-r", str(requirements)])
+
+
+def _requirements_file(root: Path) -> Path | None:
+    requirements = root / "requirements.txt"
+    return requirements if requirements.exists() else None
+
+
 def _add_to_syspath(path: Path) -> None:
-    p = str(path)
-    if p not in sys.path:
-        sys.path.insert(0, p)
-        LOG.info("Added plugin path to sys.path: %s", p)
+    entry = str(path)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+        LOG.info("Added plugin path to sys.path: %s", entry)
 
 
-def _provision_one(spec, cache_dir: Path, base_dir: Path) -> Path:
-    """Clone/resolve a single external plugin and wire it into the environment.
+def resolve_install_spec(
+    source: str,
+    ref: str | None = None,
+    subdir: str | None = None,
+    cls: str | list[str] | None = None,
+):
+    """Turn a user-supplied source into a concrete ``PluginSpec``.
 
-    Returns the directory the plugin package lives under (root + subdir), used both
-    for sys.path injection and for class auto-discovery.
+    Git URLs and local paths resolve today; a name lookup against a plugin registry
+    would slot in here as another branch returning the same ``PluginSpec``.
     """
-    # Serialize clone + install across ranks/processes that share this cache.
-    lock = FileLock(str(cache_dir / f"{_source_key(spec.source, spec.ref)}.lock"))
+    from axolotl.utils.schemas.config import PluginSpec
+
+    if _looks_like_git(source):
+        return PluginSpec(cls=cls, source=source, ref=ref, subdir=subdir)
+
+    path = Path(source[len("file://") :] if source.startswith("file://") else source)
+    if path.expanduser().exists() or any(sep in source for sep in ("/", "\\")):
+        return PluginSpec(cls=cls, source=source, ref=ref, subdir=subdir)
+
+    raise ValueError(
+        f"Cannot resolve plugin source {source!r}: expected a git URL or a local path."
+    )
+
+
+def provision(
+    spec,
+    cache_dir: str | Path | None = None,
+    base_dir: Path | None = None,
+    mode: InstallMode = "auto",
+    update: bool = False,
+    confirm: Callable[[ProvisionPlan], bool] | None = None,
+) -> ProvisionResult:
+    """Fetch a plugin source and make it importable, reporting what was done.
+
+    ``confirm`` is called with the resolved plan after the source is fetched and
+    before any of its code runs; returning False aborts.
+    """
+    resolved_cache = ensure_cache_dir(cache_dir)
+    base_dir = base_dir or Path.cwd()
+
+    # Serialize clone + install across processes that share this cache.
+    lock = FileLock(str(resolved_cache / f"{_source_key(spec.source, spec.ref)}.lock"))
     with lock:
         if _looks_like_git(spec.source):
             root = _clone_or_update(
                 spec.source,
                 spec.ref,
-                _clone_target(cache_dir, spec.source, spec.ref),
-                spec.update,
+                _clone_target(resolved_cache, spec.source, spec.ref),
+                update,
             )
+            resolved_sha = _head_sha(root)
         else:
             root = _resolve_local(spec.source, base_dir)
-        if spec.pip_install:
-            _pip_install(spec.pip_install, root)
-    search_path = _resolve_subdir(root, spec.subdir)
-    # An editable install already exposes the package; sys.path injection is only
-    # needed when we load the plugin straight from the source tree.
-    if spec.pip_install != "editable":
-        _add_to_syspath(search_path)
-    return search_path
+            resolved_sha = _head_sha(root)
+
+        search_path = _resolve_subdir(root, spec.subdir)
+        package_root = _package_root(root, search_path)
+        if mode == "pip" and package_root is None:
+            raise ValueError(
+                f"{root} has no {' / '.join(_PACKAGE_MARKERS)}; it cannot be pip "
+                "installed. Use --mode syspath to load it from the source tree."
+            )
+        install_mode: Literal["pip", "syspath"] = (
+            "pip" if mode != "syspath" and package_root is not None else "syspath"
+        )
+        # A local path is a plugin under development; track the tree, not a snapshot.
+        editable = install_mode == "pip" and not _looks_like_git(spec.source)
+        if editable:
+            # An editable install tracks a mutable tree, so no commit describes it.
+            resolved_sha = None
+        requirements = _requirements_file(root) if install_mode == "syspath" else None
+
+        plan = ProvisionPlan(
+            source=spec.source,
+            ref=spec.ref,
+            subdir=spec.subdir,
+            root=root,
+            search_path=search_path,
+            resolved_sha=resolved_sha,
+            mode=install_mode,
+            package_root=package_root,
+            editable=editable,
+            requirements=requirements,
+        )
+        if confirm is not None and not confirm(plan):
+            raise ProvisionAborted(f"Install of {spec.source} was declined")
+
+        if install_mode == "pip" and package_root is not None:
+            _pip_install(package_root, editable=editable)
+        elif requirements is not None:
+            _pip_install_requirements(requirements)
+
+    # Needed for class auto-discovery below, and for syspath mode it is the install.
+    _add_to_syspath(search_path)
+    importlib.invalidate_caches()
+
+    if spec.cls:
+        cls = [spec.cls] if isinstance(spec.cls, str) else list(spec.cls)
+    else:
+        cls = [_discover_plugin_cls(search_path, installed=install_mode == "pip")]
+
+    return ProvisionResult(
+        source=spec.source,
+        ref=spec.ref,
+        subdir=spec.subdir,
+        root=root,
+        search_path=search_path,
+        resolved_sha=resolved_sha,
+        mode=install_mode,
+        syspath_entry=str(search_path) if install_mode == "syspath" else None,
+        cls=cls,
+    )
 
 
 # Directories/modules that are never the plugin package; skip during discovery.
@@ -226,15 +357,20 @@ def _candidate_modules(search_dir: Path) -> list[str]:
             if mod not in _DISCOVERY_SKIP_MODS and not mod.startswith("test_"):
                 modules.append(mod)
     # Loose modules (e.g. setup.py) are only imported when there's no real package.
-    return packages or modules
+    found = packages or modules
+    if not found and (search_dir / "src").is_dir():
+        # src layout: the package name is the same wherever it is imported from.
+        return _candidate_modules(search_dir / "src")
+    return found
 
 
-def _discover_plugin_cls(search_dir: Path) -> str:
+def _discover_plugin_cls(search_dir: Path, installed: bool = False) -> str:
     """Find the single BasePlugin subclass exported by the package(s) under search_dir.
 
     Standard plugin layout: an importable package whose top-level ``__init__`` exports
     exactly one ``BasePlugin`` subclass. Raises if zero or several are found, so the
-    user knows to set ``cls`` explicitly.
+    user knows to pass ``--cls`` explicitly. ``installed`` reports whether a pip
+    install already happened, which changes what the user has to do next.
     """
     from axolotl.integrations.base import BasePlugin
 
@@ -260,40 +396,17 @@ def _discover_plugin_cls(search_dir: Path) -> str:
     found = sorted(set(found))
     if len(found) == 1:
         return found[0]
+    if not found and installed:
+        raise ValueError(
+            f"The package at {search_dir} was installed, but no BasePlugin subclass "
+            "could be discovered in it. Re-run with `--cls <dotted.path.To.Plugin>` "
+            "to record which class to load."
+        )
     if not found:
         raise ValueError(
             f"No BasePlugin subclass found under {search_dir}. Export your plugin "
-            "from the package's __init__, or set `cls` explicitly."
+            "from the package's __init__, or pass `--cls` explicitly."
         )
     raise ValueError(
-        f"Multiple plugin classes found ({', '.join(found)}); set `cls` to pick one."
+        f"Multiple plugin classes found ({', '.join(found)}); pass `--cls` to pick one."
     )
-
-
-def provision_plugins(cfg) -> None:
-    """Normalize ``cfg['plugins']`` to ``list[str]``, provisioning any external sources.
-
-    Idempotent: a no-op when every entry is already a dotted path string.
-    """
-    plugins = cfg.get("plugins") if cfg else None
-    if not plugins or all(isinstance(p, str) for p in plugins):
-        return
-
-    from axolotl.utils.schemas.config import PluginSpec
-
-    cache_dir = _resolve_cache_dir(cfg)
-    base_dir = Path.cwd()
-    normalized: list[str] = []
-    for entry in plugins:
-        if isinstance(entry, str):
-            normalized.append(entry)
-            continue
-        spec = entry if isinstance(entry, PluginSpec) else PluginSpec(**dict(entry))
-        search_path = _provision_one(spec, cache_dir, base_dir) if spec.source else None
-        if spec.cls:
-            normalized.extend([spec.cls] if isinstance(spec.cls, str) else spec.cls)
-        elif search_path is not None:
-            normalized.append(_discover_plugin_cls(search_path))
-        else:
-            raise ValueError("plugin entry needs `cls` when no `source` is given")
-    cfg["plugins"] = normalized

@@ -15,7 +15,7 @@ from transformers.utils.import_utils import (
 )
 
 from axolotl.integrations.config import merge_input_args
-from axolotl.integrations.provisioning import provision_plugins
+from axolotl.integrations.verification import verify_plugins
 from axolotl.loaders.constants import MULTIMODAL_AUTO_MODEL_MAPPING
 from axolotl.loaders.utils import load_model_config
 from axolotl.model_support import Unsupported, get_model_support
@@ -509,7 +509,7 @@ def prepare_plugins(cfg):
     if cfg.get("plugins"):
         from axolotl.integrations.base import PluginManager
 
-        provision_plugins(cfg)
+        verify_plugins(cfg)
         plugin_manager = PluginManager.get_instance()
         for plugin_name in cfg["plugins"]:
             plugin_manager.register(plugin_name)

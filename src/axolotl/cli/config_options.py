@@ -2960,13 +2960,7 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         ("--plugins",),
         None,
         None,
-        "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping with `cls` plus an external `source` (git URL / local path). See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html",
-    ),
-    (
-        ("--plugin-cache-dir",),
-        None,
-        None,
-        "Directory for cloned external plugin sources (default ./.axolotl_plugins/). Overridable via the AXOLOTL_PLUGIN_CACHE_DIR env var.",
+        "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping referencing an externally installed plugin (`cls` plus the `source`/`ref` it was installed from). External plugins must be installed first with `axolotl plugins install`. See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html",
     ),
     (
         ("--generate-samples/--no-generate-samples",),
