@@ -28,6 +28,10 @@ from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 PLUGIN_MANAGER = PluginManager.get_instance()
+_MEGATRAIN_PLUGIN_NAMES = {
+    "axolotl.integrations.megatrain.MegaTrainPlugin",
+    "megatrain.MegaTrainPlugin",
+}
 
 
 class PatchManager:
@@ -384,7 +388,10 @@ class PatchManager:
 
     def _apply_flash_attn_4_patches(self):
         """Auto-apply FA4 when flash_attention is enabled and FA4 is available on SM90+."""
-        if not self.cfg.attn_uses_flash_lib:
+        if not self.cfg.attn_uses_flash_lib or any(
+            str(plugin) in _MEGATRAIN_PLUGIN_NAMES
+            for plugin in (self.cfg.plugins or [])
+        ):
             return
 
         from axolotl.monkeypatch.attention.flash_attn_4 import patch_flash_attn_4
