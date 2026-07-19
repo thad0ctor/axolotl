@@ -739,6 +739,18 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         "If you added new tokens to the tokenizer, you may need to save some LoRA modules because they need to know the new tokens. For LLaMA and Mistral, you need to save `embed_tokens` and `lm_head`. It may vary for other models. `embed_tokens` converts tokens to embeddings, and `lm_head` converts embeddings to token probabilities.",
     ),
     (
+        ("--lora-rank-pattern",),
+        None,
+        None,
+        "Per-module LoRA rank overrides (regex \u2192 int > 0). Forwarded to PEFT LoraConfig.rank_pattern.",
+    ),
+    (
+        ("--lora-alpha-pattern",),
+        None,
+        None,
+        "Per-module LoRA alpha overrides (regex \u2192 int > 0). Forwarded to PEFT LoraConfig.alpha_pattern.",
+    ),
+    (
         ("--lora-dropout",),
         None,
         None,
@@ -2661,6 +2673,12 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         None,
         None,
         None,
+    ),
+    (
+        ("--torch-compile-options",),
+        None,
+        None,
+        "Mapping of allowlisted torch._inductor.config flags to set before torch.compile runs. Only honored when torch_compile is truthy. Allowed keys (see INDUCTOR_COMPILE_OPTIONS_ALLOWLIST in axolotl.utils.schemas.enums): coordinate_descent_tuning, coordinate_descent_check_all_directions, shape_padding, epilogue_fusion, max_autotune_gemm, fx_graph_cache, assume_aligned_inputs, comprehensive_padding, decompose_mem_bound_mm, triton.cudagraphs. Disallowed keys are rejected at config-validation time.",
     ),
     (
         ("--max-steps",),
