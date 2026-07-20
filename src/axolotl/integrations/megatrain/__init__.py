@@ -175,6 +175,9 @@ class MegaTrainPlugin(BasePlugin):
             return None
         return "axolotl.integrations.megatrain.args.MegaTrainArgs"
 
+    def suppresses_auto_attention_patches(self, cfg) -> bool:
+        return _megatrain_enabled(cfg)
+
     def pre_model_load(self, cfg):
         if not _megatrain_enabled(cfg):
             return

@@ -788,6 +788,8 @@ def test_patch_manager_does_not_auto_upgrade_megatrain_to_fa4(monkeypatch, plugi
 
     patch = Mock()
     monkeypatch.setattr(flash_attn_4, "patch_flash_attn_4", patch)
+    # Core consults registered plugins, so mirror what `prepare_plugins` does.
+    PluginManager.get_instance().register(plugin_name)
     patch_manager = object.__new__(PatchManager)
     patch_manager.cfg = SimpleNamespace(
         attn_uses_flash_lib=True,

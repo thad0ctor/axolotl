@@ -386,13 +386,7 @@ class PatchManager:
         """Auto-apply FA4 when flash_attention is enabled and FA4 is available on SM90+."""
         if not self.cfg.attn_uses_flash_lib:
             return
-        # MegaTrain owns the attention path and asserts FA2 is unpatched, but these
-        # patches run before its `pre_model_load` hook can reject them.
-        from axolotl.integrations.megatrain.args import MEGATRAIN_PLUGIN_NAMES
-
-        if any(
-            str(plugin) in MEGATRAIN_PLUGIN_NAMES for plugin in (self.cfg.plugins or [])
-        ):
+        if PLUGIN_MANAGER.suppresses_auto_attention_patches(self.cfg):
             return
 
         from axolotl.monkeypatch.attention.flash_attn_4 import patch_flash_attn_4
