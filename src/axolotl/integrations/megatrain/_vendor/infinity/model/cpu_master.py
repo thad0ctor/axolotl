@@ -895,19 +895,27 @@ class CPUMasterModel:
                 offset += numel
 
         # Sync GPU modules
-        for p_gpu, p_cpu in zip(ctx.emb_gpu.parameters(), self.embedding.parameters()):
+        for p_gpu, p_cpu in zip(
+            ctx.emb_gpu.parameters(), self.embedding.parameters(), strict=True
+        ):
             p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
         if ctx.norm_gpu:
-            for p_gpu, p_cpu in zip(ctx.norm_gpu.parameters(), self.norm.parameters()):
+            for p_gpu, p_cpu in zip(
+                ctx.norm_gpu.parameters(), self.norm.parameters(), strict=True
+            ):
                 p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
         if not self.tied_lm_head:
-            for p_gpu, p_cpu in zip(ctx.lm_head_gpu.parameters(), self.lm_head.parameters()):
+            for p_gpu, p_cpu in zip(
+                ctx.lm_head_gpu.parameters(), self.lm_head.parameters(), strict=True
+            ):
                 p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
         if ctx.rotary_gpu:
-            for p_gpu, p_cpu in zip(ctx.rotary_gpu.parameters(), self.rotary_emb.parameters()):
+            for p_gpu, p_cpu in zip(
+                ctx.rotary_gpu.parameters(), self.rotary_emb.parameters(), strict=True
+            ):
                 p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
         ctx.param_sync_event.record(torch.cuda.current_stream(ctx.device))
@@ -1176,10 +1184,16 @@ class CPUMasterModel:
 
         if img_mask.sum() > 0 and image_embeds.numel() > 0:
             flat_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
-            n_positions = img_mask.sum().item()
+            n_positions = int(img_mask.sum().item())
             n_available = flat_embeds.shape[0]
             n_use = min(n_positions, n_available)
-            merged[img_mask][:n_use] = flat_embeds[:n_use]
+            # Index the destination directly: `merged[img_mask][:n_use] = ...`
+            # writes into the temporary that boolean indexing returns, so the
+            # image embeddings never reach `merged`.
+            positions = img_mask.nonzero(as_tuple=False)[:n_use]
+            merged[positions[:, 0], positions[:, 1]] = flat_embeds[:n_use].to(
+                merged.dtype
+            )
 
         return merged
 

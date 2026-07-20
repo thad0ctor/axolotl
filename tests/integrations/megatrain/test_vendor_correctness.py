@@ -459,3 +459,51 @@ def test_fp32_head_accumulator_leaves_ungraded_parameters_none():
 
     _, has_grads = _copy_parameter_grads_to_slab(params, torch.zeros(5))
     assert has_grads == [True, False]
+
+
+def test_vision_embeddings_are_written_into_hidden_states():
+    """`merged[img_mask][:n] = ...` writes into the temporary boolean-index copy,
+    so image embeddings silently never reached the model."""
+    from types import SimpleNamespace
+
+    master = object.__new__(CPUMasterModel)
+    master._model_config = SimpleNamespace(image_token_id=5, vision_start_token_id=None)
+
+    batch, seq, hidden_size = 2, 4, 3
+    hidden = torch.zeros(batch, seq, hidden_size)
+    input_ids = torch.tensor([[1, 5, 5, 2], [5, 3, 4, 4]])
+    image_embeds = torch.arange(1, 3 * hidden_size + 1, dtype=torch.float32).reshape(
+        3, hidden_size
+    )
+
+    merged = CPUMasterModel._merge_vision_embeddings(
+        master, hidden, image_embeds, input_ids
+    )
+
+    image_positions = input_ids == 5
+    assert torch.equal(merged[image_positions], image_embeds)
+    # Text positions must be left alone.
+    assert torch.equal(
+        merged[~image_positions],
+        torch.zeros(int((~image_positions).sum()), hidden_size),
+    )
+    # The caller's tensor must not be mutated in place.
+    assert torch.equal(hidden, torch.zeros(batch, seq, hidden_size))
+
+
+def test_vision_merge_truncates_to_available_embeddings():
+    from types import SimpleNamespace
+
+    master = object.__new__(CPUMasterModel)
+    master._model_config = SimpleNamespace(image_token_id=5, vision_start_token_id=None)
+
+    hidden = torch.zeros(1, 3, 2)
+    input_ids = torch.tensor([[5, 5, 5]])  # 3 slots, only 2 embeddings supplied
+    image_embeds = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    merged = CPUMasterModel._merge_vision_embeddings(
+        master, hidden, image_embeds, input_ids
+    )
+
+    assert torch.equal(merged[0, :2], image_embeds)
+    assert torch.equal(merged[0, 2], torch.zeros(2))

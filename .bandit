@@ -1,3 +1,3 @@
 [bandit]
-exclude = tests,src/axolotl/integrations/megatrain/_vendor
+exclude = tests
 skips = B101,B615,B102,B110

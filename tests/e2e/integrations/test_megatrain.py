@@ -199,11 +199,13 @@ def test_megatrain_trains_resumes_and_saves_vanilla_checkpoint(temp_dir, monkeyp
         for record in trainer.state.log_history
         if "learning_rate" in record
     ]
-    peak_active_memory = max(
+    memory_records = [
         float(record["memory/max_active (GiB)"])
         for record in trainer.state.log_history
         if "memory/max_active (GiB)" in record
-    )
+    ]
+    assert memory_records, "expected memory metrics in the trainer log history"
+    peak_active_memory = max(memory_records)
     assert len(losses) == 20
     assert all(math.isfinite(loss) for loss in losses)
     assert mean(losses[10:]) < mean(losses[:10])

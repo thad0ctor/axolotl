@@ -32,7 +32,6 @@ repos:
     rev: 1.9.4
     hooks:
     -   id: bandit
-        exclude: ^src/axolotl/integrations/megatrain/_vendor/
         args: [
             '--ini',
             '.bandit',

@@ -245,14 +245,23 @@ never vendored, so the following were removed from `infinity/model/`:
 Re-adding them alongside a future VERL integration is mechanical: they are a
 matched set and this file pins the upstream commit.
 
+- `infinity/model/cpu_master.py` writes merged vision embeddings into the
+  destination tensor by index. `merged[img_mask][:n] = ...` assigns into the
+  temporary that boolean indexing returns, so image embeddings were silently
+  discarded and the model saw text embeddings at every image position.
+- `infinity/model/cpu_master.py` and `infinity/model/mp_worker.py` pair the
+  CPU-to-GPU parameter-sync iterators with `zip(..., strict=True)`, so an
+  unexpected architecture fails loudly instead of syncing a truncated set of
+  weights.
+
 ### Known remaining gaps
 
 - `CPUMasterModel._prepare_4d_causal_mask` is retained from upstream but is no
   longer referenced. It builds a plain causal-or-padding mask and would drop
   sliding-window attention for `sdpa` and `eager`; use `_prepare_attention_mask`.
 - The vision/VLM path in `infinity/model/cpu_master.py` is not used by Axolotl
-  (the plugin rejects multimodal models) and `_merge_vision_embeddings` is a
-  no-op: it assigns into a boolean-mask copy rather than the tensor.
+  (the plugin rejects multimodal models). The embedding merge is fixed, but the
+  encoder and projector still run under `no_grad`, so the path is incomplete.
 Any future compatibility or behavioral change must be listed here with the
 affected files and rationale.
 

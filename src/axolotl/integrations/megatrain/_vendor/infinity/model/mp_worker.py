@@ -206,19 +206,27 @@ def _worker_load_layer_to_buffer_async(layer_idx, buffer_idx, ctx, shared_state)
 
 def _worker_sync_gpu_modules(ctx, shared_state):
     """Refresh worker's GPU modules from shared CPU master params."""
-    for p_gpu, p_cpu in zip(ctx.emb_gpu.parameters(), shared_state.embedding.parameters()):
+    for p_gpu, p_cpu in zip(
+        ctx.emb_gpu.parameters(), shared_state.embedding.parameters(), strict=True
+    ):
         p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
     if ctx.norm_gpu:
-        for p_gpu, p_cpu in zip(ctx.norm_gpu.parameters(), shared_state.norm.parameters()):
+        for p_gpu, p_cpu in zip(
+            ctx.norm_gpu.parameters(), shared_state.norm.parameters(), strict=True
+        ):
             p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
     if not shared_state.tied_lm_head:
-        for p_gpu, p_cpu in zip(ctx.lm_head_gpu.parameters(), shared_state.lm_head.parameters()):
+        for p_gpu, p_cpu in zip(
+            ctx.lm_head_gpu.parameters(), shared_state.lm_head.parameters(), strict=True
+        ):
             p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
     if ctx.rotary_gpu:
-        for p_gpu, p_cpu in zip(ctx.rotary_gpu.parameters(), shared_state.rotary_emb.parameters()):
+        for p_gpu, p_cpu in zip(
+            ctx.rotary_gpu.parameters(), shared_state.rotary_emb.parameters(), strict=True
+        ):
             p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
     ctx.param_sync_event.record(torch.cuda.current_stream(ctx.device))
