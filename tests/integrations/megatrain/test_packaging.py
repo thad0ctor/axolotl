@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from axolotl.cli.config import load_cfg
@@ -28,6 +29,7 @@ def test_distribution_metadata_includes_megatrain_artifacts():
         assert f"include src/axolotl/integrations/megatrain/{artifact}" in manifest
 
     assert "include examples/smollm2/megatrain.yaml" in manifest
+    assert "include examples/smollm2/megatrain-multigpu.yaml" in manifest
 
 
 def test_vendored_snapshot_has_expected_shape_and_provenance():
@@ -59,7 +61,34 @@ def test_vendored_snapshot_has_expected_shape_and_provenance():
     assert "Version 2.0, January 2004" in license_text
 
 
-def test_example_config_is_loadable(monkeypatch, tmp_path):
+def test_modified_vendor_files_carry_apache_change_notice():
+    """Apache-2.0 section 4(b) requires modified files to say so."""
+    vendor_dir = INTEGRATION_DIR / "_vendor/infinity"
+    modified = [
+        "adapters/hf_decoder.py",
+        "config/training.py",
+        "config/yaml_loader.py",
+        "model/cpu_master.py",
+        "model/mp_state.py",
+        "model/mp_worker.py",
+        "simple_profiler.py",
+    ]
+
+    for relative in modified:
+        header = (vendor_dir / relative).read_text(encoding="utf-8")[:400]
+        assert "https://github.com/DLYuanGod/MegaTrain" in header, relative
+        assert UPSTREAM_SHA in header, relative
+        assert "Modified by Axolotl" in header, relative
+
+    unmodified = vendor_dir / "optimizer.py"
+    assert "Modified by Axolotl" not in unmodified.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "example",
+    ["examples/smollm2/megatrain.yaml", "examples/smollm2/megatrain-multigpu.yaml"],
+)
+def test_example_config_is_loadable(monkeypatch, tmp_path, example):
     monkeypatch.setattr("axolotl.cli.config.prepare_debug_log", lambda _cfg: None)
     monkeypatch.setattr(
         "axolotl.cli.config.gpu_capabilities",
@@ -68,16 +97,14 @@ def test_example_config_is_loadable(monkeypatch, tmp_path):
                 "bf16": True,
                 "compute_capability": "sm_89",
                 "fp8": False,
-                "n_gpu": 1,
+                "n_gpu": 2,
                 "n_node": 1,
                 "tf32": True,
             },
             {"torch_version": "2.11.0"},
         ),
     )
-    raw_config = yaml.safe_load(
-        (REPO_ROOT / "examples/smollm2/megatrain.yaml").read_text(encoding="utf-8")
-    )
+    raw_config = yaml.safe_load((REPO_ROOT / example).read_text(encoding="utf-8"))
     raw_config["dataset_prepared_path"] = str(tmp_path / "prepared")
     raw_config["output_dir"] = str(tmp_path / "output")
 

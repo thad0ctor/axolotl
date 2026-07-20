@@ -286,3 +286,38 @@ def test_plugin_cleanup_hooks_close_registered_trainer_once():
     plugin.post_train_unload(config)
 
     trainer.close.assert_called_once_with()
+
+
+def test_trainer_init_normalizes_n_gpu_and_batch_size(monkeypatch):
+    """Transformers multiplies the dataloader batch by `n_gpu` for DataParallel.
+
+    MegaTrain streams one unwrapped model and shards batches itself, so that
+    multiplication would silently inflate `micro_batch_size`.
+    """
+    model = torch.nn.Linear(4, 4, bias=False)
+    manager = PluginManager.get_instance()
+    manager.cfg = DictDefault(
+        {
+            "base_model": "unused",
+            "torch_dtype": torch.bfloat16,
+            "attn_implementation": "eager",
+            "micro_batch_size": 2,
+            "gradient_accumulation_steps": 1,
+            "sequence_len": 8,
+            "learning_rate": 1e-4,
+        }
+    )
+
+    def initialize_base(self, *args, **kwargs):
+        del args, kwargs
+        self.model = model
+        # What Transformers computes on a 4-GPU host for micro_batch_size=2.
+        self.args = SimpleNamespace(per_device_train_batch_size=2, _n_gpu=4)
+        self._train_batch_size = 8
+
+    monkeypatch.setattr(AxolotlTrainer, "__init__", initialize_base)
+
+    trainer = MegaTrainTrainer()
+
+    assert trainer.args._n_gpu == 1
+    assert trainer._train_batch_size == 2

@@ -60,7 +60,8 @@ def test_build_megatrain_config_maps_core_fields(monkeypatch):
         ({"attn_implementation": "sdpa"}, "sdpa"),
         ({"attn_implementation": None, "flash_attention": True}, "flash_attention_2"),
         ({"attn_implementation": None, "sdp_attention": True}, "sdpa"),
-        ({"attn_implementation": None}, "eager"),
+        # Matches the backend Transformers picks when the config leaves it unset.
+        ({"attn_implementation": None}, "sdpa"),
     ],
 )
 def test_build_megatrain_config_maps_attention(monkeypatch, overrides, expected):
@@ -70,3 +71,24 @@ def test_build_megatrain_config_maps_attention(monkeypatch, overrides, expected)
     config = build_megatrain_config(_config(**overrides))
 
     assert config.attn_implementation == expected
+
+
+def test_build_megatrain_config_uses_requested_devices(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    config = build_megatrain_config(_config(megatrain_devices=[1, 3]))
+
+    assert config.devices == [1, 3]
+    assert config.device == 1
+    assert config.world_size == 2
+
+
+def test_build_megatrain_config_falls_back_to_current_device(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    config = build_megatrain_config(_config(megatrain_devices=None))
+
+    assert config.devices == [3]
+    assert config.world_size == 1

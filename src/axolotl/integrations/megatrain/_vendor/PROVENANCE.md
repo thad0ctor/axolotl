@@ -101,6 +101,135 @@ rewrite:
   forward that retained an unnecessary autograd graph before the actual loss
   forward rebuilt the same activation.
 
+Each modified file additionally carries a three-line header naming the upstream
+project, the pinned revision, and the fact that Axolotl changed it, as required
+by Apache-2.0 section 4(b). The 27 vendored files that are byte-identical to the
+pinned upstream commit carry no such header.
+
+### Correctness fixes to the single-GPU path
+
+- `infinity/model/cpu_master.py` no longer lets a failure in the gradient
+  accumulation worker thread hang training. The thread previously died without
+  calling `task_done()`, so `grad_task_queue.join()` and the slab free-list
+  blocked forever with no traceback. The worker now records the exception, keeps
+  draining the queue, and the error is re-raised on the training thread.
+- `infinity/model/cpu_master.py` raises a clear error when
+  `_sync_params_to_gpu()` runs after `release_gpu_buffers()` instead of failing
+  with `'NoneType' object has no attribute 'parameters'`.
+- `infinity/model/cpu_master.py` keys the streamed-layer grouping on the layer's
+  parameter structure rather than `hash(structure)`; a collision would have
+  silently merged two differently-shaped layers.
+- `infinity/model/cpu_master.py` sums the chunked cross-entropy contributions to
+  the language-model head and final norm in FP32. They are BF16 leaves, so
+  accumulating one gradient per chunk in `.grad` drifted by roughly
+  `sqrt(num_chunks) * eps` on the largest matrix in the model. The FP32
+  accumulator is allocated only when the sequence spans more than one chunk.
+
+### Multi-GPU (data-parallel) fixes
+
+The vendored multiprocessing path was unreachable from Axolotl and had not been
+exercised. It is now reachable through `megatrain_devices`, and the following
+defects were fixed:
+
+- `infinity/model/mp_worker.py` reserved gradient-slab space only for parameters
+  that had a gradient, while the reader assumed a dense layout over every
+  parameter. Any unused parameter shifted every subsequent parameter's gradient
+  by one slot and fed uninitialized slab bytes into the gap. All three
+  collectors (layer, head, embedding) now use the same
+  `_copy_parameter_grads_to_slab` / `_accumulate_parameter_grads_from_slab`
+  helpers and gradient-presence bitmap as the single-GPU path.
+- `infinity/model/cpu_master.py` forwards `global_valid_tokens` to the
+  multiprocessing path, which previously dropped it and renormalized by its own
+  microbatch-local token count.
+- `infinity/model/cpu_master.py` no longer zeroes the shared gradients on every
+  microbatch, which discarded all but the last microbatch of a gradient
+  accumulation window.
+- `infinity/model/cpu_master.py` shards each batch with `_shard_bounds` so every
+  sample is covered exactly once; the previous `B // world_size` slice silently
+  dropped the remainder. Batches smaller than the worker count are rejected.
+- `infinity/model/mp_state.py` gains `reattach_and_zero_detached_grads()`, and
+  `CPUMasterModel.ensure_grads_attached()` calls it before each streamed step.
+  Hugging Face's `Module.zero_grad()` defaults to `set_to_none=True`, which
+  detached the CPU masters from the shared-memory buffers the workers accumulate
+  into and would otherwise have made every optimizer step a no-op.
+- `infinity/model/mp_worker.py` builds its attention mask with the shared
+  `_prepare_attention_mask` helper instead of a hand-rolled causal-or-padding
+  mask. For `sdpa` and `eager` the sliding window lives entirely in the mask, so
+  the previous mask silently gave sliding-window models full-context attention.
+  It also inherits the mixed-schedule and chunked-attention rejections, and
+  resolves the per-layer-type mask mapping.
+- `infinity/model/mp_worker.py` replays each layer's CUDA RNG state during
+  activation recomputation, matching the single-GPU path, so dropout masks agree
+  between the original and recomputed forwards.
+- `infinity/model/mp_worker.py` reports failures instead of dying. Every command
+  is answered exactly once, with the traceback carried back on a new
+  `WorkerResult.error` field; the parent surfaces it through
+  `CPUMasterModel._await_worker_result`, which also polls worker liveness and
+  applies a timeout rather than blocking forever.
+- `infinity/model/mp_worker.py` backpropagates each normalized loss chunk
+  immediately rather than retaining the whole chunked graph, computes fallback
+  cross entropy in FP32, and uses the same FP32 head-gradient accumulator as the
+  single-GPU path.
+- `infinity/model/mp_worker.py` runs the initial embedding forward under
+  `torch.no_grad()` and drops a duplicate final-normalization forward whose
+  result was discarded; both previously retained an unused autograd graph for
+  the whole step.
+- `infinity/model/mp_worker.py` raises `NotImplementedError` for vision inputs
+  instead of silently ignoring `pixel_values` and `vision_kwargs`.
+- `infinity/model/mp_state.py` strips Transformers' `_hidden_kernels` caches from
+  the shared modules before spawning workers. Transformers 5.x attaches
+  `{name: Func()}` to every attention module, where `Func` is defined inside a
+  function and therefore unpicklable, which made worker spawn fail outright with
+  `Can't pickle local object '_create_func_module.<locals>.Func'`. The dict is
+  only a discovery cache for `kernelize()`, which this integration never calls.
+- `infinity/model/cpu_master.py` and `infinity/model/mp_worker.py` release each
+  FP32 head-gradient accumulator as it is consumed, so the largest one is not
+  pinned on the GPU for the duration of the layer backward.
+- `infinity/config/training.py` gains `fp32_head_grad` (default on). The FP32
+  head-gradient accumulator costs 4 bytes per `lm_head` element on each GPU
+  (~2 GB for a 128k x 4096 head), which matters on the memory-constrained setups
+  layer streaming exists to serve, so it can be turned off.
+- `infinity/model/cpu_master.py` idles surplus workers instead of raising when a
+  batch has fewer rows than there are GPUs. `dataloader_drop_last` defaults to
+  false, so the trailing batch of an epoch is short whenever the dataset does not
+  divide evenly, and failing there would kill the run after a full epoch.
+- `infinity/model/cpu_master.py` and `infinity/model/mp_worker.py` leave
+  `grad=None` for head/norm parameters that never received a gradient rather than
+  writing a zero, so the slab presence bitmap keeps skipping them and the
+  optimizer does not apply decay to untouched parameters.
+- `infinity/model/cpu_master.py` shards `_forward_logits_multiprocess` with
+  `_shard_bounds` too; it previously dropped the remainder onto the last rank and
+  handed empty slices to the others when the batch was smaller than the worker
+  count.
+- `infinity/model/mp_worker.py` drains its gradient queue in a `finally` and
+  clears the recorded worker error after every reply, so a failed step cannot
+  leave in-flight writes landing in shared gradients or report a stale traceback
+  against a later command.
+- `infinity/config/training.py` requires the batch to hold at least one sample
+  per worker instead of being exactly divisible by the worker count, matching
+  the remainder-distributing `_shard_bounds` split.
+- `infinity/model/mp_state.py` tries versioned `libcudart` sonames (a pip
+  `torch` ships `libcudart.so.12`, not the unversioned name) and declares
+  `argtypes`/`restype` before calling `cudaHostRegister`. It also verifies that
+  the shared-gradient list length matches the parameters it re-attached.
+
+### Known remaining gaps
+
+- `CPUMasterModel._prepare_4d_causal_mask` is retained from upstream but is no
+  longer referenced. It builds a plain causal-or-padding mask and would drop
+  sliding-window attention for `sdpa` and `eager`; use `_prepare_attention_mask`.
+- The vision/VLM path in `infinity/model/cpu_master.py` is not used by Axolotl
+  (the plugin rejects multimodal models) and `_merge_vision_embeddings` is a
+  no-op: it assigns into a boolean-mask copy rather than the tensor.
+- `infinity/ops/`, `infinity/scheduler/`, `infinity/memory/`, `infinity/runtime/`,
+  `infinity/adapters/`, `infinity/csrc/`, `infinity/optimizer.py`,
+  `infinity/profiler.py`, `infinity/simple_profiler.py`,
+  `infinity/true_cpu_offloading.py`, `infinity/model/transformer.py`, and
+  `infinity/data/datasets.py` are retained for upstream-diff fidelity but are
+  never imported by the integration. Several contain defects (notably an
+  interleaved `rotate_half` against a half-split cos/sin cache in
+  `infinity/ops/layers.py`). Do not adopt them without review.
+
 Any future compatibility or behavioral change must be listed here with the
 affected files and rationale.
 

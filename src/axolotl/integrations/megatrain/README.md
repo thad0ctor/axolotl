@@ -9,7 +9,8 @@ checkpoint layout.
 
 ## Requirements
 
-- One CUDA GPU with BF16 support.
+- At least one CUDA GPU with BF16 support. Additional GPUs are used by listing
+  them in `megatrain_devices`.
 - One Axolotl process. Launch through `axolotl train`, not `torchrun` or a
   distributed launcher.
 - Enough host RAM for the model, optimizer state, working copies, dataset, and
@@ -48,6 +49,29 @@ Face format and can be loaded without the MegaTrain integration.
 |---|---:|---|
 | `megatrain_checkpoint_interval` | `4` | Number of transformer layers in a recomputation segment. Lower values retain more persistent checkpoints; higher values build a larger temporary recomputation cache. Benchmark both directions when tuning memory. |
 | `megatrain_num_grad_slabs` | `12` | Number of reusable pinned host gradient buffers. More buffers can improve overlap but consume more RAM. Keep this at least twice the checkpoint interval. |
+| `megatrain_devices` | current device | CUDA device indices to shard each microbatch across. Omit for single-GPU training. |
+| `megatrain_fp32_head_grad` | `true` | Sum chunked cross-entropy gradients for the output head and final norm in FP32. Costs 4 bytes per `lm_head` element of GPU scratch on each device; set to `false` to trade some gradient precision for VRAM. |
+
+## Multi-GPU
+
+MegaTrain parallelizes over data, not parameters: it keeps one set of FP32 CPU
+masters and spawns one worker process per GPU, each streaming the same layers
+against its own shard of the microbatch. Gradients accumulate into shared-memory
+buffers that the single CPU optimizer then steps.
+
+```yaml
+megatrain_devices: [0, 1, 2, 3]
+micro_batch_size: 4
+```
+
+Axolotl still runs as a **single** process — launch with `axolotl train`, not
+`torchrun` or an Accelerate multi-process runner. MegaTrain owns process
+creation itself, so combining it with an external launcher is rejected.
+
+`micro_batch_size` must be at least `len(megatrain_devices)`, because each
+microbatch is sharded across the workers. Host RAM requirements are unchanged
+(there is still exactly one CPU master), but each worker adds its own GPU
+context, layer buffers, and pinned gradient slabs.
 
 The integration derives the remaining MegaTrain settings from standard Axolotl
 keys:
@@ -61,6 +85,7 @@ keys:
 | `gradient_accumulation_steps` | Number of streamed microsteps per optimizer step |
 | `sequence_len` | Maximum sequence length |
 | `learning_rate`, `weight_decay`, `adam_beta1`, `adam_beta2`, `adam_epsilon` | CPU optimizer settings |
+| `megatrain_devices` | GPUs to shard each microbatch across |
 | `max_grad_norm` | CPU-master gradient clipping threshold |
 
 MegaTrain performs its own checkpointed layer streaming, so the example disables
@@ -86,7 +111,7 @@ weights, and resumed training use FP32 masters without BF16 update rounding.
 | Evaluation or validation datasets | Not supported; set `val_set_size: 0` |
 | Resume from optimizer checkpoints | Supported through Axolotl's standard `resume_from_checkpoint` flow |
 | DeepSpeed, FSDP, DDP, TP, context parallelism, Ray, or `torchrun` | Not supported |
-| MegaTrain spawn-based multi-GPU training | Not supported |
+| MegaTrain spawn-based multi-GPU training | Supported through `megatrain_devices` |
 | DPO, KTO, ORPO, GRPO, reward modelling, or other RL/preference trainers | Not supported |
 | Vision-language or multimodal training | Not currently supported |
 | Nonzero dropout or mixed attention schedules | Not currently supported |
@@ -95,6 +120,12 @@ weights, and resumed training use FP32 masters without BF16 update rounding.
 
 `torch_compile` is not recommended with CPU-master streaming. Unsupported
 features are rejected early rather than falling back to Axolotl's stock trainer.
+
+Two behaviours differ from a stock Axolotl run and are deliberate:
+
+- Weight decay is not applied to embeddings or the output head, in addition to
+  Axolotl's usual exclusion of norms and biases.
+- Saved checkpoints hold FP32 weights, because the CPU masters are FP32.
 
 ## Memory sizing
 
@@ -126,6 +157,7 @@ specific layers and allocator fragmentation.
 ## Provenance
 
 The bundled runtime is a pruned, namespaced copy of MegaTrain. See the
-[provenance record](_vendor/PROVENANCE.md) for its exact upstream revision,
+[provenance record](https://github.com/axolotl-ai-cloud/axolotl/blob/main/src/axolotl/integrations/megatrain/_vendor/PROVENANCE.md)
+for its exact upstream revision,
 license, excluded files, and local changes. MegaTrain is licensed under
 Apache-2.0; the copied license is in this directory.

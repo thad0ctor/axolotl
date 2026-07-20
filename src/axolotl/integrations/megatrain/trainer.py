@@ -18,6 +18,7 @@ from axolotl.integrations.megatrain._vendor.infinity.config.training import (
 from axolotl.integrations.megatrain._vendor.infinity.model.cpu_master import (
     CPUMasterModel,
 )
+from axolotl.integrations.megatrain.args import DEFAULT_ATTN_IMPLEMENTATION
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -36,7 +37,7 @@ def _attention_implementation(cfg) -> str:
         return "flash_attention_2"
     if _cfg_value(cfg, "sdp_attention", False):
         return "sdpa"
-    return "eager"
+    return DEFAULT_ATTN_IMPLEMENTATION
 
 
 def build_megatrain_config(cfg) -> CPUMasterConfig:
@@ -47,11 +48,14 @@ def build_megatrain_config(cfg) -> CPUMasterConfig:
         if torch.cuda.is_available()
         else int(_cfg_value(cfg, "local_rank", 0))
     )
+    devices = [int(index) for index in _cfg_value(cfg, "megatrain_devices", []) or []]
+    if not devices:
+        devices = [device]
     max_steps = int(_cfg_value(cfg, "max_steps", -1))
     return CPUMasterConfig(
         model_name=str(_cfg_value(cfg, "base_model", "unknown")),
-        device=device,
-        devices=[device],
+        device=devices[0],
+        devices=devices,
         dtype=torch.bfloat16,
         attn_implementation=_attention_implementation(cfg),
         trust_remote_code=bool(_cfg_value(cfg, "trust_remote_code", False)),
@@ -72,6 +76,7 @@ def build_megatrain_config(cfg) -> CPUMasterConfig:
         log_interval=int(_cfg_value(cfg, "logging_steps", 1)),
         checkpoint_interval=int(_cfg_value(cfg, "megatrain_checkpoint_interval", 4)),
         num_grad_slabs=int(_cfg_value(cfg, "megatrain_num_grad_slabs", 12)),
+        fp32_head_grad=bool(_cfg_value(cfg, "megatrain_fp32_head_grad", True)),
         enable_timing=False,
     )
 
@@ -97,6 +102,13 @@ class MegaTrainTrainer(AxolotlTrainer):
     def __init__(self, *args, **kwargs):
         self._megatrain_closed = False
         super().__init__(*args, **kwargs)
+
+        # Transformers scales the dataloader batch by `n_gpu` for DataParallel, but
+        # MegaTrain streams one unwrapped model and shards batches itself, so on a
+        # multi-GPU host that would silently multiply `micro_batch_size`.
+        if getattr(self, "args", None) is not None:
+            self.args._n_gpu = 1
+            self._train_batch_size = self.args.per_device_train_batch_size
 
         cfg = PluginManager.get_instance().cfg
         if cfg is None:

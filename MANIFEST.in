@@ -8,6 +8,7 @@ include src/axolotl/integrations/megatrain/README.md
 include src/axolotl/integrations/megatrain/ACKNOWLEDGEMENTS.md
 include src/axolotl/integrations/megatrain/_vendor/PROVENANCE.md
 include examples/smollm2/megatrain.yaml
+include examples/smollm2/megatrain-multigpu.yaml
 recursive-include src/axolotl *.yaml
 include AGENTS.md
 recursive-include docs/agents *.md

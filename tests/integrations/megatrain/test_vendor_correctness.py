@@ -19,8 +19,10 @@ from axolotl.integrations.megatrain._vendor.infinity.model.cpu_master import (
     _accumulate_parameter_grads_from_slab,
     _copy_module_for_compute,
     _copy_parameter_grads_to_slab,
+    _dedup_parameters,
     _head_gradient_numel,
     _replay_cuda_rng_state,
+    _shard_bounds,
 )
 
 
@@ -321,3 +323,139 @@ def test_fallback_loss_and_gradients_match_supported_models(
         master.cleanup()
         del stock_model
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 5, 8, 17])
+def test_shard_bounds_cover_every_sample_exactly_once(batch_size, world_size):
+    covered = []
+    previous_end = 0
+    for rank in range(world_size):
+        start, end = _shard_bounds(batch_size, rank, world_size)
+        assert start == previous_end
+        assert start <= end
+        covered.extend(range(start, end))
+        previous_end = end
+
+    assert previous_end == batch_size
+    assert covered == list(range(batch_size))
+
+
+def test_shard_bounds_balances_the_remainder():
+    sizes = [
+        _shard_bounds(10, rank, 4)[1] - _shard_bounds(10, rank, 4)[0]
+        for rank in range(4)
+    ]
+
+    assert sum(sizes) == 10
+    assert max(sizes) - min(sizes) <= 1
+
+
+def test_dedup_parameters_collapses_tied_weights_preserving_order():
+    embedding = torch.nn.Embedding(7, 3)
+    lm_head = torch.nn.Linear(3, 7, bias=False)
+    lm_head.weight = embedding.weight
+    norm_weight = torch.nn.Parameter(torch.ones(3))
+
+    deduped = _dedup_parameters([lm_head.weight, norm_weight, embedding.weight])
+
+    assert len(deduped) == 2
+    assert deduped[0] is lm_head.weight
+    assert deduped[1] is norm_weight
+
+
+def test_cpu_master_modules_survive_spawn_pickling():
+    """Workers are spawned, so every shared module must be picklable.
+
+    Transformers attaches `_hidden_kernels = {name: Func()}` to attention modules,
+    where `Func` is defined inside a function and cannot be pickled.
+    """
+    import pickle
+
+    from axolotl.integrations.megatrain._vendor.infinity.model.mp_state import (
+        _strip_hidden_kernels,
+    )
+
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+    )
+    layer = model.model.layers[0]
+
+    _strip_hidden_kernels(layer)
+
+    assert not hasattr(layer.self_attn, "_hidden_kernels")
+    pickle.dumps(layer)
+
+
+def test_strip_hidden_kernels_is_idempotent_and_handles_none():
+    from axolotl.integrations.megatrain._vendor.infinity.model.mp_state import (
+        _strip_hidden_kernels,
+    )
+
+    assert _strip_hidden_kernels(None) == 0
+
+    module = torch.nn.Linear(2, 2)
+    assert _strip_hidden_kernels(module) == 0
+
+    module.__dict__["_hidden_kernels"] = {"x": object()}
+    assert _strip_hidden_kernels(module) == 1
+    assert _strip_hidden_kernels(module) == 0
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "world_size", "expected_workers"),
+    [(8, 4, 4), (4, 4, 4), (3, 4, 3), (1, 4, 1), (2, 2, 2), (1, 1, 1)],
+)
+def test_short_trailing_batch_idles_surplus_workers(
+    batch_size, world_size, expected_workers
+):
+    """`dataloader_drop_last` defaults to False, so the last batch of an epoch can
+    carry fewer samples than there are workers. That must not fail the run."""
+    active = min(batch_size, world_size)
+
+    assert active == expected_workers
+
+    covered = []
+    for rank in range(active):
+        start, end = _shard_bounds(batch_size, rank, active)
+        assert start < end, "an active worker must never get an empty shard"
+        covered.extend(range(start, end))
+
+    assert covered == list(range(batch_size))
+
+
+def test_fp32_head_accumulator_leaves_ungraded_parameters_none():
+    """The slab presence bitmap distinguishes `grad=None` from a zero gradient;
+    the FP32 head accumulator must not turn the former into the latter."""
+    graded = torch.nn.Parameter(torch.zeros(3))
+    ungraded = torch.nn.Parameter(torch.zeros(2))
+    params = [graded, ungraded]
+
+    accumulators = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+    seen = [False, False]
+
+    # One chunk contributes to `graded` only.
+    graded.grad = torch.tensor([1.0, 2.0, 3.0])
+    for index, parameter in enumerate(params):
+        if parameter.grad is not None:
+            accumulators[index].add_(parameter.grad.float())
+            seen[index] = True
+            parameter.grad = None
+
+    for index, parameter in enumerate(params):
+        if seen[index]:
+            parameter.grad = accumulators[index].to(parameter.dtype)
+
+    assert graded.grad is not None
+    assert torch.equal(graded.grad, torch.tensor([1.0, 2.0, 3.0]))
+    assert ungraded.grad is None
+
+    _, has_grads = _copy_parameter_grads_to_slab(params, torch.zeros(5))
+    assert has_grads == [True, False]

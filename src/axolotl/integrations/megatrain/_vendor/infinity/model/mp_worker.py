@@ -1,3 +1,7 @@
+# Vendored from MegaTrain: https://github.com/DLYuanGod/MegaTrain
+# Revision: 7f5c9597e5b20bb618932c77c922e8eac4a11c4d (Apache-2.0)
+# Modified by Axolotl; see _vendor/PROVENANCE.md for the list of changes.
+
 """Worker process for multiprocessing data parallelism.
 
 Each worker process owns one GPU and runs forward/backward independently.
@@ -7,12 +11,15 @@ shared-memory accumulators with a lock.
 
 import logging
 import threading
+import traceback
 import queue
 import torch
 import torch.nn as nn
 
 from axolotl.integrations.megatrain._vendor.infinity.model.cpu_master import (
-    _GPUContext, _copy_module_for_compute, _preserve_attn_implementation, CPUMasterModel,
+    _GPUContext, _accumulate_parameter_grads_from_slab, _copy_module_for_compute,
+    _copy_parameter_grads_to_slab, _dedup_parameters, _prepare_attention_mask,
+    _preserve_attn_implementation, _replay_cuda_rng_state,
     FLASH_CE_AVAILABLE,
 )
 if FLASH_CE_AVAILABLE:
@@ -127,7 +134,7 @@ def _create_worker_gpu_context(rank, device_id, shared_state):
     return ctx
 
 
-def _worker_grad_fn(grad_queue, worker_stop, shared_state, ctx):
+def _worker_grad_fn(grad_queue, worker_stop, shared_state, ctx, worker_error):
     """Per-worker gradient accumulation thread.
 
     Same as CPUMasterModel._grad_worker but writes to shared-memory
@@ -139,40 +146,42 @@ def _worker_grad_fn(grad_queue, worker_stop, shared_state, ctx):
         except queue.Empty:
             continue
 
-        slab_type, slab_idx, cpu_params, shapes, numels = task
+        slab_type, slab_idx, cpu_params, shapes, numels, has_grads = task
 
-        if slab_type == 'layer':
-            event = ctx.layer_slab_events[slab_idx]
-            slab_flat = ctx.layer_grad_slabs[slab_idx]
-        elif slab_type == 'head':
-            event = ctx.head_slab_event
-            slab_flat = ctx.head_grad_slab
-        else:
-            event = ctx.embed_slab_event
-            slab_flat = ctx.embed_grad_slab
+        try:
+            if slab_type == 'layer':
+                event = ctx.layer_slab_events[slab_idx]
+                slab_flat = ctx.layer_grad_slabs[slab_idx]
+            elif slab_type == 'head':
+                event = ctx.head_slab_event
+                slab_flat = ctx.head_grad_slab
+            else:
+                event = ctx.embed_slab_event
+                slab_flat = ctx.embed_grad_slab
 
-        event.synchronize()
+            event.synchronize()
 
-        # Accumulate to shared-memory p_cpu.grad with lock
-        with shared_state.grad_lock:
-            offset = 0
-            for p_cpu, shape, numel in zip(cpu_params, shapes, numels):
-                grad_view = slab_flat[offset:offset + numel].view(shape)
-                if p_cpu.grad is None:
-                    p_cpu.grad = torch.empty_like(p_cpu, device='cpu')
-                    p_cpu.grad.copy_(grad_view)
-                else:
-                    p_cpu.grad.add_(grad_view)
-                offset += numel
+            # Accumulate to shared-memory p_cpu.grad with lock
+            with shared_state.grad_lock:
+                _accumulate_parameter_grads_from_slab(
+                    cpu_params, shapes, numels, has_grads, slab_flat
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Keep draining: an un-acked task would block the command loop forever
+            # on grad_queue.join().
+            if worker_error.get('error') is None:
+                worker_error['error'] = traceback.format_exc()
+            logger.exception("MegaTrain worker gradient thread failed")
+            del exc
+        finally:
+            if slab_type == 'layer':
+                ctx.layer_slab_free_list.put(slab_idx)
+            elif slab_type == 'head':
+                ctx.head_slab_free.set()
+            else:
+                ctx.embed_slab_free.set()
 
-        if slab_type == 'layer':
-            ctx.layer_slab_free_list.put(slab_idx)
-        elif slab_type == 'head':
-            ctx.head_slab_free.set()
-        else:
-            ctx.embed_slab_free.set()
-
-        grad_queue.task_done()
+            grad_queue.task_done()
 
 
 def _worker_load_layer_to_buffer_async(layer_idx, buffer_idx, ctx, shared_state):
@@ -237,9 +246,10 @@ def gpu_worker_fn(rank, shared_state):
     # Per-process grad worker thread
     grad_queue = queue.Queue()
     worker_stop = threading.Event()
+    worker_error = {'error': None}
     grad_thread = threading.Thread(
         target=_worker_grad_fn,
-        args=(grad_queue, worker_stop, shared_state, ctx),
+        args=(grad_queue, worker_stop, shared_state, ctx, worker_error),
         daemon=True,
     )
     grad_thread.start()
@@ -254,32 +264,78 @@ def gpu_worker_fn(rank, shared_state):
             logger.info(f"Worker {rank}: shutting down")
             break
 
-        elif cmd.type == WorkerCommandType.SYNC_WEIGHTS:
-            _worker_sync_gpu_modules(ctx, shared_state)
-            result_q.put(WorkerResult())
+        # Every branch must reply exactly once: an unanswered command leaves the
+        # parent blocked on this rank's result queue.
+        try:
+            if cmd.type == WorkerCommandType.SYNC_WEIGHTS:
+                _worker_sync_gpu_modules(ctx, shared_state)
+                result = WorkerResult()
 
-        elif cmd.type == WorkerCommandType.FORWARD_BACKWARD:
-            result = _run_forward_backward(
-                rank, ctx, shared_state, grad_queue, cmd)
-            # Wait for all grad tasks to complete before signaling main
-            grad_queue.join()
-            result_q.put(result)
+            elif cmd.type == WorkerCommandType.FORWARD_BACKWARD:
+                try:
+                    result = _run_forward_backward(
+                        rank, ctx, shared_state, grad_queue, cmd)
+                finally:
+                    # Must drain even when the step raised: a task still in flight
+                    # would keep writing into shared gradients after the parent has
+                    # been told the step failed, and would be counted next step.
+                    grad_queue.join()
+                if worker_error['error'] is not None:
+                    result = WorkerResult(error=worker_error['error'])
 
-        elif cmd.type == WorkerCommandType.FORWARD_LOGITS:
-            result = _run_forward_logits(rank, ctx, shared_state, cmd)
-            result_q.put(result)
+            elif cmd.type == WorkerCommandType.FORWARD_LOGITS:
+                result = _run_forward_logits(rank, ctx, shared_state, cmd)
 
-        elif cmd.type == WorkerCommandType.RELEASE_GPU:
-            _worker_release_gpu(ctx)
-            result_q.put(WorkerResult())
+            elif cmd.type == WorkerCommandType.RELEASE_GPU:
+                _worker_release_gpu(ctx)
+                result = WorkerResult()
 
-        elif cmd.type == WorkerCommandType.REBUILD_GPU:
-            _worker_rebuild_gpu(ctx, shared_state)
-            result_q.put(WorkerResult())
+            elif cmd.type == WorkerCommandType.REBUILD_GPU:
+                _worker_rebuild_gpu(ctx, shared_state)
+                result = WorkerResult()
+
+            else:
+                result = WorkerResult(
+                    error=f"unknown worker command {cmd.type!r}"
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"Worker {rank}: command {cmd.type} failed")
+            result = WorkerResult(error=traceback.format_exc())
+
+        # Always clear, so a fault is never reported against a later command.
+        worker_error['error'] = None
+        result_q.put(result)
 
     worker_stop.set()
     grad_thread.join(timeout=5.0)
     logger.info(f"Worker {rank}: exited")
+
+
+def _worker_build_layer_kwargs(mask, cache_position, position_ids,
+                               position_embeddings, shared_state):
+    """Per-layer forward kwargs; `mask` may be a dict keyed by layer type."""
+    model_config = getattr(
+        shared_state._model_config, "text_config", shared_state._model_config
+    )
+    num_layers = len(shared_state.cpu_layers)
+    per_layer = []
+    for layer_idx in range(num_layers):
+        layer_mask = mask
+        if isinstance(mask, dict):
+            layer_mask = mask[model_config.layer_types[layer_idx]]
+        kwargs = {
+            'attention_mask': layer_mask,
+            'use_cache': False,
+            'output_attentions': False,
+        }
+        if shared_state.layer_accepts_cache_position and cache_position is not None:
+            kwargs['cache_position'] = cache_position
+        if shared_state.layer_accepts_position_embeddings and position_embeddings is not None:
+            kwargs['position_embeddings'] = position_embeddings
+        if shared_state.layer_accepts_position_ids and position_ids is not None:
+            kwargs['position_ids'] = position_ids
+        per_layer.append(kwargs)
+    return per_layer
 
 
 def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
@@ -294,6 +350,11 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
     global_valid_tokens = cmd.global_valid_tokens
     pixel_values = cmd.pixel_values
 
+    if pixel_values is not None or cmd.vision_kwargs:
+        raise NotImplementedError(
+            "MegaTrain's multi-GPU worker does not implement vision inputs."
+        )
+
     B, T = input_ids.shape
 
     ctx.compute_stream.wait_event(ctx.param_sync_event)
@@ -304,9 +365,10 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
     start.record(ctx.compute_stream)
 
     # === FORWARD ===
-    input_ids_gpu = input_ids.to(ctx.device)
-    hidden = ctx.emb_gpu(input_ids_gpu)
-    del input_ids_gpu
+    with torch.no_grad():
+        input_ids_gpu = input_ids.to(ctx.device)
+        hidden = ctx.emb_gpu(input_ids_gpu)
+        del input_ids_gpu
 
     cache_position = torch.arange(T, device=ctx.device)
     position_ids = torch.arange(T, device=ctx.device).unsqueeze(0).expand(B, -1)
@@ -325,24 +387,20 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
             position_embeddings = (cos.to(shared_state.config.dtype), sin.to(shared_state.config.dtype))
             del dummy
 
-    mask = attention_mask.to(ctx.device)
-    # Reuse the static method from CPUMasterModel
-    if mask is not None and mask.dim() == 2 and shared_state.config.attn_implementation != 'flash_attention_2':
-        mask = CPUMasterModel._prepare_4d_causal_mask(mask, shared_state.config.dtype, T)
-
-    layer_kwargs = {
-        'attention_mask': mask,
-        'use_cache': False,
-        'output_attentions': False,
-    }
-    if shared_state.layer_accepts_cache_position and cache_position is not None:
-        layer_kwargs['cache_position'] = cache_position
-    if shared_state.layer_accepts_position_embeddings and position_embeddings is not None:
-        layer_kwargs['position_embeddings'] = position_embeddings
-    if shared_state.layer_accepts_position_ids and position_ids is not None:
-        layer_kwargs['position_ids'] = position_ids
+    # Same mask construction as the single-GPU path: a hand-rolled causal|padding
+    # mask would drop sliding-window attention entirely for sdpa and eager.
+    mask = _prepare_attention_mask(
+        shared_state._model_config,
+        attention_mask.to(ctx.device) if attention_mask is not None else None,
+        hidden,
+        position_ids,
+    )
+    layer_kwargs = _worker_build_layer_kwargs(
+        mask, cache_position, position_ids, position_embeddings, shared_state
+    )
 
     checkpoints = {}
+    layer_rng_states = {}
     num_layers = len(shared_state.cpu_layers)
     checkpoint_interval = shared_state.config.checkpoint_interval
 
@@ -369,13 +427,11 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
 
                 group_id = shared_state.layer_to_group[i]
                 gpu_layer = ctx.gpu_layer_templates[group_id][buffer_idx]
-                out = gpu_layer(hidden, **layer_kwargs)
+                layer_rng_states[i] = torch.cuda.get_rng_state(ctx.device)
+                out = gpu_layer(hidden, **layer_kwargs[i])
                 hidden = out[0] if isinstance(out, tuple) else out
 
     checkpoints[num_layers] = hidden.detach()
-
-    if ctx.norm_gpu:
-        hidden = ctx.norm_gpu(hidden)
 
     fwd_end.record(ctx.compute_stream)
 
@@ -391,7 +447,33 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
         hidden_after_norm = hidden_before_norm
 
     total_loss = torch.zeros((), device=ctx.device, dtype=torch.float32)
-    total_valid_tokens = 0
+    total_valid_tokens = int(labels_gpu[:, 1:].ne(-100).sum().item())
+
+    if total_valid_tokens == 0:
+        return WorkerResult(loss_val=0.0, total_tokens=B * T, valid_tokens=0)
+
+    denom = global_valid_tokens if global_valid_tokens > 0 else total_valid_tokens
+
+    # Mirror the single-GPU path: backward each chunk immediately to bound retained
+    # logits memory, and sum the BF16 head/norm grads in FP32.
+    head_grad_params = _dedup_parameters(
+        list(ctx.lm_head_gpu.parameters())
+        + (list(ctx.norm_gpu.parameters()) if ctx.norm_gpu else [])
+    )
+    accumulate_head_grads_in_fp32 = (
+        shared_state.config.fp32_head_grad and (T - 1) > chunk_size
+    )
+    head_grad_accum = []
+    head_grad_seen = []
+    if accumulate_head_grads_in_fp32:
+        for parameter in head_grad_params:
+            accumulator = torch.zeros_like(parameter, dtype=torch.float32)
+            seen = parameter.grad is not None
+            if seen:
+                accumulator.add_(parameter.grad.float())
+                parameter.grad = None
+            head_grad_accum.append(accumulator)
+            head_grad_seen.append(seen)
 
     for t_start in range(0, T - 1, chunk_size):
         t_end = min(t_start + chunk_size, T - 1)
@@ -405,27 +487,37 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
             per_tok = ctx.ce_loss(flat_logits, flat_y)
             valid = (flat_y != -100)
             loss_chunk = per_tok[valid].sum()
-            total_valid_tokens += int(valid.sum().item())
         else:
             loss_chunk = nn.functional.cross_entropy(
-                flat_logits, flat_y, ignore_index=-100, reduction='sum'
+                flat_logits.float(), flat_y, ignore_index=-100, reduction='sum'
             )
-            total_valid_tokens += int((flat_y != -100).sum().item())
 
-        total_loss = total_loss + loss_chunk
+        total_loss.add_(loss_chunk.detach())
+        (loss_chunk / denom).backward(retain_graph=t_end < T - 1)
         del logits, loss_chunk
 
-    if total_valid_tokens == 0:
-        return WorkerResult(loss_val=0.0, total_tokens=B * T, valid_tokens=0)
+        if accumulate_head_grads_in_fp32:
+            for index, parameter in enumerate(head_grad_params):
+                if parameter.grad is not None:
+                    head_grad_accum[index].add_(parameter.grad.float())
+                    head_grad_seen[index] = True
+                    parameter.grad = None
 
-    denom = global_valid_tokens if global_valid_tokens > 0 else total_valid_tokens
-    loss = total_loss / denom
+    if accumulate_head_grads_in_fp32:
+        for index, parameter in enumerate(head_grad_params):
+            # Leave `grad=None` for parameters that never received one, so the slab
+            # presence bitmap keeps skipping them. Drop each accumulator as it is
+            # consumed; the head one is large.
+            if head_grad_seen[index]:
+                parameter.grad = head_grad_accum[index].to(parameter.dtype)
+            head_grad_accum[index] = None
+        head_grad_accum.clear()
+
     loss_val = (total_loss / total_valid_tokens).item()
 
     if not torch.isfinite(torch.tensor(loss_val)):
         logger.error(f"Worker {rank}: Loss is {loss_val}!")
 
-    loss.backward()
     ctx.loss_backward_done.record(ctx.compute_stream)
 
     grad_hidden = hidden_before_norm.grad.detach()
@@ -439,20 +531,17 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
     with torch.cuda.stream(ctx.grad_stream):
         ctx.grad_stream.wait_event(ctx.loss_backward_done)
         offset = 0
+        has_grads = []
         if not shared_state.tied_lm_head:
-            for p_gpu in ctx.lm_head_gpu.parameters():
-                if p_gpu.grad is not None:
-                    numel = p_gpu.grad.numel()
-                    slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
-                    p_gpu.grad = None
-                    offset += numel
+            offset, head_has_grads = _copy_parameter_grads_to_slab(
+                ctx.lm_head_gpu.parameters(), slab_flat, offset, ctx.grad_stream
+            )
+            has_grads.extend(head_has_grads)
         if ctx.norm_gpu:
-            for p_gpu in ctx.norm_gpu.parameters():
-                if p_gpu.grad is not None:
-                    numel = p_gpu.grad.numel()
-                    slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
-                    p_gpu.grad = None
-                    offset += numel
+            offset, norm_has_grads = _copy_parameter_grads_to_slab(
+                ctx.norm_gpu.parameters(), slab_flat, offset, ctx.grad_stream
+            )
+            has_grads.extend(norm_has_grads)
         ctx.head_slab_event.record(ctx.grad_stream)
 
     cpu_params = []
@@ -462,7 +551,7 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
         cpu_params.extend(shared_state.norm.parameters())
     shapes = [p.shape for p in cpu_params]
     numels = [p.numel() for p in cpu_params]
-    grad_queue.put(('head', None, cpu_params, shapes, numels))
+    grad_queue.put(('head', None, cpu_params, shapes, numels, has_grads))
 
     del labels_gpu, hidden_after_norm, hidden_before_norm, total_loss
 
@@ -490,7 +579,8 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
 
                     group_id = shared_state.layer_to_group[j]
                     gpu_layer = ctx.gpu_layer_templates[group_id][buffer_idx]
-                    out = gpu_layer(hidden_recompute, **layer_kwargs)
+                    with _replay_cuda_rng_state(ctx.device, layer_rng_states[j]):
+                        out = gpu_layer(hidden_recompute, **layer_kwargs[j])
                     hidden_recompute = out[0] if isinstance(out, tuple) else out
 
                 recompute_cache[j] = hidden_recompute.detach()
@@ -517,7 +607,8 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
                 for p in gpu_layer.parameters():
                     p.requires_grad_(True)
 
-                out = gpu_layer(layer_input, **layer_kwargs)
+                with _replay_cuda_rng_state(ctx.device, layer_rng_states[i]):
+                    out = gpu_layer(layer_input, **layer_kwargs[i])
                 layer_output = out[0] if isinstance(out, tuple) else out
 
                 grads = torch.autograd.grad(
@@ -560,19 +651,15 @@ def _run_forward_backward(rank, ctx, shared_state, grad_queue, cmd):
 
     with torch.cuda.stream(ctx.grad_stream):
         ctx.grad_stream.wait_event(ctx.embedding_backward_done)
-        offset = 0
-        for p_gpu in ctx.emb_gpu.parameters():
-            if p_gpu.grad is not None:
-                numel = p_gpu.grad.numel()
-                slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
-                p_gpu.grad = None
-                offset += numel
+        _, has_grads = _copy_parameter_grads_to_slab(
+            ctx.emb_gpu.parameters(), slab_flat, stream=ctx.grad_stream
+        )
         ctx.embed_slab_event.record(ctx.grad_stream)
 
     cpu_params = list(shared_state.embedding.parameters())
     shapes = [p.shape for p in cpu_params]
     numels = [p.numel() for p in cpu_params]
-    grad_queue.put(('embed', None, cpu_params, shapes, numels))
+    grad_queue.put(('embed', None, cpu_params, shapes, numels, has_grads))
 
     del input_ids_gpu, emb_out
     del mask, cache_position, position_ids, position_embeddings, grad_hidden
@@ -619,14 +706,9 @@ def _worker_collect_layer_grads_async(layer_idx, buffer_idx, ctx, shared_state, 
     gpu_layer = ctx.gpu_layer_templates[group_id][buffer_idx]
 
     with torch.cuda.stream(ctx.grad_stream):
-        offset = 0
-        for p_gpu in gpu_layer.parameters():
-            if p_gpu.grad is not None:
-                numel = p_gpu.grad.numel()
-                slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
-                p_gpu.grad.record_stream(ctx.grad_stream)
-                p_gpu.grad = None
-                offset += numel
+        _, has_grads = _copy_parameter_grads_to_slab(
+            gpu_layer.parameters(), slab_flat, stream=ctx.grad_stream
+        )
 
         ctx.layer_slab_events[slab_idx].record(ctx.grad_stream)
         ctx.template_free_events[buffer_idx].record(ctx.grad_stream)
@@ -637,6 +719,7 @@ def _worker_collect_layer_grads_async(layer_idx, buffer_idx, ctx, shared_state, 
         shared_state.layer_cpu_params[layer_idx],
         shared_state.layer_param_shapes[layer_idx],
         shared_state.layer_param_numel[layer_idx],
+        has_grads,
     ))
 
 
@@ -675,21 +758,15 @@ def _run_forward_logits(rank, ctx, shared_state, cmd):
                 position_embeddings = (cos.to(shared_state.config.dtype), sin.to(shared_state.config.dtype))
                 del dummy
 
-        mask = attention_mask.to(ctx.device)
-        if mask is not None and mask.dim() == 2 and shared_state.config.attn_implementation != 'flash_attention_2':
-            mask = CPUMasterModel._prepare_4d_causal_mask(mask, shared_state.config.dtype, T)
-
-        layer_kwargs = {
-            'attention_mask': mask,
-            'use_cache': False,
-            'output_attentions': False,
-        }
-        if shared_state.layer_accepts_cache_position and cache_position is not None:
-            layer_kwargs['cache_position'] = cache_position
-        if shared_state.layer_accepts_position_embeddings and position_embeddings is not None:
-            layer_kwargs['position_embeddings'] = position_embeddings
-        if shared_state.layer_accepts_position_ids and position_ids is not None:
-            layer_kwargs['position_ids'] = position_ids
+        mask = _prepare_attention_mask(
+            shared_state._model_config,
+            attention_mask.to(ctx.device) if attention_mask is not None else None,
+            hidden,
+            position_ids,
+        )
+        layer_kwargs = _worker_build_layer_kwargs(
+            mask, cache_position, position_ids, position_embeddings, shared_state
+        )
 
         num_layers = len(shared_state.cpu_layers)
 
@@ -713,7 +790,7 @@ def _run_forward_logits(rank, ctx, shared_state, cmd):
 
                 group_id = shared_state.layer_to_group[i]
                 gpu_layer = ctx.gpu_layer_templates[group_id][buffer_idx]
-                out = gpu_layer(hidden, **layer_kwargs)
+                out = gpu_layer(hidden, **layer_kwargs[i])
                 hidden = out[0] if isinstance(out, tuple) else out
 
         # Norm + lm_head

@@ -1,3 +1,7 @@
+# Vendored from MegaTrain: https://github.com/DLYuanGod/MegaTrain
+# Revision: 7f5c9597e5b20bb618932c77c922e8eac4a11c4d (Apache-2.0)
+# Modified by Axolotl; see _vendor/PROVENANCE.md for the list of changes.
+
 """Training configuration for CPU Master model."""
 
 from dataclasses import dataclass, field
@@ -77,6 +81,9 @@ class CPUMasterConfig:
     # Memory
     checkpoint_interval: int = 4
     num_grad_slabs: int = 12
+    # Sum chunked-CE head/norm gradients in FP32. Costs 4 bytes/element of the
+    # lm_head on GPU; disable to trade precision for VRAM.
+    fp32_head_grad: bool = True
 
     # Logging
     log_interval: int = 1
@@ -89,9 +96,11 @@ class CPUMasterConfig:
             self.devices = [self.device]
         self.world_size = len(self.devices)
 
-        if self.world_size > 1 and self.batch_size % self.world_size != 0 and self.dataset_path != "__verl__":
+        # Sharding distributes any remainder, so only one sample per worker is
+        # required rather than exact divisibility.
+        if self.world_size > 1 and self.batch_size < self.world_size and self.dataset_path != "__verl__":
             raise ValueError(
-                f"batch_size ({self.batch_size}) must be divisible by "
+                f"batch_size ({self.batch_size}) must be at least "
                 f"world_size ({self.world_size}) for multi-GPU data parallelism"
             )
 

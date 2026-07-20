@@ -14,7 +14,9 @@ from torch import nn
 from axolotl.integrations.base import BasePlugin, PluginManager
 
 from .args import (
+    DEFAULT_ATTN_IMPLEMENTATION,
     MEGATRAIN_PLUGIN_NAMES,
+    SUPPORTED_ATTN_IMPLEMENTATIONS,
     MegaTrainArgs as MegaTrainArgs,
     _megatrain_enabled,
 )
@@ -191,6 +193,22 @@ class MegaTrainPlugin(BasePlugin):
                 "MegaTrain supports one Axolotl process. Launch with `axolotl train` "
                 "instead of torchrun, Accelerate multi-process, or a distributed runner."
             )
+        devices = list(_cfg_value(cfg, "megatrain_devices", []) or [])
+        if devices:
+            device_count = torch.cuda.device_count()
+            out_of_range = [index for index in devices if index >= device_count]
+            if out_of_range:
+                raise RuntimeError(
+                    f"`megatrain_devices` names CUDA device {out_of_range[0]}, but "
+                    f"only {device_count} device(s) are visible."
+                )
+            micro_batch_size = int(_cfg_value(cfg, "micro_batch_size", 1))
+            if micro_batch_size < len(devices):
+                raise RuntimeError(
+                    "MegaTrain shards each microbatch across its GPUs, so "
+                    f"`micro_batch_size` ({micro_batch_size}) must be at least the "
+                    f"number of `megatrain_devices` ({len(devices)})."
+                )
         if cfg.torch_dtype != torch.bfloat16:
             raise RuntimeError(
                 "MegaTrain requires BF16 streamed compute. Set `bf16: true`."
@@ -200,15 +218,16 @@ class MegaTrainPlugin(BasePlugin):
                 "MegaTrain's Axolotl integration currently supports decoder-only text "
                 "models, not multimodal models."
             )
-        if cfg.attn_implementation not in (
-            "flash_attention_2",
-            "sdpa",
-            "eager",
-        ):
+        # Resolve before validating: an unset value would otherwise be rejected as
+        # `None`, and the streamed runtime needs an explicit backend to mirror.
+        attn_implementation = cfg.attn_implementation or DEFAULT_ATTN_IMPLEMENTATION
+        if attn_implementation not in SUPPORTED_ATTN_IMPLEMENTATIONS:
+            supported = ", ".join(sorted(SUPPORTED_ATTN_IMPLEMENTATIONS))
             raise RuntimeError(
-                "MegaTrain supports only `flash_attention_2`, `sdpa`, or `eager` "
-                f"attention, not {cfg.attn_implementation!r}."
+                f"MegaTrain supports only {supported} attention, not "
+                f"{cfg.attn_implementation!r}."
             )
+        cfg.attn_implementation = attn_implementation
 
         if (
             float(_cfg_value(cfg, "val_set_size", 0)) > 0
@@ -438,6 +457,8 @@ class MegaTrainPlugin(BasePlugin):
             return None
 
         decay_parameter_names = trainer.get_decay_parameter_names(trainer.model)
+        # Embeddings and the output head are additionally excluded from weight
+        # decay; this deviates from Axolotl's stock optimizer grouping.
         decay_parameter_ids = {
             id(parameter)
             for name, parameter in trainer.model.named_parameters()

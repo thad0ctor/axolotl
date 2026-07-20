@@ -1,3 +1,7 @@
+# Vendored from MegaTrain: https://github.com/DLYuanGod/MegaTrain
+# Revision: 7f5c9597e5b20bb618932c77c922e8eac4a11c4d (Apache-2.0)
+# Modified by Axolotl; see _vendor/PROVENANCE.md for the list of changes.
+
 """CPU Master Model with explicit recompute and async pipeline.
 
 This module implements a CPU-backed training system for large language models that
@@ -58,6 +62,56 @@ def _copy_parameter_grads_to_slab(parameters, slab_flat, offset=0, stream=None):
             parameter.grad = None
         offset += numel
     return offset, has_grads
+
+
+def _prepare_attention_mask(model_config, attention_mask, hidden_states, position_ids):
+    """Convert a 2D padding mask into the backend-specific mask Transformers expects."""
+    model_config = getattr(model_config, "text_config", model_config)
+    layer_types = set(getattr(model_config, "layer_types", []) or [])
+    unsupported_layer_types = layer_types - {
+        "full_attention",
+        "sliding_attention",
+    }
+    if len(layer_types) > 1:
+        raise ValueError(
+            "MegaTrain does not support mixed attention layer schedules."
+        )
+    if unsupported_layer_types or getattr(
+        model_config, "attention_chunk_size", None
+    ) is not None:
+        unsupported = (
+            ", ".join(sorted(unsupported_layer_types)) or "chunked_attention"
+        )
+        raise ValueError(
+            "MegaTrain supports full and sliding-window attention layers, "
+            f"not {unsupported}."
+        )
+    return create_masks_for_generate(
+        config=model_config,
+        inputs_embeds=hidden_states,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+
+
+def _shard_bounds(batch_size, rank, world_size):
+    """Split `batch_size` across ranks so every sample is covered exactly once."""
+    return (
+        rank * batch_size // world_size,
+        (rank + 1) * batch_size // world_size,
+    )
+
+
+def _dedup_parameters(parameters):
+    """Deduplicate by identity, preserving order (lm_head may be tied to embedding)."""
+    seen = set()
+    unique = []
+    for parameter in parameters:
+        if id(parameter) not in seen:
+            seen.add(id(parameter))
+            unique.append(parameter)
+    return unique
 
 
 def _head_gradient_numel(lm_head, norm, tied_lm_head):
@@ -356,7 +410,9 @@ def _group_layers_by_structure(cpu_layers):
 
     for i, layer in enumerate(cpu_layers):
         structure = tuple((name, tuple(p.shape)) for name, p in layer.named_parameters())
-        structure_key = hash(structure)
+        # Key on the structure itself; a hash collision would silently merge two
+        # differently-shaped layers into one streaming group.
+        structure_key = structure
 
         if structure_key not in structure_to_group_id:
             group_id = len(layer_groups)
@@ -524,6 +580,7 @@ class CPUMasterModel:
         self._model_config = hf_model.config
 
         # Branch based on world_size
+        self.worker_error = None
         self.use_multiprocessing = config.world_size > 1
         if self.use_multiprocessing:
             self._init_multiprocessing(config)
@@ -755,7 +812,7 @@ class CPUMasterModel:
             self.shared_state.cmd_queues[rank].put(
                 WorkerCommand(type=WorkerCommandType.RELEASE_GPU))
         for rank in range(self.world_size):
-            self.shared_state.result_queues[rank].get()
+            self._await_worker_result(rank)
 
         self._gpu_released = True
         logger.info(f"Released GPU buffers on {self.world_size} workers")
@@ -847,7 +904,7 @@ class CPUMasterModel:
             self.shared_state.cmd_queues[rank].put(
                 WorkerCommand(type=WorkerCommandType.REBUILD_GPU))
         for rank in range(self.world_size):
-            self.shared_state.result_queues[rank].get()
+            self._await_worker_result(rank)
 
         # Update shared flats so workers have latest weights
         self.shared_state.update_shared_flats()
@@ -874,36 +931,50 @@ class CPUMasterModel:
 
             slab_type, slab_idx, cpu_params, shapes, numels, has_grads, ctx = task
 
-            if slab_type == 'layer':
-                event = ctx.layer_slab_events[slab_idx]
-                slab_flat = ctx.layer_grad_slabs[slab_idx]
-            elif slab_type == 'head':
-                event = ctx.head_slab_event
-                slab_flat = ctx.head_grad_slab
-            else:  # 'embed'
-                event = ctx.embed_slab_event
-                slab_flat = ctx.embed_grad_slab
+            try:
+                if slab_type == 'layer':
+                    event = ctx.layer_slab_events[slab_idx]
+                    slab_flat = ctx.layer_grad_slabs[slab_idx]
+                elif slab_type == 'head':
+                    event = ctx.head_slab_event
+                    slab_flat = ctx.head_grad_slab
+                else:  # 'embed'
+                    event = ctx.embed_slab_event
+                    slab_flat = ctx.embed_grad_slab
 
-            event.synchronize()
+                event.synchronize()
 
-            _accumulate_parameter_grads_from_slab(
-                cpu_params, shapes, numels, has_grads, slab_flat
-            )
+                _accumulate_parameter_grads_from_slab(
+                    cpu_params, shapes, numels, has_grads, slab_flat
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Keep draining rather than dying: an un-acked task would block every
+                # producer forever on the slab free-list or the queue join. The error
+                # is re-raised on the training thread instead.
+                if self.worker_error is None:
+                    self.worker_error = exc
+                logger.exception("MegaTrain gradient worker failed")
+            finally:
+                if slab_type == 'layer':
+                    ctx.layer_slab_free_list.put(slab_idx)
+                elif slab_type == 'head':
+                    ctx.head_slab_free.set()
+                else:
+                    ctx.embed_slab_free.set()
 
-            if slab_type == 'layer':
-                ctx.layer_slab_free_list.put(slab_idx)
-            elif slab_type == 'head':
-                ctx.head_slab_free.set()
-            else:
-                ctx.embed_slab_free.set()
-
-            self.grad_task_queue.task_done()
+                self.grad_task_queue.task_done()
 
     def _sync_params_to_gpu(self):
         """Sync CPU master params to GPU modules (call after optimizer step)."""
         if self.use_multiprocessing:
             self._sync_params_multiprocess()
             return
+
+        if getattr(self, '_gpu_released', False):
+            raise RuntimeError(
+                "MegaTrain's GPU buffers have been released; call "
+                "rebuild_gpu_buffers() before syncing parameters to the GPU."
+            )
 
         ctx = self.gpu_contexts[0]
 
@@ -949,7 +1020,7 @@ class CPUMasterModel:
 
         # Wait for all workers to finish syncing
         for rank in range(self.world_size):
-            self.shared_state.result_queues[rank].get()
+            self._await_worker_result(rank)
 
     def _load_layer_to_buffer_async(self, layer_idx, buffer_idx, ctx):
         """Load CPU layer params to GPU buffer asynchronously.
@@ -1025,36 +1096,65 @@ class CPUMasterModel:
         return kwargs
 
     def _prepare_attention_mask(self, attention_mask, hidden_states, position_ids):
-        model_config = getattr(self._model_config, "text_config", self._model_config)
-        layer_types = set(getattr(model_config, "layer_types", []) or [])
-        unsupported_layer_types = layer_types - {
-            "full_attention",
-            "sliding_attention",
-        }
-        if len(layer_types) > 1:
-            raise ValueError(
-                "MegaTrain does not support mixed attention layer schedules."
-            )
-        if unsupported_layer_types or getattr(
-            model_config, "attention_chunk_size", None
-        ) is not None:
-            unsupported = (
-                ", ".join(sorted(unsupported_layer_types)) or "chunked_attention"
-            )
-            raise ValueError(
-                "MegaTrain supports full and sliding-window attention layers, "
-                f"not {unsupported}."
-            )
-        return create_masks_for_generate(
-            config=model_config,
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
-            past_key_values=None,
-            position_ids=position_ids,
+        return _prepare_attention_mask(
+            self._model_config, attention_mask, hidden_states, position_ids
         )
+
+    WORKER_RESULT_TIMEOUT = 1800.0
+
+    def _await_worker_result(self, rank):
+        """Wait for one worker's reply, surfacing crashes instead of hanging."""
+        import queue as queue_mod
+
+        processes = getattr(self, 'worker_processes', None)
+        process = processes[rank] if processes else None
+        deadline = self.WORKER_RESULT_TIMEOUT
+        waited = 0.0
+        poll = 5.0
+        while True:
+            try:
+                result = self.shared_state.result_queues[rank].get(timeout=poll)
+                break
+            except queue_mod.Empty:
+                if process is not None and not process.is_alive():
+                    raise RuntimeError(
+                        f"MegaTrain worker {rank} died (exit code "
+                        f"{process.exitcode}) before returning a result."
+                    )
+                waited += poll
+                if waited >= deadline:
+                    raise RuntimeError(
+                        f"MegaTrain worker {rank} did not respond within "
+                        f"{deadline:.0f}s."
+                    )
+        if getattr(result, 'error', None):
+            raise RuntimeError(
+                f"MegaTrain worker {rank} failed: {result.error}"
+            )
+        return result
+
+    def ensure_grads_attached(self):
+        """Re-point master params at the shared-memory gradients workers write into.
+
+        HF's `model.zero_grad()` defaults to `set_to_none=True`, which would detach
+        the masters from those buffers and silently discard every worker gradient.
+        """
+        if self.use_multiprocessing:
+            self.shared_state.reattach_and_zero_detached_grads()
+
+    def _raise_worker_error(self):
+        """Re-raise a gradient-worker failure on the thread driving training."""
+        error = self.worker_error
+        if error is not None:
+            self.worker_error = None
+            raise RuntimeError(
+                "MegaTrain's gradient accumulation worker failed; see the logged "
+                "traceback above."
+            ) from error
 
     def _collect_layer_grads_async(self, layer_idx, buffer_idx, ctx):
         """Collect GPU buffer grads to CPU layer using K-slab flat buffer pool."""
+        self._raise_worker_error()
         slab_idx = ctx.layer_slab_free_list.get()
         slab_flat = ctx.layer_grad_slabs[slab_idx]
 
@@ -1083,6 +1183,7 @@ class CPUMasterModel:
     def _accumulate_grads_batch(self):
         """Wait for CPU worker to finish all gradient accumulation tasks."""
         self.grad_task_queue.join()
+        self._raise_worker_error()
 
     @staticmethod
     def _prepare_4d_causal_mask(mask_2d, dtype, T):
@@ -1330,12 +1431,11 @@ class CPUMasterModel:
         from axolotl.integrations.megatrain._vendor.infinity.model.mp_state import WorkerCommand, WorkerCommandType
 
         B = input_ids.shape[0]
-        local_bs = B // self.world_size
+        active_workers = min(B, self.world_size)
 
         # Send commands to workers
-        for rank in range(self.world_size):
-            start_idx = rank * local_bs
-            end_idx = start_idx + local_bs if rank < self.world_size - 1 else B
+        for rank in range(active_workers):
+            start_idx, end_idx = _shard_bounds(B, rank, active_workers)
 
             cmd = WorkerCommand(
                 type=WorkerCommandType.FORWARD_LOGITS,
@@ -1346,8 +1446,8 @@ class CPUMasterModel:
 
         # Collect results
         all_logits = []
-        for rank in range(self.world_size):
-            result = self.shared_state.result_queues[rank].get()
+        for rank in range(active_workers):
+            result = self._await_worker_result(rank)
             all_logits.append(result.logits)
 
         # Concatenate on CPU then move to device 0
@@ -1367,7 +1467,8 @@ class CPUMasterModel:
         """
         if self.use_multiprocessing:
             return self._forward_and_backward_multiprocess(
-                input_ids, attention_mask, labels, pixel_values, **vision_kwargs
+                input_ids, attention_mask, labels, pixel_values,
+                global_valid_tokens=global_valid_tokens, **vision_kwargs
             )
 
         ctx = self.gpu_contexts[0]
@@ -1483,6 +1584,26 @@ class CPUMasterModel:
             return 0.0, B * T, {'forward': 0.0, 'backward': 0.0, 'total': 0.0}, 0
         denom = global_valid_tokens if global_valid_tokens > 0 else total_valid_tokens
 
+        # The head/norm leaves are BF16, so summing one grad per chunk into `.grad`
+        # drifts by ~sqrt(num_chunks)*eps on the largest matrix in the model. Sum the
+        # per-chunk contributions in FP32 instead and round once at the end.
+        head_grad_params = _dedup_parameters(
+            list(ctx.lm_head_gpu.parameters())
+            + (list(ctx.norm_gpu.parameters()) if ctx.norm_gpu else [])
+        )
+        accumulate_head_grads_in_fp32 = self.config.fp32_head_grad and (T - 1) > chunk_size
+        head_grad_accum = []
+        head_grad_seen = []
+        if accumulate_head_grads_in_fp32:
+            for parameter in head_grad_params:
+                accumulator = torch.zeros_like(parameter, dtype=torch.float32)
+                seen = parameter.grad is not None
+                if seen:
+                    accumulator.add_(parameter.grad.float())
+                    parameter.grad = None
+                head_grad_accum.append(accumulator)
+                head_grad_seen.append(seen)
+
         for t_start in range(0, T - 1, chunk_size):
             t_end = min(t_start + chunk_size, T - 1)
             h = hidden_after_norm[:, t_start:t_end, :]
@@ -1503,6 +1624,23 @@ class CPUMasterModel:
             total_loss.add_(loss_chunk.detach())
             (loss_chunk / denom).backward(retain_graph=t_end < T - 1)
             del logits, loss_chunk
+
+            if accumulate_head_grads_in_fp32:
+                for index, parameter in enumerate(head_grad_params):
+                    if parameter.grad is not None:
+                        head_grad_accum[index].add_(parameter.grad.float())
+                        head_grad_seen[index] = True
+                        parameter.grad = None
+
+        if accumulate_head_grads_in_fp32:
+            for index, parameter in enumerate(head_grad_params):
+                # Leave `grad=None` for parameters that never received one, so the
+                # slab presence bitmap keeps skipping them. Drop each accumulator as
+                # it is consumed; the head one is large.
+                if head_grad_seen[index]:
+                    parameter.grad = head_grad_accum[index].to(parameter.dtype)
+                head_grad_accum[index] = None
+            head_grad_accum.clear()
 
         loss_val = (total_loss / total_valid_tokens).item()
 
@@ -1675,7 +1813,8 @@ class CPUMasterModel:
         }, total_valid_tokens
 
     def _forward_and_backward_multiprocess(self, input_ids, attention_mask, labels,
-                                            pixel_values=None, **vision_kwargs):
+                                            pixel_values=None, global_valid_tokens=0,
+                                            **vision_kwargs):
         """Forward + backward with multi-GPU data parallelism.
 
         Splits the batch across workers, each running forward/backward independently.
@@ -1684,30 +1823,26 @@ class CPUMasterModel:
         from axolotl.integrations.megatrain._vendor.infinity.model.mp_state import WorkerCommand, WorkerCommandType
 
         B = input_ids.shape[0]
-        local_bs = B // self.world_size
+        # The trailing batch of an epoch is short whenever the dataset does not
+        # divide evenly, so idle the surplus workers instead of failing the run.
+        active_workers = min(B, self.world_size)
 
-        # First pass: count total valid tokens for correct loss normalization
-        total_valid_tokens = 0
-        for rank in range(self.world_size):
-            start_idx = rank * local_bs
-            end_idx = start_idx + local_bs
-            local_labels = labels[start_idx:end_idx]
-            # Valid tokens = labels != -100, shifted by 1
-            total_valid_tokens += int((local_labels[:, 1:] != -100).sum().item())
+        # Valid tokens = labels != -100, shifted by 1
+        total_valid_tokens = int((labels[:, 1:] != -100).sum().item())
 
         if total_valid_tokens == 0:
             logger.warning("No valid tokens in entire batch! Skipping...")
             return 0.0, B * input_ids.shape[1], {'forward': 0.0, 'backward': 0.0, 'total': 0.0}
 
-        # Zero shared grads before workers start accumulating
-        for p in self.get_parameters():
-            if p.grad is not None:
-                p.grad.zero_()
+        # The accumulation window's denominator, so uneven microbatches produce the
+        # same token-mean gradient as an unaccumulated batch. Never zero gradients
+        # here: the caller accumulates across microbatches.
+        denom = global_valid_tokens if global_valid_tokens > 0 else total_valid_tokens
+        self.ensure_grads_attached()
 
         # Send commands to workers
-        for rank in range(self.world_size):
-            start_idx = rank * local_bs
-            end_idx = start_idx + local_bs
+        for rank in range(active_workers):
+            start_idx, end_idx = _shard_bounds(B, rank, active_workers)
 
             local_pv = None
             if pixel_values is not None:
@@ -1718,16 +1853,13 @@ class CPUMasterModel:
                 input_ids=input_ids[start_idx:end_idx],
                 attention_mask=attention_mask[start_idx:end_idx],
                 labels=labels[start_idx:end_idx],
-                global_valid_tokens=total_valid_tokens,
+                global_valid_tokens=denom,
                 pixel_values=local_pv,
             )
             self.shared_state.cmd_queues[rank].put(cmd)
 
         # Collect results
-        results = []
-        for rank in range(self.world_size):
-            result = self.shared_state.result_queues[rank].get()
-            results.append(result)
+        results = [self._await_worker_result(rank) for rank in range(active_workers)]
 
         # Aggregate loss (weighted by local valid tokens)
         total_loss_sum = sum(r.loss_val * r.valid_tokens for r in results)

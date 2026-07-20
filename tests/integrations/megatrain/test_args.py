@@ -178,3 +178,28 @@ def test_accepts_exact_gradient_slab_boundary():
 
     assert config.megatrain_checkpoint_interval == 7
     assert config.megatrain_num_grad_slabs == 14
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [[], [0, 0], [-1], [0, 1, 1]],
+)
+def test_rejects_invalid_device_lists(devices):
+    with pytest.raises(ValidationError):
+        MegaTrainArgs.model_validate(
+            {"plugins": [PLUGIN], "megatrain_devices": devices}
+        )
+
+
+def test_accepts_multi_gpu_device_list():
+    config = MegaTrainArgs.model_validate(
+        {"plugins": [PLUGIN], "megatrain_devices": [0, 1, 2, 3]}
+    )
+
+    assert config.megatrain_devices == [0, 1, 2, 3]
+
+
+def test_devices_default_to_none_for_single_gpu():
+    config = MegaTrainArgs.model_validate({"plugins": [PLUGIN]})
+
+    assert config.megatrain_devices is None

@@ -1,3 +1,7 @@
+# Vendored from MegaTrain: https://github.com/DLYuanGod/MegaTrain
+# Revision: 7f5c9597e5b20bb618932c77c922e8eac4a11c4d (Apache-2.0)
+# Modified by Axolotl; see _vendor/PROVENANCE.md for the list of changes.
+
 """Shared state for multiprocessing data parallelism.
 
 Contains the SharedState container that holds all cross-process shared
@@ -22,6 +26,23 @@ logger = logging.getLogger(__name__)
 
 # Use spawn context throughout to avoid CUDA fork guard
 _mp_ctx = mp.get_context('spawn')
+
+
+def _strip_hidden_kernels(module):
+    """Drop Transformers' `_hidden_kernels` caches so modules can cross `spawn`.
+
+    Transformers 5.x attaches `{name: Func()}` to attention modules, where `Func`
+    is a class defined inside a function and therefore unpicklable. It is only a
+    discovery cache for `kernelize()`, which this integration never calls, so
+    removing it does not change the forward path.
+    """
+    if module is None:
+        return 0
+    removed = 0
+    for submodule in module.modules():
+        if submodule.__dict__.pop('_hidden_kernels', None) is not None:
+            removed += 1
+    return removed
 
 
 class WorkerCommandType(Enum):
@@ -52,6 +73,7 @@ class WorkerResult:
     timing: Dict[str, float] = field(default_factory=dict)
     valid_tokens: int = 0
     logits: Optional[torch.Tensor] = None  # For FORWARD_LOGITS
+    error: Optional[str] = None  # Formatted traceback if the worker raised
 
 
 class SharedState:
@@ -72,6 +94,22 @@ class SharedState:
         self.config = config
         self.world_size = config.world_size
         self.device_ids = config.devices
+
+        # --- Make the modules picklable through spawn ---
+        stripped = 0
+        for module in (
+            *cpu_master_model.cpu_layers,
+            cpu_master_model.embedding,
+            cpu_master_model.norm,
+            cpu_master_model.lm_head,
+            cpu_master_model.rotary_emb,
+        ):
+            stripped += _strip_hidden_kernels(module)
+        if stripped:
+            logger.info(
+                "Removed %d Transformers hidden-kernel cache(s) so CPU master "
+                "modules can be sent to spawned workers", stripped
+            )
 
         # --- Move all CPU master module params to shared memory ---
         # This makes them picklable through spawn with zero-copy shm handles
@@ -169,11 +207,24 @@ class SharedState:
         Must be called from a process that has initialized CUDA (i.e., workers,
         not the main process before spawning).
         """
-        try:
-            cuda_rt = ctypes.CDLL('libcudart.so')
-        except OSError:
-            logger.warning("Could not load libcudart.so — shared flats won't be pinned")
+        # A pip `torch` ships `libcudart.so.12`; the unversioned soname only comes
+        # with the CUDA toolkit dev package.
+        cuda_rt = None
+        for soname in ('libcudart.so', 'libcudart.so.13', 'libcudart.so.12',
+                       'libcudart.so.11.0'):
+            try:
+                cuda_rt = ctypes.CDLL(soname)
+                break
+            except OSError:
+                continue
+        if cuda_rt is None:
+            logger.warning("Could not load libcudart — shared flats won't be pinned")
             return
+
+        cuda_rt.cudaHostRegister.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint
+        ]
+        cuda_rt.cudaHostRegister.restype = ctypes.c_int
 
         registered = 0
         for flat in self.layer_shared_flats:
@@ -204,6 +255,30 @@ class SharedState:
                 continue
             seen.add(id(p))
             p.grad = self._param_grads[grad_idx]
+            grad_idx += 1
+        if grad_idx != len(self._param_grads):
+            raise RuntimeError(
+                "MegaTrain shared-gradient layout changed across process "
+                f"boundaries: matched {grad_idx} of {len(self._param_grads)} "
+                "parameters."
+            )
+
+    def reattach_and_zero_detached_grads(self):
+        """Re-point any detached parameter at its shared gradient, zeroing it first.
+
+        `Module.zero_grad()` defaults to `set_to_none=True`; a parameter whose grad
+        is no longer the shared tensor marks the start of a new accumulation window.
+        """
+        seen = set()
+        grad_idx = 0
+        for p in self._all_params_from_state():
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            grad = self._param_grads[grad_idx]
+            if p.grad is not grad:
+                grad.zero_()
+                p.grad = grad
             grad_idx += 1
 
     def _all_params_from_state(self):

@@ -15,6 +15,10 @@ MEGATRAIN_PLUGIN_NAMES = {
     "megatrain.MegaTrainPlugin",
 }
 
+SUPPORTED_ATTN_IMPLEMENTATIONS = frozenset({"flash_attention_2", "sdpa", "eager"})
+# Matches the backend Transformers selects when the config leaves it unset.
+DEFAULT_ATTN_IMPLEMENTATION = "sdpa"
+
 
 def _megatrain_enabled(data: Mapping[str, Any] | Any) -> bool:
     plugins = (
@@ -28,6 +32,8 @@ class MegaTrainArgs(BaseModel):
 
     megatrain_checkpoint_interval: int | None = Field(default=None, ge=1)
     megatrain_num_grad_slabs: int | None = Field(default=None, ge=1)
+    megatrain_devices: list[int] | None = Field(default=None)
+    megatrain_fp32_head_grad: bool | None = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -42,9 +48,7 @@ class MegaTrainArgs(BaseModel):
 
         configured_plugins = [str(plugin) for plugin in data.get("plugins") or []]
         megatrain_plugins = [
-            plugin
-            for plugin in configured_plugins
-            if plugin in MEGATRAIN_PLUGIN_NAMES
+            plugin for plugin in configured_plugins if plugin in MEGATRAIN_PLUGIN_NAMES
         ]
         if len(megatrain_plugins) > 1:
             reject(
@@ -381,6 +385,21 @@ class MegaTrainArgs(BaseModel):
             )
 
         return data
+
+    @model_validator(mode="after")
+    def validate_devices(self):
+        devices = self.megatrain_devices
+        if devices is None:
+            return self
+        if not devices:
+            raise ValueError(
+                "`megatrain_devices` must list at least one CUDA device index."
+            )
+        if any(device < 0 for device in devices):
+            raise ValueError("`megatrain_devices` indices must be non-negative.")
+        if len(set(devices)) != len(devices):
+            raise ValueError("`megatrain_devices` must not repeat a device index.")
+        return self
 
     @model_validator(mode="after")
     def validate_buffer_counts(self):
