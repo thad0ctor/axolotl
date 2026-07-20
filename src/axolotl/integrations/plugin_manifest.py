@@ -146,7 +146,14 @@ def record_install(
         manifest["version"] = MANIFEST_VERSION
         for cls_path in cls:
             manifest["plugins"][cls_path] = record
-        (resolved / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2) + "\n")
+        # Readers (config load) take no lock, so swap the file in atomically rather
+        # than letting them observe a half-written manifest.
+        tmp = resolved / f"{MANIFEST_FILENAME}.tmp"
+        try:
+            tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+            os.replace(tmp, resolved / MANIFEST_FILENAME)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def find_entries(spec, cache_dir: str | Path | None = None) -> list[dict[str, Any]]:

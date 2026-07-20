@@ -72,7 +72,7 @@ If a declared plugin is not importable, config load raises `PluginNotInstalledEr
 
 When `--cls` is omitted at install time, Axolotl imports the package(s) under the source (or its `subdir`) and uses the single `BasePlugin` subclass found. For a plugin to be discoverable: ship it as an importable package whose top-level `__init__.py` exports **exactly one** `BasePlugin` subclass. Discovery skips `tests/`, `docs/`, `examples/`, `build/`, `dist/`. Zero or multiple matches → the install fails and asks for `--cls`. Simplest discoverable layout (no `--subdir` needed):
 
-```
+```text
 my-plugin/pyproject.toml
 my-plugin/my_plugin/__init__.py   # from .plugin import MyPlugin; __all__ = ["MyPlugin"]
 my-plugin/my_plugin/plugin.py     # class MyPlugin(BasePlugin): ...

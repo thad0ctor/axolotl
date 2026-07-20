@@ -4,11 +4,7 @@ Nothing here reaches the network: git sources are real repositories created in
 `tmp_path`, and pip is always mocked.
 """
 
-import os
-import shutil
-import subprocess  # nosec
 import sys
-from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +16,7 @@ from axolotl.integrations.plugin_manifest import (
 )
 from axolotl.integrations.provisioning import (
     ProvisionAborted,
+    _clone_or_update,
     _clone_target,
     _looks_like_git,
     _pip_install,
@@ -29,27 +26,22 @@ from axolotl.integrations.provisioning import (
     resolve_install_spec,
 )
 
+from tests.plugin_test_utils import (
+    isolate_default_cache,
+    restore_syspath,
+    run_git,
+    stub_pip,
+)
 
-def _git(args, cwd):
-    git_bin = shutil.which("git")
-    if not git_bin:
-        pytest.skip("git executable not found in PATH")
-    return subprocess.run(  # nosec
-        [git_bin, *args],
-        cwd=str(cwd),
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env={
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@t",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@t",
-            "HOME": str(cwd),
-            "PATH": os.environ.get("PATH", ""),
-        },
-    )
+
+@pytest.fixture
+def cleanup_syspath():
+    yield from restore_syspath()
+
+
+@pytest.fixture
+def no_pip(monkeypatch):
+    return stub_pip(monkeypatch)
 
 
 def _make_plugin_module(root, modname="ext_plugin", cls="ExtPlugin"):
@@ -86,58 +78,6 @@ def _make_package_source(root, name="pkg_plugin"):
     root.mkdir(parents=True, exist_ok=True)
     (root / "pyproject.toml").write_text(f"[project]\nname='{name}'\nversion='0'\n")
     return root
-
-
-def _isolate_default_cache(tmp_path, monkeypatch):
-    """Point the per-user default cache inside tmp_path, without creating it."""
-    monkeypatch.delenv("AXOLOTL_PLUGIN_CACHE_DIR", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    return tmp_path / "xdg" / "axolotl" / "plugins"
-
-
-_TEST_MODULE_PREFIXES = {
-    "ext_plugin",
-    "nested_plugin",
-    "git_plugin",
-    "disc_plugin",
-    "disc_plugin2",
-    "sub_disc_plugin",
-    "empty_pkg",
-    "marker",
-    "multi_pkg",
-    "pkg_plugin",
-    "req_plugin",
-    "srclayout_plugin",
-}
-
-
-@pytest.fixture
-def cleanup_syspath():
-    before = list(sys.path)
-    before_mods = set(sys.modules)
-    yield
-    sys.path[:] = before
-    for name in list(sys.modules):
-        if name not in before_mods and name.split(".")[0] in _TEST_MODULE_PREFIXES:
-            sys.modules.pop(name, None)
-
-
-@pytest.fixture
-def no_pip(monkeypatch):
-    """Record every pip entry point instead of running pip."""
-    calls = SimpleNamespace(packages=[], requirements=[])
-    monkeypatch.setattr(
-        provisioning,
-        "_pip_install",
-        lambda package_root, editable: calls.packages.append((package_root, editable)),
-    )
-    monkeypatch.setattr(
-        provisioning,
-        "_pip_install_requirements",
-        calls.requirements.append,
-    )
-    return calls
 
 
 # --- source resolution ------------------------------------------------------
@@ -215,11 +155,11 @@ def test_package_dir_uses_pip_mode(tmp_path, no_pip, cleanup_syspath):
 def test_git_package_source_is_not_editable(tmp_path, no_pip, cleanup_syspath):
     work = tmp_path / "work"
     _make_package_source(work)
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "init"], cwd=work)
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "init"], cwd=work)
     bare = tmp_path / "repo.git"
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
     spec = resolve_install_spec(str(bare), cls="pkg_plugin.PkgPlugin")
     result = provision(spec, cache_dir=tmp_path / "cache")
@@ -456,14 +396,14 @@ def test_cls_list_from_one_source(tmp_path, no_pip, cleanup_syspath):
 def test_git_clone_records_resolved_sha(tmp_path, no_pip, cleanup_syspath):
     work = tmp_path / "work"
     _make_plugin_module(work, modname="git_plugin", cls="GitPlugin")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "init"], cwd=work)
-    _git(["tag", "v1"], cwd=work)
-    expected_sha = _git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "init"], cwd=work)
+    run_git(["tag", "v1"], cwd=work)
+    expected_sha = run_git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
 
     bare = tmp_path / "repo.git"  # .git suffix -> treated as a git source
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
     cache = tmp_path / "cache"
     spec = resolve_install_spec(str(bare), ref="v1", cls="git_plugin.GitPlugin")
@@ -491,16 +431,54 @@ def test_git_clone_records_resolved_sha(tmp_path, no_pip, cleanup_syspath):
     assert recorded[0]["mode"] == "syspath"
 
 
+def test_option_like_ref_is_rejected():
+    # `git checkout --upload-pack=...` would run an arbitrary program.
+    with pytest.raises(ValueError, match="may not start with"):
+        resolve_install_spec(
+            "https://github.com/org/repo.git", ref="--upload-pack=touch /tmp/pwned"
+        )
+
+
+def test_option_like_ref_never_reaches_git(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(provisioning, "_run", lambda cmd, **kwargs: ran.append(cmd))
+    target = tmp_path / "clone"
+
+    with pytest.raises(ValueError, match="may not start with"):
+        _clone_or_update("https://github.com/org/repo.git", "-b", target, update=False)
+
+    assert not ran
+    assert not target.exists()
+
+
+def test_git_invocations_end_options_before_user_input(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(provisioning, "_run", lambda cmd, **kwargs: ran.append(cmd))
+
+    _clone_or_update("--upload-pack=x.git", "v1", tmp_path / "clone", update=False)
+
+    clone, checkout = ran
+    # `--` makes git read the next argument as a repository, never as an option.
+    assert clone == [
+        "git",
+        "clone",
+        "--",
+        "--upload-pack=x.git",
+        str(tmp_path / "clone"),
+    ]
+    assert checkout == ["git", "checkout", "v1", "--"]
+
+
 def test_git_clone_reuses_cache(tmp_path, monkeypatch, no_pip, cleanup_syspath):
     work = tmp_path / "work"
     _make_plugin_module(work, modname="git_plugin", cls="GitPlugin")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "init"], cwd=work)
-    _git(["tag", "v1"], cwd=work)
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "init"], cwd=work)
+    run_git(["tag", "v1"], cwd=work)
 
     bare = tmp_path / "repo.git"
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
     cache = tmp_path / "cache"
     spec = resolve_install_spec(str(bare), ref="v1", cls="git_plugin.GitPlugin")
@@ -528,20 +506,20 @@ def test_cached_clone_interrupted_before_checkout_heals(
     work = tmp_path / "work"
     work.mkdir()
     (work / "marker.txt").write_text("v1\n")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "v1"], cwd=work)
-    _git(["tag", "rel1"], cwd=work)
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "v1"], cwd=work)
+    run_git(["tag", "rel1"], cwd=work)
     (work / "marker.txt").write_text("v2\n")
-    _git(["commit", "-q", "-am", "v2"], cwd=work)
+    run_git(["commit", "-q", "-am", "v2"], cwd=work)
 
     bare = tmp_path / "repo.git"
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
     cache = tmp_path / "cache"
     cache.mkdir()
     clone = _clone_target(cache, str(bare), "rel1")
-    _git(["clone", "-q", str(bare), str(clone)], cwd=tmp_path)
+    run_git(["clone", "-q", str(bare), str(clone)], cwd=tmp_path)
     assert (clone / "marker.txt").read_text().strip() == "v2"
 
     spec = resolve_install_spec(str(bare), ref="rel1", cls="marker.X")
@@ -556,12 +534,12 @@ def test_git_update_fast_forwards_default_branch(tmp_path, no_pip, cleanup_syspa
     work = tmp_path / "work"
     work.mkdir()
     (work / "marker.txt").write_text("v1\n")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "v1"], cwd=work)
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "v1"], cwd=work)
 
     bare = tmp_path / "repo.git"
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
     cache = tmp_path / "cache"
     spec = resolve_install_spec(str(bare), cls="marker.X")  # no ref -> default branch
@@ -569,8 +547,8 @@ def test_git_update_fast_forwards_default_branch(tmp_path, no_pip, cleanup_syspa
     assert (clone / "marker.txt").read_text().strip() == "v1"
 
     (work / "marker.txt").write_text("v2\n")
-    _git(["commit", "-q", "-am", "v2"], cwd=work)
-    _git(["push", "-q", str(bare), "HEAD"], cwd=work)
+    run_git(["commit", "-q", "-am", "v2"], cwd=work)
+    run_git(["push", "-q", str(bare), "HEAD"], cwd=work)
 
     provision(spec, cache_dir=cache)
     assert (clone / "marker.txt").read_text().strip() == "v1"
@@ -585,17 +563,17 @@ def test_git_update_with_tag_ref_stays_pinned(tmp_path, no_pip, cleanup_syspath)
     work = tmp_path / "work"
     work.mkdir()
     (work / "marker.txt").write_text("v1\n")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "v1"], cwd=work)
-    _git(["tag", "rel1"], cwd=work)
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "v1"], cwd=work)
+    run_git(["tag", "rel1"], cwd=work)
 
     bare = tmp_path / "repo.git"
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
 
     (work / "marker.txt").write_text("v2\n")
-    _git(["commit", "-q", "-am", "v2"], cwd=work)
-    _git(["push", "-q", str(bare), "HEAD"], cwd=work)
+    run_git(["commit", "-q", "-am", "v2"], cwd=work)
+    run_git(["push", "-q", str(bare), "HEAD"], cwd=work)
 
     spec = resolve_install_spec(str(bare), ref="rel1", cls="marker.X")
     clone = provision(spec, cache_dir=tmp_path / "cache", update=True).root
@@ -619,9 +597,9 @@ def test_editable_install_reports_no_sha(tmp_path, no_pip, cleanup_syspath):
     # The working tree is a local git checkout, but an editable install tracks
     # whatever it becomes, so no commit describes what is installed.
     work = _make_package_source(tmp_path / "work")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "init"], cwd=work)
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "init"], cwd=work)
     plans = []
 
     def _accept(plan):
@@ -689,7 +667,7 @@ def test_env_overrides_cache_dir(tmp_path, monkeypatch, no_pip, cleanup_syspath)
     src = tmp_path / "plugin_src"
     cls = _make_plugin_module(src)
     env_cache = tmp_path / "env_cache"
-    default_cache = _isolate_default_cache(tmp_path, monkeypatch)
+    default_cache = isolate_default_cache(tmp_path, monkeypatch)
     monkeypatch.setenv("AXOLOTL_PLUGIN_CACHE_DIR", str(env_cache))
 
     provision(resolve_install_spec(str(src), cls=cls))
@@ -703,7 +681,7 @@ def test_cache_dir_precedence(tmp_path, monkeypatch, no_pip, cleanup_syspath):
     cls = _make_plugin_module(src)
     env_cache = tmp_path / "env_cache"
     explicit = tmp_path / "explicit_cache"
-    default_cache = _isolate_default_cache(tmp_path, monkeypatch)
+    default_cache = isolate_default_cache(tmp_path, monkeypatch)
     monkeypatch.setenv("AXOLOTL_PLUGIN_CACHE_DIR", str(env_cache))
 
     provision(resolve_install_spec(str(src), cls=cls), cache_dir=explicit)
@@ -716,7 +694,7 @@ def test_cache_dir_precedence(tmp_path, monkeypatch, no_pip, cleanup_syspath):
 def test_default_cache_dir_is_per_user_not_per_project(tmp_path, monkeypatch):
     # A plugin is installed once and has to resolve from wherever training is
     # later launched, so the default must not depend on the current directory.
-    default_cache = _isolate_default_cache(tmp_path, monkeypatch)
+    default_cache = isolate_default_cache(tmp_path, monkeypatch)
     (tmp_path / "elsewhere").mkdir()
     monkeypatch.chdir(tmp_path)
     from_tmp = resolve_cache_dir()

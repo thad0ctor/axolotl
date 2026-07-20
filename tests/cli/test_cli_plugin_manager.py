@@ -4,69 +4,25 @@ Git sources are real repositories created in `tmp_path`, and pip is always mocke
 """
 
 import json
-import os
-import shutil
-import subprocess  # nosec
-import sys
-from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from axolotl.cli.plugin_manager import plugins
-from axolotl.integrations import provisioning
 from axolotl.integrations.plugin_manifest import manifest_path, record_install
 from axolotl.integrations.verification import verify_plugins
+
+from tests.plugin_test_utils import restore_syspath, run_git, stub_pip
 
 
 @pytest.fixture
 def cleanup_syspath():
-    before = list(sys.path)
-    before_mods = set(sys.modules)
-    yield
-    sys.path[:] = before
-    for name in list(sys.modules):
-        if name not in before_mods and name.startswith("cli_plugin"):
-            sys.modules.pop(name, None)
+    yield from restore_syspath()
 
 
 @pytest.fixture
 def no_pip(monkeypatch):
-    """Record every pip entry point instead of running pip."""
-    calls = SimpleNamespace(packages=[], requirements=[])
-    monkeypatch.setattr(
-        provisioning,
-        "_pip_install",
-        lambda package_root, editable: calls.packages.append((package_root, editable)),
-    )
-    monkeypatch.setattr(
-        provisioning,
-        "_pip_install_requirements",
-        calls.requirements.append,
-    )
-    return calls
-
-
-def _git(args, cwd):
-    git_bin = shutil.which("git")
-    if not git_bin:
-        pytest.skip("git executable not found in PATH")
-    return subprocess.run(  # nosec
-        [git_bin, *args],
-        cwd=str(cwd),
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env={
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@t",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@t",
-            "HOME": str(cwd),
-            "PATH": os.environ.get("PATH", ""),
-        },
-    )
+    return stub_pip(monkeypatch)
 
 
 def _module_source(tmp_path, modname="cli_plugin"):
@@ -99,14 +55,14 @@ def _git_source(tmp_path, plugin_package=False):
         )
     else:
         (work / "cli_plugin.py").write_text("class CliPlugin:\n    pass\n")
-    _git(["init", "-q"], cwd=work)
-    _git(["add", "."], cwd=work)
-    _git(["commit", "-q", "-m", "init"], cwd=work)
-    _git(["tag", "v1"], cwd=work)
-    sha = _git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
+    run_git(["init", "-q"], cwd=work)
+    run_git(["add", "."], cwd=work)
+    run_git(["commit", "-q", "-m", "init"], cwd=work)
+    run_git(["tag", "v1"], cwd=work)
+    sha = run_git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
 
     bare = tmp_path / "repo.git"
-    _git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
+    run_git(["clone", "-q", "--bare", str(work), str(bare)], cwd=tmp_path)
     return bare, sha
 
 

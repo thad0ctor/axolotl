@@ -86,6 +86,10 @@ class PluginSpec(BaseModel):
     with `axolotl plugins install <source>`.
     """
 
+    # A typo'd key (`sourc:`) would otherwise be dropped and reported later as a
+    # missing `source:` the user believes they wrote.
+    model_config = {"extra": "forbid"}
+
     cls: str | list[str] | None = Field(
         default=None,
         json_schema_extra={

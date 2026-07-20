@@ -39,8 +39,10 @@ def _install_command(spec) -> str:
         parts += ["--ref", spec.ref]
     if spec.subdir:
         parts += ["--subdir", spec.subdir]
-    if isinstance(spec.cls, str):
-        parts += ["--cls", spec.cls]
+    # `--cls` is repeatable; omitting it entirely would fall back to auto-discovery,
+    # which fails for exactly the multi-class case.
+    for cls_path in [spec.cls] if isinstance(spec.cls, str) else spec.cls or []:
+        parts += ["--cls", cls_path]
     return " ".join(parts)
 
 

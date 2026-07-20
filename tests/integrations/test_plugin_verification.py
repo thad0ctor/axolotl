@@ -14,37 +14,22 @@ import sys
 import pytest
 from pydantic import ValidationError
 
-from axolotl.integrations import provisioning
+from axolotl.integrations import plugin_manifest, provisioning
 from axolotl.integrations.plugin_manifest import manifest_path, record_install
 from axolotl.integrations.verification import PluginNotInstalledError, verify_plugins
 from axolotl.utils.schemas.config import PluginSpec
 
-_TEST_MODULE_PREFIXES = {
-    "dep_short_plugin",
-    "installed_plugin",
-    "multi_plugin",
-    "prepared_plugin",
-}
+from tests.plugin_test_utils import isolate_default_cache, restore_syspath
 
 
 @pytest.fixture
 def cleanup_syspath():
-    before = list(sys.path)
-    before_mods = set(sys.modules)
-    yield
-    sys.path[:] = before
-    for name in list(sys.modules):
-        if name not in before_mods and name.split(".")[0] in _TEST_MODULE_PREFIXES:
-            sys.modules.pop(name, None)
+    yield from restore_syspath()
 
 
 @pytest.fixture
 def default_cache(tmp_path, monkeypatch):
-    """Point the per-user default cache inside tmp_path, without creating it."""
-    monkeypatch.delenv("AXOLOTL_PLUGIN_CACHE_DIR", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    return tmp_path / "xdg" / "axolotl" / "plugins"
+    return isolate_default_cache(tmp_path, monkeypatch)
 
 
 @pytest.fixture
@@ -147,6 +132,26 @@ def test_error_message_carries_the_install_command(tmp_path, default_cache):
     )
 
 
+def test_error_message_repeats_cls_for_a_multi_class_spec(default_cache):
+    # Dropping `--cls` here would suggest an install that fails on auto-discovery.
+    cfg = {
+        "plugins": [
+            {
+                "cls": ["not_installed.Alpha", "not_installed.Beta"],
+                "source": "https://github.com/org/repo.git",
+            }
+        ]
+    }
+
+    with pytest.raises(PluginNotInstalledError) as excinfo:
+        verify_plugins(cfg)
+
+    assert (
+        "axolotl plugins install https://github.com/org/repo.git "
+        "--cls not_installed.Alpha --cls not_installed.Beta" in str(excinfo.value)
+    )
+
+
 def test_error_message_without_source_points_at_pip(default_cache):
     cfg = {"plugins": [{"cls": "definitely_not_installed.Plugin"}, "some.Other"]}
 
@@ -173,6 +178,14 @@ def test_install_only_keys_are_rejected_through_verify(default_cache):
     cfg = {"plugins": [{"cls": "a.B", "source": "/x", "update": True}]}
 
     with pytest.raises(ValidationError, match="`update` is no longer a config option"):
+        verify_plugins(cfg)
+
+
+def test_unknown_keys_are_rejected(default_cache):
+    # A typo'd key would otherwise be dropped and reported as a missing `source:`.
+    cfg = {"plugins": [{"cls": "a.B", "sourc": "/x"}]}
+
+    with pytest.raises(ValidationError, match="sourc"):
         verify_plugins(cfg)
 
 
@@ -281,6 +294,32 @@ def test_source_only_entry_resolves_cls_from_manifest(
     verify_plugins(cfg)
 
     assert cfg["plugins"] == [cls_path]
+
+
+def test_manifest_write_is_atomic(tmp_path, cache_dir, monkeypatch):
+    # Readers take no lock, so a failed write must not leave a partial manifest
+    # behind for the next `verify_plugins` to read as "plugin not installed".
+    _install_module(tmp_path / "src", "installed_plugin", cache_dir=cache_dir)
+    before = manifest_path(cache_dir).read_text()
+
+    def _boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(plugin_manifest.json, "dumps", _boom)
+    with pytest.raises(OSError, match="no space left"):
+        record_install(
+            source="/x",
+            ref=None,
+            resolved_sha=None,
+            subdir=None,
+            mode="syspath",
+            syspath_entry="/x",
+            cls=["other_plugin.Plugin"],
+            cache_dir=cache_dir,
+        )
+
+    assert manifest_path(cache_dir).read_text() == before
+    assert not (cache_dir / "manifest.json.tmp").exists()
 
 
 def test_source_only_entry_without_manifest_entry_raises(tmp_path, cache_dir):

@@ -112,10 +112,19 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> None:
         raise
 
 
+def _check_ref(ref: str) -> None:
+    # `git checkout` has no way to say "this is a ref, not a flag", so a leading dash
+    # would be parsed as an option (e.g. `--upload-pack=`, arbitrary execution).
+    if ref.startswith("-"):
+        raise ValueError(f"Invalid git ref {ref!r}: refs may not start with '-'.")
+
+
 def _clone_or_update(source: str, ref: str | None, target: Path, update: bool) -> Path:
+    if ref:
+        _check_ref(ref)
     if not target.exists():
         LOG.info("Cloning plugin source %s -> %s", source, target)
-        _run(["git", "clone", source, str(target)])
+        _run(["git", "clone", "--", source, str(target)])
     elif update:
         LOG.info("Updating plugin source at %s", target)
         _run(["git", "fetch", "--all", "--tags", "--prune"], cwd=target)
@@ -124,7 +133,7 @@ def _clone_or_update(source: str, ref: str | None, target: Path, update: bool) -
     if ref:
         # Also on cache reuse: heals a clone interrupted before the checkout, which
         # would otherwise stay pinned to the default branch.
-        _run(["git", "checkout", ref], cwd=target)
+        _run(["git", "checkout", ref, "--"], cwd=target)
     if update and _on_branch(target):
         # `git checkout` alone does not advance an already-checked-out branch, so
         # fast-forward it to the freshly fetched remote tip. Skipped when HEAD is
@@ -225,6 +234,9 @@ def resolve_install_spec(
     Git URLs and local paths resolve today; a name lookup against a plugin registry
     would slot in here as another branch returning the same ``PluginSpec``.
     """
+    if ref:
+        _check_ref(ref)
+
     from axolotl.utils.schemas.config import PluginSpec
 
     if _looks_like_git(source):
