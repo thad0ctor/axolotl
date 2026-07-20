@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import click
 
 _FULL_SHA_LEN = 40
@@ -46,6 +48,7 @@ def install(
     """Install an external plugin from a git URL or a local path."""
     from axolotl.integrations.plugin_manifest import record_install, resolve_cache_dir
     from axolotl.integrations.provisioning import (
+        InstallMode,
         ProvisionAborted,
         is_git_source,
         provision,
@@ -70,7 +73,7 @@ def install(
         result = provision(
             spec,
             cache_dir=cache_dir,
-            mode=mode,
+            mode=cast(InstallMode, mode),
             update=update,
             confirm=lambda plan: _confirm(plan, yes),
         )
