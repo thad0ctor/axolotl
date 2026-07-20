@@ -283,15 +283,8 @@ def gpu_worker_fn(rank, shared_state):
                 if worker_error['error'] is not None:
                     result = WorkerResult(error=worker_error['error'])
 
-            elif cmd.type == WorkerCommandType.FORWARD_LOGITS:
-                result = _run_forward_logits(rank, ctx, shared_state, cmd)
-
             elif cmd.type == WorkerCommandType.RELEASE_GPU:
                 _worker_release_gpu(ctx)
-                result = WorkerResult()
-
-            elif cmd.type == WorkerCommandType.REBUILD_GPU:
-                _worker_rebuild_gpu(ctx, shared_state)
                 result = WorkerResult()
 
             else:
@@ -723,86 +716,6 @@ def _worker_collect_layer_grads_async(layer_idx, buffer_idx, ctx, shared_state, 
     ))
 
 
-def _run_forward_logits(rank, ctx, shared_state, cmd):
-    """Run forward-only pass on this worker's GPU, return logits on CPU.
-
-    Used for multi-GPU inference (ref model log_probs, actor old_log_probs).
-    """
-    input_ids = cmd.input_ids
-    attention_mask = cmd.attention_mask
-
-    B, T = input_ids.shape
-
-    ctx.compute_stream.wait_event(ctx.param_sync_event)
-
-    with torch.no_grad():
-        # Embedding
-        input_ids_gpu = input_ids.to(ctx.device)
-        hidden = ctx.emb_gpu(input_ids_gpu)
-
-        # Position info
-        cache_position = torch.arange(T, device=ctx.device)
-        position_ids = torch.arange(T, device=ctx.device).unsqueeze(0).expand(B, -1)
-
-        position_embeddings = None
-        if ctx.rotary_gpu and shared_state.layer_accepts_position_embeddings:
-            if shared_state.is_vlm:
-                pos_3d = torch.arange(T, device=ctx.device).unsqueeze(0).unsqueeze(0).expand(3, B, -1)
-                dummy = torch.empty((1, 1, T, shared_state.head_dim), device=ctx.device, dtype=torch.float32)
-                cos, sin = ctx.rotary_gpu(dummy, pos_3d)
-                position_embeddings = (cos.to(shared_state.config.dtype), sin.to(shared_state.config.dtype))
-                del dummy, pos_3d
-            else:
-                dummy = torch.empty((1, 1, T, shared_state.head_dim), device=ctx.device, dtype=torch.float32)
-                cos, sin = ctx.rotary_gpu(dummy, position_ids[:1])
-                position_embeddings = (cos.to(shared_state.config.dtype), sin.to(shared_state.config.dtype))
-                del dummy
-
-        mask = _prepare_attention_mask(
-            shared_state._model_config,
-            attention_mask.to(ctx.device) if attention_mask is not None else None,
-            hidden,
-            position_ids,
-        )
-        layer_kwargs = _worker_build_layer_kwargs(
-            mask, cache_position, position_ids, position_embeddings, shared_state
-        )
-
-        num_layers = len(shared_state.cpu_layers)
-
-        # Forward through layers
-        _worker_load_layer_to_buffer_async(0, 0, ctx, shared_state)
-        ctx.weight_stream.synchronize()
-        _worker_unflatten_to_layer(0, 0, ctx, shared_state)
-
-        for i in range(num_layers):
-            buffer_idx = i % 2
-            next_buffer_idx = (i + 1) % 2
-
-            if i + 1 < num_layers:
-                _worker_load_layer_to_buffer_async(i + 1, next_buffer_idx, ctx, shared_state)
-
-            ctx.compute_stream.wait_event(ctx.weight_ready_events[buffer_idx])
-
-            with torch.cuda.stream(ctx.compute_stream):
-                _worker_unflatten_to_layer(i, buffer_idx, ctx, shared_state)
-                ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
-
-                group_id = shared_state.layer_to_group[i]
-                gpu_layer = ctx.gpu_layer_templates[group_id][buffer_idx]
-                out = gpu_layer(hidden, **layer_kwargs[i])
-                hidden = out[0] if isinstance(out, tuple) else out
-
-        # Norm + lm_head
-        if ctx.norm_gpu:
-            hidden = ctx.norm_gpu(hidden)
-        logits = ctx.lm_head_gpu(hidden)
-
-        # Move to CPU to send back via queue
-        logits_cpu = logits.cpu()
-        del hidden, logits, input_ids_gpu, mask
-
-    return WorkerResult(logits=logits_cpu)
 
 
 def _worker_release_gpu(ctx):
@@ -846,75 +759,3 @@ def _worker_release_gpu(ctx):
 
     gc.collect()
     torch.cuda.empty_cache()
-
-
-def _worker_rebuild_gpu(ctx, shared_state):
-    """Rebuild GPU buffers after release (re-create context on same device)."""
-    import queue as queue_mod
-
-    config = shared_state.config
-    device = ctx.device
-
-    # Rebuild flat buffers
-    ctx.gpu_flat_buffers = [
-        torch.empty(shared_state.max_layer_numel, dtype=config.dtype, device=device),
-        torch.empty(shared_state.max_layer_numel, dtype=config.dtype, device=device)
-    ]
-    ctx.cpu_flat_buffers = [None, None]
-
-    # Rebuild layer templates
-    ctx.gpu_layer_templates = {}
-    for gid, group in shared_state.layer_groups.items():
-        representative_idx = group['indices'][0]
-        templates = []
-        for _ in range(2):
-            template = _copy_module_for_compute(
-                shared_state.cpu_layers[representative_idx], device, config.dtype
-            )
-            _preserve_attn_implementation(template, shared_state._model_config)
-            for p in template.parameters():
-                p.requires_grad_(False)
-            templates.append(template)
-        ctx.gpu_layer_templates[gid] = templates
-
-    # Rebuild GPU modules
-    ctx.emb_gpu = _copy_module_for_compute(shared_state.embedding, device, config.dtype)
-    ctx.norm_gpu = _copy_module_for_compute(shared_state.norm, device, config.dtype)
-    ctx.lm_head_gpu = _copy_module_for_compute(shared_state.lm_head, device, config.dtype)
-    if shared_state.tied_lm_head and hasattr(ctx.lm_head_gpu, "weight"):
-        ctx.lm_head_gpu.weight = ctx.emb_gpu.weight
-    ctx.rotary_gpu = _copy_module_for_compute(
-        shared_state.rotary_emb, device, config.dtype
-    )
-
-    # Rebuild grad slabs
-    ctx.layer_grad_slabs = [
-        torch.empty(shared_state.max_layer_numel, dtype=config.dtype, device='cpu', pin_memory=True)
-        for _ in range(config.num_grad_slabs)
-    ]
-    ctx.layer_slab_events = [
-        torch.cuda.Event(enable_timing=False) for _ in range(config.num_grad_slabs)
-    ]
-    ctx.layer_slab_free_list = queue_mod.Queue()
-    for i in range(config.num_grad_slabs):
-        ctx.layer_slab_free_list.put(i)
-
-    ctx.head_grad_slab = torch.empty(shared_state.head_total_numel, dtype=config.dtype, device='cpu', pin_memory=True)
-    ctx.head_slab_event = torch.cuda.Event(enable_timing=False)
-    ctx.head_slab_free.set()
-
-    ctx.embed_grad_slab = torch.empty(shared_state.embed_total_numel, dtype=config.dtype, device='cpu', pin_memory=True)
-    ctx.embed_slab_event = torch.cuda.Event(enable_timing=False)
-    ctx.embed_slab_free.set()
-
-    # Re-init events
-    current_stream = torch.cuda.current_stream(device)
-    for i in range(2):
-        ctx.buffer_free_events[i].record(current_stream)
-        ctx.template_free_events[i].record(current_stream)
-        ctx.h2d_done_events[i].record(current_stream)
-    ctx.param_sync_event.record(current_stream)
-    current_stream.synchronize()
-
-    # Sync weights
-    _worker_sync_gpu_modules(ctx, shared_state)

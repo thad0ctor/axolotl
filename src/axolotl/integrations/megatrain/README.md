@@ -113,7 +113,7 @@ weights, and resumed training use FP32 masters without BF16 update rounding.
 | DeepSpeed, FSDP, DDP, TP, context parallelism, Ray, or `torchrun` | Not supported |
 | MegaTrain spawn-based multi-GPU training | Supported through `megatrain_devices` |
 | DPO, KTO, ORPO, GRPO, reward modelling, or other RL/preference trainers | Not supported |
-| Vision-language or multimodal training | Not currently supported |
+| Vision-language or multimodal training | Not supported; rejected at config time. The vendored runtime retains VLM scaffolding (component discovery for Qwen2-VL, LLaVA, Gemma3, InternVL, PaliGemma, and others) but it is **not functional** — see below. |
 | Nonzero dropout or mixed attention schedules | Not currently supported |
 | Other Axolotl plugins or custom trainer/loss hooks | Not currently supported |
 | Native MegaTrain CUDA extensions | Not included |
@@ -126,6 +126,26 @@ Two behaviours differ from a stock Axolotl run and are deliberate:
 - Weight decay is not applied to embeddings or the output head, in addition to
   Axolotl's usual exclusion of norms and biases.
 - Saved checkpoints hold FP32 weights, because the CPU masters are FP32.
+
+## Multimodal status
+
+VLM support is scaffolded but does not work. Enabling it is a project, not a
+config change. At minimum:
+
+- `MegaTrainTrainer.training_step` does not forward `pixel_values` or
+  `vision_kwargs`, so images never reach the runtime.
+- `_merge_vision_embeddings` assigns into a boolean-mask copy, so image
+  embeddings are silently discarded and the model trains on text embeddings at
+  the image positions.
+- The vision encoder and projector both run under `torch.no_grad()`, so neither
+  can receive a gradient, yet `get_parameters()` hands the projector to the
+  optimizer.
+- The multi-GPU worker raises `NotImplementedError` for vision inputs, and
+  `SharedState` allocates no shared gradients for vision or projector
+  parameters.
+- The vision encoder is moved to the GPU and back on every microbatch, which
+  defeats the streaming memory premise for the encoder itself.
+- Image-token detection falls back to a hard-coded Qwen2-VL token id range.
 
 ## Memory sizing
 

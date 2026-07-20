@@ -35,13 +35,26 @@ The following tracked paths were removed from the archived `infinity` tree:
 
 - `infinity/cuda_pipeline/` in its entirety, including its C++/CUDA sources,
   build scripts, tests, `build/`, `.so` and `.o` files, and egg-info metadata.
+  Nothing upstream imports its `infinity_memory_ops` extension, so removing it
+  costs no functionality.
 - Every tracked `infinity/**/__pycache__/` directory and its `.pyc` files.
+- Every module the integration never imports: `infinity/adapters/`,
+  `infinity/csrc/`, `infinity/data/`, `infinity/memory/`, `infinity/ops/`,
+  `infinity/runtime/`, `infinity/scheduler/`, `infinity/config/yaml_loader.py`,
+  `infinity/model/transformer.py`, `infinity/optimizer.py`,
+  `infinity/profiler.py`, `infinity/simple_profiler.py`, and
+  `infinity/true_cpu_offloading.py`. These are unused upstream as well —
+  `infinity/ops/attention.py` carries its own deprecation warning, and
+  `scheduler/`, `runtime/`, `adapters/`, `profiler.py`, `transformer.py`, and
+  `true_cpu_offloading.py` have no callers anywhere in the upstream repository.
+  Several contain defects (an interleaved `rotate_half` against a half-split
+  cos/sin cache in `ops/layers.py`; a scheduler whose backward pass cannot
+  complete). The re-exports that pulled `data/datasets.py`,
+  `config/yaml_loader.py`, and `model/transformer.py` into every import were
+  removed from the corresponding `__init__.py` files.
 
-Nothing else was removed from the archived `infinity` tree. In particular,
-`infinity/csrc/__init__.py` remains because it safely treats the optional
-top-level `infinity_memory_ops` extension as unavailable. The repository-level
-`build/`, `csrc/`, `verl/`, and egg-info trees were never selected for the
-archive and are not part of this vendored copy.
+The repository-level `build/`, `csrc/`, `verl/`, and egg-info trees were never
+selected for the archive and are not part of this vendored copy.
 
 ## Local changes
 
@@ -103,8 +116,7 @@ rewrite:
 
 Each modified file additionally carries a three-line header naming the upstream
 project, the pinned revision, and the fact that Axolotl changed it, as required
-by Apache-2.0 section 4(b). The 27 vendored files that are byte-identical to the
-pinned upstream commit carry no such header.
+by Apache-2.0 section 4(b). Every retained vendored file is modified, so all of them carry the header.
 
 ### Correctness fixes to the single-GPU path
 
@@ -213,6 +225,26 @@ defects were fixed:
   `argtypes`/`restype` before calling `cudaHostRegister`. It also verifies that
   the shared-gradient list length matches the parameters it re-attached.
 
+### Removal of the VERL-only API surface
+
+`verl/` — the upstream RL stack that is the sole caller of these methods — was
+never vendored, so the following were removed from `infinity/model/`:
+
+- `forward_and_backward_custom_loss()`, used only by VERL's GRPO loss.
+- `forward_logits()`, `_forward_hidden()`, `_forward_logits_multiprocess()`, and
+  the worker's `_run_forward_logits()`, used only for VERL rollout log-probs.
+- `rebuild_gpu_buffers()`, `_rebuild_gpu_buffers_multiprocess()`, and the
+  worker's `_worker_rebuild_gpu()`, used only by VERL to free VRAM for a
+  colocated rollout engine and rebuild afterwards. `release_gpu_buffers()` is
+  retained because the trainer calls it on shutdown.
+- The now-unreachable `FORWARD_LOGITS` and `REBUILD_GPU` worker commands and the
+  `WorkerResult.logits` field.
+- `_prepare_4d_causal_mask()` (superseded by `_prepare_attention_mask`) and
+  `zero_grad()` (Hugging Face drives gradient zeroing).
+
+Re-adding them alongside a future VERL integration is mechanical: they are a
+matched set and this file pins the upstream commit.
+
 ### Known remaining gaps
 
 - `CPUMasterModel._prepare_4d_causal_mask` is retained from upstream but is no
@@ -221,15 +253,6 @@ defects were fixed:
 - The vision/VLM path in `infinity/model/cpu_master.py` is not used by Axolotl
   (the plugin rejects multimodal models) and `_merge_vision_embeddings` is a
   no-op: it assigns into a boolean-mask copy rather than the tensor.
-- `infinity/ops/`, `infinity/scheduler/`, `infinity/memory/`, `infinity/runtime/`,
-  `infinity/adapters/`, `infinity/csrc/`, `infinity/optimizer.py`,
-  `infinity/profiler.py`, `infinity/simple_profiler.py`,
-  `infinity/true_cpu_offloading.py`, `infinity/model/transformer.py`, and
-  `infinity/data/datasets.py` are retained for upstream-diff fidelity but are
-  never imported by the integration. Several contain defects (notably an
-  interleaved `rotate_half` against a half-split cos/sin cache in
-  `infinity/ops/layers.py`). Do not adopt them without review.
-
 Any future compatibility or behavioral change must be listed here with the
 affected files and rationale.
 

@@ -36,7 +36,7 @@ def test_vendored_snapshot_has_expected_shape_and_provenance():
     vendor_dir = INTEGRATION_DIR / "_vendor/infinity"
     vendor_files = [path for path in vendor_dir.rglob("*") if path.is_file()]
 
-    assert len([path for path in vendor_files if path.suffix == ".py"]) == 34
+    assert len([path for path in vendor_files if path.suffix == ".py"]) == 7
     assert not [
         path
         for path in vendor_files
@@ -65,13 +65,13 @@ def test_modified_vendor_files_carry_apache_change_notice():
     """Apache-2.0 section 4(b) requires modified files to say so."""
     vendor_dir = INTEGRATION_DIR / "_vendor/infinity"
     modified = [
-        "adapters/hf_decoder.py",
+        "__init__.py",
+        "config/__init__.py",
         "config/training.py",
-        "config/yaml_loader.py",
+        "model/__init__.py",
         "model/cpu_master.py",
         "model/mp_state.py",
         "model/mp_worker.py",
-        "simple_profiler.py",
     ]
 
     for relative in modified:
@@ -80,8 +80,10 @@ def test_modified_vendor_files_carry_apache_change_notice():
         assert UPSTREAM_SHA in header, relative
         assert "Modified by Axolotl" in header, relative
 
-    unmodified = vendor_dir / "optimizer.py"
-    assert "Modified by Axolotl" not in unmodified.read_text(encoding="utf-8")
+    # Every retained vendored file is modified, so the notice must be universal.
+    assert sorted(
+        str(path.relative_to(vendor_dir)) for path in vendor_dir.rglob("*.py")
+    ) == sorted(modified)
 
 
 @pytest.mark.parametrize(

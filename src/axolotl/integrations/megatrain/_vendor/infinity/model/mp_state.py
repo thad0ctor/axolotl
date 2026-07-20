@@ -47,17 +47,15 @@ def _strip_hidden_kernels(module):
 
 class WorkerCommandType(Enum):
     FORWARD_BACKWARD = auto()
-    FORWARD_LOGITS = auto()
     SYNC_WEIGHTS = auto()
     RELEASE_GPU = auto()
-    REBUILD_GPU = auto()
     SHUTDOWN = auto()
 
 
 @dataclass
 class WorkerCommand:
     type: WorkerCommandType
-    # For FORWARD_BACKWARD / FORWARD_LOGITS:
+    # For FORWARD_BACKWARD:
     input_ids: Optional[torch.Tensor] = None
     attention_mask: Optional[torch.Tensor] = None
     labels: Optional[torch.Tensor] = None
@@ -72,7 +70,6 @@ class WorkerResult:
     total_tokens: int = 0
     timing: Dict[str, float] = field(default_factory=dict)
     valid_tokens: int = 0
-    logits: Optional[torch.Tensor] = None  # For FORWARD_LOGITS
     error: Optional[str] = None  # Formatted traceback if the worker raised
 
 

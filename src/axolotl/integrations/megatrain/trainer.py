@@ -294,6 +294,16 @@ class MegaTrainTrainer(AxolotlTrainer):
         )
 
     @override
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # The streamed runtime already measures each step; surface it instead of
+        # discarding it, since it is the signal for tuning `checkpoint_interval`.
+        timing = getattr(self, "_megatrain_last_timing", None)
+        if timing:
+            logs.setdefault("megatrain/forward_s", round(float(timing["forward"]), 4))
+            logs.setdefault("megatrain/backward_s", round(float(timing["backward"]), 4))
+        super().log(logs, start_time=start_time)
+
+    @override
     def _clip_grad_norm(self, model):
         return torch.nn.utils.clip_grad_norm_(
             self._ensure_cpu_master().get_parameters(), self.args.max_grad_norm

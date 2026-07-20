@@ -1,3 +1,7 @@
+# Vendored from MegaTrain: https://github.com/DLYuanGod/MegaTrain
+# Revision: 7f5c9597e5b20bb618932c77c922e8eac4a11c4d (Apache-2.0)
+# Modified by Axolotl; see _vendor/PROVENANCE.md for the list of changes.
+
 """MegaTrain: RAM-Centric Architecture for LLM/VLM Training.
 
 Supports any HuggingFace decoder-only model and VLM:
@@ -9,14 +13,10 @@ Supports any HuggingFace decoder-only model and VLM:
 
 from .model.cpu_master import CPUMasterModel
 from .config.training import CPUMasterConfig
-from .data.datasets import ChatDataset, MetaMathDataset, collate_fn
 
 __version__ = "0.3.0"
 
 __all__ = [
     "CPUMasterModel",
     "CPUMasterConfig",
-    "ChatDataset",
-    "MetaMathDataset",
-    "collate_fn",
 ]
