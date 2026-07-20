@@ -1,0 +1,41 @@
+base_model: HuggingFaceTB/SmolLM2-135M
+
+plugins:
+  - axolotl.integrations.megatrain.MegaTrainPlugin
+
+datasets:
+  - path: tatsu-lab/alpaca
+    type: alpaca
+    split: train[:1000]
+
+dataset_prepared_path: ./outputs/smollm2-megatrain-multigpu/prepared
+output_dir: ./outputs/smollm2-megatrain-multigpu
+val_set_size: 0
+
+sequence_len: 512
+sample_packing: false
+
+# Each microbatch is sharded across these GPUs, so micro_batch_size must be at
+# least len(megatrain_devices). Launch with `axolotl train`, not torchrun.
+megatrain_devices: [0, 1]
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+max_steps: 100
+
+optimizer: adamw_torch
+learning_rate: 0.0002
+lr_scheduler: cosine
+warmup_ratio: 0.1
+weight_decay: 0.0
+
+bf16: true
+gradient_checkpointing: false
+attn_implementation: sdpa
+
+megatrain_checkpoint_interval: 4
+megatrain_num_grad_slabs: 12
+
+logging_steps: 1
+save_strategy: steps
+save_steps: 25
+save_total_limit: 2

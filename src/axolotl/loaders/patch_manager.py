@@ -386,6 +386,8 @@ class PatchManager:
         """Auto-apply FA4 when flash_attention is enabled and FA4 is available on SM90+."""
         if not self.cfg.attn_uses_flash_lib:
             return
+        if PLUGIN_MANAGER.suppresses_auto_attention_patches(self.cfg):
+            return
 
         from axolotl.monkeypatch.attention.flash_attn_4 import patch_flash_attn_4
 

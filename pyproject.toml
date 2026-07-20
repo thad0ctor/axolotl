@@ -178,6 +178,10 @@ axolotl = [
     "**/*.yaml",
     "**/*.jinja",
     "integrations/kernels/libs/scattermoe_lora/metadata.json",
+    "integrations/megatrain/LICENSE",
+    "integrations/megatrain/README.md",
+    "integrations/megatrain/ACKNOWLEDGEMENTS.md",
+    "integrations/megatrain/_vendor/PROVENANCE.md",
 ]
 
 [tool.setuptools.packages.find]
@@ -189,6 +193,7 @@ version = { file = "VERSION" }
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+extend-exclude = ["src/axolotl/integrations/megatrain/_vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "C90", "B", "I"]

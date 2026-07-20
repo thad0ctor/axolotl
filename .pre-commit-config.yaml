@@ -15,11 +15,14 @@ repos:
     hooks:
     -   id: ruff
         args: [--fix]
+        exclude: ^src/axolotl/integrations/megatrain/_vendor/
     -   id: ruff-format
+        exclude: ^src/axolotl/integrations/megatrain/_vendor/
 -   repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.19.1
     hooks:
     - id: mypy
+      exclude: ^src/axolotl/integrations/megatrain/_vendor/
       additional_dependencies:
         [
             'types-PyYAML',
