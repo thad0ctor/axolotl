@@ -233,7 +233,6 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
         per_tensor_amax_to_scale,
     )
 
-    t = t.contiguous()
     if (
         (policy.hadamard or policy.stochastic)
         and t.is_cuda
@@ -264,6 +263,7 @@ def _quantize(t: torch.Tensor, policy: QuantPolicy):
             per_tensor_scale=pts,
             is_swizzled_scales=True,
         )
+    t = t.contiguous()
     if policy.hadamard:
         t = _apply_rht(t).contiguous()
     # Clamp amax like the mslk fast path (_mslk_quantize_recipe_op): an all-zero
@@ -307,7 +307,7 @@ def _fp4_mm(a_hp: torch.Tensor, b_hp: torch.Tensor, a_pol, b_pol) -> torch.Tenso
     from torchao.prototype.mx_formats.nvfp4_tensor import _addmm_nvfp4_dispatch
 
     a_q = _quantize(a_hp, a_pol)
-    b_q = _quantize(b_hp.t().contiguous(), b_pol).t()
+    b_q = _quantize(b_hp.t(), b_pol).t()
     return _addmm_nvfp4_dispatch(a_q, b_q, torch.ops.aten.mm.default)
 
 
@@ -390,7 +390,7 @@ class NVFP4LinearFunction(torch.autograd.Function):
             # bit-identical to _fp4_mm(g, weight, ..)'s internal weight quant.
             g_p, m = _pad_to_block(g, 0)
             if w_dgrad is None:
-                w_dgrad = _quantize(weight.t().contiguous(), QuantPolicy()).t()
+                w_dgrad = _quantize(weight.t(), QuantPolicy()).t()
             g_q = _quantize(g_p, g_pol)
             grad_x = _addmm_nvfp4_dispatch(g_q, w_dgrad, torch.ops.aten.mm.default)[:m]
             grad_x = grad_x.reshape(ctx.x_shape)
@@ -399,7 +399,7 @@ class NVFP4LinearFunction(torch.autograd.Function):
             # wgrad: grad_w[N,K] = g.t()[N,M] @ x[M,K]    (contraction M, RHT).
             # Unchanged — uses only g and the saved x, never the weight value, so
             # the master-weight gradient is bit-identical to the requant path.
-            gt, _ = _pad_to_block(g.t().contiguous(), 1)  # [N, M_pad]
+            gt, _ = _pad_to_block(g.t(), 1)  # [N, M_pad]
             xp, _ = _pad_to_block(x2d, 0)  # [M_pad, K]
             grad_w = _fp4_mm(gt, xp, rht_pol, rht_pol)
 
@@ -465,7 +465,7 @@ class NVFP4Linear(nn.Module):
             # fprop b-operand represents W.T ([K,N]): quantize W then transpose.
             self._wq_fprop = _quantize(w, QuantPolicy()).t()
             # dgrad b-operand represents W ([N,K]) blocked along N: quantize W.T.
-            self._wq_dgrad = _quantize(w.t().contiguous(), QuantPolicy()).t()
+            self._wq_dgrad = _quantize(w.t(), QuantPolicy()).t()
             self._wq_version = version
         return self._wq_fprop, self._wq_dgrad
 
@@ -1863,7 +1863,8 @@ def _mslk_quantize_recipe_op(
     hadamard: bool,
     stochastic: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    t = t.contiguous()
+    # No .contiguous(): the kernels index via strides, so transposed views
+    # (the wgrad b-operand) quantize in place of a materialized copy.
     m, n = t.shape
     amax = _recipe_rht_amax(t, bool(hadamard))
     global_scale = _NVFP4_GLOBAL_AMAX / torch.clamp(amax, min=1e-12)
@@ -1950,7 +1951,8 @@ def _mslk_quantize_rtn_op(
     """
     from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-    t = t.contiguous()
+    # No .contiguous(): the kernel indexes via strides (transposed dgrad-layout
+    # weight views quantize without the materialized transpose copy).
     m, n = t.shape
     pts = per_tensor_amax_to_scale(_abs_amax(t).clamp(min=1e-12))
     q = t.new_empty(m, n // 2, dtype=torch.uint8)
