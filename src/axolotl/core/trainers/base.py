@@ -48,6 +48,7 @@ from axolotl.core.trainers.utils import (
     sanitize_kwargs_for_tagging,
     trainable_tokens_per_sec_per_gpu,
 )
+from axolotl.model_support import prepare_model_for_save
 from axolotl.utils import get_not_null
 from axolotl.utils.bench import get_gpu_memory_usage
 from axolotl.utils.dict import DictDefault
@@ -926,6 +927,8 @@ class AxolotlTrainer(
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         LOG.info(f"Saving model checkpoint to {output_dir}")
+
+        prepare_model_for_save(self.axolotl_cfg, self.model)
 
         # fix for Context Parallel save: CP eval invalidates tensor storage
         # pointers, so clone to CPU to get fresh valid storage for safetensors

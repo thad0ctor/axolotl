@@ -24,6 +24,8 @@ from axolotl.integrations.base import PluginManager
 from axolotl.model_support import (
     ModelHookContext,
     ModelHookPhase,
+    apply_checkpoint_conversions,
+    apply_patch_mappings,
     check_capability,
     get_model_support,
     get_model_support_for_cfg,
@@ -182,11 +184,9 @@ class PatchManager:
             self._hook_context(model),
         )
 
-        if self.cfg.model_config_type == "nemotron_h":
-            # Must run after model build because NemotronHForCausalLM.__init__
-            # calls register_nemotron_h_conversion_mapping() with overwrite=True,
-            # which would clobber any earlier fix.
-            self._fix_nemotron_h_conversion_mapping()
+        # Re-applied after the build because a model's ``__init__`` may register
+        # its own conversion mapping with ``overwrite=True``.
+        apply_checkpoint_conversions(support, self.cfg, model=model)
 
         # Gemma 4 hybrid attention runs here in post-build (NOT post-load):
         # the per-layer ``self_attn.config._attn_implementation="sdpa"``
@@ -202,6 +202,9 @@ class PatchManager:
 
     def _apply_model_support_pre_load_hook(self):
         support = get_model_support(self.cfg.model_config_type)
+        # Declarative registrations first, so a hook can still override them.
+        apply_patch_mappings(support, self.cfg)
+        apply_checkpoint_conversions(support, self.cfg)
         run_model_support_hooks(
             support,
             ModelHookPhase.BEFORE_MODEL_BUILD,
@@ -629,49 +632,6 @@ class PatchManager:
                 )
 
                 patch_qwen3_5_moe_fused_attn()
-
-    @staticmethod
-    def _fix_nemotron_h_conversion_mapping():
-        """Remove the spurious embedding→embeddings WeightRenaming from the
-        nemotron_h checkpoint conversion mapping.
-
-        The nvidia Hub model registers:
-            WeightRenaming("embedding.weight", "embeddings.weight")
-        to handle a legacy checkpoint variant. Its reverse (applied on save)
-        converts ``embeddings`` back to ``embedding``, which silently renames
-        ``backbone.embeddings.weight`` → ``backbone.embedding.weight`` when
-        merging LoRA adapters back into the base model.
-        """
-        try:
-            from transformers.conversion_mapping import (
-                WeightRenaming,
-                get_checkpoint_conversion_mapping,
-                register_checkpoint_conversion_mapping,
-            )
-        except ImportError:
-            return
-
-        mapping = get_checkpoint_conversion_mapping("nemotron_h")
-        if mapping is None:
-            return
-
-        filtered = [
-            entry
-            for entry in mapping
-            if not (
-                isinstance(entry, WeightRenaming)
-                and entry.source_patterns == ["embedding.weight"]
-                and entry.target_patterns == ["embeddings.weight"]
-            )
-        ]
-        if len(filtered) != len(mapping):
-            register_checkpoint_conversion_mapping(
-                "nemotron_h", filtered, overwrite=True
-            )
-            LOG.info(
-                "Removed embedding→embeddings WeightRenaming from nemotron_h "
-                "checkpoint conversion mapping"
-            )
 
     def _apply_fp8_patches(self):
         """Apply patches for FP8 support."""

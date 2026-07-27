@@ -6,19 +6,21 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping, overload
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, overload
 from weakref import WeakKeyDictionary
 
 from .base import Capability, ModelSupport
 
 if TYPE_CHECKING:
     from peft import PeftModel
+    from torch import nn
     from transformers import (
         PretrainedConfig,
         PreTrainedModel,
         PreTrainedTokenizerBase,
         ProcessorMixin,
     )
+    from transformers.core_model_loading import WeightTransform
 
     from axolotl.processing_strategies import ProcessingStrategy
     from axolotl.utils.dict import DictDefault
@@ -33,6 +35,7 @@ class ModelHookPhase(str, Enum):
     BEFORE_MODEL_BUILD = "before_model_build"
     AFTER_BASE_MODEL_BUILD = "after_base_model_build"
     AFTER_ADAPTER_LOAD = "after_adapter_load"
+    BEFORE_SAVE = "before_save"
 
 
 @dataclass(frozen=True)
@@ -55,9 +58,29 @@ class ModelHookContext:
     reference_model: bool | None = None
 
 
+@dataclass(frozen=True)
+class CheckpointConversionContext:
+    """Inputs for one checkpoint-conversion edit.
+
+    ``key`` is the registry key being adapted — a ``model_type`` — and
+    ``conversions`` is what transformers currently has registered under it
+    (empty when nothing is registered). The adapter returns the full
+    replacement list, or ``None`` to leave the key untouched.
+    """
+
+    key: str
+    conversions: tuple[WeightTransform, ...] = ()
+    cfg: DictDefault | None = None
+    model: PreTrainedModel | PeftModel | None = None
+
+
 ModelHook = Callable[[ModelHookContext], None]
 AutoModelClassProvider = Callable[[], type | None]
 ProcessingStrategyClassProvider = Callable[[], type["ProcessingStrategy"] | None]
+PatchMappingProvider = Callable[[], Mapping[str, type["nn.Module"]] | None]
+CheckpointConversionsProvider = Callable[
+    [CheckpointConversionContext], Sequence["WeightTransform"] | None
+]
 ConfigMatcher = Callable[["DictDefault"], bool]
 ProcessorMatcher = Callable[["ProcessorMixin"], bool]
 
@@ -77,28 +100,38 @@ _ACTIVE_LEGACY_HOOK: ContextVar[tuple[int, ModelHookPhase, int] | None] = Contex
 )
 
 
+def _layer_strategy(inherited: Any, override: Any) -> Any:
+    return inherited if isinstance(override, _InheritStrategy) else override
+
+
 @dataclass(frozen=True)
 class ModelStrategies:
     """Lazy component providers supplied by a model family.
 
-    Each field is a zero-argument callable that returns a component class or ``None``.
+    ``auto_model_cls``, ``processing_strategy_cls`` and ``patch_mappings`` are
+    zero-argument callables returning a component class, a class, or a class-name
+    mapping; ``checkpoint_conversions`` takes a `CheckpointConversionContext`.
     Providers should import optional or heavyweight implementations only when called.
     """
 
     auto_model_cls: AutoModelClassProvider | None = None
     processing_strategy_cls: ProcessingStrategyClassProvider | None = None
+    patch_mappings: PatchMappingProvider | None = None
+    checkpoint_conversions: CheckpointConversionsProvider | None = None
 
     def with_overrides(self, overrides: ModelStrategyOverrides) -> ModelStrategies:
         return ModelStrategies(
-            auto_model_cls=(
-                self.auto_model_cls
-                if isinstance(overrides.auto_model_cls, _InheritStrategy)
-                else overrides.auto_model_cls
+            auto_model_cls=_layer_strategy(
+                self.auto_model_cls, overrides.auto_model_cls
             ),
-            processing_strategy_cls=(
-                self.processing_strategy_cls
-                if isinstance(overrides.processing_strategy_cls, _InheritStrategy)
-                else overrides.processing_strategy_cls
+            processing_strategy_cls=_layer_strategy(
+                self.processing_strategy_cls, overrides.processing_strategy_cls
+            ),
+            patch_mappings=_layer_strategy(
+                self.patch_mappings, overrides.patch_mappings
+            ),
+            checkpoint_conversions=_layer_strategy(
+                self.checkpoint_conversions, overrides.checkpoint_conversions
             ),
         )
 
@@ -115,6 +148,10 @@ class ModelStrategyOverrides:
     processing_strategy_cls: (
         ProcessingStrategyClassProvider | None | _InheritStrategy
     ) = _INHERIT_STRATEGY
+    patch_mappings: PatchMappingProvider | None | _InheritStrategy = _INHERIT_STRATEGY
+    checkpoint_conversions: CheckpointConversionsProvider | None | _InheritStrategy = (
+        _INHERIT_STRATEGY
+    )
 
 
 @dataclass(frozen=True)
@@ -264,16 +301,15 @@ def _legacy_cfg_hook(
     return hook
 
 
-def _legacy_post_load_hook(
+def _legacy_model_hook(
     support: ModelSupport,
+    phase: ModelHookPhase,
     method: Callable[[DictDefault, Any], None],
 ) -> ModelHook:
     def hook(context: ModelHookContext) -> None:
         if context.model is None:
-            raise ValueError("AFTER_ADAPTER_LOAD requires a model instance")
-        token = _ACTIVE_LEGACY_HOOK.set(
-            (id(support), ModelHookPhase.AFTER_ADAPTER_LOAD, id(context.cfg))
-        )
+            raise ValueError(f"{phase.name} requires a model instance")
+        token = _ACTIVE_LEGACY_HOOK.set((id(support), phase, id(context.cfg)))
         try:
             method(context.cfg, context.model)
         finally:
@@ -358,6 +394,8 @@ _LEGACY_DECLARATION_NAMES = (
     "capabilities",
     "get_auto_model_cls",
     "get_processing_strategy_cls",
+    "get_patch_mappings",
+    "get_checkpoint_conversions",
     "matches_cfg",
     "matches_processor",
     "pre_config_load",
@@ -365,6 +403,7 @@ _LEGACY_DECLARATION_NAMES = (
     "pre_tokenizer_load",
     "pre_model_load",
     "post_model_load",
+    "pre_save",
 )
 
 
@@ -425,6 +464,18 @@ def resolve_model_support(
                 processing_strategy_cls=support.get_processing_strategy_cls
             )
         )
+    declares_patch_mappings, _ = _declared_value(support, "get_patch_mappings")
+    if declares_patch_mappings:
+        strategies = strategies.with_overrides(
+            ModelStrategyOverrides(patch_mappings=support.get_patch_mappings)
+        )
+    declares_conversions, _ = _declared_value(support, "get_checkpoint_conversions")
+    if declares_conversions:
+        strategies = strategies.with_overrides(
+            ModelStrategyOverrides(
+                checkpoint_conversions=support.get_checkpoint_conversions
+            )
+        )
     declares_cfg_matcher, _ = _declared_value(support, "matches_cfg")
     if declares_cfg_matcher:
         matchers = matchers.with_overrides(ModelMatchers(cfg=support.matches_cfg))
@@ -447,11 +498,16 @@ def resolve_model_support(
             legacy_hooks[phase] = (
                 _legacy_cfg_hook(support, phase, getattr(support, method_name)),
             )
-    declares_ready_hook, _ = _declared_value(support, "post_model_load")
-    if declares_ready_hook:
-        legacy_hooks[ModelHookPhase.AFTER_ADAPTER_LOAD] = (
-            _legacy_post_load_hook(support, support.post_model_load),
-        )
+    legacy_model_phases = (
+        (ModelHookPhase.AFTER_ADAPTER_LOAD, "post_model_load"),
+        (ModelHookPhase.BEFORE_SAVE, "pre_save"),
+    )
+    for phase, method_name in legacy_model_phases:
+        declares_method, _ = _declared_value(support, method_name)
+        if declares_method:
+            legacy_hooks[phase] = (
+                _legacy_model_hook(support, phase, getattr(support, method_name)),
+            )
     hooks = hooks.with_additions(ModelHooks(legacy_hooks))
 
     return ResolvedModelProfile(

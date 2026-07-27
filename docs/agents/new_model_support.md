@@ -100,10 +100,13 @@ Move one concern at a time using this mapping:
 | `capabilities = {...}` | `ModelProfile(capabilities={...})` |
 | `get_auto_model_cls()` | `ModelStrategyOverrides(auto_model_cls=provider)` |
 | `get_processing_strategy_cls()` | `ModelStrategyOverrides(processing_strategy_cls=provider)` |
+| `get_patch_mappings()` | `ModelStrategyOverrides(patch_mappings=provider)` |
+| `get_checkpoint_conversions()` | `ModelStrategyOverrides(checkpoint_conversions=adapter)` |
 | `matches_cfg()` / `matches_processor()` | `ModelMatchers(cfg=...)` / `ModelMatchers(processor=...)` |
 | `validate_cfg()` | `CONFIGURE_RUN` hook |
 | `pre_config_load()` / `pre_tokenizer_load()` / `pre_model_load()` | `BEFORE_CONFIG_LOAD` / `BEFORE_TOKENIZER_LOAD` / `BEFORE_MODEL_BUILD` hook |
 | `post_model_load()` | `AFTER_ADAPTER_LOAD` hook |
+| `pre_save()` | `BEFORE_SAVE` hook |
 
 Unless a profile phase explicitly replaces its family hooks, hooks from the family, profile, and legacy method are additive. Remove a legacy method once its behavior moves into a profile hook, or the old and new implementations both run. The compatibility guard prevents a legacy method's `super()` call from re-entering the declarative hook, but it cannot identify duplicate logic implemented in both places. `AFTER_BASE_MODEL_BUILD` has no legacy-method equivalent.
 
@@ -119,6 +122,7 @@ Hooks receive an immutable `ModelHookContext` containing the run config and the 
 | `BEFORE_MODEL_BUILD` | At the established pre-load patch slot before checkpoint construction; use only for patches that must exist while the model class is imported or instantiated. |
 | `AFTER_BASE_MODEL_BUILD` | Immediately after the raw base model is built and before adapters are applied. |
 | `AFTER_ADAPTER_LOAD` | After adapters and final load setup, before the remaining generic and plugin post-load hooks. |
+| `BEFORE_SAVE` | Before `save_pretrained` writes weights — every trainer checkpoint, the final save, and the legacy LoRA merge. Runs repeatedly, so hooks must be idempotent. |
 
 The context fields available at each phase are:
 
@@ -130,10 +134,27 @@ The context fields available at each phase are:
 | `BEFORE_MODEL_BUILD` | Available | Available | Optional | — | Available |
 | `AFTER_BASE_MODEL_BUILD` | Available | Available | Optional | Raw base model | Available |
 | `AFTER_ADAPTER_LOAD` | Available | Available | Optional | Final loaded model | Available |
+| `BEFORE_SAVE` | — | — | — | Model being saved, when the caller has one | — |
 
 `cfg` is always available. Although the context dataclass prevents assigning different field values, the contained config and model objects remain mutable so hooks can apply their intended configuration or patch. At `BEFORE_TOKENIZER_LOAD`, the exact type may already be available as `cfg.model_config_type`, but the `model_config` object itself is not included in the context. The standard loading helper supplies a processor for multimodal runs; direct `ModelLoader` callers must pass one explicitly if their hooks require it.
 
 The hook runner deliberately does not suppress repeated calls. A long-lived process may load multiple models or need per-run reconfiguration, so module-level monkeypatch functions must be idempotent themselves: guard against re-wrapping, preserve the original callable when practical, and leave model-instance hooks safe to run for every model.
+
+### Transformers registries
+
+transformers owns two process-wide registries that a profile can claim declaratively instead of monkey-patching. Both are applied by `axolotl.model_support.hf_registries` at fixed boundaries, so a descriptor never calls the transformers registration functions itself.
+
+`ModelStrategyOverrides(patch_mappings=provider)` takes a zero-argument provider returning `{class name or regex: nn.Module subclass}`, registered through `register_patch_mapping`. transformers swaps those classes in only while a model is constructed by `from_pretrained` / `from_config` and restores the originals afterwards, and it keeps `_can_record_outputs` recorders pointed at the replacement. Prefer this over mutating `transformers.models.<arch>.modeling_<arch>` attributes: the replacement is scoped to model construction and `reset_patch_mappings()` releases it.
+
+`ModelStrategyOverrides(checkpoint_conversions=adapter)` takes a callable receiving a `CheckpointConversionContext` (the registry key, the transforms currently registered for it, the run config, and the model when one exists). It returns the full replacement list — so it can add, filter, or reorder — or `None` to leave the key untouched. Three properties matter:
+
+- **It is a save-path contract too.** `save_pretrained(save_original_format=True)` reverses every transform through `ConversionOps.reverse_op`, which raises `NotImplementedError` on the base class. A converter that loads correctly but has no reverse fails at save or writes wrong key names; axolotl warns at registration time when an op has no reverse. Adapter-only saves skip the reversal, so this surfaces first on full fine-tune saves and LoRA merges.
+- **It is applied more than once.** Before the build, after it (a model's `__init__` may re-register its own mapping with `overwrite=True`), and again at `BEFORE_SAVE`. Adapters must therefore be idempotent — a filter that finds nothing to remove should return `None`.
+- **Class names outrank `model_type`.** transformers resolves conversions by model class name first. An edit keyed on `model_type` is silently inert when the loaded class has its own registered mapping; axolotl warns when it detects that shadowing.
+
+Custom-code (`trust_remote_code`) architectures get no conversions at all unless their `model_type` or class name was explicitly registered, which makes this strategy the only route for remote-code checkpoints that need renaming or fusion.
+
+`model_support/nemotron_h/` is the reference example: it drops a Hub-registered renaming whose reverse corrupted merged checkpoints.
 
 ### Registration and fallback
 
@@ -314,6 +335,8 @@ For a new architecture, start with a `ModelSupport` descriptor in `model_support
 | Attention mask fixes | `core/trainers/base.py` `compute_loss()` | Sample packing mask removal |
 | Loss logging fixes | `core/trainers/base.py` `__init__()` | model_accepts_loss_kwargs override |
 | PEFT/LoRA patches | `loaders/adapter.py` | ClippableLinear redirect |
+| Module class replacement | `ModelStrategyOverrides(patch_mappings=...)` | Swap an attention or experts class at build time |
+| Checkpoint key renames / fusion | `ModelStrategyOverrides(checkpoint_conversions=...)` | NemotronH embedding rename |
 | Attention patches | `monkeypatch/attention/` | FA4 tuple fix |
 | Legacy model-specific patches | `loaders/patch_manager.py` `_apply_model_specific_patches()` | Llama4, Kimi, NemotronH |
 | CCE patches | `ml-cross-entropy` repo `transformers/` | Per-model cce_forward |

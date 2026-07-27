@@ -31,6 +31,7 @@ from axolotl.contribs.lgpl import (  # pylint: disable = no-name-in-module
 )
 from axolotl.integrations.base import PluginManager
 from axolotl.loaders import ModelLoader, load_processor, load_tokenizer
+from axolotl.model_support import prepare_model_for_save
 from axolotl.telemetry.errors import send_errors
 from axolotl.telemetry.manager import TelemetryManager
 from axolotl.utils.ctx_managers.sequence_parallel import SequenceParallelContextManager
@@ -273,6 +274,8 @@ def save_trained_model(
         model: The trained model to save.
     """
     LOG.info(f"Training completed! Saving trained model to {cfg.output_dir}.")
+
+    prepare_model_for_save(cfg, model)
 
     # Post training module hooks
     for name, module in model.named_modules():

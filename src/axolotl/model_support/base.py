@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Generic, Mapping, TypeVar, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Generic,
+    Mapping,
+    Sequence,
+    TypeVar,
+    Union,
+    cast,
+)
 
 from axolotl.utils.logging import get_logger
 
@@ -13,7 +23,7 @@ if TYPE_CHECKING:
     from axolotl.processing_strategies import ProcessingStrategy
     from axolotl.utils.dict import DictDefault
 
-    from .profile import ModelHookPhase, ModelProfile
+    from .profile import CheckpointConversionContext, ModelHookPhase, ModelProfile
 
 LOG = get_logger(__name__)
 
@@ -148,6 +158,33 @@ class ModelSupport:
         provider = resolved.strategies.processing_strategy_cls
         return provider() if provider is not None else None
 
+    def get_patch_mappings(self) -> "Mapping[str, type] | None":
+        """Module classes transformers should swap in while building this model.
+
+        Keys are exact class names or regex patterns, matched against
+        transformers' own module classes; see `register_patch_mapping`.
+        """
+        from .profile import _resolve_declarative_model_support
+
+        resolved = _resolve_declarative_model_support(self)
+        provider = resolved.strategies.patch_mappings
+        return provider() if provider is not None else None
+
+    def get_checkpoint_conversions(
+        self, context: "CheckpointConversionContext"
+    ) -> "Sequence[Any] | None":
+        """Edit the checkpoint conversion mapping transformers uses for this model.
+
+        Applies to both loading and saving: transformers reverses these
+        transforms in `save_pretrained`, so every operation needs a
+        ``reverse_op``. Returning ``None`` leaves the key untouched.
+        """
+        from .profile import _resolve_declarative_model_support
+
+        resolved = _resolve_declarative_model_support(self)
+        provider = resolved.strategies.checkpoint_conversions
+        return provider(context) if provider is not None else None
+
     def matches_processor(self, processor: "ProcessorMixin") -> bool:
         """Whether this descriptor owns the given multimodal processor."""
         from .profile import _resolve_declarative_model_support
@@ -214,3 +251,12 @@ class ModelSupport:
         from .profile import ModelHookPhase
 
         self._run_profile_hook(ModelHookPhase.AFTER_ADAPTER_LOAD, cfg, model)
+
+    def pre_save(self, cfg: "DictDefault", model: "PreTrainedModel") -> None:
+        """Prepare state that `save_pretrained` consumes.
+
+        Runs before every checkpoint and final save, so hooks must be idempotent.
+        """
+        from .profile import ModelHookPhase
+
+        self._run_profile_hook(ModelHookPhase.BEFORE_SAVE, cfg, model)

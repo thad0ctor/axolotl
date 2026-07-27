@@ -9,6 +9,7 @@ import torch
 from axolotl.cli.config import load_cfg
 from axolotl.cli.utils import load_model_and_tokenizer
 from axolotl.cli.utils.lora_merge import merge_lora_sharded_efficient
+from axolotl.model_support import prepare_model_for_save
 from axolotl.telemetry.errors import send_errors
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.logging import get_logger
@@ -52,6 +53,8 @@ def _do_merge_lora_legacy(*, cfg: DictDefault) -> None:
 
     model.generation_config.do_sample = True
     model.config.use_cache = True
+
+    prepare_model_for_save(cfg, model)
 
     if cfg.local_rank == 0:
         LOG.info(f"Saving merged model to: {str(Path(cfg.output_dir) / 'merged')}...")

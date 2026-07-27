@@ -202,8 +202,10 @@ quartodoc:
         - model_support.base
         - model_support.profile
         - model_support.templates
+        - model_support.hf_registries
         - model_support.kimi_linear.patch_kimi_linear
         - model_support.registry
+        - model_support.save
         - monkeypatch.models.llama4.modeling
         - monkeypatch.models.mamba_utils
         - monkeypatch.models.mistral3.mistral_common_tokenizer
