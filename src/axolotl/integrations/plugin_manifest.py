@@ -59,7 +59,9 @@ def resolve_cache_dir(cache_dir: str | Path | None = None) -> Path:
     """
     raw = cache_dir or os.environ.get(CACHE_DIR_ENV)
     if raw:
-        return Path(raw).expanduser()
+        # Absolute, so a relative `--cache-dir`/env var does not silently resolve
+        # against a different cwd at train time than at install time.
+        return Path(raw).expanduser().resolve()
     xdg = os.environ.get(XDG_CACHE_ENV)
     base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
     return base.joinpath(*DEFAULT_CACHE_SUBPATH)
@@ -67,14 +69,30 @@ def resolve_cache_dir(cache_dir: str | Path | None = None) -> Path:
 
 def ensure_cache_dir(cache_dir: str | Path | None = None) -> Path:
     resolved = resolve_cache_dir(cache_dir)
+    existed = resolved.exists()
     resolved.mkdir(parents=True, exist_ok=True)
-    # Keeps a checkout clean if someone points the cache inside a repo.
+    # A `*` ignore keeps clones out of a repo -- but only write it into a directory
+    # we own. Pointed at an existing populated dir (e.g. `--cache-dir .`), it would
+    # otherwise gitignore the user's whole project.
     gitignore = resolved / ".gitignore"
-    if not gitignore.exists():
+    owned = not existed or _is_our_cache(resolved)
+    if owned and not gitignore.exists():
         gitignore.write_text(
             "# Created by axolotl for installed third-party plugins.\n*\n"
         )
     return resolved
+
+
+def _is_our_cache(path: Path) -> bool:
+    contents = {p.name for p in path.iterdir()}
+    return (
+        not contents
+        or contents <= {MANIFEST_FILENAME, ".gitignore"}
+        or all(
+            name.endswith((".lock", ".tmp")) or (path / name / ".git").exists()
+            for name in contents
+        )
+    )
 
 
 def manifest_path(cache_dir: str | Path | None = None) -> Path:
@@ -87,7 +105,9 @@ def load_manifest(cache_dir: str | Path | None = None) -> dict[str, Any]:
         data = json.loads(path.read_text())
     except FileNotFoundError:
         return _empty_manifest()
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError covers both JSONDecodeError and a UnicodeDecodeError from a
+        # truncated or non-UTF-8 file; either way, warn and carry on.
         LOG.warning("Ignoring unreadable plugin manifest at %s: %s", path, exc)
         return _empty_manifest()
     if not isinstance(data, dict) or not isinstance(data.get("plugins"), dict):
@@ -114,7 +134,8 @@ def load_manifest(cache_dir: str | Path | None = None) -> dict[str, Any]:
 def entries(cache_dir: str | Path | None = None) -> list[dict[str, Any]]:
     """Manifest entries, each with its plugin key folded in as ``key``."""
     plugins = load_manifest(cache_dir).get("plugins", {})
-    return [{"key": key, **value} for key, value in sorted(plugins.items())]
+    # key last: a hostile entry carrying its own "key" must not override the real one.
+    return [{**value, "key": key} for key, value in sorted(plugins.items())]
 
 
 def record_install(
@@ -184,7 +205,9 @@ def apply_syspath_entries(specs: Iterable, cache_dir: str | Path | None = None) 
         for entry in find_entries(spec, cache_dir):
             path = entry.get("syspath_entry")
             if path and path not in sys.path and Path(path).is_dir():
-                sys.path.insert(0, path)
+                # Append, never prepend: a plugin repo's top-level modules must not
+                # shadow the stdlib or site-packages for the rest of the process.
+                sys.path.append(path)
                 added = True
                 LOG.debug("Added plugin path to sys.path: %s", path)
     if added:

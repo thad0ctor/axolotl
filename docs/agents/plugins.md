@@ -2,7 +2,7 @@
 
 Plugins extend the training pipeline through hooks, loaded via the `plugins:` config key. Entries are either a dotted class path (built-in or already-importable) or a mapping referencing an **externally installed** plugin.
 
-External plugins are a **two-step flow**: install explicitly, then reference from the config. Config load never clones, pip installs, runs a subprocess, hits the network, or writes to disk — it only verifies that what the config declares is already importable.
+External plugins are a **two-step flow**: install explicitly, then reference from the config. Config load performs no fetch itself — axolotl never clones, pip installs, runs a subprocess, or hits the network at load time; it only verifies that what the config declares is already importable. (Verifying importability does `import` the plugin, so the plugin's own top-level code runs and may itself write `.pyc` files or do anything an import does — the guarantee is about axolotl, not about trusting the plugin.)
 
 ## 1. Install
 
@@ -80,7 +80,7 @@ my-plugin/my_plugin/plugin.py     # class MyPlugin(BasePlugin): ...
 
 ## Cache Directory & Manifest
 
-Per user, not per project — a plugin is installed once and must resolve from wherever training is later launched. Precedence: `--cache-dir` > `AXOLOTL_PLUGIN_CACHE_DIR` > `$XDG_CACHE_HOME/axolotl/plugins` > `~/.cache/axolotl/plugins`. There is **no config key** for this, and nothing is cwd-relative. The cache writes its own `.gitignore`, so pointing it inside a repo does not dirty the checkout.
+Per user, not per project — a plugin is installed once and must resolve from wherever training is later launched. Precedence: `--cache-dir` > `AXOLOTL_PLUGIN_CACHE_DIR` > `$XDG_CACHE_HOME/axolotl/plugins` > `~/.cache/axolotl/plugins`. There is **no config key** for this. A relative `--cache-dir`/env value is resolved to an absolute path, so prefer an absolute one to avoid surprises across working directories. A freshly created cache writes its own `.gitignore`; it will **not** add one to a directory that already holds other files, so pointing `--cache-dir` at a populated repo does not ignore your project.
 
 Config load reads the cache but takes no flags, so `--cache-dir` only helps if training sees the same directory — the install prints a reminder to export `AXOLOTL_PLUGIN_CACHE_DIR` when it is non-default.
 

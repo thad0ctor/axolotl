@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import re
 import subprocess  # nosec
 import sys
 from dataclasses import dataclass
@@ -112,6 +113,21 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> None:
         raise
 
 
+# `<transport>::<address>` invokes a git remote helper -- `ext::sh -c <payload>`
+# runs an arbitrary program. `--` before the source stops option injection but not
+# this, so reject the syntax outright. Anchored, so it never matches `https://`,
+# `git@host:path`, or an IPv6 URL whose `::` sits inside brackets.
+_REMOTE_HELPER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
+
+
+def _check_source(source: str) -> None:
+    if _REMOTE_HELPER_RE.match(source):
+        raise ValueError(
+            f"Refusing plugin source {source!r}: git remote-helper transports "
+            "(`<name>::…`) can execute arbitrary programs."
+        )
+
+
 def _check_ref(ref: str) -> None:
     # `git checkout` has no way to say "this is a ref, not a flag", so a leading dash
     # would be parsed as an option (e.g. `--upload-pack=`, arbitrary execution).
@@ -120,6 +136,7 @@ def _check_ref(ref: str) -> None:
 
 
 def _clone_or_update(source: str, ref: str | None, target: Path, update: bool) -> Path:
+    _check_source(source)
     if ref:
         _check_ref(ref)
     if not target.exists():
@@ -219,7 +236,9 @@ def _requirements_file(root: Path) -> Path | None:
 def _add_to_syspath(path: Path) -> None:
     entry = str(path)
     if entry not in sys.path:
-        sys.path.insert(0, entry)
+        # Append, never prepend: a plugin repo with a top-level `logging.py` (etc.)
+        # must not shadow the stdlib or site-packages for the rest of the process.
+        sys.path.append(entry)
         LOG.info("Added plugin path to sys.path: %s", entry)
 
 
@@ -234,6 +253,7 @@ def resolve_install_spec(
     Git URLs and local paths resolve today; a name lookup against a plugin registry
     would slot in here as another branch returning the same ``PluginSpec``.
     """
+    _check_source(source)
     if ref:
         _check_ref(ref)
 

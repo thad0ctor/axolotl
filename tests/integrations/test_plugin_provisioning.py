@@ -469,6 +469,31 @@ def test_git_invocations_end_options_before_user_input(tmp_path, monkeypatch):
     assert checkout == ["git", "checkout", "v1", "--"]
 
 
+@pytest.mark.parametrize("bad", ["ext::sh -c id.git", "fd::17/repo.git"])
+def test_remote_helper_sources_are_rejected(bad, tmp_path, monkeypatch):
+    # `<name>::…` invokes a git remote helper (arbitrary program). `--` before the
+    # source does not stop this, so it must be rejected before any git runs.
+    monkeypatch.setattr(
+        provisioning, "_run", lambda *a, **k: pytest.fail("git ran on a helper source")
+    )
+    with pytest.raises(ValueError, match="remote-helper"):
+        resolve_install_spec(bad)
+    with pytest.raises(ValueError, match="remote-helper"):
+        _clone_or_update(bad, None, tmp_path / "c", update=False)
+
+
+@pytest.mark.parametrize(
+    "ok",
+    [
+        "https://github.com/o/r.git",
+        "git@github.com:o/r.git",
+        "https://[2001:db8::1]/r.git",  # IPv6 `::` is not remote-helper syntax
+    ],
+)
+def test_normal_git_sources_are_accepted(ok):
+    assert resolve_install_spec(ok).source == ok
+
+
 def test_git_clone_reuses_cache(tmp_path, monkeypatch, no_pip, cleanup_syspath):
     work = tmp_path / "work"
     _make_plugin_module(work, modname="git_plugin", cls="GitPlugin")
@@ -704,3 +729,20 @@ def test_default_cache_dir_is_per_user_not_per_project(tmp_path, monkeypatch):
 
     monkeypatch.delenv("XDG_CACHE_HOME")
     assert resolve_cache_dir() == tmp_path / "home" / ".cache" / "axolotl" / "plugins"
+
+
+def test_gitignore_not_written_into_a_populated_dir(tmp_path):
+    from axolotl.integrations.plugin_manifest import ensure_cache_dir
+
+    project = tmp_path / "myrepo"
+    project.mkdir()
+    (project / "train.py").write_text("x = 1\n")
+
+    ensure_cache_dir(str(project))
+
+    # `--cache-dir .` must not gitignore the user's whole project.
+    assert not (project / ".gitignore").exists()
+    # a fresh, empty cache dir still self-ignores
+    empty = tmp_path / "fresh_cache"
+    ensure_cache_dir(str(empty))
+    assert (empty / ".gitignore").exists()

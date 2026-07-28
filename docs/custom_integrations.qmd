@@ -301,11 +301,19 @@ A pip-installed plugin can also contribute its own `axolotl` subcommand — see
 
 ::: {.callout-warning}
 
-Loading a config never fetches or installs anything: it only checks that the plugins it
-declares are already importable. Installing is where trust is required — `axolotl plugins
-install` runs code from the source (its build backend, and an import of its modules to
-discover the plugin class). Only install plugins you trust, and pin `--ref` to a full
-commit SHA so that what you install today is what you get tomorrow. Only the plugin and
-its dependencies are installed; the Axolotl install itself is never modified.
+Loading a config never fetches or installs anything: axolotl runs no git, pip, or
+network at load time. It does `import` the declared plugin to verify it, so the plugin's
+own module code runs — the safety comes from installation being the explicit, trusted
+step, not from load being sandboxed.
+
+Installing is where trust is required — `axolotl plugins install` runs code from the
+source (its build backend, and an import of its modules to discover the plugin class).
+Only install plugins you trust, and pin `--ref` to a full commit SHA. Pinning is
+strongest for packages installed with pip (`--mode pip`), which snapshot the commit into
+your environment. A source loaded from its tree (`--mode syspath`, and any local path) is
+re-read from that directory on every run, so a `ref:` in the config records provenance
+but does **not** freeze the code — if the checkout changes underneath you, config load
+warns that what is installed no longer matches the pin. Only the plugin and its
+dependencies are installed; the Axolotl install itself is never modified.
 
 :::

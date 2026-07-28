@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import shlex
+from collections.abc import Mapping
 
 from axolotl.integrations.plugin_manifest import apply_syspath_entries, find_entries
 from axolotl.utils.logging import get_logger
@@ -43,7 +45,9 @@ def _install_command(spec) -> str:
     # which fails for exactly the multi-class case.
     for cls_path in [spec.cls] if isinstance(spec.cls, str) else spec.cls or []:
         parts += ["--cls", cls_path]
-    return " ".join(parts)
+    # Config strings are untrusted; a shared config must not render a copy-pasteable
+    # `source; curl | sh` in the "run this to install" hint.
+    return shlex.join(parts)
 
 
 def _not_importable(cls_path: str, spec) -> PluginNotInstalledError:
@@ -92,6 +96,10 @@ def _check_importable(cls_path: str, spec) -> None:
         if spec.source:
             message += f"\nTo reinstall it, run:\n  {_install_command(spec)}"
         raise PluginNotInstalledError(message) from exc
+    except Exception as exc:  # a plugin whose import raises for any other reason
+        raise PluginNotInstalledError(
+            f"Plugin {cls_path!r} could not be imported: {type(exc).__name__}: {exc}."
+        ) from exc
 
     if not hasattr(module, class_name):
         raise PluginNotInstalledError(
@@ -100,14 +108,63 @@ def _check_importable(cls_path: str, spec) -> None:
         )
 
 
+def _warn_provenance_drift(spec) -> None:
+    """Flag when a config's `source`/`ref` disagree with what was installed.
+
+    The checkout cannot be re-verified against the pinned SHA without running git,
+    which config load must not do -- so surface the drift rather than enforce it.
+    """
+    if not (spec.source and spec.cls):
+        return
+    for entry in find_entries(spec):
+        installed = entry.get("source")
+        if installed and installed != spec.source:
+            LOG.warning(
+                "Plugin %s is pinned to source %r in the config, but was installed "
+                "from %r. Reinstall to match, or update the config.",
+                spec.cls,
+                spec.source,
+                installed,
+            )
+        if spec.ref and spec.ref not in (entry.get("ref"), entry.get("resolved_sha")):
+            LOG.warning(
+                "Plugin %s is pinned to ref %r, but the installed copy is %r (%s). "
+                "The pin is not what is loaded.",
+                spec.cls,
+                spec.ref,
+                entry.get("ref"),
+                entry.get("resolved_sha"),
+            )
+
+
 def _spec_cls_paths(spec) -> list[str]:
     if spec.cls:
         return [spec.cls] if isinstance(spec.cls, str) else list(spec.cls)
     # Only the manifest can name the class; discovery needs the source tree.
-    for entry in find_entries(spec):
-        if entry.get("cls"):
-            return list(entry["cls"])
-    raise _unresolved(spec)
+    candidates = [
+        tuple(entry["cls"]) for entry in find_entries(spec) if entry.get("cls")
+    ]
+    distinct = list(dict.fromkeys(candidates))
+    if not distinct:
+        raise _unresolved(spec)
+    if len(distinct) > 1:
+        classes = ", ".join(sorted(c for group in distinct for c in group))
+        raise PluginNotInstalledError(
+            f"Source {spec.source!r} resolves to more than one installed plugin "
+            f"({classes}); set `cls` in the plugin entry to pick which to load."
+        )
+    return list(distinct[0])
+
+
+def _parse_entry(entry, plugin_spec):
+    if isinstance(entry, (str, plugin_spec)):
+        return entry
+    if isinstance(entry, Mapping):
+        return plugin_spec(**dict(entry))
+    raise ValueError(
+        f"Invalid `plugins` entry {entry!r}: expected a dotted class path string or a "
+        "mapping with `cls`/`source`."
+    )
 
 
 def verify_plugins(cfg) -> None:
@@ -121,10 +178,7 @@ def verify_plugins(cfg) -> None:
 
     from axolotl.utils.schemas.config import PluginSpec
 
-    parsed = [
-        entry if isinstance(entry, (str, PluginSpec)) else PluginSpec(**dict(entry))
-        for entry in plugins
-    ]
+    parsed = [_parse_entry(entry, PluginSpec) for entry in plugins]
     apply_syspath_entries([entry for entry in parsed if not isinstance(entry, str)])
 
     normalized: list[str] = []
@@ -132,6 +186,7 @@ def verify_plugins(cfg) -> None:
         if isinstance(entry, str):
             normalized.append(entry)
             continue
+        _warn_provenance_drift(entry)
         for cls_path in _spec_cls_paths(entry):
             _check_importable(cls_path, entry)
             normalized.append(cls_path)

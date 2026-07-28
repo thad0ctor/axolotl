@@ -118,13 +118,19 @@ def list_plugins(cache_dir: str | None):
         return
 
     header = ("CLASS", "SOURCE", "COMMIT", "MODE", "INSTALLED")
+
+    def _cell(value) -> str:
+        # A manifest can be hand-edited or shared; coerce so a non-string field
+        # neither crashes `.ljust` nor injects newlines/ANSI into the table.
+        return str(value if value is not None else "").replace("\n", " ")
+
     table = [
         (
-            row["key"],
-            row.get("source") or "",
-            (row.get("resolved_sha") or "")[:8],
-            row.get("mode") or "",
-            row.get("installed_at") or "",
+            _cell(row.get("key")),
+            _cell(row.get("source")),
+            _cell(row.get("resolved_sha"))[:8],
+            _cell(row.get("mode")),
+            _cell(row.get("installed_at")),
         )
         for row in rows
     ]
