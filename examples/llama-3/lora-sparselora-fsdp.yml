@@ -1,0 +1,84 @@
+# SparseLoRA: contextual-sparsity LoRA fine-tuning.
+# Calibrates a per-layer sparsity schedule on your own data before training.
+# See docs/agents/sparselora.md and src/axolotl/integrations/sparselora/README.md.
+plugins:
+  - axolotl.integrations.sparselora.SparseLoRAPlugin
+
+base_model: NousResearch/Meta-Llama-3-8B-Instruct
+model_type: LlamaForCausalLM
+tokenizer_type: AutoTokenizer
+
+chat_template: llama3
+datasets:
+  - path: fozziethebeat/alpaca_messages_2k_test
+    type: chat_template
+
+dataset_prepared_path:
+val_set_size: 0.05
+output_dir: ./outputs/lora-sparselora-out
+
+sequence_len: 4096
+sample_packing: false          # supported; leave off for maximum sparsity (packing dilutes it)
+
+adapter: lora
+lora_model_dir:
+lora_r: 32
+lora_alpha: 16
+lora_dropout: 0.05
+# Attention-only LoRA is required by SparseLoRA v1 (no MLP projections).
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# SparseLoRA configuration.
+sparselora:
+  target_sparsity: 0.9
+  # attn_sparsity:             # attention base sparsity; defaults to min(target_sparsity, 0.75)
+  predictor_rank: 8
+  start_step: 0.1              # keep the first 10% of training dense
+  end_step: 1.0
+  calibration:
+    # structural (default): z-lab positional profile from layer structure, no forward pass.
+    # faithful/proxy: refine the structural band with a sensitivity sweep (faithful adds a warm-up).
+    # preset: load a published z-lab schedule (requires `preset`/`preset_mode`).
+    # none: use an explicit `layer_sparsity` map verbatim.
+    method: structural         # structural (default) | faithful | proxy | preset | none
+    # num_samples: 128         # faithful/proxy: examples drawn for the sweep
+    # warmup_steps: 50         # faithful: dense LoRA warm-up steps before the sweep
+  # cache_dir:                 # defaults to {output_dir}/sparselora_calibration
+  # share_calibration: false   # opt-in anonymous schedule sharing (off by default)
+
+gradient_accumulation_steps: 4
+micro_batch_size: 2
+num_epochs: 1
+optimizer: adamw_torch
+lr_scheduler: cosine
+learning_rate: 0.0002
+
+bf16: auto
+tf32: false
+
+gradient_checkpointing: true
+logging_steps: 1
+attn_implementation: eager
+
+warmup_ratio: 0.1
+weight_decay: 0.0
+special_tokens:
+   pad_token: <|end_of_text|>
+
+# Multi-GPU FSDP. The sparse-module swap happens before FSDP wraps the model,
+# and each base weight is all-gathered in the FSDP forward pre-hook, so the
+# contextual output/input slicing operates on the full materialized tensor.
+# Works with FSDP1 and FSDP2 (set fsdp_version: 2). DeepSpeed ZeRO-3 is not
+# supported (it shards parameters without an in-forward all-gather of self.weight).
+fsdp_version: 1
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  state_dict_type: FULL_STATE_DICT
