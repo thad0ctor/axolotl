@@ -141,6 +141,20 @@ class BasePlugin:
             cfg: The configuration for the plugin.
         """
 
+    def suppresses_auto_attention_patches(self, cfg: DictDefault) -> bool:
+        """Whether to skip the attention patches core applies opportunistically.
+
+        These run before `pre_model_load`, so a plugin that owns the attention
+        path cannot reject them from its own hooks.
+
+        Args:
+            cfg: The configuration for the plugin.
+
+        Returns:
+            `True` to suppress them.
+        """
+        return False
+
     def post_model_build(self, cfg: DictDefault, model: PreTrainedModel):
         """Performs actions after the model is built/loaded, but before any adapters are applied.
 
@@ -526,6 +540,20 @@ class PluginManager:
         """
         for plugin in self.plugins.values():
             plugin.pre_model_load(cfg)
+
+    def suppresses_auto_attention_patches(self, cfg: DictDefault) -> bool:
+        """Whether any registered plugin suppresses core's automatic attention patches.
+
+        Args:
+            cfg: The configuration for the plugins.
+
+        Returns:
+            `True` if at least one plugin suppresses them.
+        """
+        return any(
+            plugin.suppresses_auto_attention_patches(cfg)
+            for plugin in self.plugins.values()
+        )
 
     def post_model_build(self, cfg: DictDefault, model: PreTrainedModel):
         """Calls the `post_model_build` method of all registered plugins after the
