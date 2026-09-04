@@ -9,7 +9,6 @@ from functools import partial
 from tempfile import NamedTemporaryFile
 from typing import List, Optional
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import torch
@@ -18,6 +17,7 @@ from datasets import IterableDataset, disable_caching, enable_caching
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from transformers.utils import is_torch_bf16_gpu_available
 
+from axolotl.utils.datasets import dataset_map_buffer_kwargs
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.distributed import init_distributed_state, reduce_and_broadcast
 from axolotl.utils.environment import check_cuda_p2p_ib_support
@@ -271,12 +271,19 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         # If it's a list, we assume we're dealing with a batch
         if isinstance(labels[0], int):
             # Single example: return a single bool
-            return np.any(labels != -100)
+            return any(v != -100 for v in labels)
 
-        # Batched: 'labels' is a list of lists
-        # Return a list of booleans, one per sub-list
-        results = [np.any(row_labels != -100) for row_labels in labels]
+        results = [any(v != -100 for v in row_labels) for row_labels in labels]
         return results
+
+    def raise_if_empty(dataset):
+        if len(dataset) == 0:
+            raise ValueError(
+                "The dataset has no samples left after dropping samples with no "
+                "trainable tokens. Every sample had all of its labels masked to "
+                "-100, so there is nothing to train on. Check `train_on_inputs`, "
+                "`roles_to_train`, and your prompt strategy / chat template."
+            )
 
     try:
         prior_len = len(train_dataset)
@@ -284,9 +291,11 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         # handle iterable datasets case
         prior_len = None
     filter_map_kwargs = {}
+    map_buffer_kwargs = {}
     if not isinstance(train_dataset, IterableDataset):
         filter_map_kwargs["num_proc"] = cfg.dataset_num_proc
         filter_map_kwargs["load_from_cache_file"] = not cfg.is_preprocess
+        map_buffer_kwargs = dataset_map_buffer_kwargs(cfg, batched=True)
 
     drop_long_kwargs = {}
     if filter_map_kwargs:
@@ -295,14 +304,14 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         drop_no_trainable_tokens,
         batched=True,
         **filter_map_kwargs,
+        **map_buffer_kwargs,
         **drop_long_kwargs,
     )
     if prior_len:
         dropped = prior_len - len(train_dataset)
         if dropped:
-            LOG.warning(
-                f"Dropped {dropped} samples with no trainable tokens from train dataset"
-            )
+            LOG.warning(f"Dropped {dropped} samples with no trainable tokens")
+        raise_if_empty(train_dataset)
 
     if eval_dataset:
         try:
@@ -313,6 +322,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         eval_dataset = eval_dataset.filter(
             drop_no_trainable_tokens,
             **filter_map_kwargs,
+            **map_buffer_kwargs,
             **drop_long_kwargs,
         )
         if prior_len:
@@ -321,6 +331,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                 LOG.warning(
                     f"Dropped {dropped} samples with no trainable tokens from eval dataset"
                 )
+            raise_if_empty(eval_dataset)
 
     if cfg.group_by_length:
         train_dataset = train_dataset.map(
@@ -328,6 +339,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             num_proc=cfg.dataset_num_proc,
             load_from_cache_file=not cfg.is_preprocess,
             desc="Group By Length",
+            **map_buffer_kwargs,
         )
 
     if cfg.use_pose:
@@ -345,6 +357,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             num_proc=cfg.dataset_num_proc,
             load_from_cache_file=not cfg.is_preprocess,
             desc="Add position_id column (PoSE)",
+            **map_buffer_kwargs,
         )
         train_dataset = train_dataset.sort("sequence_len")
         if cfg.eval_sample_packing is not False:
@@ -354,6 +367,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                     num_proc=cfg.dataset_num_proc,
                     load_from_cache_file=not cfg.is_preprocess,
                     desc="Add position_id column (PoSE)",
+                    **map_buffer_kwargs,
                 )
     elif cfg.sample_packing:
         drop_long_kwargs = {}
@@ -363,6 +377,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             add_position_ids,
             batched=True,
             **filter_map_kwargs,
+            **map_buffer_kwargs,
             **drop_long_kwargs,
         )
         if cfg.eval_sample_packing:
@@ -370,6 +385,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                 eval_dataset = eval_dataset.map(
                     add_position_ids,
                     **filter_map_kwargs,
+                    **map_buffer_kwargs,
                     **drop_long_kwargs,
                 )
 
@@ -656,6 +672,9 @@ def setup_parallelism_envs(cfg):
 
 
 def prepare_optim_env(cfg):
+    if cfg.ddp_timeout:
+        os.environ.setdefault("AXOLOTL_NCCL_TIMEOUT", str(cfg.ddp_timeout))
+
     if not check_cuda_p2p_ib_support():
         if os.getenv("NCCL_P2P_DISABLE") is None:
             LOG.warning("P2P support not detected, setting `NCCL_P2P_DISABLE=1`")
