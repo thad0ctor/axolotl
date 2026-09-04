@@ -8,7 +8,6 @@ format:
 
 ## Supported Models
 
-- [Gemma-4](#sec-gemma-4) *(NEW)*
 - [Mllama](#sec-mllama)
 - [Llama4](#sec-llama4)
 - [Pixtral](#sec-pixtral)
@@ -17,16 +16,21 @@ format:
 - [Mistral-Small-4](#sec-mistral-small-4)
 - [Magistral-Small-2509](#sec-magistral-small-2509)
 - [Voxtral](#sec-voxtral)
+- [Gemma-4](#sec-gemma-4)
 - [Gemma-3](#sec-gemma-3)
 - [Gemma-3n](#sec-gemma-3n)
 - [Qwen2-VL](#sec-qwen2-vl)
 - [Qwen2.5-VL](#sec-qwen25-vl)
+- [Qwen3-VL](#sec-qwen3-vl)
 - [Qwen3.5](#sec-qwen3-5)
+- [Qwen3.8-Flash-Next](#sec-qwen3-8-flash-next)
 - [GLM-4.6V](#sec-glm-4-6v)
 - [SmolVLM2](#sec-smolvlm2)
 - [LFM2-VL](#sec-lfm2-vl)
 - [Intern-VL](#sec-intern-vl)
 - [PaddleOCR-VL](#sec-paddleocr-vl)
+- [North Micro Vision Instruct](#sec-north-micro-vision-instruct)
+- [Muse Glimmer](#sec-muse-glimmer)
 
 ## Usage
 
@@ -60,7 +64,23 @@ image_size: 512
 image_resize_algorithm: bilinear
 ```
 
-Please see [examples](https://github.com/axolotl-ai/axolotl/tree/main/examples) folder for full configs.
+Please see [examples](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples) folder for full configs.
+
+### Capping image resolution {#sec-image-resolution}
+
+`image_size` resizes every image with PIL before it reaches the processor: a tuple resizes to exactly `(width, height)`, an int preserves aspect ratio and pads to a black square. It applies both when images are processed at collate time (`skip_prepare_dataset: true`) and during pre-tokenization.
+
+For processors that support native resolution controls, `processor_kwargs` forwards kwargs to the processor's `from_pretrained()` and is usually the better lever — the processor scales images within its own patch-grid logic instead of a fixed square. For the Qwen-VL family:
+
+```yaml
+processor_kwargs:
+  max_pixels: 1003520  # ~1280 merged vision tokens per image (after 2x2 merging)
+  # min_pixels: 3136
+```
+
+::: {.callout-warning}
+Some processors apply no resolution cap by default. The Qwen3-VL processor defaults to `size.longest_edge: 16777216` (a 16-megapixel *area* budget), so a 1700x2200 document scan produces ~14,600 patches — roughly 90 MB of `pixel_values` and ~3,650 vision tokens per image. Defaults differ across the family: Qwen2-VL caps at `max_pixels: 1003520` and Qwen2.5-VL at 12,845,056. If pre-tokenization exhausts host RAM or training is slow on high-resolution images, set `max_pixels` (or `image_size`) first.
+:::
 
 ::: {.callout-tip}
 Some of our chat_templates have been extended to support broader dataset types. This should not break any existing configs.
@@ -236,14 +256,18 @@ base_model: Qwen/Qwen3.5-9B
 chat_template: qwen3_5
 ```
 
-### PaddleOCR-VL {#sec-paddleocr-vl}
+### Qwen3.8-Flash-Next {#sec-qwen3-8-flash-next}
+
+::: {.callout-tip}
+Please make sure to install `torchvision` via `uv pip install torchvision`.
+:::
 
 ```yaml
-base_model: PaddlePaddle/PaddleOCR-VL-1.6
+base_model: Qwen/Qwen3.8-Flash-Next
 processor_type: AutoProcessor
 ```
 
-Keep `sample_packing: false` and do not enable Liger or Cut Cross Entropy. See the [example configs and tips](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/paddleocr-vl) for details.
+See the [example configs and tips](https://docs.axolotl.ai/docs/models/qwen3.8-flash-next.html) for details.
 
 ### GLM-4.6V {#sec-glm-4-6v}
 
@@ -285,6 +309,31 @@ Please make sure to install `timm` via `pip3 install timm==1.0.19`
 
 ```yaml
 base_model: OpenGVLab/InternVL3_5-8B
+```
+
+### PaddleOCR-VL {#sec-paddleocr-vl}
+
+```yaml
+base_model: PaddlePaddle/PaddleOCR-VL-1.6
+processor_type: AutoProcessor
+```
+
+Keep `sample_packing: false` and do not enable Liger or Cut Cross Entropy. See the [example configs and tips](https://docs.axolotl.ai/docs/models/paddleocr-vl.html) for details.
+
+### North Micro Vision Instruct {#sec-north-micro-vision-instruct}
+
+```yaml
+base_model: CohereLabs/North-Micro-Vision-Instruct
+processor_type: AutoProcessor
+```
+
+### Muse Glimmer {#sec-muse-glimmer}
+
+Requires `transformers>=5.15.0`.
+
+```yaml
+base_model: meta-models/Muse-Glimmer-30B
+processor_type: AutoProcessor
 ```
 
 ## Dataset Format
