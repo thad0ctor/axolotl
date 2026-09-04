@@ -138,7 +138,9 @@ class DataCollatorForSeq2Seq:
                     features["position_ids"]
                 )
                 features["cu_seq_lens_q"] = cu_q
-                features["cu_seq_lens_k"] = cu_k
+                # transformers aliases k to q; dynamo (torch >= 2.13) graph-breaks an
+                # autograd.Function that receives the same tensor twice.
+                features["cu_seq_lens_k"] = cu_k.clone() if cu_k is cu_q else cu_k
                 features["max_length_q"] = int(max_q)
                 features["max_length_k"] = int(max_k)
             except (

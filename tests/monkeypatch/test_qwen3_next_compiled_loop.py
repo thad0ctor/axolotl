@@ -14,7 +14,6 @@ pytest.importorskip("fla")
 @pytest.fixture
 def packing_patched():
     """Apply the qwen3_next packing patch (torch_compile on) and restore globals after."""
-    from fla.modules import FusedRMSNormGated
     from transformers.models.qwen3_next import modeling_qwen3_next as hf
 
     from axolotl.monkeypatch.models.qwen3_next import modeling as qm
@@ -22,31 +21,12 @@ def packing_patched():
     saved = {
         "decoder_forward": hf.Qwen3NextDecoderLayer.forward,
         "gdn_forward": hf.Qwen3NextGatedDeltaNet.forward,
-        "norm_forward": FusedRMSNormGated.forward,
-        "norm_present": hasattr(FusedRMSNormGated, "_axolotl_compile_boundary"),
-        "norm_flag": getattr(FusedRMSNormGated, "_axolotl_compile_boundary", None),
-        "chunk": getattr(hf, "chunk_gated_delta_rule", None),
-        "recurrent": getattr(hf, "fused_recurrent_gated_delta_rule", None),
-        "norm_cls": getattr(hf, "FusedRMSNormGated", None),
-        "fast_path": getattr(hf, "is_fast_path_available", None),
         "fla_ops_flag": qm._FLA_COMPILED_OPS,
     }
     qm.patch_qwen3_next_modeling_packing(torch_compile=True)
     yield qm
     hf.Qwen3NextDecoderLayer.forward = saved["decoder_forward"]
     hf.Qwen3NextGatedDeltaNet.forward = saved["gdn_forward"]
-    FusedRMSNormGated.forward = saved["norm_forward"]
-    if saved["norm_present"]:
-        FusedRMSNormGated._axolotl_compile_boundary = saved["norm_flag"]
-    else:
-        try:
-            delattr(FusedRMSNormGated, "_axolotl_compile_boundary")
-        except AttributeError:
-            pass
-    hf.chunk_gated_delta_rule = saved["chunk"]
-    hf.fused_recurrent_gated_delta_rule = saved["recurrent"]
-    hf.FusedRMSNormGated = saved["norm_cls"]
-    hf.is_fast_path_available = saved["fast_path"]
     qm._FLA_COMPILED_OPS = saved["fla_ops_flag"]
 
 

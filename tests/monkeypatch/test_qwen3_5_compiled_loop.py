@@ -14,8 +14,6 @@ pytest.importorskip("fla")
 @pytest.fixture
 def packing_patched():
     """Apply the packing patch (torch_compile on) and restore globals after; op registrations can't be undone, so _OPS_BUILT stays True by design (re-registering raises)."""
-    import fla.modules.fused_norm_gate  # noqa: F401  (ensure importable)
-    from fla.modules import FusedRMSNormGated
     from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
 
     from axolotl.monkeypatch.models.qwen3_5 import modeling as qm
@@ -23,31 +21,12 @@ def packing_patched():
     saved = {
         "decoder_forward": hf.Qwen3_5DecoderLayer.forward,
         "gdn_forward": hf.Qwen3_5GatedDeltaNet.forward,
-        "norm_forward": FusedRMSNormGated.forward,
-        "norm_present": hasattr(FusedRMSNormGated, "_axolotl_compile_boundary"),
-        "norm_flag": getattr(FusedRMSNormGated, "_axolotl_compile_boundary", None),
-        "chunk": getattr(hf, "chunk_gated_delta_rule", None),
-        "recurrent": getattr(hf, "fused_recurrent_gated_delta_rule", None),
-        "norm_cls": getattr(hf, "FusedRMSNormGated", None),
-        "fast_path": getattr(hf, "is_fast_path_available", None),
         "fla_ops_flag": qm._FLA_COMPILED_OPS,
     }
     qm.patch_qwen3_5_modeling_packing(torch_compile=True)
     yield qm
     hf.Qwen3_5DecoderLayer.forward = saved["decoder_forward"]
     hf.Qwen3_5GatedDeltaNet.forward = saved["gdn_forward"]
-    FusedRMSNormGated.forward = saved["norm_forward"]
-    if saved["norm_present"]:
-        FusedRMSNormGated._axolotl_compile_boundary = saved["norm_flag"]
-    else:
-        try:
-            delattr(FusedRMSNormGated, "_axolotl_compile_boundary")
-        except AttributeError:
-            pass
-    hf.chunk_gated_delta_rule = saved["chunk"]
-    hf.fused_recurrent_gated_delta_rule = saved["recurrent"]
-    hf.FusedRMSNormGated = saved["norm_cls"]
-    hf.is_fast_path_available = saved["fast_path"]
     qm._FLA_COMPILED_OPS = saved["fla_ops_flag"]
 
 
@@ -195,7 +174,7 @@ class TestDecoderLoopCompiles:
             position_ids=position_ids,
             use_cache=False,
             cu_seq_lens_q=cu_q,
-            cu_seq_lens_k=cu_k,
+            cu_seq_lens_k=cu_k.clone(),  # de-aliased like the collator does
             max_length_q=int(max_q),
             max_length_k=int(max_k),
         ).last_hidden_state
@@ -310,7 +289,7 @@ class TestDecoderLoopCompiles:
             position_ids=position_ids,
             use_cache=False,
             cu_seq_lens_q=cu_q,
-            cu_seq_lens_k=cu_k,
+            cu_seq_lens_k=cu_k.clone(),  # de-aliased like the collator does
             max_length_q=int(max_q),
             max_length_k=int(max_k),
         )
