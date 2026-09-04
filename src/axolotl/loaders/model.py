@@ -526,14 +526,53 @@ class ModelLoader:
 
         return lora_config
 
+    def _keep_no_placement_params_on_cpu(self):
+        """Stop the offloaded ``_no_placement_params`` being pulled back into VRAM.
+
+        These land in host RAM on their own (Qwen3.8-Flash-Next's n-gram table arrives as
+        128 checkpoint shards that transformers concatenates on CPU) and the model gathers
+        rows on whatever device the weight sits on. What drags them onto the accelerator is
+        ``Accelerator.prepare_model``, which skips its ``model.to(device)`` for a quantized
+        model carrying an ``hf_device_map`` but does not get one from transformers when the
+        map is a single device.
+
+        That skip is accelerate 1.13.0's ``accelerator.py`` L1824 branch shadowing the
+        ``model.to(self.device)`` at L1864, so an accelerate bump that reorders the two
+        silently pulls the table back into VRAM.
+        ``tests/loaders/test_ple_offload_accelerate_contract.py`` fails if that happens.
+        """
+        suffixes = getattr(self.model, "_no_placement_params", None) or []
+        targets = [
+            name
+            for name, param in self.model.named_parameters()
+            if any(name.endswith(suffix) for suffix in suffixes)
+            and param.device.type == "cpu"
+        ]
+        if not targets:
+            LOG.warning(
+                "ple_cpu_offload is set but no `_no_placement_params` of %s are in host "
+                "RAM, so there is nothing to keep there.",
+                self.cfg.model_config_type,
+            )
+            return
+
+        if not hasattr(self.model, "hf_device_map"):
+            self.model.hf_device_map = {"": int(os.environ.get("LOCAL_RANK", 0))}
+        LOG.info("ple_cpu_offload: keeping %s in host RAM", ", ".join(targets))
+
     def _apply_post_lora_load_setup(self, skip_move_to_device: bool):
         """Apply final optimizations and patches."""
+        if self.cfg.ple_cpu_offload:
+            self._keep_no_placement_params_on_cpu()
+
         # Place model on accelerator
         if (
             self.cfg.ddp
             and not self.cfg.load_in_8bit
             and not (self.cfg.rl and self.cfg.load_in_4bit)
             and not skip_move_to_device
+            # would drag the offloaded table onto the accelerator with everything else
+            and not self.cfg.ple_cpu_offload
         ):
             self.model.to(f"{str(get_device_type())}:{self.cfg.local_rank}")
 
@@ -821,6 +860,16 @@ class ModelLoader:
         if hf_impl == "flash_attention_4":
             configure_fa4()
             return hf_impl
+
+        # Ring attention only substitutes the `flash_attention_2` dispatch key.
+        if (self.cfg.context_parallel_size or 1) > 1:
+            LOG.info(
+                "Not upgrading %s to Flash Attention 4: ring attention only "
+                "supports the flash attention 2 backend.",
+                hf_impl,
+            )
+            return hf_impl
+
         if fa4_usable(self.model_config):
             configure_fa4()
             LOG.info("Flash Attention 4 enabled (upgraded from %s).", hf_impl)
