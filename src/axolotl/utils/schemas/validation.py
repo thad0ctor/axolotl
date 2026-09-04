@@ -16,11 +16,36 @@ from axolotl.utils.schemas.enums import (
     ChatTemplate,
     RingAttnFunc,
     RLType,
+    attn_impl_base,
 )
+from axolotl.utils.schemas.fp8 import DEFAULT_FP8_RECIPE, resolve_fp8_recipe
 
 LOG = get_logger(__name__)
 
 SUPPORTED_METRICS = {"sacrebleu", "comet", "ter", "chrf", "perplexity"}
+
+
+def _is_multimodal_packing(data) -> bool:
+    """True when the config is a multimodal run using sample packing."""
+    is_multimodal = bool(data.get("processor_type") or data.get("is_multimodal"))
+    packing = bool(data.get("sample_packing") or data.get("eval_sample_packing"))
+    return is_multimodal and packing
+
+
+def _is_buffered_mm_packing(data) -> bool:
+    """True when MM sample packing routes to the buffered (tokenize-on-the-fly) packer.
+
+    Both `streaming` and `skip_prepare_dataset` mean the dataset is never prepared
+    with cached `length`/media, so packing runs through the buffered packer. The
+    buffered packer only serves the train set, so `eval_sample_packing` alone
+    does not qualify.
+    """
+    is_multimodal = bool(data.get("processor_type") or data.get("is_multimodal"))
+    return (
+        is_multimodal
+        and bool(data.get("sample_packing"))
+        and bool(data.get("streaming") or data.get("skip_prepare_dataset"))
+    )
 
 
 class DatasetValidationMixin:
@@ -150,10 +175,19 @@ class DatasetValidationMixin:
             and data.get("eval_sample_packing") is None
             and not data.get("eval_table_size")
         ):
-            LOG.info(
-                "explicitly setting `eval_sample_packing` to match `sample_packing`",
-            )
-            data["eval_sample_packing"] = True
+            if _is_buffered_mm_packing(data):
+                # The buffered packer only serves the train set; the eval multipack
+                # sampler needs a prepared dataset's length/input_ids columns.
+                LOG.info(
+                    "setting `eval_sample_packing: false` for buffered multimodal "
+                    "sample packing (eval runs unpacked)",
+                )
+                data["eval_sample_packing"] = False
+            else:
+                LOG.info(
+                    "explicitly setting `eval_sample_packing` to match `sample_packing`",
+                )
+                data["eval_sample_packing"] = True
 
         if (
             data.get("sample_packing")
@@ -179,9 +213,66 @@ class DatasetValidationMixin:
 
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def check_mm_sample_packing(cls, data):
+        if not _is_multimodal_packing(data):
+            return data
+
+        # `streaming` or `skip_prepare_dataset` (no cached `length`/media) routes to
+        # the buffered multimodal packer instead of the materialized
+        # MultipackBatchSampler; both tokenize on the fly.
+
+        if data.get("remove_unused_columns") is None:
+            LOG.info(
+                "setting `remove_unused_columns: false` for multimodal sample packing"
+            )
+            data["remove_unused_columns"] = False
+        elif data.get("remove_unused_columns") is not False:
+            raise ValueError(
+                "Multimodal sample packing requires `remove_unused_columns: false` so "
+                "media columns (e.g. `pixel_values`) survive collation."
+            )
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_mm_sample_packing_streaming(cls, data):
+        # The buffered MM packer only serves the `streaming: true` path; a
+        # `pretraining_dataset` routes to the text streaming loader, which would
+        # silently drop media.
+        if _is_multimodal_packing(data) and data.get("pretraining_dataset"):
+            raise ValueError(
+                "Multimodal sample packing is not supported with "
+                "`pretraining_dataset` (media would be silently dropped). Use "
+                "`streaming: true` with a `datasets:` entry for streaming "
+                "multimodal packing instead."
+            )
+        return data
+
 
 class AttentionValidationMixin:
     """Validation methods related to attention mechanisms."""
+
+    @model_validator(mode="after")
+    def check_mm_packing_real_batches_flash(self):
+        # transformers' flash path only reads packed cu_seqlens from position_ids
+        # when the batch is a single row; multi-row batches attend across packs.
+        if (
+            self.sample_packing
+            and self.multipack_real_batches
+            and self.attn_supports_packing
+            and (self.processor_type or getattr(self, "is_multimodal", None))
+        ):
+            LOG.warning(
+                "`multipack_real_batches: true` with `attn_implementation=%r` "
+                "produces multi-row packed batches, which flash attention cannot "
+                "isolate. Leave `multipack_real_batches` unset (one pack of "
+                "micro_batch_size * sequence_len tokens per step) or use sdpa.",
+                self.attn_implementation,
+            )
+        return self
 
     @model_validator(mode="after")
     def check_sample_packing_without_attention(self):
@@ -219,9 +310,10 @@ class TrainingValidationMixin:
     @classmethod
     def check_batch_size_fields(cls, data):
         fields = ("micro_batch_size", "gradient_accumulation_steps", "batch_size")
-        non_empty_count = sum(1 for field in fields if data.get(field))
+        if data.get("micro_batch_size") or data.get("gradient_accumulation_steps"):
+            return data
 
-        if non_empty_count < 2:
+        if data.get("batch_size"):
             raise ValueError(f"At least two of {', '.join(fields)} must be set")
         return data
 
@@ -424,6 +516,21 @@ class TrainingValidationMixin:
     @model_validator(mode="before")
     @classmethod
     def check_fp8_config(cls, data):
+        fp8_config = data.get("fp8_config")
+        fp8_recipe = resolve_fp8_recipe(fp8_config)
+        if fp8_config is not None and not data.get("fp8"):
+            raise ValueError(
+                "`fp8_config` requires `fp8: true`; "
+                "set `fp8: true` or remove `fp8_config`."
+            )
+        if (
+            data.get("fp8_enable_fsdp_float8_all_gather")
+            and fp8_recipe != DEFAULT_FP8_RECIPE
+        ):
+            raise ValueError(
+                "`fp8_enable_fsdp_float8_all_gather` only supports the tensorwise "
+                "`fp8_config.recipe`; disable it when using rowwise scaling."
+            )
         if data.get("fp8") and not data.get("torch_compile"):
             LOG.warning(
                 "torch_compile is strongly recommended for FP8 training in order to "
@@ -904,6 +1011,75 @@ class OptimizationValidationMixin:
 
     @model_validator(mode="before")
     @classmethod
+    def check_polora(cls, data):
+        if data.get("optimizer") != "polora":
+            return data
+        if data.get("adapter") not in ("lora", "qlora"):
+            raise ValueError(
+                "polora only updates LoRA (A, B) factors and requires "
+                "adapter: lora or qlora."
+            )
+        if data.get("deepspeed") or (data.get("tensor_parallel_size") or 1) > 1:
+            # ZeRO partitions the optimizer step itself, and TP shards the rank dim;
+            # polora needs whole factors to build its r x r curvature matrices.
+            raise ValueError(
+                "polora is not compatible with DeepSpeed or tensor parallelism. "
+                "Use single-GPU, DDP, or FSDP2."
+            )
+        if data.get("fsdp") or data.get("fsdp_config"):
+            if str(cls._resolve_fsdp_version(data)) != "2":
+                raise ValueError(
+                    "polora requires FSDP2. Set fsdp_version: 2 to use polora with FSDP."
+                )
+
+        untrained = [
+            key
+            for key in (
+                "lora_modules_to_save",
+                "unfrozen_parameters",
+                "peft_use_dora",
+                "peft_trainable_token_indices",
+                "lisa_step_interval",
+                "reward_model",
+                "process_reward_model",
+            )
+            if data.get(key)
+        ]
+        if untrained:
+            raise ValueError(
+                f"polora has no fallback optimizer, so the parameters added by {untrained} "
+                "would never be trained. Remove them or pick a different optimizer."
+            )
+
+        # The factory builds the optimizer straight from the model, bypassing axolotl's
+        # parameter grouping, so per-group learning rates never take effect.
+        ignored_lrs = [
+            key
+            for key in (
+                "loraplus_lr_ratio",
+                "lr_groups",
+                "embedding_lr",
+                "embedding_lr_scale",
+            )
+            if data.get(key)
+        ]
+        if ignored_lrs:
+            raise ValueError(
+                f"polora sets its own per-factor step size, so {ignored_lrs} would be "
+                "silently ignored. Remove them or pick a different optimizer."
+            )
+
+        if data.get("relora_steps"):
+            raise ValueError(
+                "relora resets optimizer state through Optimizer.state, which polora "
+                "does not use, so its momentum would survive every merge."
+            )
+        if data.get("weight_decay"):
+            LOG.warning("polora has no weight decay term; weight_decay is ignored.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def check_qgalore(cls, data):
         if data.get("optimizer") != "q_galore_adamw8bit":
             return data
@@ -1153,6 +1329,23 @@ class OptimizationValidationMixin:
 
         return self
 
+    @model_validator(mode="after")
+    def check_fsdp2_cpu_ram_efficient_loading_w_4bit(self):
+        # nf4 quantizes on rank 0 only: its params keep the packed `(N, 1)` shape there while the
+        # other ranks stay on meta unpacked, so the FSDP2 load scatters mismatched sizes.
+        if (
+            self.fsdp_config
+            and str(self.fsdp_version) == "2"
+            and self.fsdp_config.cpu_ram_efficient_loading
+            and self.load_in_4bit
+        ):
+            raise ValueError(
+                "FSDP2 does not support `cpu_ram_efficient_loading` with load_in_4bit; the "
+                "rank-0-only bitsandbytes quantization deadlocks the state dict scatter. "
+                "Please set `fsdp_config.cpu_ram_efficient_loading` to false."
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def check_tensor_parallel_size_update_ds_json(cls, data):
@@ -1285,6 +1478,44 @@ class SystemValidationMixin:
 
         return data
 
+    @model_validator(mode="after")
+    def check_flash_attn_available(self):
+        if self.attn_implementation not in ("flash_attention_2", "flash_attention_3"):
+            return self
+
+        import torch
+
+        # CPU-only boxes may just be preprocessing for a GPU box; don't block them.
+        if not torch.cuda.is_available():
+            return self
+
+        from transformers.utils import (
+            is_flash_attn_2_available,
+            is_flash_attn_3_available,
+        )
+
+        # Mirror runtime resolution: the flash-attn package OR a kernels-hub binary
+        # matching this torch build.
+        if self.attn_implementation == "flash_attention_3":
+            available = is_flash_attn_3_available(kernels_fallback_ok=True)
+        else:
+            # transformers probes the hub at v1 but loads a different major, so ask
+            # about the version we actually pin instead.
+            from axolotl.monkeypatch.attention.fa2_hub_kernel import (
+                is_fa2_hub_kernel_available,
+            )
+
+            available = is_flash_attn_2_available() or is_fa2_hub_kernel_available()
+        if not available:
+            raise ValueError(
+                f"attn_implementation: {self.attn_implementation} is set, but no "
+                "flash-attn build is available in this environment: the flash-attn "
+                "package is not installed and the kernels hub has no prebuilt binary "
+                f"for torch {torch.__version__}. Install a flash-attn build matching "
+                "your torch version, or set `attn_implementation: sdpa`."
+            )
+        return self
+
 
 class ChatTemplateValidationMixin:
     """Validation methods related to chat template configuration."""
@@ -1333,7 +1564,10 @@ class PretrainingValidationMixin:
     @classmethod
     def check_pretraining_split_batches_accelerate(cls, data):
         # alternatively set ACCELERATE_SPLIT_BATCHES=False
-        if data.get("pretraining_dataset"):
+        # Accelerate's default dispatch would slice pixel_values' non-batch leading
+        # dim (patches, not batch), corrupting media; force it off for streaming MM.
+        buffered_mm_packing = _is_buffered_mm_packing(data)
+        if data.get("pretraining_dataset") or buffered_mm_packing:
             accelerator_config = data.get("accelerator_config", {})
             if not accelerator_config:
                 data["accelerator_config"] = {
@@ -1345,6 +1579,41 @@ class PretrainingValidationMixin:
                     data["accelerator_config"]["split_batches"] = False
                 if accelerator_config.get("dispatch_batches") is None:
                     data["accelerator_config"]["dispatch_batches"] = False
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def force_num_workers_zero_for_streaming_mm(cls, data):
+        # The buffered MM packer has no worker sharding, so num_workers > 0 would
+        # re-iterate the source per worker and duplicate rows.
+        if _is_buffered_mm_packing(data):
+            if data.get("dataloader_num_workers") or (
+                data.get("dataloader_prefetch_factor") is not None
+            ):
+                LOG.warning(
+                    "Overriding `dataloader_num_workers` to 0 (and "
+                    "`dataloader_prefetch_factor` to None) for buffered multimodal "
+                    "sample packing; the buffered packer has no worker sharding, so "
+                    "workers > 0 would duplicate rows."
+                )
+            data["dataloader_num_workers"] = 0
+            # prefetch_factor is only valid with workers > 0.
+            data["dataloader_prefetch_factor"] = None
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_buffered_mm_packing_eval_packing(cls, data):
+        # The buffered packer only serves the train set; eval multipack needs a
+        # prepared dataset's length/input_ids and would KeyError on raw rows.
+        if _is_buffered_mm_packing(data) and data.get("eval_sample_packing"):
+            raise ValueError(
+                "eval_sample_packing is not supported with buffered multimodal "
+                "sample packing (streaming or skip_prepare_dataset): the buffered "
+                "packer only packs the train set, and the eval multipack sampler "
+                "requires a prepared dataset. Set `eval_sample_packing: false` "
+                "(eval runs unpacked) or drop `skip_prepare_dataset`/`streaming`."
+            )
         return data
 
     @model_validator(mode="before")
@@ -1379,6 +1648,47 @@ class PretrainingValidationMixin:
 
     @model_validator(mode="before")
     @classmethod
+    def check_skip_prepare_mm_packing_w_max_steps(cls, data):
+        # The buffered MM packer yields an unknown number of packs, so epoch length
+        # is unknowable; a length-less IterableDataset reaches HF Trainer and needs
+        # max_steps. streaming/pretraining are covered by their own validators above.
+        if (
+            _is_buffered_mm_packing(data)
+            and not data.get("streaming")
+            and not data.get("pretraining_dataset")
+            and not data.get("max_steps")
+        ):
+            raise ValueError(
+                "max_steps must be set when using skip_prepare_dataset with "
+                "multimodal sample_packing. The buffered packer yields an unknown "
+                "number of packs, so the Trainer cannot infer the epoch length."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_skip_prepare_mm_packing_limitations(cls, data):
+        # The skip_prepare buffered route loads only datasets[0] and never splits
+        # a validation set; fail loudly instead of silently dropping data.
+        # (Streaming has its own multi-dataset validator.)
+        if not _is_buffered_mm_packing(data) or data.get("streaming"):
+            return data
+        if data.get("datasets") and len(data.get("datasets")) > 1:
+            raise ValueError(
+                "skip_prepare_dataset with multimodal sample_packing supports a "
+                "single `datasets:` entry; additional datasets would be silently "
+                "ignored. Combine the datasets or drop `skip_prepare_dataset`."
+            )
+        if data.get("val_set_size"):
+            raise ValueError(
+                "val_set_size is not supported with skip_prepare_dataset "
+                "multimodal sample_packing (the unprepared dataset is never "
+                "split). Use `test_datasets` instead."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def check_streaming_w_multiple_datasets(cls, data):
         if (
             data.get("streaming")
@@ -1407,21 +1717,6 @@ class ModelCompatibilityValidationMixin:
             self.base_model and "mpt" in self.base_model.lower()
         ) and self.gradient_checkpointing:
             raise ValueError("gradient_checkpointing is not supported for MPT models")
-        return self
-
-    @model_validator(mode="after")
-    def check_nemotron_h_gradient_checkpointing(self):
-        if (
-            self.base_model
-            and "nemotron-h" in self.base_model.lower()
-            and self.gradient_checkpointing
-            and not self.sample_packing
-        ):
-            raise ValueError(
-                "gradient_checkpointing for nemotron_h requires sample_packing: true. "
-                "The upstream model marks supports_gradient_checkpointing=False; "
-                "axolotl only enables it after applying the sample-packing patch."
-            )
         return self
 
     @model_validator(mode="after")
@@ -1652,10 +1947,11 @@ class ComplexValidationMixin:
                 "parallelism (compressed-KV all-gather); skipping the flash/ring-attention requirement."
             )
         elif self.context_parallel_size > 1:
-            if not self.attn_uses_flash_lib:
+            if attn_impl_base(self.attn_implementation) != "flash_attention_2":
                 raise ValueError(
-                    "context_parallel_size > 1 requires flash attention "
-                    "(attn_implementation: flash_attention_2 or flash_attention_3)."
+                    "context_parallel_size > 1 requires attn_implementation: "
+                    "flash_attention_2. Ring attention only supports the flash "
+                    "attention 2 backend."
                 )
 
             if self.sample_packing and self.micro_batch_size > 1:

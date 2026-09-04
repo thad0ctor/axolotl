@@ -9,7 +9,6 @@ from functools import partial
 from tempfile import NamedTemporaryFile
 from typing import List, Optional
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import torch
@@ -23,6 +22,7 @@ from axolotl.utils.distributed import init_distributed_state, reduce_and_broadca
 from axolotl.utils.environment import check_cuda_p2p_ib_support
 from axolotl.utils.logging import get_logger
 from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
+from axolotl.utils.samplers.balanced import default_sample_packing_strategy
 
 LOG = get_logger(__name__)
 
@@ -109,7 +109,8 @@ def add_position_ids(sample):
         # Position IDs for a single example
         # As a list
         sample["position_ids"] = list(range(seq_len))
-        sample["length"] = seq_len
+        if "length" not in sample:
+            sample["length"] = seq_len
 
     else:
         # ---- BATCHED EXAMPLES ----
@@ -123,7 +124,8 @@ def add_position_ids(sample):
 
         # Now store them back
         sample["position_ids"] = position_ids_batch
-        sample["length"] = lengths_batch
+        if "length" not in sample:
+            sample["length"] = lengths_batch
 
     return sample
 
@@ -214,6 +216,7 @@ def filter_sequences_by_length(
     min_sequence_len = min_sequence_len or 2
 
     input_ids = sample["input_ids"]
+    explicit_lengths = sample.get("length")
 
     # Edge case: if input_ids is empty
     if not input_ids:
@@ -223,7 +226,9 @@ def filter_sequences_by_length(
     # Check if single example or batched by looking at the first element
     if isinstance(input_ids[0], int):
         # Single example (input_ids is a list of int)
-        length = len(input_ids)
+        length = (
+            int(explicit_lengths) if explicit_lengths is not None else len(input_ids)
+        )
         if raise_on_drop and length > sequence_len:
             raise ValueError(
                 f"Sequence encountered with {length} tokens, which exceeds the maximum {sequence_len}."
@@ -232,8 +237,10 @@ def filter_sequences_by_length(
 
     # Batched (input_ids is a list of lists)
     results = []
-    for seq in input_ids:
-        length = len(seq)
+    for idx, seq in enumerate(input_ids):
+        length = (
+            int(explicit_lengths[idx]) if explicit_lengths is not None else len(seq)
+        )
         if raise_on_drop and length > sequence_len:
             raise ValueError(
                 f"Sequence encountered with {length} tokens, which exceeds the maximum {sequence_len}."
@@ -271,12 +278,19 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         # If it's a list, we assume we're dealing with a batch
         if isinstance(labels[0], int):
             # Single example: return a single bool
-            return np.any(labels != -100)
+            return any(v != -100 for v in labels)
 
-        # Batched: 'labels' is a list of lists
-        # Return a list of booleans, one per sub-list
-        results = [np.any(row_labels != -100) for row_labels in labels]
+        results = [any(v != -100 for v in row_labels) for row_labels in labels]
         return results
+
+    def raise_if_empty(dataset):
+        if len(dataset) == 0:
+            raise ValueError(
+                "The dataset has no samples left after dropping samples with no "
+                "trainable tokens. Every sample had all of its labels masked to "
+                "-100, so there is nothing to train on. Check `train_on_inputs`, "
+                "`roles_to_train`, and your prompt strategy / chat template."
+            )
 
     try:
         prior_len = len(train_dataset)
@@ -300,9 +314,8 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
     if prior_len:
         dropped = prior_len - len(train_dataset)
         if dropped:
-            LOG.warning(
-                f"Dropped {dropped} samples with no trainable tokens from train dataset"
-            )
+            LOG.warning(f"Dropped {dropped} samples with no trainable tokens")
+        raise_if_empty(train_dataset)
 
     if eval_dataset:
         try:
@@ -321,6 +334,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                 LOG.warning(
                     f"Dropped {dropped} samples with no trainable tokens from eval dataset"
                 )
+            raise_if_empty(eval_dataset)
 
     if cfg.group_by_length:
         train_dataset = train_dataset.map(
@@ -485,6 +499,12 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 drop_last=True,
                 num_processes=cfg.dataset_num_proc,
                 mp_start_method=cfg.sample_packing_mp_start_method or "fork",
+                packing_strategy=default_sample_packing_strategy(
+                    bool(
+                        getattr(cfg, "is_multimodal", False)
+                        or getattr(cfg, "processor_type", None)
+                    )
+                ),
             )
 
             data_loader = DataLoader(
@@ -656,6 +676,9 @@ def setup_parallelism_envs(cfg):
 
 
 def prepare_optim_env(cfg):
+    if cfg.ddp_timeout:
+        os.environ.setdefault("AXOLOTL_NCCL_TIMEOUT", str(cfg.ddp_timeout))
+
     if not check_cuda_p2p_ib_support():
         if os.getenv("NCCL_P2P_DISABLE") is None:
             LOG.warning("P2P support not detected, setting `NCCL_P2P_DISABLE=1`")
