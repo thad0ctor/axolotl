@@ -590,6 +590,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     train_on_eos=train_on_eos,
                     role_boundaries_override=role_boundaries_override,
                     field_messages=field_messages or None,
+                    model_type=self.cfg.model_config_type,
                 )
             elif self.cfg.batch_flattening:
                 collator = DataCollatorWithFlattening
@@ -600,6 +601,27 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 collator = DataCollatorForSeq2Seq
 
         kwargs["return_tensors"] = "pt"
+
+        is_packed_mode = (
+            training_args.eval_sample_packing
+            if is_eval
+            else training_args.sample_packing
+        )
+        if (
+            collator
+            in (
+                V2BatchSamplerDataCollatorForSeq2Seq,
+                BatchSamplerDataCollatorForSeq2Seq,
+            )
+            and self.cfg.attn_implementation == "flash_attention_2"
+            and is_packed_mode
+            and self.cfg.torch_compile
+            and self.cfg.model_config_type in SUPPORTED_MULTIPACK_MODEL_TYPES
+        ):
+            # Model-agnostic: transformers consumes these FlashAttentionKwargs for any model, skipping its
+            # per-layer varlen derivation — a data-dependent op (aten.nonzero) that graph-breaks under compile.
+            # Gated on torch_compile so non-compiled runs keep the existing per-layer derivation behavior.
+            kwargs["emit_fa_varlen_kwargs"] = True
 
         return collator(
             *collator_args,
