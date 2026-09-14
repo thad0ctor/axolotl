@@ -80,7 +80,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="../../site_libs/quarto-html/quarto-syntax-highlighting-dark-b85bc7c33db8c58e0ec93c3465666fed.css" rel="stylesheet" id="quarto-text-highlighting-styles">
 <script src="../../site_libs/bootstrap/bootstrap.min.js"></script>
 <link href="../../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
-<link href="../../site_libs/bootstrap/bootstrap-14e28d6e25143e046c6083be1c4a5d0f.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
+<link href="../../site_libs/bootstrap/bootstrap-78a647deb80769e567571e157382893c.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
 <script id="quarto-search-options" type="application/json">{
   "location": "navbar",
   "copy-button": false,
@@ -213,6 +213,24 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
           </a> 
       </div>
       <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth2 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../../docs/models/ling3.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Ling 3.0</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../../docs/models/muse-glimmer.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Muse Glimmer</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../../docs/models/cohere-north-micro-vision-instruct.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">North Micro Vision Instruct</span></a>
+  </div>
+</li>
           <li class="sidebar-item">
   <div class="sidebar-item-container"> 
   <a href="../../docs/models/shieldstral.html" class="sidebar-item-text sidebar-link">
@@ -377,6 +395,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../../docs/models/llama-2.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Llama 2</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../../docs/models/qwen3.8-flash-next.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Qwen 3.8 Flash Next</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -593,6 +617,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../../docs/ray-integration.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Ray Train</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../../docs/skypilot.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SkyPilot</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -868,7 +898,6 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <li><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.get_cu_seqlens" id="toc-axolotl.monkeypatch.models.qwen3_next.modeling.get_cu_seqlens" class="nav-link" data-scroll-target="#axolotl.monkeypatch.models.qwen3_next.modeling.get_cu_seqlens">get_cu_seqlens</a></li>
   <li><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_decoder_layer" id="toc-axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_decoder_layer" class="nav-link" data-scroll-target="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_decoder_layer">patch_qwen3_next_decoder_layer</a></li>
   <li><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_gateddelta_layer" id="toc-axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_gateddelta_layer" class="nav-link" data-scroll-target="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_gateddelta_layer">patch_qwen3_next_gateddelta_layer</a></li>
-  <li><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports" id="toc-axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports" class="nav-link" data-scroll-target="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports">patch_qwen3_next_imports</a></li>
   <li><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing" id="toc-axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing" class="nav-link" data-scroll-target="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing">patch_qwen3_next_modeling_packing</a></li>
   </ul></li>
   </ul></li>
@@ -908,10 +937,6 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <td>Patch Qwen3NextGatedDeltaNet to parse cu_seqlens and pass to chunk_gated_delta_rule</td>
 </tr>
 <tr class="even">
-<td><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports">patch_qwen3_next_imports</a></td>
-<td>Patch Qwen3Next imports to use try/except instead of is_flash_linear_attention_available.</td>
-</tr>
-<tr class="odd">
 <td><a href="#axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing">patch_qwen3_next_modeling_packing</a></td>
 <td>Apply all Qwen3Next model patches.</td>
 </tr>
@@ -921,7 +946,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <h3 class="anchored" data-anchor-id="axolotl.monkeypatch.models.qwen3_next.modeling.get_cu_seqlens">get_cu_seqlens</h3>
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>monkeypatch.models.qwen3_next.modeling.get_cu_seqlens(position_ids)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Adapted from transformers.modeling_flash_attention_utils.prepare_fa_kwargs_from_position_ids.</p>
-<p>https://github.com/huggingface/transformers/blob/0f1b128d3359a26bd18be99c26d7f04fb3cba914/src/transformers/modeling_flash_attention_utils.py#L316</p>
+<p>https://github.com/huggingface/transformers/blame/c676202114bb929ba4377f90fc92c5a8fec72da6/src/transformers/modeling_flash_attention_utils.py#L458-L495</p>
 </section>
 <section id="axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_decoder_layer" class="level3">
 <h3 class="anchored" data-anchor-id="axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_decoder_layer">patch_qwen3_next_decoder_layer</h3>
@@ -933,14 +958,9 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_gateddelta_layer()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Patch Qwen3NextGatedDeltaNet to parse cu_seqlens and pass to chunk_gated_delta_rule</p>
 </section>
-<section id="axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports" class="level3">
-<h3 class="anchored" data-anchor-id="axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports">patch_qwen3_next_imports</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_imports()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Patch Qwen3Next imports to use try/except instead of is_flash_linear_attention_available.</p>
-</section>
 <section id="axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing" class="level3">
 <h3 class="anchored" data-anchor-id="axolotl.monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing">patch_qwen3_next_modeling_packing</h3>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>monkeypatch.models.qwen3_next.modeling.patch_qwen3_next_modeling_packing()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Apply all Qwen3Next model patches.</p>
 
 

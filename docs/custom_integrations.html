@@ -80,7 +80,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 <link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-b85bc7c33db8c58e0ec93c3465666fed.css" rel="stylesheet" id="quarto-text-highlighting-styles">
 <script src="../site_libs/bootstrap/bootstrap.min.js"></script>
 <link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
-<link href="../site_libs/bootstrap/bootstrap-14e28d6e25143e046c6083be1c4a5d0f.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-78a647deb80769e567571e157382893c.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
 <script id="quarto-search-options" type="application/json">{
   "location": "navbar",
   "copy-button": false,
@@ -213,6 +213,24 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
           </a> 
       </div>
       <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth2 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/ling3.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Ling 3.0</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/muse-glimmer.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Muse Glimmer</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/cohere-north-micro-vision-instruct.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">North Micro Vision Instruct</span></a>
+  </div>
+</li>
           <li class="sidebar-item">
   <div class="sidebar-item-container"> 
   <a href="../docs/models/shieldstral.html" class="sidebar-item-text sidebar-link">
@@ -377,6 +395,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/models/llama-2.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Llama 2</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/qwen3.8-flash-next.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Qwen 3.8 Flash Next</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -593,6 +617,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/ray-integration.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Ray Train</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/skypilot.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SkyPilot</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -910,7 +940,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <li><a href="#scattermoe-nvfp4-w4a16-lora" id="toc-scattermoe-nvfp4-w4a16-lora" class="nav-link" data-scroll-target="#scattermoe-nvfp4-w4a16-lora">ScatterMoE NVFP4 (W4A16) LoRA</a></li>
   <li><a href="#sonicmoe-nvfp4-w4a4-lora" id="toc-sonicmoe-nvfp4-w4a4-lora" class="nav-link" data-scroll-target="#sonicmoe-nvfp4-w4a4-lora">SonicMoE NVFP4 (W4A4) LoRA</a></li>
   <li><a href="#model-support" id="toc-model-support" class="nav-link" data-scroll-target="#model-support">Model Support</a></li>
-  <li><a href="#blackwell-sm_120-note" id="toc-blackwell-sm_120-note" class="nav-link" data-scroll-target="#blackwell-sm_120-note">Blackwell (sm_120) note</a></li>
+  <li><a href="#epilogue-check-why-gpt_oss-is-no-on-sonicmoe" id="toc-epilogue-check-why-gpt_oss-is-no-on-sonicmoe" class="nav-link" data-scroll-target="#epilogue-check-why-gpt_oss-is-no-on-sonicmoe">Epilogue check (why <code>gpt_oss</code> is No on SonicMoE)</a></li>
   <li><a href="#feature-comparison" id="toc-feature-comparison" class="nav-link" data-scroll-target="#feature-comparison">Feature comparison</a></li>
   <li><a href="#note-on-megablocks" id="toc-note-on-megablocks" class="nav-link" data-scroll-target="#note-on-megablocks">Note on MegaBlocks</a></li>
   </ul></li>
@@ -1108,7 +1138,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <ul>
 <li>If you are installing from pip</li>
 </ul>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip3</span> uninstall <span class="at">-y</span> cut-cross-entropy <span class="kw">&amp;&amp;</span> <span class="ex">pip3</span> install <span class="st">"cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@5f0c7a7"</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip3</span> uninstall <span class="at">-y</span> cut-cross-entropy <span class="kw">&amp;&amp;</span> <span class="ex">pip3</span> install <span class="st">"cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@4dfa522"</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </section>
 <section id="usage" class="level3">
 <h3 class="anchored" data-anchor-id="usage">Usage</h3>
@@ -1124,6 +1154,9 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <li>cohere</li>
 <li>cohere2</li>
 <li>cohere2_moe</li>
+<li>cohere2_vision</li>
+<li>cohere_compass</li>
+<li>cohere_compass_text</li>
 <li>deepseek_v2</li>
 <li>deepseek_v3</li>
 <li>deepseek_v4</li>
@@ -1174,6 +1207,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <li>mistral4</li>
 <li>mixtral</li>
 <li>mllama</li>
+<li>muse_glimmer</li>
 <li>nemotron_h</li>
 <li>olmo</li>
 <li>olmo2</li>
@@ -1195,6 +1229,8 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <li>qwen3_next</li>
 <li>qwen3_vl</li>
 <li>qwen3_vl_moe</li>
+<li>qwen4_exp</li>
+<li>qwen4_exp_text</li>
 <li>seed_oss</li>
 <li>smollm3</li>
 <li>step3p5</li>
@@ -1247,8 +1283,8 @@ bidirectional context.</p>
 <section id="quickstart" class="level3">
 <h3 class="anchored" data-anchor-id="quickstart">Quickstart</h3>
 <p>Train with an example config (Llama‑3.2 1B):
-- Pretrain: <code>axolotl train examples/llama-3/diffusion-3.2-1b-pretrain.yaml</code>
-- SFT: <code>axolotl train examples/llama-3/diffusion-3.2-1b-sft.yaml</code></p>
+- Pretrain: <code>axolotl train examples/llama-3/diffusion/pretrain-1b.yaml</code>
+- SFT: <code>axolotl train examples/llama-3/diffusion/sft-1b.yaml</code></p>
 </section>
 <section id="basic-configuration" class="level3">
 <h3 class="anchored" data-anchor-id="basic-configuration">Basic Configuration</h3>
@@ -1810,18 +1846,19 @@ on the <code>cp</code> axis (e.g.&nbsp;GLM-5.2 DSA via the kernels plugin); stoc
 <tr class="even">
 <td><code>gpt_oss</code></td>
 <td style="text-align: center;">Yes</td>
-<td style="text-align: center;">Yes</td>
+<td style="text-align: center;">No</td>
 <td style="text-align: center;">-</td>
 <td style="text-align: center;">-</td>
 </tr>
 </tbody>
 </table>
 <p>NVFP4 for <code>deepseek_v4</code> is supported via ScatterMoE with <code>use_dsv4_kernels</code> (its own fused-kernel path), so it is not a row above.</p>
-<p><code>gpt_oss</code> carries the decorator with <code>is_concatenated=False, is_transposed=True, has_bias=True</code> and uses a sigmoid-GLU activation with clamping. Both forwards read these flags off <code>self</code> and dispatch accordingly: the ScatterMoE forward handles the transposed/interleaved/biased layout and clamped sigmoid-GLU via its Triton path (no weight transpose, interleaved gate/up, per-expert bias folded into the grouped GEMM); the SonicMoE forward uses the upstream CUTLASS kernel.</p>
+<p><code>gpt_oss</code> carries the decorator with <code>is_concatenated=False, is_transposed=True, has_bias=True</code> and uses a clamped sigmoid-GLU activation. The ScatterMoE forward handles the transposed/interleaved/biased layout and that epilogue via its Triton path (no weight transpose, interleaved gate/up, per-expert bias folded into the grouped GEMM).</p>
 </section>
-<section id="blackwell-sm_120-note" class="level3">
-<h3 class="anchored" data-anchor-id="blackwell-sm_120-note">Blackwell (sm_120) note</h3>
-<p><code>use_sonicmoe</code> runs on consumer Blackwell (sm_120) when the loaded <code>sonic-moe</code> kernel bundles quack 0.6.1 (on nvidia-cutlass-dsl 4.6.0). The upstream <code>kernels-community/sonic-moe</code> prebuilt may still bundle quack 0.3.11 (no sm_120 GEMM) until the rebuild lands; point at a quack 0.6.1 build or use <code>use_scattermoe</code>. NVFP4 experts on sm_120 take the dequant path (no native W4A4: <code>fp4_cute</code> is SM100/SM110-only).</p>
+<section id="epilogue-check-why-gpt_oss-is-no-on-sonicmoe" class="level3">
+<h3 class="anchored" data-anchor-id="epilogue-check-why-gpt_oss-is-no-on-sonicmoe">Epilogue check (why <code>gpt_oss</code> is No on SonicMoE)</h3>
+<p>SonicMoE picks its fused epilogue from <code>config.hidden_act</code>, which cannot express a clamped or otherwise non-plain GLU. <code>GptOssConfig.hidden_act</code> is <code>"silu"</code>, so <code>gpt_oss</code> silently ran plain SwiGLU (10.4% top-1 agreement, teacher-forced NLL 2.30 -&gt; 8.12 on <code>openai/gpt-oss-20b</code>).</p>
+<p>Axolotl now probes each model’s declared <code>_apply_gate</code> numerically at load and raises if the chosen path cannot reproduce it, pointing at <code>expert_backend: scattermoe</code>.</p>
 </section>
 <section id="feature-comparison" class="level3">
 <h3 class="anchored" data-anchor-id="feature-comparison">Feature comparison</h3>
@@ -1957,7 +1994,7 @@ on the <code>cp</code> axis (e.g.&nbsp;GLM-5.2 DSA via the kernels plugin); stoc
 </section>
 <section id="example-config" class="level3">
 <h3 class="anchored" data-anchor-id="example-config">Example Config</h3>
-<p>See <a href="examples/llama-3/sparse-finetuning.yaml"><code>examples/llama-3/sparse-finetuning.yaml</code></a> for a complete example.</p>
+<p>See <a href="https://github.com/axolotl-ai-cloud/axolotl/blob/main/examples/llama-3/sparse-finetuning.yaml"><code>examples/llama-3/sparse-finetuning.yaml</code></a> for a complete example.</p>
 <hr>
 </section>
 <section id="inference-with-vllm" class="level3">
@@ -2076,28 +2113,20 @@ sparse model before inference for even greater performance benefits.:</p>
 <span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a><span class="fu">liger_layer_norm</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
 <span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="fu">liger_fused_linear_cross_entropy</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
 <span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a><span class="fu">liger_use_token_scaling</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a><span class="fu">liger_use_token_scaling</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a><span class="fu">liger_kernel_impl</span><span class="kw">:</span><span class="at"> cutedsl</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </section>
 <section id="supported-models-2" class="level3">
 <h3 class="anchored" data-anchor-id="supported-models-2">Supported Models</h3>
+<p>Any model type in liger-kernel’s native dispatch table (<code>liger_kernel.transformers.monkey_patch.MODEL_TYPE_TO_APPLY_LIGER_FN</code>) is supported out of the box — llama, mistral, mixtral, qwen2/qwen3 families, gemma through gemma4, deepseek_v4, glm4, phi3, olmo2, paligemma, and many more (50+ types as of liger 0.8.1).</p>
+<p>On top of the native table, axolotl hand-patches these types (not covered upstream, or extended with kernels the native path lacks):</p>
 <ul>
 <li>deepseek_v2</li>
-<li>gemma</li>
-<li>gemma2</li>
-<li>gemma3</li>
-<li>granite</li>
+<li>gemma4_unified / gemma4_unified_text</li>
+<li>granitemoe</li>
 <li>jamba</li>
-<li>llama</li>
-<li>mistral</li>
-<li>mixtral</li>
-<li>mllama</li>
-<li>mllama_text_model</li>
-<li>olmo2</li>
-<li>paligemma</li>
-<li>phi3</li>
-<li>qwen2</li>
-<li>qwen2_5_vl</li>
-<li>qwen2_vl</li>
+<li>qwen3_5 / qwen3_5_moe (adds the fused gated-RMSNorm kernel for linear-attention layers)</li>
 </ul>
 </section>
 <section id="citation-3" class="level3">

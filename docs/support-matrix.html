@@ -46,7 +46,7 @@ ul.task-list li input[type="checkbox"] {
 <link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-b85bc7c33db8c58e0ec93c3465666fed.css" rel="stylesheet" id="quarto-text-highlighting-styles">
 <script src="../site_libs/bootstrap/bootstrap.min.js"></script>
 <link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
-<link href="../site_libs/bootstrap/bootstrap-14e28d6e25143e046c6083be1c4a5d0f.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-78a647deb80769e567571e157382893c.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="dark">
 <script id="quarto-search-options" type="application/json">{
   "location": "navbar",
   "copy-button": false,
@@ -179,6 +179,24 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
           </a> 
       </div>
       <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth2 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/ling3.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Ling 3.0</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/muse-glimmer.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Muse Glimmer</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/cohere-north-micro-vision-instruct.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">North Micro Vision Instruct</span></a>
+  </div>
+</li>
           <li class="sidebar-item">
   <div class="sidebar-item-container"> 
   <a href="../docs/models/shieldstral.html" class="sidebar-item-text sidebar-link">
@@ -343,6 +361,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/models/llama-2.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Llama 2</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/models/qwen3.8-flash-next.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Qwen 3.8 Flash Next</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -559,6 +583,12 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
   <div class="sidebar-item-container"> 
   <a href="../docs/ray-integration.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">Ray Train</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../docs/skypilot.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SkyPilot</span></a>
   </div>
 </li>
           <li class="sidebar-item">
@@ -1164,7 +1194,7 @@ gtag('config', 'G-9KYCVJBNMQ', { 'anonymize_ip': true});
 <tr class="even">
 <td><strong>Train-time (compute)</strong></td>
 <td>faster/leaner training, high-precision master weights kept</td>
-<td><code>fp8: true</code> (torchao float8, <code>fp8_enable_fsdp_float8_all_gather</code>), <code>qat:</code> (fake-quant during training)</td>
+<td><code>fp8: true</code> (torchao float8, <code>fp8_config.recipe</code>, <code>fp8_enable_fsdp_float8_all_gather</code>), <code>qat:</code> (fake-quant during training)</td>
 <td>full fine-tune ✅</td>
 </tr>
 <tr class="odd">
@@ -1270,7 +1300,7 @@ Note
 <tbody>
 <tr class="odd">
 <td>Liger</td>
-<td>plugin <code>liger</code> + <code>liger_rope</code>, <code>liger_rms_norm(_gated)</code>, <code>liger_swiglu</code>/<code>liger_glu_activation</code>, <code>liger_cross_entropy</code>, <code>liger_fused_linear_cross_entropy</code></td>
+<td>plugin <code>liger</code> + <code>liger_rope</code>, <code>liger_rms_norm(_gated)</code>, <code>liger_swiglu</code>/<code>liger_glu_activation</code>, <code>liger_cross_entropy</code>, <code>liger_fused_linear_cross_entropy</code>; opt-in backend via <code>liger_kernel_impl: cutile\|cutedsl</code> (fused-linear-CE stays Triton)</td>
 <td>RoPE, RMSNorm, SwiGLU, CE, fused-linear-CE</td>
 </tr>
 <tr class="even">
@@ -1576,7 +1606,7 @@ Warning
 </section>
 <section id="optimizers-schedulers" class="level2">
 <h2 class="anchored" data-anchor-id="optimizers-schedulers">Optimizers &amp; schedulers</h2>
-<p><strong>Optimizers:</strong> all HuggingFace / <code>bitsandbytes</code> optimizers, plus AdamW (torch-fused, optimi), TorchAO 4-bit/8-bit/FP8 AdamW, ADOPT, CAME, Muon, Dion, SinkGD, Flash AdamW/Adam/SGD/SGDW/Lion, Q-GaLore. (Muon / Flash / Q-GaLore require FSDP2, not DeepSpeed.)</p>
+<p><strong>Optimizers:</strong> all HuggingFace / <code>bitsandbytes</code> optimizers, plus AdamW (torch-fused, optimi), TorchAO 4-bit/8-bit/FP8 AdamW, ADOPT, CAME, Muon, Dion, SinkGD, Flash AdamW/Adam/SGD/SGDW/Lion, Q-GaLore, PoLoRA. (Muon / Flash / Q-GaLore / PoLoRA require FSDP2, not DeepSpeed; PoLoRA is additionally LoRA-only.)</p>
 <p><strong>Schedulers:</strong> cosine (+min-lr, +constant-ratio, +quadratic warmup), REX, one-cycle, linear warmup, jagged-restart (ReLoRA).</p>
 <p><strong>Also:</strong> gradient checkpointing (+CPU/disk offload), gradient accumulation, NEFTune, LR groups / embedding LR, loss watchdog, early stopping, <code>torch_compile</code>.</p>
 </section>
@@ -1744,6 +1774,10 @@ Warning
 <td>FSDP2 (not DeepSpeed)</td>
 </tr>
 <tr class="even">
+<td>PoLoRA optimizer</td>
+<td>LoRA/QLoRA + single-GPU, DDP, or FSDP2 (not DeepSpeed/TP)</td>
+</tr>
+<tr class="odd">
 <td>EBFT (<code>rl: ebft</code>)</td>
 <td><code>ebft:</code> config block</td>
 </tr>
