@@ -446,6 +446,18 @@ class TrainerBuilderBase(abc.ABC):
                 optimizer_cls = FlashLion
                 if "betas" in adam_kwargs:
                     optimizer_kwargs["betas"] = adam_kwargs["betas"]
+            elif self.cfg.optimizer == "gefenx":
+                from gefen import Gefen
+
+                optimizer_cls = Gefen
+                optimizer_kwargs.update(adam_kwargs)
+            elif self.cfg.optimizer == "gefenx_muon":
+                from axolotl.utils.optimizers.gefenx import (
+                    GefenXMuonHybridOptimizerFactory,
+                )
+
+                optimizer_cls = GefenXMuonHybridOptimizerFactory
+                optimizer_kwargs.update(adam_kwargs)
             else:
                 raise ValueError(
                     f"Unhandled optimizer: {self.cfg.optimizer}. Please raise an Issue."
@@ -460,6 +472,15 @@ class TrainerBuilderBase(abc.ABC):
                     for mapping in self.cfg.optim_args.replace(" ", "").split(","):
                         key, value = mapping.split("=")
                         optimizer_kwargs[key] = value
+
+            if self.cfg.optimizer == "gefenx":
+                # Restore native types on string-form optim_args (the gefenx_muon
+                # factory does this itself).
+                from axolotl.utils.optimizers.gefenx import coerce_optim_arg
+
+                optimizer_kwargs = {
+                    k: coerce_optim_arg(v) for k, v in optimizer_kwargs.items()
+                }
 
             # Note: This is not used in training_args_kwargs, but in trainer_kwargs
             trainer_kwargs["optimizer_cls_and_kwargs"] = (
@@ -690,9 +711,9 @@ class TrainerBuilderBase(abc.ABC):
         if self.cfg.reward_model or self.cfg.rl:
             training_args_kwargs["max_length"] = self.cfg.sequence_len
 
-        if self.cfg.fsdp_config or self.cfg.fsdp:
+        if self.cfg.fsdp_config:
             training_args_kwargs["fsdp_config"] = self.cfg.fsdp_config
-            training_args_kwargs["fsdp"] = self.cfg.fsdp if self.cfg.fsdp else True
+            training_args_kwargs["fsdp"] = True
 
         self._configure_reporting(training_args_kwargs)
         self._configure_hub_parameters(training_args_kwargs)
