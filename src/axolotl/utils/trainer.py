@@ -17,6 +17,7 @@ from datasets import IterableDataset, disable_caching, enable_caching
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from transformers.utils import is_torch_bf16_gpu_available
 
+from axolotl.utils.datasets import dataset_map_buffer_kwargs
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.distributed import init_distributed_state, reduce_and_broadcast
 from axolotl.utils.environment import check_cuda_p2p_ib_support
@@ -242,7 +243,7 @@ def filter_sequences_by_length(
 
 
 def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
-    drop_attn_mask = cfg.model_config_type in ["mamba", "gemma3"]
+    drop_attn_mask = cfg.model_config_type in ["gemma3"]
     if drop_attn_mask:
         LOG.info("dropping attention_mask column")
         train_dataset = train_dataset.remove_columns("attention_mask")
@@ -290,9 +291,11 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         # handle iterable datasets case
         prior_len = None
     filter_map_kwargs = {}
+    map_buffer_kwargs = {}
     if not isinstance(train_dataset, IterableDataset):
         filter_map_kwargs["num_proc"] = cfg.dataset_num_proc
         filter_map_kwargs["load_from_cache_file"] = not cfg.is_preprocess
+        map_buffer_kwargs = dataset_map_buffer_kwargs(cfg, batched=True)
 
     drop_long_kwargs = {}
     if filter_map_kwargs:
@@ -301,6 +304,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         drop_no_trainable_tokens,
         batched=True,
         **filter_map_kwargs,
+        **map_buffer_kwargs,
         **drop_long_kwargs,
     )
     if prior_len:
@@ -318,6 +322,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
         eval_dataset = eval_dataset.filter(
             drop_no_trainable_tokens,
             **filter_map_kwargs,
+            **map_buffer_kwargs,
             **drop_long_kwargs,
         )
         if prior_len:
@@ -334,6 +339,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             num_proc=cfg.dataset_num_proc,
             load_from_cache_file=not cfg.is_preprocess,
             desc="Group By Length",
+            **map_buffer_kwargs,
         )
 
     if cfg.use_pose:
@@ -351,6 +357,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             num_proc=cfg.dataset_num_proc,
             load_from_cache_file=not cfg.is_preprocess,
             desc="Add position_id column (PoSE)",
+            **map_buffer_kwargs,
         )
         train_dataset = train_dataset.sort("sequence_len")
         if cfg.eval_sample_packing is not False:
@@ -360,6 +367,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                     num_proc=cfg.dataset_num_proc,
                     load_from_cache_file=not cfg.is_preprocess,
                     desc="Add position_id column (PoSE)",
+                    **map_buffer_kwargs,
                 )
     elif cfg.sample_packing:
         drop_long_kwargs = {}
@@ -369,6 +377,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
             add_position_ids,
             batched=True,
             **filter_map_kwargs,
+            **map_buffer_kwargs,
             **drop_long_kwargs,
         )
         if cfg.eval_sample_packing:
@@ -376,6 +385,7 @@ def process_datasets_for_packing(cfg, train_dataset, eval_dataset):
                 eval_dataset = eval_dataset.map(
                     add_position_ids,
                     **filter_map_kwargs,
+                    **map_buffer_kwargs,
                     **drop_long_kwargs,
                 )
 
@@ -425,11 +435,8 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
         if update:
             cfg.total_num_tokens = total_num_tokens
 
-    skip_estimates = cfg.model_config_type == "mamba"
-
     if (
-        not skip_estimates
-        and not cfg.total_supervised_tokens
+        not cfg.total_supervised_tokens
         and not cfg.skip_prepare_dataset
         and not cfg.reward_model
     ):
@@ -447,7 +454,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
         if update:
             cfg.total_supervised_tokens = total_supervised_tokens
 
-    if not skip_estimates and cfg.sample_packing:
+    if cfg.sample_packing:
         # we have to drop anything longer then sequence len otherwise
         # flash attention with position ids fails
 
@@ -548,6 +555,20 @@ def setup_deepspeed_env(cfg, stage=None):
             "Distributed State already initialized before Deepspeed setup"
         )
 
+    if cfg.lora_fp32_gradients:
+        from axolotl.monkeypatch.deepspeed_utils import (
+            patch_zero_gradient_accumulation_dtype,
+        )
+        from axolotl.utils.lora_precision import configure_deepspeed_lora_precision
+
+        if isinstance(cfg.deepspeed, dict):
+            ds_config = dict(cfg.deepspeed)
+        else:
+            with open(cfg.deepspeed, encoding="utf-8") as stream:
+                ds_config = json.load(stream)
+        cfg.deepspeed = DictDefault(configure_deepspeed_lora_precision(ds_config))
+        patch_zero_gradient_accumulation_dtype()
+
     os.environ["ACCELERATE_USE_DEEPSPEED"] = "true"
     if isinstance(cfg.deepspeed, DictDefault):
         with NamedTemporaryFile(
@@ -597,19 +618,13 @@ def setup_deepspeed_env(cfg, stage=None):
 def setup_fsdp_envs(cfg):
     os.environ["ACCELERATE_USE_FSDP"] = "true"
 
-    # TODO @SalmanMohammadi remove FSDP1 args in 0.12
-    if str(cfg.fsdp_version) == "2":
-        os.environ["FSDP_VERSION"] = "2"
+    os.environ["FSDP_VERSION"] = "2"
     if cfg.fsdp_config.activation_checkpointing:
         os.environ["FSDP_ACTIVATION_CHECKPOINTING"] = "true"
     if cfg.fsdp_config.offload_params:
         os.environ["FSDP_OFFLOAD_PARAMS"] = "true"
-    if cfg.fsdp_config.sync_module_states:
-        os.environ["FSDP_SYNC_MODULE_STATES"] = "true"
     if cfg.fsdp_config.cpu_ram_efficient_loading:
         os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
-    if cfg.fsdp_config.use_orig_params:
-        os.environ["FSDP_USE_ORIG_PARAMS"] = "true"
     if cfg.fsdp_config.state_dict_type:
         os.environ["FSDP_STATE_DICT_TYPE"] = cfg.fsdp_config.state_dict_type
     if cfg.fsdp_config.cpu_offload_pin_memory is not None:
@@ -643,9 +658,6 @@ def setup_parallelism_envs(cfg):
         set_accelerate_parallelism_config = True
         os.environ["PARALLELISM_CONFIG_CP_SIZE"] = str(cfg.context_parallel_size)
         os.environ["ACCELERATE_ALLOW_CP_STANDALONE"] = "true"
-        from axolotl.monkeypatch.accelerate.parallelism_config import patch_prepare_cp
-
-        patch_prepare_cp()
     # Expert Parallel patch must apply before the first `Accelerator()`
     # call so `ep_size` lands in the mesh.
     if cfg.expert_parallel_size and cfg.expert_parallel_size > 1:
