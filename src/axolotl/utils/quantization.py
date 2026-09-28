@@ -2,8 +2,6 @@
 Utilities for quantization including QAT and PTQ using torchao.
 """
 
-import functools
-
 import torch
 from packaging import version
 from torchao.core.config import AOBaseConfig
@@ -38,6 +36,15 @@ if version.parse(torch.__version__) >= version.parse("2.8.0"):
         from torchao.prototype.mx_formats import NVFP4WeightOnlyConfig
 
         quantization_config_to_str[NVFP4WeightOnlyConfig] = "nvfp4"
+    except (ImportError, RuntimeError):
+        pass
+
+    try:
+        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
+
+        quantization_config_to_str[NVFP4DynamicActivationNVFP4WeightConfig] = (
+            "nvfp4-dynamic"
+        )
     except (ImportError, RuntimeError):
         pass
 
@@ -125,6 +132,16 @@ def get_quantization_config(
 
         if group_size is not None and group_size != 16:
             raise ValueError("NVFP4 quantization must use a group_size of 16")
+        if activation_dtype == TorchAOQuantDType.nvfp4:
+            from torchao.prototype.mx_formats import (
+                NVFP4DynamicActivationNVFP4WeightConfig,
+            )
+
+            return NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=False)
+        if activation_dtype is not None:
+            raise ValueError(
+                "NVFP4 weights support only NVFP4 or unquantized activations"
+            )
         return NVFP4WeightOnlyConfig()
 
     if weight_dtype == TorchAOQuantDType.mxfp4:
@@ -171,37 +188,27 @@ def _attach_torchao_quantizer(
     model.hf_quantizer = quantizer
 
 
-def patch_transformers_skip_quantized_init():
-    """Stop ``from_pretrained`` from re-initializing torchao-quantized weights.
+def _model_device(model) -> torch.device | None:
+    param = next(model.parameters(), None)
+    return param.device if param is not None else None
 
-    transformers re-runs ``_init_weights`` on every module during loading; the
-    generic implementation does ``init.normal_(module.weight.float(), ...)``.
-    ``.float()`` on a torchao tensor subclass (e.g. ``MXTensor``) returns a new
-    tensor that both drops the ``_is_hf_initialized`` skip flag and does not
-    implement ``normal_``, so loading an MX checkpoint raises NotImplementedError.
-    Re-initializing an already-loaded quantized weight is never correct, so we
-    skip those modules entirely.
-    """
-    from torchao.utils import TorchAOBaseTensor
-    from transformers import PreTrainedModel
 
-    if getattr(PreTrainedModel._initialize_weights, "_axolotl_torchao_patched", False):
+def _maybe_install_native_nvfp4(
+    weight_dtype: TorchAOQuantDType | None = None,
+    device: torch.device | int | None = None,
+) -> None:
+    """On Blackwell, route torchao to_nvfp4 through the byte-identical hardware-cvt fast path (no-op elsewhere)."""
+    if weight_dtype is not None and weight_dtype != TorchAOQuantDType.nvfp4:
         return
-
-    original = PreTrainedModel._initialize_weights
-
-    @functools.wraps(original)
-    def _initialize_weights(self, module, *args, **kwargs):
-        if any(
-            isinstance(param, TorchAOBaseTensor)
-            for param in module.parameters(recurse=False)
-        ):
-            module._is_hf_initialized = True
-            return None
-        return original(self, module, *args, **kwargs)
-
-    _initialize_weights._axolotl_torchao_patched = True
-    PreTrainedModel._initialize_weights = _initialize_weights
+    try:
+        from axolotl.integrations.kernels.libs.scattermoe_lora.nvfp4_native_quant import (
+            install_native_nvfp4,
+            is_blackwell_native_nvfp4_available,
+        )
+    except ImportError:  # pragma: no cover - native quant module optional
+        return
+    if is_blackwell_native_nvfp4_available(device):
+        install_native_nvfp4()
 
 
 def quantize_model(
@@ -222,6 +229,7 @@ def quantize_model(
         quantize_embedding: Whether to quantize the model's embedding weights.
 
     """
+    _maybe_install_native_nvfp4(weight_dtype, _model_device(model))
     linear_ptq_config = get_quantization_config(
         weight_dtype=weight_dtype,
         activation_dtype=activation_dtype,
@@ -256,6 +264,10 @@ def quantize_model(
         model._is_mx_quantized = True
         # MX checkpoints reload via plain from_pretrained (no HF quantizer), so guard
         # transformers' weight re-init against the MXTensor weights it will encounter.
+        from axolotl.monkeypatch.quantized_init import (
+            patch_transformers_skip_quantized_init,
+        )
+
         patch_transformers_skip_quantized_init()
     else:
         _attach_torchao_quantizer(
@@ -425,6 +437,7 @@ def convert_qat_model(
     """
     This function converts a QAT model which has fake quantized layers back to the original model.
     """
+    _maybe_install_native_nvfp4(device=_model_device(model))
     was_ternary = convert_ternary_model(model)
     config = QATConfig(step="convert")
     if not was_ternary:
