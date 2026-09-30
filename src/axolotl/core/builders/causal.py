@@ -16,7 +16,6 @@ from trl.trainer.reward_trainer import DataCollatorForPreference
 
 from axolotl.core.builders.base import TrainerBuilderBase
 from axolotl.core.trainers import (
-    AxolotlMambaTrainer,
     AxolotlPRMTrainer,
     AxolotlRewardTrainer,
     AxolotlTrainer,
@@ -40,7 +39,6 @@ from axolotl.utils.chat_templates import get_chat_template_from_config
 from axolotl.utils.collators import (
     BatchSamplerDataCollatorForSeq2Seq,
     DataCollatorForSeq2Seq,
-    MambaDataCollator,
     V2BatchSamplerDataCollatorForSeq2Seq,
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
@@ -155,8 +153,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             trainer_cls = plugin_manager.get_trainer_cls(self.cfg)
             if trainer_cls:
                 return trainer_cls
-        if self.cfg.model_config_type == "mamba":
-            return AxolotlMambaTrainer
         if self.cfg.reward_model:
             return AxolotlRewardTrainer
         if self.cfg.process_reward_model:
@@ -481,9 +477,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             ):
                 return None
 
-        if self.cfg.model_config_type == "mamba":
-            return MambaDataCollator(tokenizer=self.tokenizer)
-
         use_batch_sampler_collator = False
         if is_eval is False and training_args.sample_packing:
             use_batch_sampler_collator = True
@@ -601,6 +594,27 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 collator = DataCollatorForSeq2Seq
 
         kwargs["return_tensors"] = "pt"
+
+        is_packed_mode = (
+            training_args.eval_sample_packing
+            if is_eval
+            else training_args.sample_packing
+        )
+        if (
+            collator
+            in (
+                V2BatchSamplerDataCollatorForSeq2Seq,
+                BatchSamplerDataCollatorForSeq2Seq,
+            )
+            and self.cfg.attn_implementation == "flash_attention_2"
+            and is_packed_mode
+            and self.cfg.torch_compile
+            and self.cfg.model_config_type in SUPPORTED_MULTIPACK_MODEL_TYPES
+        ):
+            # Model-agnostic: transformers consumes these FlashAttentionKwargs for any model, skipping its
+            # per-layer varlen derivation — a data-dependent op (aten.nonzero) that graph-breaks under compile.
+            # Gated on torch_compile so non-compiled runs keep the existing per-layer derivation behavior.
+            kwargs["emit_fa_varlen_kwargs"] = True
 
         return collator(
             *collator_args,
