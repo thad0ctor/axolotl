@@ -65,6 +65,7 @@ Agent-specific references:
 - [docs/agents/pretraining.md](docs/agents/pretraining.md) — continual pretraining
 - [docs/agents/model_architectures.md](docs/agents/model_architectures.md) — model-specific quirks (Gemma4, Qwen3.5 MoE, etc.)
 - [docs/agents/new_model_support.md](docs/agents/new_model_support.md) — debugging and adding support for new model architectures
+- [docs/agents/sparselora.md](docs/agents/sparselora.md) — SparseLoRA contextual-sparsity LoRA acceleration (self-calibrating; model-agnostic: Llama/Qwen/Mistral/Gemma/Phi3/...)
 
 ## Config Pattern
 
@@ -121,6 +122,14 @@ Setup, CI matrix, GPU e2e, skip-CI keywords: [.github/CONTRIBUTING.md](.github/C
 - Schemas: all config validation via Pydantic in `utils/schemas/`
 - HF Hub kernels live at `huggingface.co/kernels/<org>/<name>` (API `/api/kernels/...`); the bare `huggingface.co/<org>/<name>` path is a different namespace that silently serves a stale mirror
 - Flash attention does not need the `flash_attn` package. `attn_implementation: flash_attention_2` (or `flash_attention: true`) resolves through transformers to the `kernels-community/flash-attn2` hub kernel when the package is absent; the config validator and `tests/e2e/utils.py::flash_attn_available` both accept that. `import flash_attn` failing does not mean flash attention is unavailable.
+
+## Agent Skills
+
+Repo-specific workflow guides (plus scripts) under `.agents/skills/`, auto-discovered by Claude Code (via the `.claude/skills` → `.agents/skills` symlink) and read natively by Codex/Gemini. See [`.agents/skills/README.md`](.agents/skills/README.md); layout is enforced by `tests/test_agent_skill_layout.py`.
+
+| Skill | What it does |
+|-------|--------------|
+| [`sparselora-add-model`](.agents/skills/sparselora-add-model/SKILL.md) | Adds or verifies a model architecture's SparseLoRA sparse wiring (`src/axolotl/integrations/sparselora/arch_wiring.py`); introspects MLP/attention classes, runs a smoke apply+forward, and guides custom wiring for non-standard attention. |
 
 ## Comment Style
 

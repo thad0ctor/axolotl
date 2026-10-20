@@ -15,6 +15,7 @@ dependencies = [
     "torch>=2.13.0,<2.15.0",
     "packaging==26.0",
     "huggingface_hub>=1.31.0",
+    "safetensors",
     "peft==0.21.2",
     "tokenizers==0.23.3",
     "transformers==5.20.1",
@@ -207,7 +208,11 @@ version = { file = "VERSION" }
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-extend-exclude = ["src/axolotl/core/trainers/prm"]
+# Vendored third-party code is kept verbatim; do not lint/reformat it.
+extend-exclude = [
+    "src/axolotl/core/trainers/prm",
+    "src/axolotl/integrations/sparselora/_vendor",
+]
 force-exclude = true
 
 [tool.ruff.lint]

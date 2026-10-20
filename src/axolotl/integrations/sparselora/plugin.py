@@ -1,0 +1,552 @@
+"""SparseLoRA contextual-sparsity plugin for Axolotl.
+
+Composes on top of a standard full-precision LoRA adapter: after the trainer is
+built (model + adapter ready, before the training loop and any DDP wrapping), it
+calibrates a per-layer sparsity schedule on a slice of the *same* dataset,
+computes the SVD predictor factors from the base weights, and applies the
+vendored SparseLoRA machinery.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from torch import nn
+
+from axolotl.integrations.base import BasePlugin
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.logging import get_logger
+
+from .cache import compute_cache_key, entry_dir, load_cached, maybe_share, save_cached
+from .calibration import calibrate, discover_target_modules, method_name
+from .factors import compute_factor_tensors
+
+LOG = get_logger(__name__)
+
+_SUPPORTED_ADAPTERS = {"lora", "qlora"}
+_COMPILE_BOUNDARIES_SET = False
+# The packing mode the mask-builder boundary is installed for (``None`` = not
+# yet installed). Tracked separately from ``_COMPILE_BOUNDARIES_SET`` because the
+# mask builder / token split-join is packing-dependent and must reinstall on a
+# mode flip, whereas the vendored forward/predictor disable-wrapping is one-time.
+_MASK_BOUNDARY_PACKING: bool | None = None
+
+
+def _is_deepspeed_zero3(deepspeed: Any) -> bool:
+    """True if the DeepSpeed config selects ZeRO stage 3.
+
+    ``cfg.deepspeed`` may be a path string to a JSON config, an already-parsed
+    dict, or a JSON string. Inspect the parsed ``zero_optimization.stage`` when
+    possible and fall back to a substring match on the path/string form.
+    """
+    if not deepspeed:
+        return False
+
+    config = deepspeed
+    if isinstance(deepspeed, str):
+        import json
+        import os
+
+        if os.path.isfile(deepspeed):
+            try:
+                with open(deepspeed, encoding="utf-8") as f:
+                    config = json.load(f)
+            except (OSError, ValueError):
+                return "zero3" in deepspeed
+        else:
+            try:
+                config = json.loads(deepspeed)
+            except ValueError:
+                return "zero3" in deepspeed
+
+    if isinstance(config, dict):
+        zero = config.get("zero_optimization", {})
+        if not isinstance(zero, dict):
+            # Legacy boolean form maps to stage 1 (or 0), never 3.
+            return False
+        return int(zero.get("stage", 0)) == 3
+
+    return "zero3" in str(deepspeed)
+
+
+def resolve_layer_sparsity(
+    layer_sparsity: dict[str, float], target_names: list[str]
+) -> dict[str, float]:
+    """Map explicit ``layer_sparsity`` keys onto discovered module names.
+
+    Keys may be a full module path or a suffix of one (e.g. ``model.layers.3.mlp``).
+    A key matching no module is an error rather than a silent drop to dense.
+    """
+    schedule: dict[str, float] = {}
+    for raw_key, val in dict(layer_sparsity).items():
+        matches = [n for n in target_names if n == raw_key or n.endswith("." + raw_key)]
+        if not matches:
+            raise ValueError(
+                f"sparselora.layer_sparsity key {raw_key!r} matches no sparsifiable "
+                "module. Use a full module path or a suffix of one "
+                "(e.g. 'model.layers.3.mlp')."
+            )
+        for n in matches:
+            schedule[n] = float(val)
+    return schedule
+
+
+def _install_token_boundary(packing: bool) -> None:
+    """Install the packing-dependent mask builder and wrap it as a disable region.
+
+    Split out from :func:`_apply_compile_boundaries` because the mask builder and
+    token split/join are packing-dependent: a run that switches ``sample_packing``
+    within the same interpreter must reinstall the correct hooks, or a packed run
+    would silently reuse the unpacked contiguous single-block path (wrong packed
+    semantics, not merely a missed optimization). ``install_fast_tokens`` is keyed
+    by ``packing`` so it reinstalls on a flip; this wrapper re-applies the
+    ``torch.compiler.disable`` boundary to the freshly-installed mask builder.
+    """
+    global _MASK_BOUNDARY_PACKING
+    if _MASK_BOUNDARY_PACKING == packing:
+        return
+
+    import torch
+
+    from ._vendor.sparselora import api
+    from .fast_tokens import install_fast_tokens
+
+    # Install the mask builder (and, unpacked, the contiguous-block token
+    # split/join) before wrapping it, so the torch.compiler.disable below wraps
+    # the installed version. Packing needs the multi-segment boolean mask.
+    install_fast_tokens(packing=packing)
+    api._compute_output_token_mask = torch.compiler.disable(
+        api._compute_output_token_mask
+    )
+    _MASK_BOUNDARY_PACKING = packing
+
+
+def _apply_compile_boundaries(packing: bool = False) -> None:
+    """Mark SparseLoRA's data-dependent code as ``torch.compiler.disable`` regions.
+
+    Contextual sparsity (top-k channel selection, boolean-mask token splits,
+    quantized dequant) cannot be captured in a static graph — under ``torch
+    .compile`` it raises a backend failure. Disabling Dynamo on these entry
+    points makes the compiler graph-break around them (running them eagerly,
+    which is already fast) and compile the rest of the model. No-op at eager
+    runtime.
+
+    The packing-dependent mask-builder boundary is (re)installed every call via
+    :func:`_install_token_boundary`; the packing-independent forward/predictor
+    disable-wrapping below is applied once.
+    """
+    _install_token_boundary(packing)
+
+    global _COMPILE_BOUNDARIES_SET
+    if _COMPILE_BOUNDARIES_SET:
+        return
+
+    import torch
+
+    from . import arch_wiring
+    from ._vendor.sparselora.modules import llama, predictors
+    from .sparse_linear_4bit import SparseLinear4bit
+
+    disable = torch.compiler.disable
+    llama.SparseLlamaMLP.forward = disable(llama.SparseLlamaMLP.forward)  # type: ignore[method-assign]
+    llama.SparseLlamaAttention.forward = disable(llama.SparseLlamaAttention.forward)  # type: ignore[method-assign]
+    # Generic attention has its own forward; the MLP/linear paths inherit the
+    # (already-disabled) vendored functions, so only the override needs marking.
+    arch_wiring.SparseAttention.forward = disable(arch_wiring.SparseAttention.forward)  # type: ignore[method-assign]
+    # Phi3 fused attention overrides forward indirectly via _qkv (data-dependent
+    # combined-index slicing); the fused MLP overrides the (already-disabled)
+    # SwiGLU _block. Disable their forwards explicitly so Dynamo graph-breaks
+    # around the contextual-sparsity selection in both.
+    arch_wiring.SparseFusedQKVAttention.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseFusedQKVAttention.forward
+    )
+    arch_wiring.SparseFusedGateUpMLP.forward = disable(  # type: ignore[method-assign]
+        arch_wiring.SparseFusedGateUpMLP.forward
+    )
+    arch_wiring.SparseLinearBias.forward = disable(arch_wiring.SparseLinearBias.forward)  # type: ignore[method-assign]
+    for cls in (
+        predictors.FFNPredictor,
+        predictors.AttentionPredictor,
+        predictors.GQAAttentionPredictor,
+        arch_wiring._GELUFFNPredictor,
+    ):
+        cls.predict = disable(cls.predict)  # type: ignore[method-assign]
+    SparseLinear4bit.forward = disable(SparseLinear4bit.forward)  # type: ignore[method-assign]
+
+    _COMPILE_BOUNDARIES_SET = True
+
+
+def _broadcast_rank0_schedule(
+    dist: Any, layer_sparsity: dict, write_cache: Any
+) -> dict:
+    """Enforce rank 0's schedule on every rank and rank-gate the cache write.
+
+    **Every rank must call this with its own already-computed ``layer_sparsity``**
+    — calibration runs in lockstep on all ranks so its collectives (and the
+    ``faithful`` dense warm-up) match. Isolating calibration to a single rank
+    deadlocks (the other ranks issue collectives rank 0 never reaches), so the
+    only thing gated to rank 0 here is the disk write, not the compute.
+
+    bf16-reduction nondeterminism could in principle flip a single top-k /
+    loss-budget decision differently across ranks, desyncing the sparse-module
+    swap and corrupting the FSDP flat-param structure. The ``broadcast_object_list``
+    (a single collective all ranks issue) overwrites every rank's schedule with
+    rank 0's, making the swap bit-identical. Only rank 0 runs ``write_cache`` (the
+    ``save_cached`` / ``maybe_share`` I/O) to avoid a concurrent-write race.
+
+    The schedule is broadcast **before** the rank-0 write so a write exception can
+    never strand the other ranks: if rank 0 raised inside ``write_cache`` before
+    the first collective, every other rank would block forever in
+    ``broadcast_object_list``. Instead rank 0 broadcasts the schedule first, then
+    catches any write error and broadcasts an error flag, so all ranks reach the
+    ``barrier`` and raise (or proceed) together. The ``barrier`` also guarantees
+    non-zero ranks do not read the factor files before rank 0 finished writing.
+
+    Caller guarantees a process group with ``world_size > 1``. ``dist`` is
+    ``torch.distributed`` (or a test double exposing ``get_rank`` /
+    ``broadcast_object_list`` / ``barrier``).
+    """
+    is_rank0 = dist.get_rank() == 0
+
+    # Broadcast rank 0's schedule first so no rank can be left blocking in a
+    # collective if the subsequent write raises.
+    payload: list[Any] = [layer_sparsity if is_rank0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    schedule: dict = payload[0]
+
+    # Only rank 0 writes; propagate success/failure so every rank raises together
+    # instead of some hanging at the barrier while rank 0 has already exited.
+    error: list[Any] = [None]
+    if is_rank0:
+        try:
+            write_cache()
+        except Exception as exc:  # noqa: BLE001 - re-raised on every rank below
+            error[0] = repr(exc)
+    dist.broadcast_object_list(error, src=0)
+    dist.barrier()
+    if error[0] is not None:
+        raise RuntimeError(
+            "SparseLoRA: rank 0 failed to write the calibration cache "
+            f"({error[0]}); all ranks abort together."
+        )
+    return schedule
+
+
+class SparseLoRAPlugin(BasePlugin):
+    """Enable SparseLoRA contextual sparsity for full-precision LoRA fine-tuning."""
+
+    def get_input_args(self) -> str:
+        return "axolotl.integrations.sparselora.SparseLoRAArgs"
+
+    def _settings(self, cfg: DictDefault):
+        settings = getattr(cfg, "sparselora", None)
+        if not settings or not settings.enabled:
+            return None
+        return settings
+
+    def _validate(
+        self, cfg: DictDefault, model: nn.Module, target_names: list[str]
+    ) -> None:
+        if cfg.adapter not in _SUPPORTED_ADAPTERS:
+            raise ValueError(
+                f"SparseLoRA composes on a LoRA/QLoRA adapter; got "
+                f"adapter={cfg.adapter!r}. Set `adapter: lora` or `qlora`."
+            )
+        if cfg.load_in_8bit:
+            raise ValueError(
+                "SparseLoRA does not support 8-bit bases. Use a full-precision "
+                "base (adapter: lora) or a 4-bit base (adapter: qlora, "
+                "load_in_4bit: true)."
+            )
+        if _is_deepspeed_zero3(cfg.deepspeed):
+            raise ValueError(
+                "SparseLoRA v1 supports single-GPU / DDP / FSDP only; DeepSpeed "
+                "ZeRO-3 shards parameters and is not yet supported."
+            )
+
+        # Architecture support: auto-register sparse wiring for the loaded
+        # model's MLP/attention classes (Llama is pre-registered; Qwen2/Qwen3/
+        # Mistral/... are introspected and mapped to the generic wiring), then
+        # confirm every target is covered and has supported semantics.
+        from ._vendor.sparselora.modules import get_module_mapping
+        from .arch_wiring import register_arch_wiring, unsupported_reason
+
+        registered = register_arch_wiring(model)
+        if registered:
+            LOG.info(
+                "SparseLoRA: registered generic sparse wiring for %s.",
+                ", ".join(
+                    f"{cls} ({role})" for cls, role in sorted(registered.items())
+                ),
+            )
+
+        module_map = get_module_mapping()
+        modules = dict(model.named_modules())
+
+        reasons = sorted(
+            {r for n in target_names if (r := unsupported_reason(modules[n]))}
+        )
+        if reasons:
+            raise ValueError(
+                "SparseLoRA cannot sparsify this model: " + "; ".join(reasons)
+            )
+
+        unsupported = {
+            type(modules[n]).__name__
+            for n in target_names
+            if type(modules[n]) not in module_map
+        }
+        if unsupported:
+            raise ValueError(
+                f"SparseLoRA wiring not available for module type(s) {sorted(unsupported)}. "
+                "Supported: Llama + any SwiGLU-MLP / standard-attention architecture "
+                "(Qwen2, Qwen3, Mistral, ...). Register custom wiring via "
+                "`register_sparse_module` to extend support."
+            )
+
+        # The vendored MLP sparse path passes indices as a kwarg that only a
+        # plain SparseLinear accepts; a LoRA-wrapped MLP projection (gate/up/down,
+        # or the fused gate_up_proj) collides with the patched lora_forward.
+        # z-lab's recipe is attention-only.
+        mlp_proj_names = {"gate_proj", "up_proj", "down_proj", "gate_up_proj"}
+        mlp_lora = [
+            name
+            for name, module in model.named_modules()
+            if name.rsplit(".", 1)[-1] in mlp_proj_names
+            and hasattr(module, "base_layer")
+        ]
+        if mlp_lora:
+            raise ValueError(
+                "SparseLoRA v1 requires attention-only LoRA; found LoRA adapters on "
+                f"MLP projections: {mlp_lora}. Remove gate_proj/up_proj/down_proj from "
+                "`lora_target_modules` (e.g. use q_proj,k_proj,v_proj,o_proj)."
+            )
+
+        # The vendored predictor buffers are sized with the configured rank, so a
+        # projection smaller than predictor_rank fails at load_state_dict after
+        # calibration has already run. Fail early with the offending projection.
+        # output_sparse_weights slices fused qkv_proj/gate_up_proj into their
+        # logical sub-blocks, so the check sees the real per-sub-block dims.
+        from .factors import output_sparse_weights
+
+        rank = cfg.sparselora.predictor_rank
+        too_small = [
+            f"{name}.{proj} (min dim {min(weight.shape)})"
+            for name in target_names
+            for proj, weight in output_sparse_weights(modules[name]).items()
+            if min(weight.shape) < rank
+        ]
+        if too_small:
+            raise ValueError(
+                f"sparselora.predictor_rank={rank} exceeds the smaller dimension of "
+                f"these projections: {too_small}. Lower predictor_rank."
+            )
+
+        # Every remaining LoRA layer must live inside a covered target module, else
+        # the global lora.Linear patch would call a plain nn.Linear with indices.
+        covered = tuple(n + "." for n in target_names)
+        orphan_lora = [
+            name
+            for name, module in model.named_modules()
+            if "lora_" not in name
+            and hasattr(module, "base_layer")
+            and not name.startswith(covered)
+        ]
+        if orphan_lora:
+            raise ValueError(
+                "SparseLoRA requires every LoRA-adapted module to sit inside a "
+                f"sparsifiable attention block; found adapters outside: {orphan_lora}. "
+                "Restrict `lora_target_modules` to attention projections."
+            )
+
+    def post_trainer_create(self, cfg: DictDefault, trainer: Any) -> None:
+        settings = self._settings(cfg)
+        if settings is None:
+            return
+
+        model = trainer.model
+        target_names = discover_target_modules(model)
+        self._validate(cfg, model, target_names)
+
+        rank = settings.predictor_rank
+        key = compute_cache_key(cfg)
+        cached = load_cached(cfg, key)
+
+        if cached is not None:
+            # Every rank loads the same deterministic cached schedule.
+            layer_sparsity = {k: float(v) for k, v in cached["layer_sparsity"].items()}
+        else:
+            layer_sparsity = self._calibrate_distributed(
+                cfg, model, trainer, target_names, rank, key, settings
+            )
+
+        cache_dir = entry_dir(cfg, key)
+        self._apply(cfg, model, trainer, layer_sparsity, cache_dir, rank)
+
+    def _calibrate_distributed(
+        self,
+        cfg: DictDefault,
+        model: nn.Module,
+        trainer: Any,
+        target_names: list[str],
+        rank: int,
+        key: str,
+        settings: Any,
+    ) -> dict[str, float]:
+        """Calibrate on a cache miss; deadlock-free under multi-rank.
+
+        **Every rank runs the full calibration** so the ``faithful`` warm-up and
+        any other collectives stay matched across ranks (isolating it to rank 0
+        deadlocks). With ``world_size > 1`` the schedule is then made bit-identical
+        via a broadcast all ranks issue, and only rank 0 writes the shared cache.
+        Single-GPU / no-process-group runs take the plain compute-and-write path,
+        unchanged.
+        """
+        layer_sparsity, meta, factor_tensors = self._compute_calibration(
+            cfg, model, trainer, target_names, rank, settings
+        )
+
+        def write_cache() -> None:
+            save_cached(cfg, key, layer_sparsity, meta, factor_tensors)
+            maybe_share(cfg, layer_sparsity, meta)
+
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            return _broadcast_rank0_schedule(dist, layer_sparsity, write_cache)
+        write_cache()
+        return layer_sparsity
+
+    def _compute_calibration(
+        self,
+        cfg: DictDefault,
+        model: nn.Module,
+        trainer: Any,
+        target_names: list[str],
+        rank: int,
+        settings: Any,
+    ) -> tuple[dict[str, float], dict, dict]:
+        """Compute the schedule + SVD factors without any I/O (runs on all ranks)."""
+        method = method_name(settings.calibration.method)
+        all_factors: dict = {}
+        if method == "none":
+            schedule = resolve_layer_sparsity(settings.layer_sparsity, target_names)
+        elif method in ("faithful", "proxy"):
+            # The sensitivity sweep needs factors for every candidate module.
+            all_factors = compute_factor_tensors(model, target_names, rank)
+            schedule = calibrate(cfg, model, all_factors, trainer)
+        else:
+            # structural / preset derive the schedule without a forward sweep, so
+            # only the sparsified modules (computed below) need SVD factors.
+            schedule = calibrate(cfg, model, {}, trainer)
+
+        # Cover every target module so the global LoRA patch stays safe;
+        # calibration-dense modules are explicit 0.0.
+        layer_sparsity = {n: float(schedule.get(n, 0.0)) for n in target_names}
+        positive = [n for n, s in layer_sparsity.items() if s > 0.0]
+        # Reuse sweep factors where available; only compute the rest.
+        missing = [
+            n
+            for n in positive
+            if f"{n}.gate_proj.w1" not in all_factors
+            and f"{n}.q_proj.w1" not in all_factors
+        ]
+        factor_tensors = {
+            k: v for k, v in all_factors.items() if k.rsplit(".", 2)[0] in set(positive)
+        }
+        factor_tensors.update(compute_factor_tensors(model, missing, rank))
+
+        meta = {
+            "base_model": cfg.base_model,
+            "model_type": type(model).__name__,
+            "predictor_rank": rank,
+            "target_sparsity": settings.target_sparsity,
+            "calibration_method": method_name(settings.calibration.method),
+            "num_sparsified": len(positive),
+        }
+        return layer_sparsity, meta, factor_tensors
+
+    def _apply(
+        self,
+        cfg: DictDefault,
+        model: nn.Module,
+        trainer: Any,
+        layer_sparsity: dict[str, float],
+        cache_dir: str,
+        rank: int,
+    ) -> None:
+        from ._vendor.sparselora import SparseLoRAConfig, apply_sparselora
+        from ._vendor.sparselora.callback import SparseLoRACallback
+
+        settings = cfg.sparselora
+        _apply_compile_boundaries(packing=bool(cfg.sample_packing))
+        if cfg.load_in_4bit:
+            from .sparse_linear_4bit import register_4bit_support
+
+            if not register_4bit_support():
+                raise ImportError(
+                    "load_in_4bit is set but bitsandbytes is unavailable for "
+                    "SparseLoRA's 4-bit sparse linear."
+                )
+
+        sl_config = SparseLoRAConfig(
+            layer_sparsity=layer_sparsity,
+            predictor_rank=rank,
+            path=cache_dir,
+            start_step=settings.start_step,
+            end_step=settings.end_step,
+        )
+        n_active = sum(1 for v in layer_sparsity.values() if v > 0)
+        LOG.info(
+            "SparseLoRA: applying sparsity to %d/%d modules (start_step=%s, end_step=%s).",
+            n_active,
+            len(layer_sparsity),
+            settings.start_step,
+            settings.end_step,
+        )
+        apply_sparselora(model, sl_config)
+        if cfg.load_in_4bit:
+            self._patch_4bit_lora_forward(model)
+        if cfg.fused_attn_kernel:
+            self._enable_fused_qk_norm_rope(model)
+        trainer.add_callback(SparseLoRACallback(settings.start_step, settings.end_step))
+
+    def _enable_fused_qk_norm_rope(self, model: nn.Module) -> None:
+        """Honor ``fused_attn_kernel`` on SparseLoRA's gated attention: axolotl's
+        class-level fused-attn patch is shadowed once the module is re-wired to
+        SparseGatedAttention, so enable the fused q/k-norm+RoPE kernel on the
+        sparse modules directly."""
+        from .arch_wiring import SparseGatedAttention
+
+        enabled = 0
+        for module in model.modules():
+            if isinstance(module, SparseGatedAttention):
+                module._use_fused_qk_norm_rope = True
+                enabled += 1
+        if enabled:
+            LOG.info(
+                "SparseLoRA: fused q/k-norm+RoPE kernel enabled on %d gated "
+                "attention layer(s).",
+                enabled,
+            )
+
+    def _patch_4bit_lora_forward(self, model: nn.Module) -> None:
+        """Route sparse indices through PEFT 4-bit LoRA wrappers.
+
+        ``apply_sparselora`` patches ``peft...lora.layer.Linear.forward``, but a
+        4-bit base is wrapped by a different PEFT class (``lora...Linear4bit``)
+        that the global patch misses. Bind the vendored ``lora_forward`` to each
+        such wrapper so the predicted indices reach the sparse base layer.
+        """
+        import types
+
+        from ._vendor.sparselora.modules.linear import lora_forward
+        from .sparse_linear_4bit import SparseLinear4bit
+
+        patched = 0
+        for module in model.modules():
+            base = getattr(module, "base_layer", None)
+            if isinstance(base, SparseLinear4bit) and hasattr(module, "lora_A"):
+                module.forward = types.MethodType(lora_forward, module)
+                patched += 1
+        LOG.debug("SparseLoRA: routed indices through %d 4-bit LoRA wrappers.", patched)
