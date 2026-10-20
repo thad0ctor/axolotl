@@ -91,7 +91,8 @@ def _kernels():
         HAS_PTS: tl.constexpr,
         BLOCK_B: tl.constexpr,  # bytes per program
     ):
-        row = tl.program_id(0)
+        # i64: row*K products overflow i32 on >2^31-element weight stacks (e.g. 896x4096x2048)
+        row = tl.program_id(0).to(tl.int64)
         blk = tl.program_id(1)
         offs_b = blk * BLOCK_B + tl.arange(0, BLOCK_B)
         mask_b = offs_b < K2
@@ -123,7 +124,8 @@ def _kernels():
         SF_K: tl.constexpr,
         BLOCK_SF: tl.constexpr,  # scale blocks per program
     ):
-        row = tl.program_id(0)
+        # i64: row*K products overflow i32 on >2^31-element weight stacks (e.g. 896x4096x2048)
+        row = tl.program_id(0).to(tl.int64)
         blk = tl.program_id(1)
         offs_sf = blk * BLOCK_SF + tl.arange(0, BLOCK_SF)
         mask_sf = offs_sf < SF_K
@@ -184,7 +186,8 @@ def _kernels():
         # identical quantization math to _quant_kernel, but the e4m3 scales are
         # stored straight into the dQaccum-padded swizzled SFA layout: padded
         # row p, sf col c -> tile (p//128, c//4), byte (p%32)*16 + ((p//32)%4)*4 + c%4
-        row = tl.program_id(0)
+        # i64: row*K products overflow i32 on >2^31-element weight stacks (e.g. 896x4096x2048)
+        row = tl.program_id(0).to(tl.int64)
         blk = tl.program_id(1)
         offs_sf = blk * BLOCK_SF + tl.arange(0, BLOCK_SF)
         mask_sf = offs_sf < SF_K
@@ -248,7 +251,8 @@ def _kernels():
         # unlike _quant_kernel above which follows quantize_nvfp4_ref.
         # Every division is div_rn: triton's `/` may lower to
         # reciprocal-multiply and flip values on rounding boundaries.
-        row = tl.program_id(0)
+        # i64: row*K products overflow i32 on >2^31-element weight stacks (e.g. 896x4096x2048)
+        row = tl.program_id(0).to(tl.int64)
         blk = tl.program_id(1)
         offs_sf = blk * BLOCK_SF + tl.arange(0, BLOCK_SF)
         mask_sf = offs_sf < SF_K
@@ -265,11 +269,11 @@ def _kernels():
         s = tl.minimum(tl.maximum(bs, E4M3_EPS), 448.0)
         sdec = _e4m3_rne(s)
         if HAS_PTS:
-            # torchao two-level: x * ((1/pts) / scale), NOT a divide
             r = tl.math.div_rn(tl.math.div_rn(1.0, pts), sdec)
-            q = x * r[:, None]
         else:
-            q = tl.math.div_rn(x, tl.broadcast_to(sdec[:, None], x.shape))
+            r = tl.math.div_rn(1.0, sdec)
+        # torchao 0.18 uses reciprocal multiplication for both scale modes.
+        q = x * r[:, None]
         q = tl.minimum(tl.maximum(q, -6.0), 6.0)
 
         # round-nearest-even onto the E2M1 grid: at each midpoint the tie goes
@@ -305,7 +309,8 @@ def _kernels():
     ):
         # in-place x[r, :] = bf16(f32(x[r, :]) * pts[r]); one pass instead of
         # float() -> mul -> to(bf16)
-        row = tl.program_id(0)
+        # i64: row*K products overflow i32 on >2^31-element weight stacks (e.g. 896x4096x2048)
+        row = tl.program_id(0).to(tl.int64)
         blk = tl.program_id(1)
         offs = blk * BLOCK_N + tl.arange(0, BLOCK_N)
         mask = offs < N

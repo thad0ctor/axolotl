@@ -137,6 +137,8 @@ ENV/
 env.bak/
 venv.bak/
 venv3.10/
+venv3.12/
+venv3.14/
 
 # Spyder project settings
 .spyderproject
@@ -195,3 +197,5 @@ out/
 
 # scm auto-versioning
 src/axolotl/_version.py
+.testmon/
+.ci_source_refreshed
