@@ -37,15 +37,20 @@ def _nvfp4_cls():
 
 
 def _resolve_repo_file(repo_id: str, filename: str) -> str:
-    """Resolve a checkpoint file path from a local snapshot dir or the HF hub.
+    """Resolve a checkpoint file path from a local snapshot dir, the HF cache, or the hub.
 
     A local snapshot dir (offline/air-gapped axolotl usage) would fail ``hf_hub_download``
-    with an ``HFValidationError``, so read straight from disk in that case.
+    with an ``HFValidationError``, so read straight from disk in that case. An already-cached
+    hub file is returned without a network round trip (hub requests are rate limited, and
+    ``HF_HUB_OFFLINE`` runs have no network at all).
     """
     if os.path.isdir(repo_id):
         return os.path.join(repo_id, filename)
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
+    cached = try_to_load_from_cache(repo_id, filename)
+    if isinstance(cached, str):
+        return cached
     return hf_hub_download(repo_id, filename)
 
 
@@ -62,28 +67,61 @@ def _shard_open(repo_id: str, shard: str):
     return safe_open(_resolve_repo_file(repo_id, shard), framework="pt")
 
 
-def _safetensors_metadata(repo_id: str) -> dict[str, tuple[str, tuple[int, ...]]]:
-    """Return ``{tensor_name: (dtype_str, shape)}`` for every checkpoint tensor, read from the
-    safetensors *headers* only (no weight download). Works for a hub repo or a local snapshot dir.
+def _local_shard_paths(repo_id: str) -> list[str] | None:
+    """Ordered on-disk paths of every safetensors shard, without touching the network.
+
+    ``None`` means the checkpoint is a hub repo whose shards are not all in the HF cache, so
+    only the hub metadata API can answer. A local snapshot dir always returns paths (a missing
+    shard there is a broken checkpoint, and surfacing that beats a bogus hub lookup).
     """
     if os.path.isdir(repo_id):
-        from safetensors import safe_open
-
-        out: dict[str, tuple[str, tuple[int, ...]]] = {}
-        index = os.path.join(repo_id, "model.safetensors.index.json")
-        if os.path.exists(index):
+        if os.path.exists(os.path.join(repo_id, "model.safetensors.index.json")):
             shards = sorted(set(_load_index(repo_id).values()))
         else:  # single-file checkpoint
             shards = ["model.safetensors"]
+        return [os.path.join(repo_id, shard) for shard in shards]
+
+    import json
+
+    from huggingface_hub import try_to_load_from_cache
+
+    index = try_to_load_from_cache(repo_id, "model.safetensors.index.json")
+    if isinstance(index, str):
+        with open(index) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    else:  # single-file checkpoint, or nothing cached at all
+        shards = ["model.safetensors"]
+    paths = [try_to_load_from_cache(repo_id, shard) for shard in shards]
+    if all(isinstance(p, str) for p in paths):
+        return paths  # type: ignore[return-value]
+    return None
+
+
+def _safetensors_metadata(repo_id: str) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """Return ``{tensor_name: (dtype_str, shape)}`` for every checkpoint tensor, read from the
+    safetensors *headers* only (no weight download). Prefers a local snapshot dir or the HF cache
+    and only falls back to the hub metadata API for a checkpoint that is not on disk.
+    """
+    shards = _local_shard_paths(repo_id)
+    if shards is not None:
+        from safetensors import safe_open
+
+        out: dict[str, tuple[str, tuple[int, ...]]] = {}
         for shard in shards:
-            with safe_open(os.path.join(repo_id, shard), framework="pt") as f:
+            with safe_open(shard, framework="pt") as f:
                 for name in f.keys():
                     sl = f.get_slice(name)
                     out[name] = (sl.get_dtype(), tuple(sl.get_shape()))
         return out
 
-    from huggingface_hub import HfApi
+    from huggingface_hub import HfApi, constants
 
+    if constants.HF_HUB_OFFLINE:
+        raise OSError(
+            f"HF_HUB_OFFLINE is set but the safetensors shards of '{repo_id}' are not in the HF "
+            f"cache ({constants.HF_HUB_CACHE}), so its NVFP4 layout cannot be inspected. Download "
+            "the checkpoint, or point base_model at a local snapshot directory."
+        )
     meta = HfApi().get_safetensors_metadata(repo_id)
     out = {}
     for fmeta in meta.files_metadata.values():
@@ -146,12 +184,23 @@ def inspect_nvfp4_layout(repo_id: str) -> dict:
     routed_projs: list[str] = []
     routed_sample: dict[str, tuple | None] = {}
     nonrouted: dict[str, dict] = {}
+    fp8: dict[str, dict] = {}
     qdata_names: set[str] = set()
     per_tensor_names: set[str] = set()
     for base, parts in bases.items():
         qd = _qdata(parts)
         is_nvfp4 = qd is not None and any(g in parts for g in _GROUP_SCALE_LEAVES)
-        if not is_nvfp4:  # bf16 (excluded) or fp8 module — not NVFP4
+        if not is_nvfp4:  # bf16, fp8, or unscaled: not NVFP4
+            # static-FP8 linear (e4m3 weight + weight_scale). Collected so the caller registers
+            # a dequant converter; without one the raw fp8 loads unscaled into the bf16 skeleton.
+            wmeta = parts.get("weight")
+            if (
+                wmeta is not None
+                and str(wmeta[0]).upper().startswith("F8")
+                and "weight_scale" in parts
+                and not routed_re.search(base)
+            ):
+                fp8.setdefault(layer_re.sub("", base), parts)
             continue
         qdata_names.add(qd)
         for leaf in _PER_TENSOR_LEAVES:
@@ -180,6 +229,7 @@ def inspect_nvfp4_layout(repo_id: str) -> dict:
         "routed_sample_shapes": routed_sample,
         "nonrouted_suffixes": sorted(nonrouted),
         "nonrouted_sample_shapes": nonrouted,
+        "fp8_suffixes": sorted(fp8),
         "qdata_names": sorted(qdata_names),
         "per_tensor_names": sorted(per_tensor_names),
         "naming": naming,
@@ -195,9 +245,10 @@ def fuse_nvfp4_experts(projs: list[dict], *, block_size: int = 16, dtype=None):
         {"qd": [E uint8 [N, K/2]], "sc": [E e4m3 [N, K/16]], "pts": [E f32 scalar]}
 
     Returns a torchao ``NVFP4Tensor`` ``[E, ΣN, K/2]``. The fused tensor carries ONE per-expert
-    per-tensor scale (``pts``), so when the projections export different ``pts`` the ratio is
-    folded into the later proj's group scale (dequant = qdata · group_scale · per_tensor_scale, so
-    this is exact up to e4m3 rounding) rather than silently dropping it. Used by both the
+    per-tensor scale (``pts``), so when the projections export different ``pts`` the fused pts is
+    their elementwise max and each proj's ratio (always <= 1, so the e4m3 cast cannot overflow to
+    NaN) is folded into its group scale (dequant = qdata · group_scale · per_tensor_scale, so this
+    is exact up to e4m3 rounding) rather than silently dropping it. Used by both the
     ``WeightConverter`` (modelopt skeleton load) and the post-load scale-attach path so the fusion
     + scale reconciliation live in exactly one place.
     """
@@ -214,28 +265,32 @@ def fuse_nvfp4_experts(projs: list[dict], *, block_size: int = 16, dtype=None):
     # stack/cat below produce correctly-shaped meta tensors regardless.
     is_meta = bool(projs[0]["qd"]) and projs[0]["qd"][0].is_meta
 
-    pts0 = _torch.stack([t.to(_torch.float32) for t in projs[0]["pts"]]).view(-1, 1, 1)
+    pts_all = [
+        _torch.stack([t.to(_torch.float32) for t in p["pts"]]).view(-1, 1, 1)
+        for p in projs
+    ]
+    pts_fused = pts_all[0]
+    for pts_i in pts_all[1:]:
+        pts_fused = _torch.maximum(pts_fused, pts_i)
     qdatas, scales = [], []
     for i, p in enumerate(projs):
         qd = _torch.stack(list(p["qd"]), dim=0)  # [E, N, K/2]
         sc = _torch.stack(list(p["sc"]), dim=0)  # [E, N, K/16]
-        if i > 0 and not is_meta:
-            pts_i = _torch.stack([t.to(_torch.float32) for t in p["pts"]]).view(
-                -1, 1, 1
+        if not is_meta and not _torch.allclose(pts_all[i], pts_fused):
+            sc = (sc.to(_torch.float32) * (pts_all[i] / pts_fused)).to(
+                _torch.float8_e4m3fn
             )
-            if not _torch.allclose(pts_i, pts0):
-                sc = (sc.to(_torch.float32) * (pts_i / pts0)).to(_torch.float8_e4m3fn)
-                LOG.warning(
-                    "fuse_nvfp4_experts: proj #%d per-tensor scale differs from the first; "
-                    "folded the ratio into its group scale (max %.4g)",
-                    i,
-                    (pts_i / pts0).max().item(),
-                )
+            LOG.warning(
+                "fuse_nvfp4_experts: proj #%d per-tensor scale differs from the fused max; "
+                "folded the ratio into its group scale (min %.4g)",
+                i,
+                (pts_all[i] / pts_fused).min().item(),
+            )
         qdatas.append(qd)
         scales.append(sc)
     qdata = qdatas[0] if len(qdatas) == 1 else _torch.cat(qdatas, dim=1)
     scale = scales[0] if len(scales) == 1 else _torch.cat(scales, dim=1)
-    return NVFP4Tensor(qdata, scale, block_size, dtype, per_tensor_scale=pts0)
+    return NVFP4Tensor(qdata, scale, block_size, dtype, per_tensor_scale=pts_fused)
 
 
 def patch_nvfp4_tensor_meta_ops() -> None:
@@ -402,6 +457,48 @@ def attach_nvfp4_expert_scales(model: nn.Module, repo_id: str) -> int:
     return fixed
 
 
+def patch_skip_missing_expert_init() -> None:
+    """Skip transformers' random init of the fused routed-expert params under direct load.
+
+    With the routed converters skipped (direct-load path), ``experts.gate_up_proj``/``down_proj``
+    are MISSING keys, so ``_initialize_missing_keys`` fills them with CPU ``normal_()`` right
+    before :func:`direct_load_nvfp4_experts` overwrites every byte. At Qwen3-Next-80B scale that
+    is ~155 GB of bf16 randn at a measured 0.11 GB/s: ~23 min of pure waste per launch. Mark the
+    fused 3D expert params ``_is_hf_initialized`` before init runs so ``initialize_weights``
+    skips them. Only call when the direct load WILL fill these params (same contract as skipping
+    the routed converters). Idempotent.
+    """
+    from transformers.modeling_utils import PreTrainedModel
+
+    if getattr(
+        PreTrainedModel._initialize_missing_keys, "_axolotl_skip_expert_init", False
+    ):
+        return
+    orig = PreTrainedModel._initialize_missing_keys
+
+    def patched(self, *args, **kwargs):
+        for mod in self.modules():
+            gup = getattr(mod, "gate_up_proj", None)
+            if gup is None:  # non-gated experts have no gate to fuse
+                gup = getattr(mod, "up_proj", None)
+            dn = getattr(mod, "down_proj", None)
+            if (
+                isinstance(gup, torch.Tensor)
+                and isinstance(dn, torch.Tensor)
+                and gup.ndim == 3
+                and dn.ndim == 3
+            ):
+                gup._is_hf_initialized = True
+                dn._is_hf_initialized = True
+        return orig(self, *args, **kwargs)
+
+    patched._axolotl_skip_expert_init = True  # type: ignore[attr-defined]
+    PreTrainedModel._initialize_missing_keys = patched
+    LOG.info(
+        "Patched _initialize_missing_keys to skip fused expert params (direct load fills them)"
+    )
+
+
 def direct_load_nvfp4_experts(model, repo_id: str, routed_projs: list[str]) -> int:
     """FAST routed-expert load that BYPASSES transformers' conversion loader.
 
@@ -428,17 +525,19 @@ def direct_load_nvfp4_experts(model, repo_id: str, routed_projs: list[str]) -> i
     if NVFP4Tensor is None:
         return 0
     wmap = _load_index(repo_id)
-    # per-layer expert count, from the index (no reads): count ...experts.<e>.<proj0>.weight keys.
+    # per-experts-module expert count, from the index (no reads). Keyed on the full prefix
+    # rather than the layer index: a checkpoint can carry two stacks at the same index (an MTP
+    # head alongside the decoder), and those must not collapse onto each other.
     proj0 = routed_projs[0]
-    layer_E: dict[int, int] = {}
+    prefix_E: dict[str, int] = {}
     pat = re.compile(
-        r"\.layers\.(\d+)\.mlp\.experts\.(\d+)\." + re.escape(proj0) + r"\.weight$"
+        r"(.*\.layers\.\d+\.mlp\.experts)\.(\d+)\." + re.escape(proj0) + r"\.weight$"
     )
     for key in wmap:
         m = pat.search(key)
         if m:
-            L, e = int(m.group(1)), int(m.group(2))
-            layer_E[L] = max(layer_E.get(L, 0), e + 1)
+            base, e = m.group(1), int(m.group(2))
+            prefix_E[base] = max(prefix_E.get(base, 0), e + 1)
 
     handles: dict[str, object] = {}
 
@@ -456,14 +555,10 @@ def direct_load_nvfp4_experts(model, repo_id: str, routed_projs: list[str]) -> i
     for mod_name, mod in model.named_modules():
         if not (hasattr(mod, "gate_up_proj") and hasattr(mod, "down_proj")):
             continue
-        m = re.search(r"\.layers\.(\d+)\.", "." + mod_name)
-        if m is None:
+        E = prefix_E.get(mod_name)
+        if E is None:
             continue
-        L = int(m.group(1))
-        if L not in layer_E:
-            continue
-        E = layer_E[L]
-        base = f"model.layers.{L}.mlp.experts"
+        base = mod_name
         for fused, parts in fused_map:
             sel = [p for p in parts if p in routed_projs]
             if not sel:
@@ -479,6 +574,15 @@ def direct_load_nvfp4_experts(model, repo_id: str, routed_projs: list[str]) -> i
             nvfp4 = fuse_nvfp4_experts(projs)
             setattr(mod, fused, torch.nn.Parameter(nvfp4, requires_grad=False))
             n += 1
+    if n == 0:
+        # Missing-expert init is patched out on this path, so filling nothing trains on noise.
+        raise RuntimeError(
+            f"AXOLOTL_DIRECT_EXPERT_LOAD: no routed experts matched in {repo_id!r}. This "
+            f"path needs checkpoint keys '<prefix>.layers.N.mlp.experts.E.{proj0}.weight' "
+            "whose prefix also names the module (it does not handle layouts that rename the "
+            "root, e.g. nemotron_h's backbone. -> model.). Unset AXOLOTL_DIRECT_EXPERT_LOAD "
+            "to use the standard converter path."
+        )
     return n
 
 
@@ -489,10 +593,9 @@ if __name__ == "__main__":  # local self-consistency test on real layer-0 data
     _, _scheme = _detect_scheme(wmap)
     _base_fmt = _scheme["base_fmt"]
     dev = "cuda"
-    # fused gate_up qdata+scale from w1+w3 (expert 0 only via n_experts=1 slice below)
-    gqd, gscale, gpts = _build_expert_nvfp4(
-        REPO, wmap, _base_fmt, 0, ("w1", "w3"), 4, dev
-    )
+    gate_up = _build_expert_nvfp4(REPO, wmap, _base_fmt, 0, ("w1", "w3"), 1, dev)
+    gqd, gscale = gate_up.qdata, gate_up.scale
+    gpts = gate_up.per_tensor_scale.reshape(())
     print(
         "fused gate_up qdata",
         gqd.shape,
@@ -507,7 +610,12 @@ if __name__ == "__main__":  # local self-consistency test on real layer-0 data
     qd3 = f.get_tensor("layers.0.ffn.experts.0.w3.weight").to(dev)
     s1 = f.get_tensor("layers.0.ffn.experts.0.w1.weight_scale").to(dev)
     s3 = f.get_tensor("layers.0.ffn.experts.0.w3.weight_scale").to(dev)
-    p = f.get_tensor("layers.0.ffn.experts.0.w1.weight_scale_2").to(dev).float()
+    p = (
+        f.get_tensor("layers.0.ffn.experts.0.w1.weight_scale_2")
+        .to(dev)
+        .float()
+        .reshape(())
+    )
     d1 = NVFP4Tensor(qd1, s1, 16, torch.bfloat16, per_tensor_scale=p).dequantize(
         torch.bfloat16
     )

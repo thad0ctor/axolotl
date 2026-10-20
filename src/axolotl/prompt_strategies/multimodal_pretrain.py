@@ -304,6 +304,10 @@ class ImageTokenSpec:
     image_token: str
     image_token_id: int
     image_family_token_ids: set[int]
+    # Markers the model expects around each placeholder but the processor
+    # doesn't insert (Qwen's vision_start/end); encoder wraps when set.
+    marker_prefix: str | None = None
+    marker_suffix: str | None = None
 
 
 def build_image_token_spec(
@@ -337,6 +341,27 @@ def build_image_token_spec(
     known_special_tokens |= set(
         getattr(tokenizer, "additional_special_tokens", None) or []
     )
+
+    # special=True surfaces only — keyword-masking plain added tokens from
+    # get_added_vocab() (e.g. a user-added "imagery") would -100 real text.
+    special_surfaces: set[str] = set(
+        getattr(tokenizer, "all_special_tokens", None) or []
+    )
+    special_surfaces |= set(getattr(tokenizer, "additional_special_tokens", None) or [])
+    added_decoder = getattr(tokenizer, "added_tokens_decoder", None)
+    if added_decoder:
+        try:
+            special_surfaces |= {
+                str(tok)
+                for tok in added_decoder.values()
+                if getattr(tok, "special", False)
+            }
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(
+                "tokenizer.added_tokens_decoder unusable on %s: %s",
+                type(tokenizer).__name__,
+                exc,
+            )
 
     image_token: str | None = None
     image_token_id: int | None = None
@@ -399,20 +424,30 @@ def build_image_token_spec(
         tid = resolve_id(cand)
         if tid is not None:
             family.add(tid)
-    # Dynamically mask processor-inserted layout tokens (tile/grid/global
-    # markers) that vary by model and aren't in the static candidate list.
-    # Restricted to registered special tokens, so bos/eos/pad and real text
-    # are never masked.
-    for special in known_special_tokens:
+    # Mask model-specific layout tokens (tile/grid/global markers) missing
+    # from the static candidate list; special=True only, so text is safe.
+    for special in special_surfaces:
         if not _is_image_structural_token(special):
             continue
         tid = resolve_id(special)
         if tid is not None:
             family.add(tid)
+    # Qwen's processor doesn't insert vision_start/end, but mrope needs them
+    # to locate image spans — the encoder wraps bare placeholders.
+    marker_prefix = marker_suffix = None
+    if image_token == "<|image_pad|>":  # nosec B105
+        if (
+            resolve_id("<|vision_start|>") is not None
+            and resolve_id("<|vision_end|>") is not None
+        ):
+            marker_prefix = "<|vision_start|>"
+            marker_suffix = "<|vision_end|>"
     return ImageTokenSpec(
         image_token=image_token,
         image_token_id=image_token_id,  # type: ignore[arg-type]
         image_family_token_ids=family,
+        marker_prefix=marker_prefix,
+        marker_suffix=marker_suffix,
     )
 
 

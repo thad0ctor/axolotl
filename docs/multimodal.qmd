@@ -8,7 +8,6 @@ format:
 
 ## Supported Models
 
-- [Gemma-4](#sec-gemma-4) *(NEW)*
 - [Mllama](#sec-mllama)
 - [Llama4](#sec-llama4)
 - [Pixtral](#sec-pixtral)
@@ -17,15 +16,21 @@ format:
 - [Mistral-Small-4](#sec-mistral-small-4)
 - [Magistral-Small-2509](#sec-magistral-small-2509)
 - [Voxtral](#sec-voxtral)
+- [Gemma-4](#sec-gemma-4)
 - [Gemma-3](#sec-gemma-3)
 - [Gemma-3n](#sec-gemma-3n)
 - [Qwen2-VL](#sec-qwen2-vl)
 - [Qwen2.5-VL](#sec-qwen25-vl)
+- [Qwen3-VL](#sec-qwen3-vl)
 - [Qwen3.5](#sec-qwen3-5)
+- [Qwen3.8-Flash-Next](#sec-qwen3-8-flash-next)
 - [GLM-4.6V](#sec-glm-4-6v)
 - [SmolVLM2](#sec-smolvlm2)
 - [LFM2-VL](#sec-lfm2-vl)
 - [Intern-VL](#sec-intern-vl)
+- [PaddleOCR-VL](#sec-paddleocr-vl)
+- [North Micro Vision Instruct](#sec-north-micro-vision-instruct)
+- [Muse Glimmer](#sec-muse-glimmer)
 
 ## Usage
 
@@ -59,7 +64,7 @@ image_size: 512
 image_resize_algorithm: bilinear
 ```
 
-Please see [examples](https://github.com/axolotl-ai/axolotl/tree/main/examples) folder for full configs.
+Please see [examples](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples) folder for full configs.
 
 ::: {.callout-tip}
 Some of our chat_templates have been extended to support broader dataset types. This should not break any existing configs.
@@ -170,7 +175,7 @@ Gemma 4 VLM training starts with high loss (~8-15). This is expected — see the
 :::
 
 ::: {.callout-tip}
-For DDP training, axolotl auto-detects Gemma4 and sets `use_reentrant=False` and `ddp_find_unused_parameters=True`. However, when `activation_offloading: true`, `ddp_find_unused_parameters` is skipped (checkpoint wrappers conflict with it); use `freeze_mm_modules: true` instead to handle unused vision/audio params. For FSDP2, use `fsdp_transformer_layer_cls_to_wrap: Gemma4TextDecoderLayer`.
+For DDP training, axolotl auto-detects Gemma4 and sets `use_reentrant=False` and `ddp_find_unused_parameters=True`. However, when `activation_offloading: true`, `ddp_find_unused_parameters` is skipped (checkpoint wrappers conflict with it); use `freeze_mm_modules: true` instead to handle unused vision/audio params. For FSDP2, use `fsdp_config.transformer_layer_cls_to_wrap: Gemma4TextDecoderLayer`.
 :::
 
 ### Gemma-3 {#sec-gemma-3}
@@ -235,6 +240,19 @@ base_model: Qwen/Qwen3.5-9B
 chat_template: qwen3_5
 ```
 
+### Qwen3.8-Flash-Next {#sec-qwen3-8-flash-next}
+
+::: {.callout-tip}
+Please make sure to install `torchvision` via `uv pip install torchvision`.
+:::
+
+```yaml
+base_model: Qwen/Qwen3.8-Flash-Next
+processor_type: AutoProcessor
+```
+
+See the [example configs and tips](https://docs.axolotl.ai/docs/models/qwen3.8-flash-next.html) for details.
+
 ### GLM-4.6V {#sec-glm-4-6v}
 
 Both GLM-4.6V (106B MoE) and GLM-4.6V-Flash (9B) are supported.
@@ -275,6 +293,31 @@ Please make sure to install `timm` via `pip3 install timm==1.0.19`
 
 ```yaml
 base_model: OpenGVLab/InternVL3_5-8B
+```
+
+### PaddleOCR-VL {#sec-paddleocr-vl}
+
+```yaml
+base_model: PaddlePaddle/PaddleOCR-VL-1.6
+processor_type: AutoProcessor
+```
+
+Keep `sample_packing: false` and do not enable Liger or Cut Cross Entropy. See the [example configs and tips](https://docs.axolotl.ai/docs/models/paddleocr-vl.html) for details.
+
+### North Micro Vision Instruct {#sec-north-micro-vision-instruct}
+
+```yaml
+base_model: CohereLabs/North-Micro-Vision-Instruct
+processor_type: AutoProcessor
+```
+
+### Muse Glimmer {#sec-muse-glimmer}
+
+Requires `transformers>=5.15.0`.
+
+```yaml
+base_model: meta-models/Muse-Glimmer-30B
+processor_type: AutoProcessor
 ```
 
 ## Dataset Format
@@ -408,9 +451,9 @@ Notes:
 |---|---|---|
 | LLaVA-1.5 / 1.6 | `<image>` | |
 | SmolVLM / SmolVLM2 / Idefics3 | `<image>` | Processor expands to 1088 tokens (17 tiles × 64) |
-| Qwen2-VL / Qwen2.5-VL / Qwen3-VL | `<\|image_pad\|>` | Processor autowraps with `<\|vision_start\|>` / `<\|vision_end\|>` |
+| Qwen2-VL / Qwen2.5-VL / Qwen3-VL | `<\|image_pad\|>` | Axolotl wraps bare placeholders with `<\|vision_start\|>` / `<\|vision_end\|>` at encode time (the processor does **not** add them, and mrope needs them) |
 | Gemma-3 | `<start_of_image>` | Processor expands to 256 `<image_soft_token>` |
-| Gemma-4 | `<\|image\|>` | Processor expands to 256 `<\|image\|>` |
+| Gemma-4 | `<\|image\|>` | Processor expands to 280 image tokens (flanked by boi/eoi markers) |
 
 Axolotl autodetects the placeholder from the loaded processor. If autodetection
 fails, supply `image_token: <your token>` on the dataset entry.
@@ -431,6 +474,7 @@ pretraining_dataset:
     # image_token: "<image>"           # optional override; autodetect by default
     # skip_bad_images: false           # drop malformed/unloadable rows instead of aborting
     # allow_remote_images: false       # permit http(s)/URL image sources (off = SSRF-safe)
+    # max_images_per_row: 32           # reject/drop rows with more images (0 = unlimited)
 
 streaming: true
 sequence_len: 2048
@@ -443,7 +487,7 @@ gradient_accumulation_steps: 8
 ```
 
 For large streaming runs that need cheap checkpoint resume, set
-`dataset_prepared_path` so Axolotl can cache the tokenized MM CPT rows, and use
+`dataset_prepared_path` so Axolotl can cache the validated MM CPT rows (raw text plus image references; the collator re-tokenizes at batch time), and use
 `ignore_data_skip: true` when you prefer resuming optimizer/scheduler state
 without Trainer fast-forwarding through already-seen multimodal batches:
 
@@ -497,12 +541,7 @@ can run `axolotl preprocess` on this mode; the prepared Arrow dataset keeps
 
 ### Eval datasets
 
-`test_datasets` accepts multimodal entries (`type: multimodal_pretrain` or
-`multimodal: true`). Per-entry `text_column` and `image_column` are honored
-independently. When more than one multimodal entry is provided,
-`image_base_dir` and `image_token` must be either unset on every entry or
-identical across them, because the eval collator resolves both once for the
-merged eval stream.
+`test_datasets` accepts multimodal entries (`type: multimodal_pretrain` or `multimodal: true`). Every multimodal eval entry requires `path` and an explicit `split` — omitting `split` would silently evaluate on the train split. Per-entry `text_column` and `image_column` are honored independently. When more than one multimodal entry is provided, `image_base_dir`, `image_token`, `skip_bad_images`, and `allow_remote_images` must be either unset on every entry or identical across them, because the eval collator resolves them once for the merged eval stream.
 
 ### Mixed image / text-only batches
 
@@ -512,15 +551,11 @@ handed to the processor as-is.
 
 ### Bad rows and image sources
 
-By default a row that fails validation (placeholder/image-count mismatch,
-over-length, or an image that won't load) aborts the run — failures are loud,
-not silent. Set `skip_bad_images: true` on the dataset entry to warn-and-drop
-those rows instead, which is useful for large, noisy corpora.
+By default a row that fails validation (placeholder/image-count mismatch, over-length, too many images, an image that won't load, or an image that loads but crashes the processor — e.g. extreme aspect ratios on Qwen) aborts the run — failures are loud, not silent. Set `skip_bad_images: true` on the dataset entry to warn-and-drop those rows instead, which is useful for large, noisy corpora.
 
-Image sources with a URL scheme (`http://`, `https://`, …) are **rejected by
-default** — a training collator fetching arbitrary URLs from dataset shards is
-an SSRF vector. Set `allow_remote_images: true` to opt in. Relative paths that
-escape `image_base_dir` (e.g. `../../etc/passwd`) are always rejected.
+Rows carrying more than `max_images_per_row` images (default 32) are rejected (or dropped with `skip_bad_images`) — each image expands to a large pixel tensor at the collator, so an unbounded count is an OOM vector. Set `max_images_per_row: 0` to disable the cap.
+
+Image sources with a URL scheme (`http://`, `https://`, …) are **rejected by default** — a training collator fetching arbitrary URLs from dataset shards is an SSRF vector. Set `allow_remote_images: true` to opt in. When `image_base_dir` is set it acts as a sandbox: any path — relative or absolute, including via symlinks — that resolves outside it is rejected.
 
 Verified VLM families:
 
@@ -577,6 +612,10 @@ If those ids contribute to loss, the model is trained to predict patch or
 marker tokens rather than only the target text. On architectures like
 Qwen-VL and SmolVLM, leaving them unmasked substantially increases loss and can
 destabilize training.
+
+## Preference and RL training
+
+DPO, KTO and GRPO also train on image datasets with the same model setup. See [Multimodal (vision) datasets](rlhf.qmd#multimodal) for the dataset shapes and limitations.
 
 ## FAQ
 

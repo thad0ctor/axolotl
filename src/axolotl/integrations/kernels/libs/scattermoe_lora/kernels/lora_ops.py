@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .autotune_profiles import profile_dx_mx_configs, profile_fwd_configs
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -296,9 +298,10 @@ def _compute_expert_block_lora(
 
     # Base weight pointers: W[E_idx, :, :] is [K, N], load [BLOCK_K, BLOCK_N]
     X_blk_ptrs = X_ptr + M_in_idx[:, None] * stride_xm + K_block[None, :] * stride_xk
+    # i64 expert offset: E_idx * stride_we overflows i32 on a >2^31-element expert stack
     W_blk_ptrs = (
         W_ptr
-        + E_idx * stride_we
+        + E_idx.to(tl.int64) * stride_we
         + K_block[:, None] * stride_wk
         + N_block[None, :] * stride_wn
     )
@@ -415,8 +418,8 @@ def _prune_fwd_configs(configs, named_args, **kwargs):
     """
     smem_cap = _get_smem_capacity()
 
-    # Get BLOCK_R from named_args if available, else assume worst case
-    block_r = named_args.get("BLOCK_R", 64)
+    meta = {**named_args, **kwargs}
+    block_r = meta.get("BLOCK_R", 64)
 
     scored = []
     for config in configs:
@@ -449,7 +452,12 @@ def _prune_fwd_configs(configs, named_args, **kwargs):
 
     pruned = [c for s, c in scored if s <= smem_cap - _SMEM_SLACK]
     if pruned:
-        return pruned
+        return profile_fwd_configs(
+            pruned,
+            torch.cuda.get_device_capability(meta["X_ptr"].device),
+            smem_cap,
+            meta,
+        )
     if scored:
         # All surviving configs exceed SMEM — return the one with smallest usage
         scored.sort(key=lambda x: x[0])
@@ -467,7 +475,7 @@ def _prune_fwd_configs(configs, named_args, **kwargs):
 
 @triton.autotune(
     configs=_scatter2scatter_lora_configs(),
-    key=["M_BUCKET", "N", "K"],
+    key=["M_BUCKET", "N", "K", "BLOCK_R"],
     prune_configs_by={"early_config_prune": _prune_fwd_configs},
 )
 @triton.heuristics(
@@ -897,7 +905,7 @@ def _compute_expert_block_lora_dX(
     # As [BLOCK_N, BLOCK_K] tile: row=n, col=k
     WT_blk_ptrs = (
         W_ptr
-        + E_idx * stride_we
+        + E_idx.to(tl.int64) * stride_we
         + N_block[:, None] * stride_wn  # row = n dimension
         + K_block[None, :] * stride_wk
     )  # col = k dimension
@@ -2445,14 +2453,14 @@ def _compute_expert_block_lora_mxfp4(
     # Packed W pointers: tile shape [BLOCK_N, BLOCK_K] (each byte loaded twice)
     Wp_blk_ptrs = (
         Wp_ptr
-        + E_idx * stride_wpe
+        + E_idx.to(tl.int64) * stride_wpe
         + N_block[:, None] * stride_wpn
         + K_byte_block[None, :] * stride_wpk
     )
     # Scale pointers: tile shape [BLOCK_N, BLOCK_K] (broadcast within block)
     Ws_blk_ptrs = (
         Ws_ptr
-        + E_idx * stride_wse
+        + E_idx.to(tl.int64) * stride_wse
         + N_block[:, None] * stride_wsn
         + K_scale_block[None, :] * stride_wsk
     )
@@ -3001,14 +3009,14 @@ def _compute_expert_block_lora_dX_mxfp4(
     # stride_wpn (= K/2) is large, but the K row stride is 1.
     Wp_blk_ptrs = (
         Wp_ptr
-        + E_idx * stride_wpe
+        + E_idx.to(tl.int64) * stride_wpe
         + N_block[None, :] * stride_wpn
         + K_byte_block[:, None] * stride_wpk
     )
     # Scale [E, N, K/32]; row=K_scale_idx (broadcast within MX_BLOCK_SIZE), col=N
     Ws_blk_ptrs = (
         Ws_ptr
-        + E_idx * stride_wse
+        + E_idx.to(tl.int64) * stride_wse
         + N_block[None, :] * stride_wsn
         + K_scale_block[:, None] * stride_wsk
     )
@@ -3164,12 +3172,10 @@ def _profile_dX_mx_configs(configs, meta):
 
 def _prune_dX_mx_configs(configs, named_args, **kwargs):
     """Prune dX MX configs by SMEM and register pressure (MX-aware)."""
-    profiled = _profile_dX_mx_configs(configs, kwargs)
-    if profiled is not None:
-        return profiled
-
-    smem_cap = min(_get_smem_capacity(), _DX_MX_VALIDATED_SMEM)
-    block_r = named_args.get("BLOCK_R", 64)
+    meta = {**named_args, **kwargs}
+    device_smem = _get_smem_capacity()
+    smem_cap = min(device_smem, _DX_MX_VALIDATED_SMEM)
+    block_r = meta.get("BLOCK_R", 64)
 
     scored = []
     for config in configs:
@@ -3207,7 +3213,12 @@ def _prune_dX_mx_configs(configs, named_args, **kwargs):
 
     pruned = [c for s, c in scored if s <= smem_cap - _SMEM_SLACK]
     if pruned:
-        return pruned
+        selected = profile_dx_mx_configs(
+            pruned, torch.cuda.get_device_capability(), device_smem, meta
+        )
+        if selected is not pruned:
+            return selected
+        return _profile_dX_mx_configs(pruned, meta) or pruned
     if scored:
         scored.sort(key=lambda x: x[0])
         return [scored[0][1]]
@@ -3223,7 +3234,7 @@ def _prune_dX_mx_configs(configs, named_args, **kwargs):
 
 @triton.autotune(
     configs=_scatter2scatter_lora_dX_mx_configs(),
-    key=["M_BUCKET", "N", "K"],
+    key=["M_BUCKET", "N", "K", "BLOCK_R"],
     prune_configs_by={"early_config_prune": _prune_dX_mx_configs},
 )
 @triton.heuristics(

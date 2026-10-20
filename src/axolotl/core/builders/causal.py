@@ -12,16 +12,17 @@ from transformers import (
     EarlyStoppingCallback,
     Trainer,
 )
+from transformers.utils.generic import is_flash_attention_requested
 from trl.trainer.reward_trainer import DataCollatorForPreference
 
 from axolotl.core.builders.base import TrainerBuilderBase
 from axolotl.core.trainers import (
-    AxolotlMambaTrainer,
     AxolotlPRMTrainer,
     AxolotlRewardTrainer,
     AxolotlTrainer,
 )
 from axolotl.integrations.base import PluginManager
+from axolotl.model_support import get_model_support_for_cfg, resolve_model_support
 from axolotl.monkeypatch.multipack import SUPPORTED_MULTIPACK_MODEL_TYPES
 from axolotl.monkeypatch.relora import ReLoRACallback
 from axolotl.processing_strategies import get_processing_strategy
@@ -40,31 +41,33 @@ from axolotl.utils.chat_templates import get_chat_template_from_config
 from axolotl.utils.collators import (
     BatchSamplerDataCollatorForSeq2Seq,
     DataCollatorForSeq2Seq,
-    MambaDataCollator,
     V2BatchSamplerDataCollatorForSeq2Seq,
 )
 from axolotl.utils.collators.mm_chat import MultiModalChatDataCollator
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.import_helper import get_cls_from_module_str
 from axolotl.utils.logging import get_logger
+from axolotl.utils.mm_cpt import is_mm_cpt_entry
 
 LOG = get_logger(__name__)
 
 _MM_NUM_WORKERS_WARNED: set = set()
 
 
-def _warn_if_num_workers_zero_for_mm(cfg, log) -> None:
+def _warn_if_num_workers_zero_for_mm(cfg, log, check_train_on_inputs=True) -> None:
     if not getattr(cfg, "processor_type", None):
         return
     if getattr(cfg, "dataloader_num_workers", None) not in (None, 0):
         return
-    if getattr(cfg, "train_on_inputs", False):
+    if check_train_on_inputs and getattr(cfg, "train_on_inputs", False):
         return
     if "mm_num_workers_zero" in _MM_NUM_WORKERS_WARNED:
         return
     _MM_NUM_WORKERS_WARNED.add("mm_num_workers_zero")
     log.warning(
-        "Increase dataloader_num_workers to speed up multimodal training with assistant-only loss masking (currently dataloader_num_workers=0)."
+        "Increase dataloader_num_workers to speed up multimodal training — "
+        "image decoding and processor runs happen in the dataloader "
+        "(currently dataloader_num_workers=0)."
     )
 
 
@@ -73,17 +76,7 @@ def _is_multimodal_cpt(cfg) -> bool:
 
 
 def _entry_is_multimodal_cpt(entry) -> bool:
-    if entry is None:
-        return False
-    ds_type = None
-    mm_flag = None
-    if hasattr(entry, "type"):
-        ds_type = getattr(entry, "type", None)
-        mm_flag = getattr(entry, "multimodal", None)
-    elif isinstance(entry, dict):
-        ds_type = entry.get("type")
-        mm_flag = entry.get("multimodal")
-    return (ds_type == "multimodal_pretrain") or bool(mm_flag)
+    return is_mm_cpt_entry(entry)
 
 
 def _get_mm_cpt_config(cfg, is_eval: bool = False):
@@ -127,11 +120,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             callbacks.append(QATCallback(self.cfg.qat))
 
         if self.cfg.include_tkps:
-            callbacks.append(
-                TokensPerSecondCallback(
-                    resume_from_checkpoint=self.cfg.resume_from_checkpoint,
-                )
-            )
+            callbacks.append(TokensPerSecondCallback(cfg=self.cfg))
         return callbacks
 
     def get_post_trainer_create_callbacks(self, trainer):
@@ -190,13 +179,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         """
         Gets the trainer class for the given configuration.
         """
-        if self.cfg.plugins:
-            plugin_manager = PluginManager.get_instance()
-            trainer_cls = plugin_manager.get_trainer_cls(self.cfg)
-            if trainer_cls:
-                return trainer_cls
-        if self.cfg.model_config_type == "mamba":
-            return AxolotlMambaTrainer
+        plugin_manager = PluginManager.get_instance()
+        trainer_cls = plugin_manager.get_trainer_cls(self.cfg)
+        if trainer_cls:
+            return trainer_cls
         if self.cfg.reward_model:
             return AxolotlRewardTrainer
         if self.cfg.process_reward_model:
@@ -212,6 +198,13 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 raise ValueError(
                     f"Failed to load custom trainer class '{self.cfg.trainer_cls}': {e}"
                 ) from e
+
+        profile = resolve_model_support(get_model_support_for_cfg(self.cfg))
+        trainer_factory = None if profile is None else profile.strategies.trainer_cls
+        if trainer_factory is not None:
+            trainer_cls = trainer_factory(self.cfg)
+            if trainer_cls is not None:
+                return trainer_cls
 
         return AxolotlTrainer
 
@@ -244,10 +237,13 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         elif self.cfg.sample_packing and self.cfg.eval_sample_packing is False:
             training_arguments_kwargs["dataloader_drop_last"] = True
 
+        trainer_cls = self._get_trainer_cls()
         if self.cfg.remove_unused_columns is not None:
             training_arguments_kwargs["remove_unused_columns"] = (
                 self.cfg.remove_unused_columns
             )
+        elif getattr(trainer_cls, "requires_all_columns", lambda _cfg: False)(self.cfg):
+            training_arguments_kwargs["remove_unused_columns"] = False
 
         if self.cfg.do_bench_eval:
             training_arguments_kwargs["do_bench_eval"] = self.cfg.do_bench_eval
@@ -312,6 +308,11 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs["curriculum_sampling"] = self.cfg.curriculum_sampling
 
         training_arguments_kwargs["sample_packing"] = bool(self.cfg.sample_packing)
+        training_arguments_kwargs["batch_flattening"] = bool(self.cfg.batch_flattening)
+        training_arguments_kwargs["balance_labels"] = bool(self.cfg.balance_labels)
+        training_arguments_kwargs["label_balance_window_optim_steps"] = (
+            self.cfg.label_balance_window_optim_steps or 1
+        )
         training_arguments_kwargs["sample_packing_drop_attention_mask"] = (
             self.cfg.attn_decontaminates_packing
         )
@@ -395,11 +396,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 self.cfg.image_resize_algorithm
             )
 
-        if self.cfg.plugins:
-            plugin_manager = PluginManager.get_instance()
-            plugin_training_args = plugin_manager.get_training_args(self.cfg)
-            if plugin_training_args:
-                training_arguments_kwargs.update(plugin_training_args)
+        plugin_manager = PluginManager.get_instance()
+        plugin_training_args = plugin_manager.get_training_args(self.cfg)
+        if plugin_training_args:
+            training_arguments_kwargs.update(plugin_training_args)
 
         if self.cfg.reward_model:
             training_args_cls = AxolotlRewardConfig
@@ -445,7 +445,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             )
             trainer_kwargs["compute_loss_func"] = configured_eaft_loss
 
-        trainer_cls = self._get_trainer_cls()
+        if self.cfg.use_dft:
+            from axolotl.monkeypatch.loss.dft import dft_loss
+
+            trainer_kwargs["compute_loss_func"] = dft_loss
 
         trainer_kwargs, trainer_cls = self.hook_pre_create_trainer(
             trainer_kwargs, trainer_cls
@@ -494,6 +497,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         # if the trainer has the `axolotl_cfg` property, set it
         if hasattr(trainer, "axolotl_cfg"):
             trainer.axolotl_cfg = self.cfg
+            if hasattr(trainer, "post_set_axolotl_cfg"):
+                trainer.post_set_axolotl_cfg()
         for callback in self.get_post_trainer_create_callbacks(trainer):
             trainer.add_callback(callback)
 
@@ -531,6 +536,20 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             collator_kwargs["pad_to_multiple_of"] = pad_to_multiple_of
         return MultiModalPretrainDataCollator(**collator_kwargs)
 
+    def _uses_deepspeed_sequence_parallel(self) -> bool:
+        # DeepSpeed's Ulysses dataloader adapter gathers and slices every batch tensor as
+        # [batch, seq]; the 1-D cu_seq_lens metadata has no sequence dim to slice.
+        return bool(self.cfg.deepspeed) and (self.cfg.context_parallel_size or 1) > 1
+
+    def _dispatches_batches(self) -> bool:
+        # accelerate's DataLoaderDispatcher, its default for iterable datasets, reads the batch
+        # size off the first tensor and slices every tensor along dim 0 per process, which
+        # cuts the 1-D cu_seq_lens metadata down to a single element.
+        dispatch_batches = (self.cfg.accelerator_config or {}).get("dispatch_batches")
+        if dispatch_batches is not None:
+            return dispatch_batches
+        return bool(self.cfg.streaming or self.cfg.pretraining_dataset)
+
     def build_collator(
         self,
         training_args,  # type: "AxolotlTrainingArguments"  # type: ignore
@@ -544,6 +563,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 and self.processor
                 and _is_multimodal_cpt(self.cfg)
             ):
+                if not is_eval:
+                    _warn_if_num_workers_zero_for_mm(
+                        self.cfg, LOG, check_train_on_inputs=False
+                    )
                 return self._build_mm_pretrain_collator(
                     pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
                     is_eval=is_eval,
@@ -557,9 +580,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 self.cfg.micro_batch_size == 1 and is_eval is False
             ):
                 return None
-
-        if self.cfg.model_config_type == "mamba":
-            return MambaDataCollator(tokenizer=self.tokenizer)
 
         use_batch_sampler_collator = False
         if is_eval is False and training_args.sample_packing:
@@ -579,11 +599,20 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         collator_args = [self.tokenizer]
 
         collator_cls_and_kwargs = None
-        if self.cfg.plugins:
-            plugin_manager = PluginManager.get_instance()
-            collator_cls_and_kwargs = plugin_manager.get_collator_cls_and_kwargs(
-                self.cfg, is_eval=is_eval
+        plugin_manager = PluginManager.get_instance()
+        collator_cls_and_kwargs = plugin_manager.get_collator_cls_and_kwargs(
+            self.cfg, is_eval=is_eval
+        )
+
+        if not collator_cls_and_kwargs:
+            profile = resolve_model_support(get_model_support_for_cfg(self.cfg))
+            collator_factory = (
+                None if profile is None else profile.strategies.collator_factory
             )
+            if collator_factory is not None:
+                profile_collator = collator_factory(self.cfg, self.tokenizer, is_eval)
+                if profile_collator is not None:
+                    return profile_collator
 
         if collator_cls_and_kwargs:
             collator = collator_cls_and_kwargs[0]
@@ -609,15 +638,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             else:
                 collator = BatchSamplerDataCollatorForSeq2Seq
         else:
-            if (
-                self.cfg.processor_type
-                and self.processor
-                and _is_multimodal_cpt(self.cfg)
-            ):
-                return self._build_mm_pretrain_collator(
-                    pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
-                    is_eval=is_eval,
-                )
             if self.cfg.processor_type and self.processor:
                 collator = MultiModalChatDataCollator
                 # Mirror ChatTemplateStrategy: per-dataset masking knobs from first MM dataset, else global cfg.
@@ -676,6 +696,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     train_on_eos=train_on_eos,
                     role_boundaries_override=role_boundaries_override,
                     field_messages=field_messages or None,
+                    model_type=self.cfg.model_config_type,
                 )
             elif self.cfg.batch_flattening:
                 collator = DataCollatorWithFlattening
@@ -686,6 +707,30 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 collator = DataCollatorForSeq2Seq
 
         kwargs["return_tensors"] = "pt"
+
+        is_packed_mode = (
+            training_args.eval_sample_packing
+            if is_eval
+            else training_args.sample_packing
+        )
+        if (
+            collator
+            in (
+                V2BatchSamplerDataCollatorForSeq2Seq,
+                BatchSamplerDataCollatorForSeq2Seq,
+            )
+            and is_flash_attention_requested(
+                requested_attention_implementation=self.cfg.attn_implementation
+            )
+            and is_packed_mode
+            and self.cfg.fa_varlen_kwargs_in_collator is not False
+            and self.cfg.model_config_type in SUPPORTED_MULTIPACK_MODEL_TYPES
+            and not self._uses_deepspeed_sequence_parallel()
+            and not self._dispatches_batches()
+        ):
+            # transformers consumes these FlashAttentionKwargs for any in-tree model and skips its per-layer
+            # varlen derivation, which syncs the host several times per layer (and graph-breaks under compile).
+            kwargs["emit_fa_varlen_kwargs"] = True
 
         return collator(
             *collator_args,

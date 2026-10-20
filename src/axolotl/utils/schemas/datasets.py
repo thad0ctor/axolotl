@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from axolotl.utils.mm_cpt import is_mm_cpt_entry
 from axolotl.utils.schemas.enums import ChatTemplate
 from axolotl.utils.schemas.utils import handle_legacy_message_fields_logic
 
@@ -200,6 +201,17 @@ class SFTDataset(BaseModel):
             "description": "The specific revision of the dataset to use when loading from the Hugging Face Hub. This can be a commit hash, tag, or branch name. If not specified, the latest version will be used. This parameter is ignored for local datasets."
         },
     )
+    weight: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        json_schema_extra={
+            "description": "Sampling weight for dataset mixing. A float between 0 (exclusive) and 1 (inclusive). "
+            "When set, the dataset is shuffled and subsampled to (weight * dataset_size) examples before "
+            "merging with other datasets. For example, weight=0.5 uses 50% of the dataset. "
+            "If not set, the entire dataset is used (equivalent to weight=1.0)."
+        },
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -288,6 +300,12 @@ class PretrainingDataset(BaseModel):
             "description": "Permit fetching image sources with a URL scheme (http(s)/etc.). Off by default to avoid SSRF from untrusted shards."
         },
     )
+    max_images_per_row: int | None = Field(
+        default=32,
+        json_schema_extra={
+            "description": "Reject (or drop, with skip_bad_images) rows carrying more images than this — each image expands to a large pixel tensor at the collator. Set 0 or null to disable."
+        },
+    )
 
 
 class MultiModalPretrainDataset(PretrainingDataset):
@@ -324,7 +342,7 @@ class MultiModalEvalDataset(PretrainingDataset):
             data = data.model_dump()
         if not isinstance(data, dict):
             return data
-        if data.get("type") != "multimodal_pretrain" and not data.get("multimodal"):
+        if not is_mm_cpt_entry(data):
             raise ValueError(
                 "MultiModalEvalDataset requires type='multimodal_pretrain' "
                 "or multimodal=True"
@@ -428,6 +446,39 @@ class SyntheticDataset(BaseModel):
         default=None,
         json_schema_extra={"description": "Random seed for reproducibility"},
     )
+    min_turns: int = Field(
+        default=1, ge=1, description="Minimum input/output pairs per row"
+    )
+    max_turns: int = Field(
+        default=1, ge=1, description="Maximum input/output pairs per row"
+    )
+    min_turn_length: int = Field(
+        default=32, ge=1, description="Minimum total tokens per input/output pair"
+    )
+    input_fraction: float = Field(
+        default=0,
+        ge=0,
+        lt=1,
+        allow_inf_nan=False,
+        description="Fraction of input tokens masked to -100 per turn; 0 labels all tokens",
+    )
+
+    @model_validator(mode="after")
+    def validate_turns(self):
+        if self.min_turns > 1 and self.max_turns <= self.min_turns:
+            raise ValueError("max_turns must exceed min_turns for multi-turn data")
+        if self.max_turns > 1 and "input_fraction" not in self.model_fields_set:
+            self.input_fraction = 0.25
+        tokens_per_turn = max(self.min_turn_length, 2 if self.input_fraction > 0 else 1)
+        if (
+            self.sequence_length is not None
+            and (self.max_turns > 1 or self.input_fraction > 0)
+            and self.sequence_length < tokens_per_turn * self.min_turns
+        ):
+            raise ValueError(
+                f"sequence_length must be at least {tokens_per_turn} * min_turns"
+            )
+        return self
 
 
 DatasetConfig = (

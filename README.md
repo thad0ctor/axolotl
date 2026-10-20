@@ -22,6 +22,7 @@
     <a href="https://twitter.com/axolotl_ai"><img src="https://img.shields.io/twitter/follow/axolotl_ai?style=social" alt="twitter" style="height: 20px;"></a>
     <a href="https://colab.research.google.com/github/axolotl-ai-cloud/axolotl/blob/main/examples/colab-notebooks/colab-axolotl-example.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="google-colab" style="height: 20px;"></a>
     <br/>
+    <img src="https://github.com/axolotl-ai-cloud/axolotl/actions/workflows/docker-e2e.yml/badge.svg" alt="docker-e2e-tests">
     <img src="https://github.com/axolotl-ai-cloud/axolotl/actions/workflows/tests-nightly.yml/badge.svg" alt="tests-nightly">
     <img src="https://github.com/axolotl-ai-cloud/axolotl/actions/workflows/multi-gpu-e2e.yml/badge.svg" alt="multigpu-semi-weekly tests">
 </p>
@@ -29,11 +30,36 @@
 
 ## 🎉 Latest Updates
 
+- 2026/10:
+  - Reflection's [Beam](https://docs.axolotl.ai/docs/models/beam.html) is now supported in Axolotl, with QLoRA and expert-parallel LoRA configs including NVFP4.
+  - [Distributed training improvements](https://github.com/axolotl-ai-cloud/axolotl/pull/4091) keep EP groups node-local when the topology permits, add DeepSpeed Ulysses support through `context_parallel_size`, and fix expert-LoRA resume and FSDP2 activation checkpointing with LoRA.
+- 2026/09:
+  - New model support has been added in Axolotl for [MiniCPM5](https://docs.axolotl.ai/docs/models/minicpm5.html), [Nex-N2.5-mini](https://docs.axolotl.ai/docs/models/nex-n2.5.html), [Qwen3.6](https://docs.axolotl.ai/docs/models/qwen3.5.html), [Qwen3.8-Flash-Next](https://docs.axolotl.ai/docs/models/qwen3.8-flash-next.html), and [K2 Horizon](https://docs.axolotl.ai/docs/models/k2-horizon.html).
+  - [CPU-staged FSDP2 QLoRA loading](https://docs.axolotl.ai/docs/expert_quantization.html#cpu-staged-fsdp2-qlora-loading) lets you load models larger than a single GPU's memory without materializing a full quantized replica on each GPU.
+  - [GGUF export](https://docs.axolotl.ai/docs/export.html) is now available via `axolotl export`, with optional quantization for deployment with llama.cpp and Ollama.
+  - [NVFP4 LoRA](https://docs.axolotl.ai/docs/nvfp4_lora.html) now supports native TorchAO dense weights and merge-aware training, optimizing against the quantized merged weights for deployment.
+  - New training options: [MixLoRA](https://github.com/axolotl-ai-cloud/axolotl/tree/main/src/axolotl/integrations/mixlora) adds routed LoRA experts to dense models, and [Dynamic Fine-Tuning (DFT)](https://github.com/axolotl-ai-cloud/axolotl/pull/4008) weights the SFT loss by token probability.
+  - [Ringmaster context parallelism](https://docs.axolotl.ai/docs/sequence_parallelism.html) adds Ulysses and combined Ulysses/Ring (USP) support, sample packing, and CP fixes for GDN, KDA, and Mamba/Mamba2 models.
+  - [Torch all-to-all Expert Parallelism](https://docs.axolotl.ai/docs/custom_integrations.html#expert-parallelism-integration) enables MoE training over NVLink or PCIe without requiring DeepEP. Expanded [N-D parallelism](https://docs.axolotl.ai/docs/nd_parallelism.html) supports EP with FSDP2, HSDP, and context parallelism, plus FSDP2 + tensor parallelism.
+  - [Selective activation checkpointing](https://docs.axolotl.ai/docs/gradient_checkpointing.html#selective-activation-checkpointing-sac) adds rules to save specific projections or large matrix multiplications, with optional CPU offload to tune the memory/recomputation tradeoff.
+  - Improved [plugin integration](https://docs.axolotl.ai/docs/custom_integrations.html) includes new cloud provider interfaces for launching training jobs, with support for [Nebius Serverless Jobs](https://docs.axolotl.ai/docs/nebius-serverless.html).
+- 2026/08:
+  - New model support has been added in Axolotl for [Ling 3.0](https://docs.axolotl.ai/docs/models/ling3.html), [Muse Glimmer](https://docs.axolotl.ai/docs/models/muse-glimmer.html), [North Micro Vision Instruct](https://docs.axolotl.ai/docs/models/cohere-north-micro-vision-instruct.html) and [Shieldstral](https://docs.axolotl.ai/docs/models/shieldstral.html).
+- 2026/07:
+  - [NVFP4 (4-bit) MoE LoRA training](https://docs.axolotl.ai/docs/nvfp4_lora.html) is now supported via ScatterMoE (W4A16) and SonicMoE (W4A4), including adapter merge back into a plain NVFP4 checkpoint.
+- 2026/06:
+  - [Expert Parallelism (EP)](https://docs.axolotl.ai/docs/nd_parallelism.html) for distributed MoE training via DeepEP, remote training through [Tinker-compatible APIs](https://github.com/axolotl-ai-cloud/axolotl/pull/3614), [Context Parallelism for hybrid SSM models](https://github.com/axolotl-ai-cloud/axolotl/pull/3572) (Nemotron-H, Falcon-H1, Bamba), [BitNet 1.58-bit](https://github.com/axolotl-ai-cloud/axolotl/pull/3634) fine-tuning, and a [multimodal assistant-only loss-masking fix](https://github.com/axolotl-ai-cloud/axolotl/pull/3625).
+
+<details>
+
+<summary>Expand older updates</summary>
+
 - 2026/04:
-  - New model support has been added in Axolotl for [Mistral Medium 3.5](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/mistral-medium-3_5) and [Gemma 4](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/gemma4).
+  - New model support has been added in Axolotl for [Mistral Medium 3.5](https://docs.axolotl.ai/docs/models/mistral-medium-3_5.html) and [Gemma 4](https://docs.axolotl.ai/docs/models/gemma4.html).
+  - New RL and kernels: [Async GRPO](https://github.com/axolotl-ai-cloud/axolotl/pull/3486) (up to 58% faster steps), [Flash Attention 4](https://docs.axolotl.ai/docs/attention.html#flash-attention), [NeMo Gym](https://github.com/axolotl-ai-cloud/axolotl/pull/3516), and [EBFT](https://github.com/axolotl-ai-cloud/axolotl/pull/3527).
   - Axolotl is now [uv-first](https://github.com/axolotl-ai-cloud/axolotl/pull/3545) and has [SonicMoE fused LoRA](https://github.com/axolotl-ai-cloud/axolotl/pull/3519) support.
 - 2026/03:
-  - New model support has been added in Axolotl for [Mistral Small 4](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/mistral4), [Qwen3.5, Qwen3.5 MoE](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/qwen3.5), [GLM-4.7-Flash](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/glm47-flash), [GLM-4.6V](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/glm46v), and [GLM-4.5-Air](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/glm45).
+  - New model support has been added in Axolotl for [Mistral Small 4](https://docs.axolotl.ai/docs/models/mistral4.html), [Qwen3.5, Qwen3.5 MoE](https://docs.axolotl.ai/docs/models/qwen3.5.html), [GLM-4.7-Flash](https://docs.axolotl.ai/docs/models/glm47-flash.html), [GLM-4.6V](https://docs.axolotl.ai/docs/models/glm46v.html), and [GLM-4.5-Air](https://docs.axolotl.ai/docs/models/glm45.html).
   - [MoE expert quantization](https://docs.axolotl.ai/docs/expert_quantization.html) support (via `quantize_moe_experts: true`) greatly reduces VRAM when training MoE models (FSDP2 compat).
 - 2026/02:
   - [ScatterMoE LoRA](https://github.com/axolotl-ai-cloud/axolotl/pull/3410) support. LoRA fine-tuning directly on MoE expert weights using custom Triton kernels.
@@ -44,11 +70,6 @@
   - Axolotl now includes support for [Kimi-Linear](https://docs.axolotl.ai/docs/models/kimi-linear.html), [Plano-Orchestrator](https://docs.axolotl.ai/docs/models/plano.html), [MiMo](https://docs.axolotl.ai/docs/models/mimo.html), [InternVL 3.5](https://docs.axolotl.ai/docs/models/internvl3_5.html), [Olmo3](https://docs.axolotl.ai/docs/models/olmo3.html), [Trinity](https://docs.axolotl.ai/docs/models/trinity.html), and [Ministral3](https://docs.axolotl.ai/docs/models/ministral3.html).
   - [Distributed Muon Optimizer](https://github.com/axolotl-ai-cloud/axolotl/pull/3264) support has been added for FSDP2 pretraining.
 - 2025/10: New model support has been added in Axolotl for: [Qwen3 Next](https://docs.axolotl.ai/docs/models/qwen3-next.html), [Qwen2.5-vl, Qwen3-vl](https://github.com/axolotl-ai-cloud/axolotl/tree/main/examples/qwen2_5-vl), [Qwen3, Qwen3MoE](https://docs.axolotl.ai/docs/models/qwen3.html), [Granite 4](https://docs.axolotl.ai/docs/models/granite4.html), [HunYuan](https://docs.axolotl.ai/docs/models/hunyuan.html), [Magistral 2509](https://docs.axolotl.ai/docs/models/magistral/vision.html), [Apertus](https://docs.axolotl.ai/docs/models/apertus.html), and [Seed-OSS](https://docs.axolotl.ai/docs/models/seed-oss.html).
-
-<details>
-
-<summary>Expand older updates</summary>
-
 - 2025/09: Axolotl now has text diffusion training. Read more [here](https://github.com/axolotl-ai-cloud/axolotl/tree/main/src/axolotl/integrations/diffusion).
 - 2025/08: QAT has been updated to include NVFP4 support. See [PR](https://github.com/axolotl-ai-cloud/axolotl/pull/3107).
 - 2025/07:
@@ -75,10 +96,10 @@ Axolotl is a free and open-source tool designed to streamline post-training and 
 Features:
 
 - **Multiple Model Support**: Train various models like GPT-OSS, LLaMA, Mistral, Mixtral, Pythia, and many more models available on the Hugging Face Hub.
-- **Multimodal Training**: Fine-tune vision-language models (VLMs) including LLaMA-Vision, Qwen2-VL, Pixtral, LLaVA, SmolVLM2, GLM-4.6V, InternVL 3.5, Gemma 3n, and audio models like Voxtral with image, video, and audio support.
-- **Training Methods**: Full fine-tuning, LoRA, QLoRA, GPTQ, QAT, Preference Tuning (DPO, IPO, KTO, ORPO), RL (GRPO, GDPO), and Reward Modelling (RM) / Process Reward Modelling (PRM).
+- **Multimodal Training**: Fine-tune vision-language models (VLMs) including LLaMA-Vision, Qwen2-VL, Pixtral, LLaVA, SmolVLM2, GLM-4.6V, InternVL 3.5, Gemma 3n, PaddleOCR-VL, Muse Glimmer, and audio models like Voxtral with image, video, and audio support.
+- **Training Methods**: Full fine-tuning, LoRA, QLoRA, GPTQ, QAT (int8/int4/FP8/NVFP4/MXFP4), FP8 mixed-precision training, NVFP4/MXFP4 MoE LoRA, Preference Tuning (DPO, IPO, KTO, ORPO), RL (GRPO, GDPO), and Reward Modelling (RM) / Process Reward Modelling (PRM).
 - **Easy Configuration**: Re-use a single YAML configuration file across the full fine-tuning pipeline: dataset preprocessing, training, evaluation, quantization, and inference.
-- **Performance Optimizations**: [Multipacking](https://docs.axolotl.ai/docs/multipack.html), [Flash Attention 2/3/4](https://docs.axolotl.ai/docs/attention.html#flash-attention), [Xformers](https://docs.axolotl.ai/docs/attention.html#xformers), [Flex Attention](https://docs.axolotl.ai/docs/attention.html#flex-attention), [SageAttention](https://docs.axolotl.ai/docs/attention.html#sageattention), [Liger Kernel](https://docs.axolotl.ai/docs/custom_integrations.html#liger-kernels), [Cut Cross Entropy](https://docs.axolotl.ai/docs/custom_integrations.html#cut-cross-entropy), [ScatterMoE](https://docs.axolotl.ai/docs/custom_integrations.html#kernels-integration), [Sequence Parallelism (SP)](https://docs.axolotl.ai/docs/sequence_parallelism.html), [LoRA optimizations](https://docs.axolotl.ai/docs/lora_optims.html), [Multi-GPU training (FSDP1, FSDP2, DeepSpeed)](https://docs.axolotl.ai/docs/multi-gpu.html), [Multi-node training (Torchrun, Ray)](https://docs.axolotl.ai/docs/multi-node.html), and many more!
+- **Performance Optimizations**: [Multipacking](https://docs.axolotl.ai/docs/multipack.html), [Flash Attention 2/3/4](https://docs.axolotl.ai/docs/attention.html#flash-attention), [Xformers](https://docs.axolotl.ai/docs/attention.html#xformers), [Flex Attention](https://docs.axolotl.ai/docs/attention.html#flex-attention), [SageAttention](https://docs.axolotl.ai/docs/attention.html#sageattention), [Liger Kernel](https://docs.axolotl.ai/docs/custom_integrations.html#liger-kernels), [Cut Cross Entropy](https://docs.axolotl.ai/docs/custom_integrations.html#cut-cross-entropy), [ScatterMoE](https://docs.axolotl.ai/docs/custom_integrations.html#kernels-integration), [Sequence Parallelism (SP)](https://docs.axolotl.ai/docs/sequence_parallelism.html), [LoRA optimizations](https://docs.axolotl.ai/docs/lora_optims.html), [Multi-GPU training (FSDP2, DeepSpeed)](https://docs.axolotl.ai/docs/multi-gpu.html), [Multi-node training (Torchrun, Ray)](https://docs.axolotl.ai/docs/multi-node.html), and many more!
 - **Flexible Dataset Handling**: Load from local, HuggingFace, and cloud (S3, Azure, GCP, OCI) datasets.
 - **Cloud Ready**: We ship [Docker images](https://hub.docker.com/u/axolotlai) and also [PyPI packages](https://pypi.org/project/axolotl/) for use on cloud platforms and local hardware.
 
@@ -89,8 +110,8 @@ Features:
 **Requirements**:
 
 - NVIDIA GPU (Ampere or newer for `bf16` and Flash Attention) or AMD GPU
-- Python >=3.11 (3.12 recommended)
-- PyTorch ≥2.11.0
+- Python >=3.12 (3.12 recommended)
+- PyTorch ≥2.13.0 (2.13.0 recommended)
 
 ### Google Colab
 
@@ -109,7 +130,7 @@ export UV_TORCH_BACKEND=cu130
 uv venv --python 3.12
 source .venv/bin/activate
 
-uv pip install torch==2.12.0 torchvision
+uv pip install torch==2.14.0 torchvision
 uv pip install --no-build-isolation axolotl[deepspeed]
 
 # Download example axolotl configs, deepspeed configs
@@ -159,6 +180,7 @@ That's it! Check out our [Getting Started Guide](https://docs.axolotl.ai/docs/ge
 ## 📚 Documentation
 
 - [Installation Options](https://docs.axolotl.ai/docs/installation.html) - Detailed setup instructions for different environments
+- [Support Matrix](https://docs.axolotl.ai/docs/support-matrix.html) - Feature support, compatibility, and known gaps
 - [Configuration Guide](https://docs.axolotl.ai/docs/config-reference.html) - Full configuration options and examples
 - [Dataset Loading](https://docs.axolotl.ai/docs/dataset_loading.html) - Loading datasets from various sources
 - [Dataset Guide](https://docs.axolotl.ai/docs/dataset-formats/) - Supported formats and how to use them
@@ -170,7 +192,7 @@ That's it! Check out our [Getting Started Guide](https://docs.axolotl.ai/docs/ge
 
 ## AI Agent Support
 
-Axolotl ships with built-in documentation optimized for AI coding agents (Claude Code, Cursor, Copilot, etc.). These docs are bundled with the pip package — no repo clone needed.
+Axolotl ships with built-in documentation optimized for AI coding agents (Claude Code, Cursor, Copilot, etc.). These docs are bundled with the pip package, no repo clone needed.
 
 ```bash
 # Show overview and available training methods
@@ -206,7 +228,7 @@ Contributions are welcome! Please see our [Contributing Guide](https://github.co
 
 Axolotl has opt-out telemetry that helps us understand how the project is being used
 and prioritize improvements. We collect basic system information, model types, and
-error rates—never personal data or file paths. Telemetry is enabled by default. To
+error rates, never personal data or file paths. Telemetry is enabled by default. To
 disable it, set AXOLOTL_DO_NOT_TRACK=1. For more details, see our [telemetry documentation](https://docs.axolotl.ai/docs/telemetry.html).
 
 ## ❤️ Sponsors

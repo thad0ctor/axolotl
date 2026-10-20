@@ -1,9 +1,12 @@
 """Data handling specific to streaming datasets."""
 
 import functools
+import hashlib
+import re
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import torch
 from datasets import Dataset
 from torch.utils.data import RandomSampler
@@ -11,7 +14,9 @@ from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 from axolotl.utils.collators import PretrainingBatchSamplerDataCollatorForSeq2Seq
 from axolotl.utils.logging import get_logger
+from axolotl.utils.mm_cpt import is_mm_cpt_entry
 from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
+from axolotl.utils.samplers.utils import get_dataset_label_counts
 from axolotl.utils.trainer import process_pretraining_datasets_for_packing
 
 LOG = get_logger(__name__)
@@ -185,9 +190,22 @@ def encode_streaming_multimodal(
     text_column: str = "text",
     image_column: str = "images",
     skip_bad_rows: bool = False,
+    marker_prefix: Optional[str] = None,
+    marker_suffix: Optional[str] = None,
+    max_images_per_row: Optional[int] = None,
 ) -> Dict[str, List]:
     texts: List[str] = examples[text_column]
     imgs_list: List[List[str]] = examples[image_column]
+
+    # Wrap bare placeholders with the model's flanking markers (Qwen's
+    # vision_start/end); already-wrapped occurrences are left alone.
+    bare_placeholder = None
+    if marker_prefix and marker_suffix:
+        bare_placeholder = re.compile(
+            rf"(?<!{re.escape(marker_prefix)})"
+            rf"{re.escape(image_token)}"
+            rf"(?!{re.escape(marker_suffix)})"
+        )
 
     if len(texts) != len(imgs_list):
         raise ValueError(
@@ -195,9 +213,6 @@ def encode_streaming_multimodal(
             f"but image column has {len(imgs_list)}"
         )
 
-    input_ids: List[List[int]] = []
-    labels: List[List[int]] = []
-    attention_mask: List[List[int]] = []
     keep_images: List[List[str]] = []
     keep_text: List[str] = []
 
@@ -220,18 +235,30 @@ def encode_streaming_multimodal(
                     f"encode_streaming_multimodal: image {j} in row must be "
                     f"str, got {type(ip).__name__}."
                 )
-        # No truncation: counting on truncated ids and storing untruncated text
-        # (which the collator re-tokenizes without truncation) silently produces
-        # oversize batches and confusing placeholder/image-count mismatches.
+        if max_images_per_row and len(imgs) > max_images_per_row:
+            msg = (
+                f"Multimodal CPT row has {len(imgs)} images, exceeding "
+                f"max_images_per_row={max_images_per_row}. Each image expands "
+                f"to a large pixel tensor at the processor; raise the cap "
+                f"deliberately if your rows legitimately carry this many."
+            )
+            if skip_bad_rows:
+                LOG.warning("%s — dropping row.", msg)
+                continue
+            raise ValueError(msg)
+        if bare_placeholder is not None:
+            text = bare_placeholder.sub(
+                f"{marker_prefix}{image_token}{marker_suffix}", text
+            )
+        # Validation-only tokenize (the collator's processor call produces the
+        # model's input_ids); no truncation, or trailing placeholders vanish.
         enc = tokenizer(text, add_special_tokens=True)
         ids = list(enc["input_ids"])
-        mask = list(enc["attention_mask"])
-        # Append EOS unless the tokenizer already did (avoids a double EOS on
-        # add_eos_token tokenizers) or has none (avoids appending a None id).
+        # Budget the EOS the collator will append.
         eos_id = tokenizer.eos_token_id
+        n_tokens = len(ids)
         if eos_id is not None and (not ids or ids[-1] != eos_id):
-            ids.append(eos_id)
-            mask.append(1)
+            n_tokens += 1
         # Count by id — `text.count` substring-matches `<image>` in `<image_soft_token>`.
         n_placeholders = sum(1 for t in ids if t == image_token_id)
         if n_placeholders != len(imgs):
@@ -244,9 +271,9 @@ def encode_streaming_multimodal(
                 LOG.warning("%s — dropping row.", msg)
                 continue
             raise ValueError(msg)
-        if len(ids) > max_tokens:
+        if n_tokens > max_tokens:
             msg = (
-                f"Multimodal CPT row tokenizes to {len(ids)} tokens which "
+                f"Multimodal CPT row tokenizes to {n_tokens} tokens which "
                 f"exceeds sequence_len={max_tokens}. Pre-chunk your text or "
                 f"raise sequence_len (image patch expansion at the processor "
                 f"may push the final length even higher)."
@@ -255,17 +282,12 @@ def encode_streaming_multimodal(
                 LOG.warning("%s — dropping row.", msg)
                 continue
             raise ValueError(msg)
-        # Labels = ids; collator masks image-family ids after re-tokenization.
-        input_ids.append(ids)
-        labels.append(list(ids))
-        attention_mask.append(mask)
         keep_images.append(list(imgs))
         keep_text.append(text)
 
+    # Only what the collator consumes; token columns would be dead weight
+    # (the processor re-tokenizes) at ~3x the payload.
     return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "attention_mask": attention_mask,
         "images": keep_images,
         "_mm_text": keep_text,
     }
@@ -314,6 +336,8 @@ def wrap_streaming_dataset(
             batch_size=cfg.micro_batch_size,
             multipack_attn=multipack_attn,
             bin_size=cfg.sample_packing_bin_size,
+            balance_labels=bool(cfg.balance_labels),
+            seed=cfg.data_seed if cfg.data_seed is not None else (cfg.seed or 0),
         )
 
         # Set this to 1 so downstream data_loader doesn't try to increase the batch size
@@ -338,12 +362,8 @@ def wrap_streaming_dataset(
             else lambda key, default=None: getattr(ds_first, key, default)
         )
         text_column = get_ds_value("text_column", "text") or "text"
-        ds_type = (get_ds_value("type", None) or "").strip()
-        is_mm_cpt = ds_type == "multimodal_pretrain" or bool(
-            get_ds_value("multimodal", False)
-        )
 
-        if is_mm_cpt:
+        if is_mm_cpt_entry(ds_first):
             if processor is None:
                 raise ValueError(
                     "Multimodal CPT (type: multimodal_pretrain) requires a "
@@ -362,6 +382,7 @@ def wrap_streaming_dataset(
             )
             image_column = get_ds_value("image_column", None) or "images"
             skip_bad_rows = bool(get_ds_value("skip_bad_images", False))
+            max_images_per_row = get_ds_value("max_images_per_row", 32)
             LOG.info(
                 f"multimodal streaming CPT: placeholder={spec.image_token!r} "
                 f"(id={spec.image_token_id})"
@@ -375,6 +396,9 @@ def wrap_streaming_dataset(
                 text_column=text_column,
                 image_column=image_column,
                 skip_bad_rows=skip_bad_rows,
+                marker_prefix=spec.marker_prefix,
+                marker_suffix=spec.marker_suffix,
+                max_images_per_row=max_images_per_row,
             )
         else:
             encode = functools.partial(
@@ -425,6 +449,8 @@ def encode_packed_streaming(
     max_seq_length: int = 2048,
     batch_size: int = 4,
     multipack_attn: Optional[bool] = True,
+    balance_labels: bool = False,
+    seed: int = 0,
 ) -> Dict[str, List]:
     # tokenize all the examples
     # rows get split with stride (overlap)
@@ -439,9 +465,33 @@ def encode_packed_streaming(
         drop_attention_mask=multipack_attn,
     )
 
+    lengths = get_dataset_lengths(train_dataset)
+    label_counts = label_start_counts = None
+    if balance_labels:
+        if collate_fn.tokenizer.padding_side != "right":
+            raise ValueError("Label-balanced packing requires right padding")
+        if {"labels", "shift_labels"}.intersection(train_dataset.column_names):
+            label_counts, label_start_counts = get_dataset_label_counts(train_dataset)
+        else:
+            # Pretraining creates labels from input_ids during collation.
+            label_counts = lengths
+            label_start_counts = np.ones_like(lengths)
+
+    if balance_labels:
+        digest = hashlib.sha256(str(seed).encode("ascii"))
+        for batch in train_dataset.select_columns(["input_ids"]).iter(batch_size=1024):
+            for ids in batch["input_ids"]:
+                digest.update(len(ids).to_bytes(8, "little"))
+                digest.update(np.asarray(ids, dtype="<i8").tobytes())
+        seed = int.from_bytes(digest.digest()[:8], "little")
+
     sampler = MultipackBatchSampler(
         sampler=RandomSampler(train_dataset),
-        lengths=get_dataset_lengths(train_dataset),
+        lengths=lengths,
+        label_counts=label_counts,
+        label_start_counts=label_start_counts,
+        seed=seed,
+        padding_multiple=getattr(collate_fn, "pad_to_multiple_of", None) or 1,
         batch_size=1,
         batch_max_len=batch_size * max_seq_length,
         drop_last=True,

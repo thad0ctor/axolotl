@@ -1,14 +1,13 @@
 """Module for TRL RL trainers"""
 
-from trl import RewardTrainer
+from trl import KTOTrainer, RewardTrainer
 from trl.experimental.cpo import CPOTrainer
-from trl.experimental.kto import KTOTrainer
 from trl.experimental.orpo import ORPOTrainer
-from trl.experimental.prm import PRMTrainer
 
 from axolotl.core.trainers.mixins import DistributedParallelMixin, RngLoaderMixin
 from axolotl.core.trainers.mixins.optimizer import OptimizerInitMixin, OptimizerMixin
 from axolotl.core.trainers.mixins.scheduler import SchedulerMixin
+from axolotl.core.trainers.prm.prm_trainer import PRMTrainer
 
 
 class AxolotlORPOTrainer(
@@ -80,7 +79,7 @@ class AxolotlPRMTrainer(
     PRMTrainer,
 ):
     """
-    Extend the base trl.PRMTrainer for axolotl helpers
+    Extend the vendored PRMTrainer for axolotl helpers
     """
 
     tag_names = ["axolotl", "prm"]

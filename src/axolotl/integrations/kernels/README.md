@@ -7,7 +7,7 @@ class ExpertsInterface(GeneralInterface):
     _global_mapping = {
         "batched_mm": batched_mm_experts_forward,
         "grouped_mm": grouped_mm_experts_forward,
-        "sonicmoe":   sonicmoe_experts_forward,   # upstream HF integration
+        "sonicmoe": sonicmoe_experts_forward,  # upstream HF integration
     }
 ```
 
@@ -42,10 +42,13 @@ use_sonicmoe: true
 The sonic-moe kernel ships through the HF [`kernels`](https://github.com/huggingface/kernels) package. Transformers v5.8+ auto-fetches a prebuilt kernel from [`kernels-community/sonic-moe`](https://huggingface.co/kernels-community/sonic-moe) on first use:
 
 ```bash
-pip install kernels "nvidia-cutlass-dsl==4.4.2"
+uv pip install kernels "nvidia-cutlass-dsl==4.6.0" "apache-tvm-ffi>=0.1.10,<0.2"
 ```
 
+`apache-tvm-ffi` is an undeclared runtime dependency of `nvidia-cutlass-dsl` 4.6.0 (absent from its `Requires-Dist`, so pip will not pull it); `<0.1.10` breaks `cute.compile`, so pin it explicitly.
+
 **Note:** Blackwell support is in upstream beta. On Blackwell GPUs Axolotl automatically sets `USE_QUACK_GEMM=1` to enable the Blackwell kernels.
+
 
 ## How It Works
 
@@ -57,7 +60,7 @@ The `KernelsPlugin` runs once before model loading and:
 
 That's the entire integration — there is no per-architecture SparseMoEBlock monkey-patch, no per-model routing code, and no weight-layout conversion. As new MoE models adopt the decorator upstream they immediately benefit from both kernels.
 
-## LoRA Support
+## BF16 LoRA Support
 
 Both kernels train PEFT adapters on `gate_up_proj` / `down_proj` (and `gate` for the router) end-to-end:
 
@@ -66,31 +69,74 @@ Both kernels train PEFT adapters on `gate_up_proj` / `down_proj` (and `gate` for
 
 Both paths detect PEFT `ParamWrapper` on individual expert parameters (`target_parameters` API) and unwrap them before dispatch.
 
+### ScatterMoE NVFP4 (W4A16) LoRA
+
+Train LoRA on ModelOpt NVFP4 checkpoint via ScatterMoE. Routed experts are dequantized to bf16 (W4A16).
+
+Requires:
+- CUDA GPU with Triton.
+- `qwen3_moe`, `qwen3_next`, `deepseek_v4`, `glm_moe_dsa`, and `gemma4_text`
+
+**Tip:** in our tests, the Triton `dequant` path below is currently faster end to end than the ScatterMoE NVFP4 (if the arch is supported).
+
+### SonicMoE NVFP4 (W4A4) LoRA
+
+Train LoRA on ModelOpt NVFP4 checkpoint via Quack (e.g. `nvidia/Qwen3-30B-A3B-NVFP4`).
+
+Requires:
+- Blackwell SM100 for W4A4, others for W4A16
+- `qwen3_moe` / `qwen3_next`
+
+Install the pinned quack kernels (other versions untested):
+
+```bash
+uv pip install "quack-kernels==0.6.1" "nvidia-cutlass-dsl==4.6.0" "apache-tvm-ffi>=0.1.10,<0.2"
+```
+
+`AXOLOTL_SONICMOE_NVFP4_BACKEND` picks the expert GEMM (unset = auto):
+
+| Backend | Compute | Runs on |
+|---------|---------|---------|
+| `fp4_cute` | native W4A4 tensor cores (quack) | Blackwell B200/GB200 (SM100/110) |
+| `dequant` | dequant to bf16 (W4A16) | any CUDA GPU with Triton |
+
+Advanced tuning knobs (fused up-proj, per-tensor-scale fold, fp8 DeepGEMM backward) are exposed as other `AXOLOTL_SONICMOE_NVFP4_*` env vars; defaults are correct for normal training.
+
+**Tip:** in our tests, the Triton `dequant` path is currently faster (and lower mem) end to end than the `fp4_cute` path for < 100B param MoE model. However, `fp4_cute` should overtake when expert matmul become more dominant cost.
+
 ## Model Support
 
-Any model whose `Experts` class is decorated with `@use_experts_implementation` upstream works automatically. As of transformers 5.8 this includes (verified):
+Any model whose `Experts` class is decorated with `@use_experts_implementation` upstream works automatically. As of transformers 5.8 this includes (verified). The `bf16` columns are base (unquantized) support; the `NVFP4` columns mark which kernel trains LoRA on a ModelOpt NVFP4 checkpoint of that arch:
 
-| Model Type        | ScatterMoE | SonicMoE |
-|-------------------|:---------:|:--------:|
-| `mixtral`         |    Yes    |   Yes    |
-| `qwen2_moe`       |    Yes    |   Yes    |
-| `qwen3_moe`       |    Yes    |   Yes    |
-| `qwen3_5_moe`     |    Yes    |   Yes    |
-| `olmoe`           |    Yes    |   Yes    |
-| `mistral4`        |    Yes    |   Yes    |
-| `glm_moe_dsa`     |    Yes    |   Yes    |
-| `deepseek_v3`     |    Yes    |   Yes    |
-| `minimax_m2`      |    Yes    |   Yes    |
-| `ernie4_5_moe`    |    Yes    |   Yes    |
-| `hunyuan_v1_moe`  |    Yes    |   Yes    |
-| `gemma4_text`     |    Yes    |   Yes    |
-| `gpt_oss`         |    Yes    |   Yes    |
+| Model Type        | ScatterMoE (bf16) | SonicMoE (bf16) | NVFP4 (ScatterMoE) | NVFP4 (SonicMoE) |
+|-------------------|:---------:|:--------:|:---:|:---:|
+| `mixtral`         |    Yes    |   Yes    |  -  |  -  |
+| `qwen2_moe`       |    Yes    |   Yes    |  -  |  -  |
+| `qwen3_moe`       |    Yes    |   Yes    | Yes | Yes |
+| `qwen3_next`      |    Yes    |   Yes    | Yes | Yes |
+| `qwen3_5_moe`     |    Yes    |   Yes    |  -  |  -  |
+| `olmoe`           |    Yes    |   Yes    |  -  |  -  |
+| `mistral4`        |    Yes    |   Yes    |  -  |  -  |
+| `glm_moe_dsa`     |    Yes    |   Yes    | Yes |  -  |
+| `deepseek_v3`     |    Yes    |   Yes    |  -  |  -  |
+| `minimax_m2`      |    Yes    |   Yes    |  -  |  -  |
+| `ernie4_5_moe`    |    Yes    |   Yes    |  -  |  -  |
+| `hunyuan_v1_moe`  |    Yes    |   Yes    |  -  |  -  |
+| `gemma4_text`     |    Yes    |   Yes    | Yes |  -  |
+| `gpt_oss`         |    Yes    |   No     |  -  |  -  |
+| `nemotron_h`      |    Yes    |   Yes¹   | Yes | Yes¹ |
 
-`gpt_oss` carries the decorator with `is_concatenated=False, is_transposed=True, has_bias=True` and uses a sigmoid-GLU activation with clamping. Both forwards read these flags off `self` and dispatch accordingly: the ScatterMoE forward handles the transposed/interleaved/biased layout and clamped sigmoid-GLU via its Triton path (no weight transpose, interleaved gate/up, per-expert bias folded into the grouped GEMM); the SonicMoE forward uses the upstream CUTLASS kernel.
+NVFP4 for `deepseek_v4` is supported via ScatterMoE with `use_dsv4_kernels` (its own fused-kernel path), so it is not a row above.
 
-### Blackwell (sm_120) note
+¹ `nemotron_h` covers Nemotron-3 latentmoe: **non-gated** relu² experts (`up_proj`/`down_proj`, no gate), operating in `moe_latent_size` when set (tokens arrive pre-projected by the block's `fc1/fc2_latent_proj`). ScatterMoE handles that layout natively; SonicMoE routes it through a `torch._grouped_mm` MLP because the current sonic-moe op layer only allows gated epilogues, and `AXOLOTL_SONICMOE_NONGATED_FUSED=1` switches to the exact REGLU rewrite (`relu²(h) == h·relu(h)`) once a build relaxes that assert. Nemotron-3 NVFP4 checkpoints (modelopt `MIXED_PRECISION`) keep the routed experts packed NVFP4 and dequantize every other quantized linear to bf16 at load; quantization there is per layer, not per module name, so one converter per suffix picks its branch from the keys each layer ships.
 
-The SonicMoE CUTLASS kernel (`kernels-community/sonic-moe`) does not currently run on consumer Blackwell (sm_120) — its bundled quack `GemmSm120` predates the `concat_layout` arg the dispatcher passes. On sm_120, `use_sonicmoe` with a standard-layout model transparently falls back to the ScatterMoE Triton path, which runs there. `gpt_oss` on sm_120 should use `use_scattermoe` directly (bf16 base; MXFP4 weights dequantize on the fly as with other MXFP4 models — fused MXFP4 for `gpt_oss` is not yet wired).
+`gpt_oss` carries the decorator with `is_concatenated=False, is_transposed=True, has_bias=True` and uses a clamped sigmoid-GLU activation. The ScatterMoE forward handles the transposed/interleaved/biased layout and that epilogue via its Triton path (no weight transpose, interleaved gate/up, per-expert bias folded into the grouped GEMM).
+
+### Epilogue check (why `gpt_oss` is No on SonicMoE)
+
+SonicMoE picks its fused epilogue from `config.hidden_act`, which cannot express a clamped or otherwise non-plain GLU. `GptOssConfig.hidden_act` is `"silu"`, so `gpt_oss` silently ran plain SwiGLU (10.4% top-1 agreement, teacher-forced NLL 2.30 -> 8.12 on `openai/gpt-oss-20b`).
+
+Axolotl now probes each model's declared `_apply_gate` numerically at load and raises if the chosen path cannot reproduce it, pointing at `expert_backend: scattermoe`.
 
 ## Feature comparison
 
@@ -106,3 +152,22 @@ The SonicMoE CUTLASS kernel (`kernels-community/sonic-moe`) does not currently r
 ## Note on MegaBlocks
 
 We tested [MegaBlocks](https://huggingface.co/kernels-community/megablocks) but were unable to ensure numerical accuracy, so we did not integrate it. It was also incompatible with many newer model architectures in transformers.
+
+## Autotune warm-start cache
+
+Triton keeps each `@triton.autotune` winner only in the process, so every run re-benchmarks every
+(shape, dtype) key. Under expert parallelism that benchmark lands at different moments on different
+ranks, which DeepEP's combine barrier reads as a straggler. `autotune_cache_path` persists the winners:
+
+```yaml
+plugins:
+  - axolotl.integrations.kernels.KernelsPlugin
+use_scattermoe: true
+autotune_cache_path: /shared/cache/autotune/b200.json
+```
+
+After the kernels load, the file is read and every record whose kernel is loaded, whose candidate
+config matrix still matches, and whose key is not yet measured is inserted into that autotuner's
+cache. The file is rewritten at every checkpoint and at train end with the union of all ranks'
+winners. Files record the GPU they were measured on and are ignored on a different GPU model, since
+the winners are device-specific.

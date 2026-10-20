@@ -54,6 +54,10 @@ def _make_images(directory: Path, n: int) -> list[Path]:
     return out
 
 
+def spec_token(env) -> str:
+    return build_image_token_spec(env.processor).image_token
+
+
 def _entry(jsonl_path: Path) -> DictDefault:
     return DictDefault(
         {
@@ -126,16 +130,14 @@ class TestCacheBuildAndReload:
             env.entry, env.cfg, env.tokenizer, env.processor
         )
         assert len(ds) == 8
-        assert set(ds.column_names) >= {
-            "input_ids",
-            "labels",
-            "attention_mask",
-            "images",
-            "_mm_text",
-        }
-        # Sanity: labels mirror input_ids pre-collator (collator masks image ids later).
-        for ids, lbls in zip(ds[0:8]["input_ids"], ds[0:8]["labels"], strict=True):
-            assert list(ids) == list(lbls)
+        # Only what the collator consumes is cached; the processor re-tokenizes
+        # `_mm_text` at batch time, so token columns would be dead weight.
+        assert set(ds.column_names) == {"images", "_mm_text"}
+        for text, imgs, src in zip(
+            ds[0:8]["_mm_text"], ds[0:8]["images"], env.images, strict=True
+        ):
+            assert spec_token(env) in text
+            assert imgs == [str(src)]
 
         h = generate_pretraining_dataset_hash(
             env.cfg,
@@ -212,10 +214,7 @@ class TestCacheBuildAndReload:
         )
         torch_ds = ds.with_format("torch")
         row = torch_ds[0]
-        import torch
 
-        assert isinstance(row["input_ids"], torch.Tensor)
-        assert isinstance(row["labels"], torch.Tensor)
-        assert isinstance(row["attention_mask"], torch.Tensor)
         assert isinstance(row["images"], list)
+        assert all(isinstance(p, str) for p in row["images"])
         assert isinstance(row["_mm_text"], str)

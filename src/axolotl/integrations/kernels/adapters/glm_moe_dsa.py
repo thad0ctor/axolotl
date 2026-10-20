@@ -16,7 +16,11 @@ axis (composing with EP on the orthogonal ``ep`` axis).
 
 from __future__ import annotations
 
-from axolotl.integrations.kernels.adapters import ModelAdapter
+from axolotl.integrations.kernels.adapters import (
+    ModelAdapter,
+    load_base_model_config,
+    modelopt_nvfp4_model_config,
+)
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
@@ -42,46 +46,20 @@ def _disable_cudnn_sdp() -> None:
 def is_glm_moe_dsa_nvfp4_modelopt(cfg) -> bool:
     """True iff the base model is a GLM-5.2 (``glm_moe_dsa``) NVFP4-modelopt checkpoint
     (``quant_method=modelopt``, ``quant_algo=NVFP4``). Any failure returns False."""
-    try:
-        from transformers import AutoConfig
-
-        # Honor the user's opt-in rather than forcing remote code: glm_moe_dsa is a native
-        # transformers model, so config loading needs no remote code by default.
-        hf_cfg = AutoConfig.from_pretrained(
-            cfg.base_model,
-            trust_remote_code=bool(getattr(cfg, "trust_remote_code", False)),
-        )
-    except Exception:
-        return False
-    if str(getattr(hf_cfg, "model_type", "")) != "glm_moe_dsa":
-        return False
-    qcfg = getattr(hf_cfg, "quantization_config", None)
-    if qcfg is None:
-        return False
-    if isinstance(qcfg, dict):
-        return (
-            qcfg.get("quant_method") == "modelopt" and qcfg.get("quant_algo") == "NVFP4"
-        )
+    model_config = modelopt_nvfp4_model_config(cfg)
     return (
-        getattr(qcfg, "quant_method", None) == "modelopt"
-        and getattr(qcfg, "quant_algo", None) == "NVFP4"
+        model_config is not None
+        and str(getattr(model_config, "model_type", "")) == "glm_moe_dsa"
     )
 
 
 def _is_glm_moe_dsa(cfg) -> bool:
     """True iff the base model is a glm_moe_dsa checkpoint (any quant)."""
-    try:
-        from transformers import AutoConfig
-
-        # Honor the user's opt-in rather than forcing remote code: glm_moe_dsa is a native
-        # transformers model, so config loading needs no remote code by default.
-        hf_cfg = AutoConfig.from_pretrained(
-            cfg.base_model,
-            trust_remote_code=bool(getattr(cfg, "trust_remote_code", False)),
-        )
-    except Exception:
-        return False
-    return str(getattr(hf_cfg, "model_type", "")) == "glm_moe_dsa"
+    model_config = load_base_model_config(cfg)
+    return (
+        model_config is not None
+        and str(getattr(model_config, "model_type", "")) == "glm_moe_dsa"
+    )
 
 
 def _resolve_cp_group(cfg):
@@ -126,6 +104,7 @@ class GlmMoeDsaAdapter(ModelAdapter):
         from axolotl.integrations.kernels.libs.scattermoe_lora.nvfp4_moe_loading import (
             inspect_nvfp4_layout,
             patch_nvfp4_tensor_meta_ops,
+            patch_skip_missing_expert_init,
         )
         from axolotl.integrations.kernels.libs.scattermoe_lora.nvfp4_weight_converter import (
             patch_conversion_loader_rank0_only,
@@ -179,6 +158,7 @@ class GlmMoeDsaAdapter(ModelAdapter):
                 False  # don't register the slow routed converters
             )
             register_nvfp4_converters_for_layout("glm_moe_dsa", reg_layout)
+            patch_skip_missing_expert_init()
             LOG.info("glm_moe_dsa: routed experts will be DIRECT-loaded (fast path)")
         else:
             register_nvfp4_converters_for_layout("glm_moe_dsa", layout)

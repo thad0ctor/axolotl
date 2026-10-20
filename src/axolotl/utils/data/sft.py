@@ -1,6 +1,7 @@
 """Data handling specific to SFT."""
 
 import functools
+import glob
 import os
 import tempfile
 from typing import Literal
@@ -38,8 +39,10 @@ from axolotl.utils.data.wrappers import get_dataset_wrapper
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.distributed import is_local_main_process
 from axolotl.utils.logging import get_logger
+from axolotl.utils.mm_cpt import is_mm_cpt_entry
 from axolotl.utils.trainer import (
     calculate_total_num_steps,
+    deepspeed_context_parallel,
     process_datasets_for_packing,
 )
 
@@ -100,6 +103,13 @@ def _prepare_standard_dataset(
         train_dataset, eval_dataset, prompters = loader.load(_load_datasets)
     finally:
         loader.cleanup()
+
+    from axolotl.core.trainers.diffusion_lm.sampling import (
+        filter_native_diffusion_dataset,
+    )
+
+    train_dataset = filter_native_diffusion_dataset(cfg, train_dataset, split="train")
+    eval_dataset = filter_native_diffusion_dataset(cfg, eval_dataset, split="eval")
 
     if os.environ.get("AXOLOTL_IS_PREPROCESS") == "1":
         return train_dataset, eval_dataset, -1, prompters
@@ -167,10 +177,7 @@ def _prepare_streaming_dataset(
     eval_dataset = None
     if cfg.test_datasets:
         test_dicts = [t if isinstance(t, dict) else dict(t) for t in cfg.test_datasets]
-        is_mm_cpt_eval = any(
-            t.get("type") == "multimodal_pretrain" or bool(t.get("multimodal"))
-            for t in test_dicts
-        )
+        is_mm_cpt_eval = any(is_mm_cpt_entry(t) for t in test_dicts)
         if is_mm_cpt_eval:
             # Modality homogeneity is enforced by check_multimodal_cpt at config
             # parse time; every entry here is guaranteed to be MM.
@@ -220,7 +227,7 @@ def _pretraining_config_from_entry(entry: dict) -> DictDefault:
             "image_token": entry.get("image_token"),
             "skip_bad_images": entry.get("skip_bad_images"),
             "allow_remote_images": entry.get("allow_remote_images"),
-            "trust_remote_code": entry.get("trust_remote_code", False),
+            "max_images_per_row": entry.get("max_images_per_row", 32),
         }
     )
 
@@ -248,7 +255,7 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
             "image_token": None,  # nosec
             "skip_bad_images": None,
             "allow_remote_images": None,
-            "trust_remote_code": False,
+            "max_images_per_row": 32,
         }
     )
 
@@ -395,8 +402,11 @@ def _load_streaming_dataset(
         iter_dataset = _create_placeholder_dataset(pretraining_config)
     else:
         ds_type = pretraining_config.get("ds_type")
-        if ds_type:
-            # ds_type names the loader (e.g. 'json'); path is the data_files glob.
+        path = pretraining_config.get("path")
+        # ds_type routes to a packaged loader only for local paths; Hub repo
+        # paths keep the historical path-first load (ds_type was ignored here).
+        path_is_local = bool(path) and (os.path.exists(path) or bool(glob.glob(path)))
+        if ds_type and (not path or path_is_local):
             iter_dataset = load_dataset(
                 ds_type,
                 streaming=True,
@@ -405,7 +415,6 @@ def _load_streaming_dataset(
                 data_files=(
                     pretraining_config["data_files"] or pretraining_config["path"]
                 ),
-                trust_remote_code=pretraining_config.get("trust_remote_code", False),
             )
         else:
             iter_dataset = load_dataset(
@@ -414,7 +423,6 @@ def _load_streaming_dataset(
                 split=pretraining_config["split"],
                 name=pretraining_config["name"],
                 data_files=pretraining_config["data_files"],
-                trust_remote_code=pretraining_config.get("trust_remote_code", False),
             )
 
     # Apply skip if specified
@@ -445,10 +453,7 @@ def _create_placeholder_dataset(
     image_column: str | None = None
     if pretraining_config is not None:
         text_column = pretraining_config.get("text_column") or "text"
-        is_mm = pretraining_config.get("type") == "multimodal_pretrain" or bool(
-            pretraining_config.get("multimodal")
-        )
-        if is_mm:
+        if is_mm_cpt_entry(pretraining_config):
             image_column = pretraining_config.get("image_column") or "images"
 
     if image_column is None:
@@ -555,8 +560,10 @@ def _load_raw_datasets(
             dataset = handle_long_seq_in_dataset(dataset, cfg.eval_sequence_len, cfg)
         else:
             dataset = handle_long_seq_in_dataset(dataset, cfg.sequence_len, cfg)
-        if (split == "train" and cfg.sample_packing) or (
-            split == "test" and cfg.eval_sample_packing
+        if (
+            (split == "train" and cfg.sample_packing)
+            or (split == "test" and cfg.eval_sample_packing)
+            or deepspeed_context_parallel(cfg)
         ):
             dataset, _ = process_datasets_for_packing(cfg, dataset, None)
 
@@ -613,6 +620,29 @@ def _load_and_process_single_dataset(
         dataset = dataset.shuffle(seed=seed).shard(
             num_shards=dataset_config.shards, index=shards_idx
         )
+
+    # Apply weight-based subsampling before tokenization to save compute
+    if (
+        dataset_config.weight is not None
+        and dataset_config.weight < 1.0
+        and not streaming
+    ):
+        original_len = len(dataset)
+        if original_len == 0:
+            LOG.warning(
+                f"Skipping weight subsampling for dataset "
+                f"'{dataset_config.path}' because it is empty."
+            )
+        else:
+            num_samples = min(
+                original_len,
+                max(1, int(original_len * dataset_config.weight)),
+            )
+            dataset = dataset.shuffle(seed=seed).select(range(num_samples))
+            LOG.info(
+                f"Applied weight={dataset_config.weight} to dataset "
+                f"'{dataset_config.path}': {original_len} -> {num_samples} samples"
+            )
 
     # Apply dataset wrapper
     dataset_wrapper, dataset_prompter = get_dataset_wrapper(
