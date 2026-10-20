@@ -50,6 +50,7 @@ sections = [
     ("Knowledge Distillation (KD)", "kd"),
     ("Liger Kernels", "liger"),
     ("Language Model Evaluation Harness (LM Eval)", "lm_eval"),
+    ("MegaTrain", "megatrain"),
     ("Spectrum", "spectrum"),
     ("LLMCompressor", "llm_compressor")
 ]

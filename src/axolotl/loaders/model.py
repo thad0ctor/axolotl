@@ -1136,6 +1136,13 @@ class ModelLoader:
             configure_fa4()
             return hf_impl
 
+        if self.plugin_manager.suppresses_auto_attention_patches(self.cfg):
+            LOG.info(
+                "Not upgrading %s to Flash Attention 4: a plugin owns the attention path.",
+                hf_impl,
+            )
+            return hf_impl
+
         # Ring attention only substitutes the `flash_attention_2` dispatch key.
         if (self.cfg.context_parallel_size or 1) > 1:
             LOG.info(

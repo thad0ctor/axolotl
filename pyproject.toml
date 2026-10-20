@@ -194,6 +194,10 @@ axolotl = [
     "core/trainers/prm/NOTICE",
     "integrations/kernels/libs/scattermoe_lora/metadata.json",
     "integrations/diffusion_decision/vendored/DJEV_LICENSE",
+    "integrations/megatrain/LICENSE",
+    "integrations/megatrain/README.md",
+    "integrations/megatrain/ACKNOWLEDGEMENTS.md",
+    "integrations/megatrain/_vendor/PROVENANCE.md",
 ]
 
 "axolotl.integrations.baseten" = ["template/*.sh", "template/*.py"]
@@ -207,7 +211,10 @@ version = { file = "VERSION" }
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-extend-exclude = ["src/axolotl/core/trainers/prm"]
+extend-exclude = [
+    "src/axolotl/core/trainers/prm",
+    "src/axolotl/integrations/megatrain/_vendor",
+]
 force-exclude = true
 
 [tool.ruff.lint]
