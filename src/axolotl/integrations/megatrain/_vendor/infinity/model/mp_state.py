@@ -29,18 +29,23 @@ _mp_ctx = mp.get_context('spawn')
 
 
 def _strip_hidden_kernels(module):
-    """Drop Transformers' `_hidden_kernels` caches so modules can cross `spawn`.
+    """Drop the hub-kernel discovery caches so modules can cross `spawn`.
 
     Transformers 5.x attaches `{name: Func()}` to attention modules, where `Func`
-    is a class defined inside a function and therefore unpicklable. It is only a
-    discovery cache for `kernelize()`, which this integration never calls, so
-    removing it does not change the forward path.
+    is a class defined inside a function and therefore unpicklable. `kernels`
+    stores it as `_hidden_kernels` before 0.17 and `_kernel_funcs` from 0.17 on.
+    It is only a discovery cache for `kernelize()`, which this integration never
+    calls, so removing it does not change the forward path.
     """
     if module is None:
         return 0
     removed = 0
     for submodule in module.modules():
-        if submodule.__dict__.pop('_hidden_kernels', None) is not None:
+        stripped = False
+        for key in ('_hidden_kernels', '_kernel_funcs'):
+            if submodule.__dict__.pop(key, None) is not None:
+                stripped = True
+        if stripped:
             removed += 1
     return removed
 

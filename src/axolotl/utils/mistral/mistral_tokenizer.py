@@ -6,7 +6,10 @@ from typing import Optional
 import numpy as np
 from mistral_common.protocol.instruct.request import ModelSettings
 from mistral_common.protocol.instruct.validator import ValidationMode
-from mistral_common.tokens.tokenizers.utils import download_tokenizer_from_hf_hub
+from mistral_common.tokens.tokenizers.utils import (
+    download_tokenizer_from_hf_hub,
+    get_one_valid_tokenizer_file,
+)
 from pydantic import ValidationError
 from torch import Tensor
 from transformers.tokenization_mistral_common import MistralCommonBackend
@@ -122,15 +125,20 @@ class HFMistralTokenizer(MistralCommonBackend):
                 except (AttributeError, NotImplementedError):
                     system_prompt = None
 
-                return normalizer._instruct_request_class(
+                request_class = normalizer._instruct_request_class
+                continuation_kwargs = {}
+                if "continue_final_message" in request_class.model_fields:
+                    continuation_kwargs["continue_final_message"] = getattr(
+                        request, "continue_final_message", False
+                    )
+
+                return request_class(
                     messages=messages,
                     system_prompt=system_prompt,
                     available_tools=request.tools,
                     truncate_at_max_tokens=None,
-                    continue_final_message=getattr(
-                        request, "continue_final_message", False
-                    ),
                     settings=settings,
+                    **continuation_kwargs,
                 )
 
         normalizer.from_chat_completion_request = from_chat_completion_request
@@ -265,17 +273,23 @@ class HFMistralTokenizer(MistralCommonBackend):
                 f"Kwargs {list(kwargs.keys())} are not supported by `MistralCommonBackend.from_pretrained`."
             )
 
-        if not os.path.isfile(pretrained_model_name_or_path):
+        if os.path.isfile(pretrained_model_name_or_path):
+            tokenizer_path = str(pretrained_model_name_or_path)
+        elif os.path.isdir(pretrained_model_name_or_path):
+            # Local dir (e.g. a merge-lora output), as upstream MistralCommonBackend does
+            tokenizer_path = os.path.join(
+                pretrained_model_name_or_path,
+                get_one_valid_tokenizer_file(os.listdir(pretrained_model_name_or_path)),
+            )
+        else:
             tokenizer_path = download_tokenizer_from_hf_hub(
                 repo_id=str(pretrained_model_name_or_path),
-                cache_dir=str(cache_dir),
+                cache_dir=str(cache_dir) if cache_dir is not None else None,
                 token=token,
                 revision=revision,
                 force_download=force_download,
                 local_files_only=local_files_only,
             )
-        else:
-            tokenizer_path = str(pretrained_model_name_or_path)
 
         return cls(
             name_or_path=str(pretrained_model_name_or_path),

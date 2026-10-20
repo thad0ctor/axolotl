@@ -1,6 +1,8 @@
 default_language_version:
     python: python3
 
+exclude: ^src/axolotl/core/trainers/prm/
+
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -11,7 +13,7 @@ repos:
     -   id: no-commit-to-branch
         args: ['--branch', 'main']
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.8
+    rev: v0.16.9
     hooks:
     -   id: ruff
         args: [--fix]
@@ -19,7 +21,7 @@ repos:
     -   id: ruff-format
         exclude: ^src/axolotl/integrations/megatrain/_vendor/
 -   repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.1
+    rev: v2.3.1
     hooks:
     - id: mypy
       exclude: ^src/axolotl/integrations/megatrain/_vendor/

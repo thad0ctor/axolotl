@@ -11,7 +11,7 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
-from axolotl.integrations.base import BasePlugin, PluginManager
+from axolotl.integrations.base import BasePlugin, PluginManager, get_builtin_plugins
 
 from .args import (
     DEFAULT_ATTN_IMPLEMENTATION,
@@ -286,11 +286,15 @@ class MegaTrainPlugin(BasePlugin):
         configured_plugins = {
             str(plugin) for plugin in (_cfg_value(cfg, "plugins", []) or [])
         }
+        # Builtin plugins are always registered; their hooks are no-ops unless the
+        # parallelism they implement is configured, which MegaTrainArgs rejects.
+        builtin_plugins = set(get_builtin_plugins())
         stale_plugins = [
             name
             for name, plugin in manager.plugins.items()
             if name not in configured_plugins
             and name not in MEGATRAIN_PLUGIN_NAMES
+            and name not in builtin_plugins
             and not isinstance(plugin, MegaTrainPlugin)
         ]
         if stale_plugins:

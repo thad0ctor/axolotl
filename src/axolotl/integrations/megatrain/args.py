@@ -120,7 +120,11 @@ class MegaTrainArgs(BaseModel):
                 "Set `ddp: false` and do not use torchrun.",
             )
 
-        for key in ("tensor_parallel_size", "context_parallel_size"):
+        for key in (
+            "tensor_parallel_size",
+            "context_parallel_size",
+            "expert_parallel_size",
+        ):
             if (data.get(key) or 1) > 1:
                 reject(
                     key,

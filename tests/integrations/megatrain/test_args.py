@@ -25,6 +25,7 @@ PLUGIN = "axolotl.integrations.megatrain.MegaTrainPlugin"
         ({"ddp": True}, "ddp"),
         ({"tensor_parallel_size": 2}, "tensor_parallel_size"),
         ({"context_parallel_size": 2}, "context_parallel_size"),
+        ({"expert_parallel_size": 2}, "expert_parallel_size"),
         ({"model_quantization_config": "Mxfp4Config"}, "model_quantization_config"),
         ({"qat": {"weight_dtype": "int8"}}, "qat"),
         ({"fp8": True}, "fp8"),

@@ -127,9 +127,13 @@ def test_schema_merge_deduplicates_canonical_and_shorthand_instances():
         _minimal_config(plugins=["megatrain.MegaTrainPlugin"])
     )
 
-    assert manager.get_input_args() == [
-        "axolotl.integrations.megatrain.args.MegaTrainArgs"
-    ]
+    # Builtin plugins register their own args; MegaTrain's must appear exactly once.
+    assert (
+        manager.get_input_args().count(
+            "axolotl.integrations.megatrain.args.MegaTrainArgs"
+        )
+        == 1
+    )
     assert config.megatrain_checkpoint_interval is None
 
 
@@ -781,44 +785,34 @@ def test_persistent_cross_entropy_patch_is_rejected(monkeypatch):
         _assert_cross_entropy_is_unpatched()
 
 
-@pytest.mark.parametrize("plugin_name", [PLUGIN, "megatrain.MegaTrainPlugin"])
-def test_patch_manager_does_not_auto_upgrade_megatrain_to_fa4(monkeypatch, plugin_name):
-    from axolotl.loaders.patch_manager import PatchManager
+def _fa4_loader(monkeypatch, plugins):
+    from axolotl.loaders.model import ModelLoader
     from axolotl.monkeypatch.attention import flash_attn_4
 
-    patch = Mock()
-    monkeypatch.setattr(flash_attn_4, "patch_flash_attn_4", patch)
+    monkeypatch.setattr(flash_attn_4, "fa4_usable", lambda _model_config: True)
+    configure = Mock()
+    monkeypatch.setattr(flash_attn_4, "configure_fa4", configure)
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.cfg = DictDefault({"plugins": plugins})
+    loader.model_config = LlamaConfig()
+    return loader, configure
+
+
+@pytest.mark.parametrize("plugin_name", [PLUGIN, "megatrain.MegaTrainPlugin"])
+def test_model_loader_does_not_auto_upgrade_megatrain_to_fa4(monkeypatch, plugin_name):
     # Core consults registered plugins, so mirror what `prepare_plugins` does.
     PluginManager.get_instance().register(plugin_name)
-    patch_manager = object.__new__(PatchManager)
-    patch_manager.cfg = SimpleNamespace(
-        attn_uses_flash_lib=True,
-        plugins=[plugin_name],
-    )
-    patch_manager.model_config = LlamaConfig()
+    loader, configure = _fa4_loader(monkeypatch, plugins=[plugin_name])
 
-    patch_manager._apply_flash_attn_4_patches()
-
-    patch.assert_not_called()
+    assert loader._resolve_flash_attention_4("flash_attention_2") == "flash_attention_2"
+    configure.assert_not_called()
 
 
-def test_patch_manager_preserves_stock_fa4_upgrade(monkeypatch):
-    from axolotl.loaders.patch_manager import PatchManager
-    from axolotl.monkeypatch.attention import flash_attn_4
+def test_model_loader_preserves_stock_fa4_upgrade(monkeypatch):
+    loader, configure = _fa4_loader(monkeypatch, plugins=[])
 
-    patch = Mock()
-    model_config = LlamaConfig()
-    monkeypatch.setattr(flash_attn_4, "patch_flash_attn_4", patch)
-    patch_manager = object.__new__(PatchManager)
-    patch_manager.cfg = SimpleNamespace(
-        attn_uses_flash_lib=True,
-        plugins=[],
-    )
-    patch_manager.model_config = model_config
-
-    patch_manager._apply_flash_attn_4_patches()
-
-    patch.assert_called_once_with(model_config)
+    assert loader._resolve_flash_attention_4("flash_attention_2") == "flash_attention_4"
+    configure.assert_called_once_with()
 
 
 def test_active_plugin_hook_contracts():

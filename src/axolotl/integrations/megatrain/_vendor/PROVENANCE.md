@@ -188,8 +188,9 @@ defects were fixed:
   the whole step.
 - `infinity/model/mp_worker.py` raises `NotImplementedError` for vision inputs
   instead of silently ignoring `pixel_values` and `vision_kwargs`.
-- `infinity/model/mp_state.py` strips Transformers' `_hidden_kernels` caches from
-  the shared modules before spawning workers. Transformers 5.x attaches
+- `infinity/model/mp_state.py` strips the hub-kernel discovery caches (`_hidden_kernels`
+  before `kernels` 0.17, `_kernel_funcs` after) from the shared modules before
+  spawning workers. Transformers 5.x attaches
   `{name: Func()}` to every attention module, where `Func` is defined inside a
   function and therefore unpicklable, which made worker spawn fail outright with
   `Can't pickle local object '_create_func_module.<locals>.Func'`. The dict is
