@@ -9,7 +9,7 @@ plugins:
   - axolotl.integrations.sparselora.SparseLoRAPlugin
 
 adapter: lora
-lora_target_modules: [q_proj, k_proj, v_proj, o_proj]   # attention-only (required)
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]   # default safe target set
 
 sparselora:
   target_sparsity: 0.9      # higher = faster, more loss
@@ -42,7 +42,7 @@ sparselora:
 
 ## Supported models
 
-Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistral, Cohere, StableLM, Gemma2/3/4, Phi3**, and most SwiGLU-MLP transformers. Only gated MLPs with an activation other than SiLU/`gelu_tanh` are unsupported (refused with a clear error). Full matrix and how to add a model: [`docs/agents/sparselora.md`](../../../../docs/agents/sparselora.md).
+Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistral, Cohere, StableLM, Gemma2/3/4, Phi3**, and most SwiGLU-MLP transformers. Vision attention is supported for Qwen3-VL, Gemma4, Gemma3/SigLIP, and InternVL-style towers; non-gated ViT MLPs with `fc1/fc2` or `linear_fc1/linear_fc2` are supported too. Only gated MLPs with an activation other than SiLU/`gelu_tanh` are unsupported (refused with a clear error). Full matrix and how to add a model: [`docs/agents/sparselora.md`](../../../../docs/agents/sparselora.md).
 
 ## Compatibility (v1)
 
@@ -51,8 +51,8 @@ Auto-detected at apply time: **Llama, Qwen2/3, Qwen3.5/3.6 (gated + MoE), Mistra
 | LoRA (bf16) | ✅ | `adapter: lora` |
 | QLoRA (4-bit) | ✅ | `adapter: qlora` + `load_in_4bit` |
 | 8-bit base | ❌ | |
-| Attention-only LoRA | ✅ | `q/k/v/o_proj` (or `qkv_proj/o_proj` for Phi3) — **required** |
-| LoRA on MLP | ❌ | don't LoRA the MLP projections |
+| Attention LoRA | ✅ | `q/k/v/o_proj`, `qkv/proj`, `out_proj`, or `projection_layer` depending on architecture |
+| MLP LoRA | ✅ | `gate/up/down`, fused `gate_up`, `fc1/fc2`, or Qwen3-VL `linear_fc1/linear_fc2` when the MLP layout is sparsifiable |
 | Single GPU | ✅ | |
 | DDP (multi-GPU) | ✅ | |
 | FSDP | ✅ | FSDP1 + FSDP2; swap runs before wrapping, weight is all-gathered in forward |

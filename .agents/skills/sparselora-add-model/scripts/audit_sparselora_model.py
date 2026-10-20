@@ -5,15 +5,18 @@ Given an architecture name (``--arch qwen2``) or a HuggingFace id
 (``--base-model Qwen/Qwen2.5-0.5B``), this:
 
 1. instantiates a *small* model of that architecture (real hidden/head dims,
-   ``--layers`` layers so it stays CPU-cheap), attaches attention-only LoRA,
-2. checks each block exposes the SwiGLU MLP (gate/up/down) and standard
-   attention (q/k/v/o) projections SparseLoRA needs,
+   ``--layers`` layers so it stays CPU-cheap), attaches LoRA to discovered
+   sparsifiable projections,
+2. checks each block exposes a supported MLP/attention layout: SwiGLU
+   gate/up/down, fused gate_up, non-gated ViT fc1/fc2, standard q/k/v attention,
+   or known vision attention aliases,
 3. runs ``register_arch_wiring`` and reports which sparse module each MLP /
    attention class maps to, including any unsupported semantics (e.g. a
-   non-SiLU/non-gelu_tanh gated MLP, or fused projections),
-4. smoke-tests sparse apply + forward/backward on CUDA when available; on CPU it
-   performs structural checks only, because the sparse predictors need GPU
-   kernels (liger/Triton).
+   non-SiLU/non-gelu_tanh gated MLP, or unsupported fused projections),
+4. smoke-tests sparse apply + forward for synthetic vision towers, and
+   forward/backward for text models on CUDA when available; CPU text audits stay
+   structural-only because the sparse predictors need GPU kernels
+   (liger/Triton).
 
 For ``--base-model``, the architecture is built from the repo's config (random
 weights, no checkpoint); custom repo code runs only with ``--trust-remote-code``.
@@ -29,6 +32,7 @@ import argparse
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 EXIT_OK = 0
@@ -71,6 +75,175 @@ def _tiny_model(arch: str, layers: int):
     return getattr(tf, model_cls)(config)
 
 
+class _VisionBlockWrapper:
+    """Small holder matching ``...visual.blocks.0.{attn,mlp}`` model paths."""
+
+    @staticmethod
+    def wrap(attn=None, mlp=None):
+        import torch.nn as nn
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                block = nn.Module()
+                if attn is not None:
+                    block.attn = attn
+                if mlp is not None:
+                    block.mlp = mlp
+                self.visual = nn.Module()
+                self.visual.blocks = nn.ModuleList([block])
+
+            def forward(self, x):
+                return x
+
+        return Model()
+
+
+def _tiny_vision_model(arch: str):
+    import torch
+
+    arch = arch.lower()
+    if arch in {"qwen3vl", "qwen3-vl"}:
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+            Qwen3VLVisionConfig,
+        )
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLVisionAttention,
+            Qwen3VLVisionMLP,
+        )
+
+        cfg = Qwen3VLVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_heads=4,
+            depth=1,
+            out_hidden_size=64,
+        )
+        cfg._attn_implementation = "eager"
+        model = _VisionBlockWrapper.wrap(
+            Qwen3VLVisionAttention(cfg), Qwen3VLVisionMLP(cfg)
+        )
+
+        def smoke(sm, targets):
+            del targets
+            mods = dict(sm.named_modules())
+            attn = next(m for n, m in mods.items() if n.endswith("attn"))
+            mlp = next(m for n, m in mods.items() if n.endswith("mlp"))
+            x = torch.randn(6, 32, dtype=torch.bfloat16)
+            cu = torch.tensor([0, 6], dtype=torch.int32)
+            cos = torch.ones(6, 8, dtype=torch.bfloat16)
+            sin = torch.zeros(6, 8, dtype=torch.bfloat16)
+            out = attn(x, cu_seqlens=cu, position_embeddings=(cos, sin))
+            out = mlp(out)
+            assert out.shape == x.shape and torch.isfinite(out.float()).all()
+            return "vision attn+MLP forward OK"
+
+        return model, smoke
+
+    if arch == "gemma4":
+        from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4VisionAttention,
+            Gemma4VisionMLP,
+        )
+
+        cfg = Gemma4VisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+        )
+        cfg._attn_implementation = "eager"
+        model = _VisionBlockWrapper.wrap(
+            Gemma4VisionAttention(cfg, layer_idx=0), Gemma4VisionMLP(cfg)
+        )
+
+        def smoke(sm, targets):
+            del targets
+            mods = dict(sm.named_modules())
+            attn = next(m for n, m in mods.items() if n.endswith("attn"))
+            mlp = next(m for n, m in mods.items() if n.endswith("mlp"))
+            x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+            cos = torch.ones(1, 6, 8, dtype=torch.bfloat16)
+            sin = torch.zeros(1, 6, 8, dtype=torch.bfloat16)
+            pos = torch.zeros(1, 6, 2, dtype=torch.long)
+            out = attn(x, position_embeddings=(cos, sin), position_ids=pos)[0]
+            out = mlp(out)
+            assert out.shape == x.shape and torch.isfinite(out.float()).all()
+            return "vision attn+MLP forward OK"
+
+        return model, smoke
+
+    if arch in {"gemma3", "siglip"}:
+        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+        from transformers.models.siglip.modeling_siglip import (
+            SiglipAttention,
+            SiglipMLP,
+        )
+
+        cfg = SiglipVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+        )
+        cfg._attn_implementation = "eager"
+        model = _VisionBlockWrapper.wrap(SiglipAttention(cfg), SiglipMLP(cfg))
+
+        def smoke(sm, targets):
+            del targets
+            mods = dict(sm.named_modules())
+            attn = next(m for n, m in mods.items() if n.endswith("attn"))
+            mlp = next(m for n, m in mods.items() if n.endswith("mlp"))
+            x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+            out = attn(x)[0]
+            out = mlp(out)
+            assert out.shape == x.shape and torch.isfinite(out.float()).all()
+            return "vision attn+MLP forward OK"
+
+        return model, smoke
+
+    if arch in {"internvl", "internvl3"}:
+        from transformers.models.internvl.configuration_internvl import (
+            InternVLVisionConfig,
+        )
+        from transformers.models.internvl.modeling_internvl import (
+            InternVLVisionAttention,
+            InternVLVisionMLP,
+        )
+
+        cfg = InternVLVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            use_qk_norm=True,
+        )
+        cfg._attn_implementation = "eager"
+        model = _VisionBlockWrapper.wrap(
+            InternVLVisionAttention(cfg), InternVLVisionMLP(cfg)
+        )
+
+        def smoke(sm, targets):
+            del targets
+            mods = dict(sm.named_modules())
+            attn = next(m for n, m in mods.items() if n.endswith("attn"))
+            mlp = next(m for n, m in mods.items() if n.endswith("mlp"))
+            x = torch.randn(1, 6, 32, dtype=torch.bfloat16)
+            out = attn(x)[0]
+            out = mlp(out)
+            assert out.shape == x.shape and torch.isfinite(out.float()).all()
+            return "vision attn+MLP forward OK"
+
+        return model, smoke
+
+    raise ValueError(
+        f"unknown --vision-arch {arch!r}; known: qwen3vl, gemma4, gemma3/siglip, internvl"
+    )
+
+
 def _from_pretrained(base_model: str, layers: int, trust_remote_code: bool = False):
     """Instantiate ``base_model``'s architecture from its config, shrunk to
     ``layers`` layers (real hidden/head dims, random weights, no checkpoint).
@@ -97,7 +270,16 @@ class Findings:
     smoke: str = "not run"
 
 
-def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
+def _target_suffix(name: str, module) -> str:
+    return f"{name}.linear" if hasattr(module, "linear") else name
+
+
+def audit(
+    model,
+    predictor_rank: int,
+    sparsity: float,
+    smoke_fn: Callable | None = None,
+) -> tuple[Findings, int]:
     import torch
     from peft import LoraConfig, get_peft_model
 
@@ -110,7 +292,9 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
         get_module_mapping,
     )
     from axolotl.integrations.sparselora.arch_wiring import (
+        is_fused_gate_up_mlp,
         is_fused_qkv_attention,
+        is_non_gated_mlp,
         is_standard_attention,
         is_swiglu_mlp,
         register_arch_wiring,
@@ -118,29 +302,50 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
     )
     from axolotl.integrations.sparselora.calibration import discover_target_modules
     from axolotl.integrations.sparselora.factors import (
+        attention_output_projection_name,
         compute_factor_tensors,
+        fused_qkv_projection_name,
+        non_gated_mlp_projection_names,
         save_factors,
     )
 
     f = Findings()
 
-    # Discover the attention LoRA targets from the model: fused-projection
-    # models (Phi3) expose ``qkv_proj`` rather than separate ``q/k/v_proj``, so a
-    # hardcoded q/k/v target list would attach no adapters and mis-audit them.
-    lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    lora_targets: set[str] = set()
     for mod in model.modules():
-        if is_fused_qkv_attention(mod):
-            lora_targets = ["qkv_proj", "o_proj"]
-            break
         if is_standard_attention(mod):
-            break
+            out = attention_output_projection_name(mod)
+            for proj in ("q_proj", "k_proj", "v_proj", out):
+                if proj is not None:
+                    lora_targets.add(_target_suffix(proj, getattr(mod, proj)))
+        elif is_fused_qkv_attention(mod):
+            qkv = fused_qkv_projection_name(mod)
+            out = attention_output_projection_name(mod)
+            for proj in (qkv, out):
+                if proj is not None:
+                    lora_targets.add(_target_suffix(proj, getattr(mod, proj)))
+
+        if is_swiglu_mlp(mod):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                lora_targets.add(_target_suffix(proj, getattr(mod, proj)))
+        elif is_fused_gate_up_mlp(mod):
+            for proj in ("gate_up_proj", "down_proj"):
+                lora_targets.add(_target_suffix(proj, getattr(mod, proj)))
+        elif is_non_gated_mlp(mod):
+            names = non_gated_mlp_projection_names(mod)
+            if names is not None:
+                for proj in names:
+                    lora_targets.add(_target_suffix(proj, getattr(mod, proj)))
+
+    if not lora_targets:
+        lora_targets = {"q_proj", "k_proj", "v_proj", "o_proj"}
 
     model = get_peft_model(
         model,
         LoraConfig(
             r=predictor_rank,
             lora_alpha=2 * predictor_rank,
-            target_modules=lora_targets,
+            target_modules=sorted(lora_targets),
         ),
     ).eval()
 
@@ -148,8 +353,9 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
     modules = dict(model.named_modules())
     if not targets:
         f.refusals.append(
-            "no SwiGLU-MLP or standard-attention blocks found (gate/up/down or "
-            "q/k/v/o projections missing) — architecture not sparsifiable as-is."
+            "no supported MLP or attention blocks found (gate/up/down, fused "
+            "gate_up/down, fc1/fc2, q/k/v/o, or fused qkv projections missing) "
+            "- architecture not sparsifiable as-is."
         )
         return f, EXIT_UNSUPPORTED
 
@@ -164,9 +370,9 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
             refusals[reason] = None
             continue
         sparse_cls = mapping.get(type(mod))
-        if is_swiglu_mlp(mod):
+        if is_swiglu_mlp(mod) or is_fused_gate_up_mlp(mod) or is_non_gated_mlp(mod):
             f.mlp_classes[cls] = sparse_cls.__name__ if sparse_cls else "UNMAPPED"
-        elif is_standard_attention(mod):
+        elif is_standard_attention(mod) or is_fused_qkv_attention(mod):
             f.attn_classes[cls] = sparse_cls.__name__ if sparse_cls else "UNMAPPED"
     f.refusals = list(refusals)
 
@@ -176,8 +382,30 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
         f.refusals.append("a target class did not map to any sparse module")
         return f, EXIT_UNSUPPORTED
 
-    # Smoke test needs CUDA: the vendored MLP/attention forwards use liger's
-    # silu_mul + Triton predictors, so even a dense forward can't run on CPU.
+    if smoke_fn is not None:
+        try:
+            sm = model.to(torch.bfloat16).eval()
+            with tempfile.TemporaryDirectory() as d:
+                save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
+                apply_sparselora(
+                    sm,
+                    SparseLoRAConfig(
+                        layer_sparsity={t: sparsity for t in targets},
+                        predictor_rank=predictor_rank,
+                        path=d,
+                    ),
+                )
+            sparse_mods = [m for m in sm.modules() if isinstance(m, SparseModule)]
+            assert sparse_mods, "no sparse modules were installed"
+            note = smoke_fn(sm, targets)
+            f.smoke = f"PASSED (sparse @ {sparsity}, {note})"
+            return f, EXIT_OK
+        except Exception as exc:  # noqa: BLE001
+            f.smoke = f"FAILED ({type(exc).__name__}: {exc})"
+            f.notes.append(traceback.format_exc())
+            return f, EXIT_UNSUPPORTED
+
+    # Text smoke test needs CUDA: the vendored SiLU MLP path uses liger kernels.
     use_cuda = torch.cuda.is_available()
     if not use_cuda:
         f.smoke = "skipped (no CUDA; liger predictors + silu_mul need a GPU)"
@@ -189,16 +417,16 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
 
     try:
         sm = model.to("cuda").to(torch.bfloat16).train()
-        d = tempfile.mkdtemp()
-        save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
-        apply_sparselora(
-            sm,
-            SparseLoRAConfig(
-                layer_sparsity={t: sparsity for t in targets},
-                predictor_rank=predictor_rank,
-                path=d,
-            ),
-        )
+        with tempfile.TemporaryDirectory() as d:
+            save_factors(compute_factor_tensors(sm, targets, predictor_rank), d)
+            apply_sparselora(
+                sm,
+                SparseLoRAConfig(
+                    layer_sparsity={t: sparsity for t in targets},
+                    predictor_rank=predictor_rank,
+                    path=d,
+                ),
+            )
         sparse_mods = [m for m in sm.modules() if isinstance(m, SparseModule)]
         assert sparse_mods, "no sparse modules were installed"
 
@@ -233,7 +461,7 @@ def audit(model, predictor_rank: int, sparsity: float) -> tuple[Findings, int]:
 def _print(target: str, f: Findings, code: int) -> None:
     print(f"\nSparseLoRA model audit: {target}")
     print("=" * 60)
-    print("\n[1] SwiGLU MLP classes -> sparse module")
+    print("\n[1] MLP classes -> sparse module")
     if f.mlp_classes:
         for cls, role in sorted(f.mlp_classes.items()):
             print(f"    {cls:32s} -> {role}")
@@ -268,6 +496,10 @@ def main() -> int:
         "--arch", help="synthetic tiny model: llama|qwen2|qwen3|mistral|gemma2"
     )
     g.add_argument(
+        "--vision-arch",
+        help="synthetic tiny vision tower: qwen3vl|gemma4|gemma3|siglip|internvl",
+    )
+    g.add_argument(
         "--base-model", help="HuggingFace id; built from config, no checkpoint"
     )
     ap.add_argument(
@@ -282,13 +514,17 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    target = args.arch or args.base_model
+    target = args.arch or args.vision_arch or args.base_model
     try:
-        model = (
-            _tiny_model(args.arch, args.layers)
-            if args.arch
-            else _from_pretrained(args.base_model, args.layers, args.trust_remote_code)
-        )
+        smoke_fn = None
+        if args.arch:
+            model = _tiny_model(args.arch, args.layers)
+        elif args.vision_arch:
+            model, smoke_fn = _tiny_vision_model(args.vision_arch)
+        else:
+            model = _from_pretrained(
+                args.base_model, args.layers, args.trust_remote_code
+            )
     except Exception as exc:  # noqa: BLE001
         print(
             f"could not instantiate {target!r}: {type(exc).__name__}: {exc}",
@@ -297,7 +533,7 @@ def main() -> int:
         return EXIT_CANNOT_AUDIT
 
     try:
-        findings, code = audit(model, args.predictor_rank, args.sparsity)
+        findings, code = audit(model, args.predictor_rank, args.sparsity, smoke_fn)
     except ImportError as exc:
         print(f"could not audit (missing dependency): {exc}", file=sys.stderr)
         return EXIT_CANNOT_AUDIT
