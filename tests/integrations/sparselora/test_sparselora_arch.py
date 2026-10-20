@@ -859,12 +859,15 @@ def test_stablelm_partial_rotary_supported():
         SparseLoRAConfig,
         apply_sparselora,
     )
-    from axolotl.integrations.sparselora.arch_wiring import unsupported_reason
+    from axolotl.integrations.sparselora.arch_wiring import (
+        _partial_rotary_factor,
+        unsupported_reason,
+    )
 
     model = _stablelm_lora()
     attn = next(m for n, m in model.named_modules() if n.endswith("self_attn"))
     head_dim = attn.config.hidden_size // attn.config.num_attention_heads
-    assert attn.config.partial_rotary_factor < 1.0  # genuinely partial-rotary
+    assert _partial_rotary_factor(attn.config) < 1.0  # genuinely partial-rotary
     assert unsupported_reason(attn) is None  # no longer refused
     register_arch_wiring(model)
     targets = discover_target_modules(model)

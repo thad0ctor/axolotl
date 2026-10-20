@@ -8,12 +8,11 @@ from dataclasses import dataclass, field
 from typing import Optional, Type
 
 from transformers import TrainingArguments
-from trl import RewardConfig
+from trl import KTOConfig, RewardConfig
 from trl.experimental.cpo import CPOConfig
-from trl.experimental.kto import KTOConfig
 from trl.experimental.orpo import ORPOConfig
-from trl.experimental.prm import PRMConfig
 
+from axolotl.core.trainers.prm import PRMConfig
 from axolotl.integrations.config import merge_training_args
 
 AxolotlTrainingMixins: Type = merge_training_args()

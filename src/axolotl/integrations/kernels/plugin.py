@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Axolotl AI
+# Licensed under the Apache License, Version 2.0
+
 import importlib
 import os
 
@@ -16,8 +20,10 @@ LOG = get_logger(__name__)
 def _check_sonicmoe_gpu_compat():
     """Validate GPU compute capability for SonicMoE and configure env.
 
-    Supported: Hopper (sm_90), Blackwell (sm_100 - sm_103).
-    B300 (sm_103) additionally requires Triton 3.6.0.
+    Supported: Hopper (sm_90) and Blackwell (sm_100-sm_103 datacenter, sm_120+
+    consumer). Consumer Blackwell (sm_120) needs a sonic-moe build bundling
+    quack 0.6.1 with nvidia-cutlass-dsl 4.6.0 (earlier prebuilts lack the sm_120
+    GEMM). B300 (sm_103) additionally requires Triton 3.6.0.
     """
     if not torch.cuda.is_available():
         return
@@ -28,12 +34,6 @@ def _check_sonicmoe_gpu_compat():
         raise RuntimeError(
             f"SonicMoE requires Hopper (sm_90) or Blackwell (sm_100+) GPU, "
             f"but detected sm_{cc[0]}{cc[1]}."
-        )
-
-    if cc > (10, 3):
-        raise RuntimeError(
-            f"SonicMoE does not yet support sm_{cc[0]}{cc[1]}. "
-            f"Supported: Hopper (sm_90) and Blackwell (sm_100 - sm_103)."
         )
 
     if cc >= (10, 0):
@@ -56,6 +56,92 @@ def _check_sonicmoe_gpu_compat():
                 f"B300 (sm_103) requires Triton 3.6.x, but found {triton.__version__}."
             )
 
+    _check_sonicmoe_cutlass_dsl()
+
+
+def _check_sonicmoe_cutlass_dsl():
+    """Fail fast when the installed cutlass DSL is outside quack's declared range, instead of a
+    cryptic MLIR/import crash (quack 0.6.1 pinned ==4.6.0, 0.6.3+ need >=4.7)."""
+    from importlib.metadata import (
+        PackageNotFoundError,
+        requires,
+        version as _pkg_version,
+    )
+
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    try:
+        cutlass_dsl_version = _pkg_version("nvidia-cutlass-dsl")
+    except PackageNotFoundError:
+        cutlass_dsl_version = None
+    try:
+        quack_version = _pkg_version("quack-kernels")
+        quack_requires = requires("quack-kernels") or []
+    except PackageNotFoundError:
+        quack_version, quack_requires = None, []
+    cutlass_spec = None
+    for entry in quack_requires:
+        try:
+            requirement = Requirement(entry)
+        except InvalidRequirement:
+            continue
+        if requirement.name == "nvidia-cutlass-dsl" and requirement.marker is None:
+            cutlass_spec = requirement.specifier
+            break
+    if (
+        cutlass_dsl_version is not None
+        and cutlass_spec is not None
+        and not cutlass_spec.contains(cutlass_dsl_version, prereleases=True)
+    ):
+        raise RuntimeError(
+            f"SonicMoE (quack-kernels {quack_version}) requires "
+            f"nvidia-cutlass-dsl{cutlass_spec}, but found {cutlass_dsl_version} "
+            f"(uv pip install 'nvidia-cutlass-dsl{cutlass_spec}')."
+        )
+
+    # apache-tvm-ffi is an UNDECLARED dep of cutlass-dsl (absent from its Requires-Dist, so
+    # pip won't auto-pull it): <0.1.10 breaks cute.compile, >=0.2 is unvalidated.
+    try:
+        tvm_ffi_version = _pkg_version("apache-tvm-ffi")
+    except PackageNotFoundError:
+        tvm_ffi_version = None
+    if tvm_ffi_version is not None:
+        try:
+            tvm_ffi_v = tuple(int(x) for x in tvm_ffi_version.split(".")[:3])
+        except ValueError:
+            tvm_ffi_v = None
+        if tvm_ffi_v is not None and not (0, 1, 10) <= tvm_ffi_v < (0, 2, 0):
+            raise RuntimeError(
+                f"SonicMoE (quack on cutlass-dsl {cutlass_dsl_version}) requires "
+                f"apache-tvm-ffi>=0.1.10,<0.2, but found {tvm_ffi_version}. cutlass-dsl "
+                f"does not pull it transitively; install it explicitly "
+                f"(uv pip install 'apache-tvm-ffi>=0.1.10,<0.2')."
+            )
+
+
+def _base_is_nvfp4_modelopt(cfg) -> bool:
+    """True iff the base is an NVFP4-modelopt checkpoint the sonicmoe path trains (a specialized
+    arch or the generic MoE gate). Reads the base config; any failure = False."""
+    from axolotl.integrations.kernels.adapters.gemma4 import is_gemma4_nvfp4_modelopt
+    from axolotl.integrations.kernels.adapters.glm_moe_dsa import (
+        is_glm_moe_dsa_nvfp4_modelopt,
+    )
+    from axolotl.integrations.kernels.adapters.nemotron_h import (
+        is_nemotron_h_nvfp4_modelopt,
+    )
+    from axolotl.integrations.kernels.adapters.nvfp4_moe import is_moe_nvfp4_modelopt
+    from axolotl.integrations.kernels.adapters.qwen3_moe import (
+        is_qwen3_moe_nvfp4_modelopt,
+    )
+
+    return (
+        is_qwen3_moe_nvfp4_modelopt(cfg)
+        or is_gemma4_nvfp4_modelopt(cfg)
+        or is_glm_moe_dsa_nvfp4_modelopt(cfg)
+        or is_nemotron_h_nvfp4_modelopt(cfg)
+        or is_moe_nvfp4_modelopt(cfg)
+    )
+
 
 class KernelsPlugin(BasePlugin):
     """Thin orchestrator: registers the expert-kernel backend and dispatches model-family
@@ -77,7 +163,8 @@ class KernelsPlugin(BasePlugin):
 
         Architecture-agnostic: routing stays in each model's SparseMoEBlock; only the experts
         call is dispatched through the registry. When EP is active the ExpertParallelPlugin owns
-        ``experts_implementation`` (a ``deep_ep_*`` composite), so we don't overwrite it here.
+        ``experts_implementation`` (``expert_parallel``, wrapping this kernel), so we don't
+        overwrite it here.
         """
         ep_active = (getattr(cfg, "expert_parallel_size", 1) or 1) > 1
 
@@ -126,6 +213,13 @@ class KernelsPlugin(BasePlugin):
             # Same frozen-quantized-base + LoRA pattern as the scattermoe path above.
             relax_quantized_training_guard()
 
+        if cfg.adapter in ("lora", "multilora") and _base_is_nvfp4_modelopt(cfg):
+            from axolotl.integrations.kernels.merge_aware_setup import (
+                configure_modelopt_merge_aware,
+            )
+
+            configure_modelopt_merge_aware(cfg)
+
         adapters = self._adapters(cfg)
         self._warn_unclaimed_nonexpert_quantization(cfg, adapters)
         for adapter in adapters:
@@ -157,15 +251,103 @@ class KernelsPlugin(BasePlugin):
             adapter.pre_lora_load(cfg, model)
 
     def post_model_load(self, cfg, model):
+        if cfg.autotune_cache_path:
+            from axolotl.integrations.kernels.autotune_cache import load_autotune_cache
+
+            load_autotune_cache(cfg.autotune_cache_path)
+        if cfg.autotune_profiles:
+            from axolotl.integrations.kernels.autotune_profiles import (
+                apply_autotune_profiles,
+            )
+
+            apply_autotune_profiles(cfg.autotune_profiles)
+        if cfg.autotune_neighborhood:
+            from axolotl.integrations.kernels.autotune_neighborhood import (
+                install_neighborhood_search,
+            )
+
+            install_neighborhood_search(cfg.autotune_neighborhood)
+        if cfg.use_sonicmoe:
+            from axolotl.integrations.kernels.libs.sonicmoe.epilogue import (
+                check_model_epilogues,
+            )
+
+            check_model_epilogues(model)
         for adapter in self._adapters(cfg):
             adapter.post_model_load(cfg, model)
 
-    def add_callbacks_pre_trainer(self, cfg, model):
-        callbacks = []
-        if cfg.use_scattermoe:
-            from axolotl.integrations.kernels.autotune_callback import (
-                AutotuneReportCallback,
+    def post_lora_load(self, cfg, model):
+        if not (cfg.use_sonicmoe and cfg.nvfp4_merge_aware):
+            return
+        from axolotl.integrations.kernels.merge_aware_linear import (
+            install_merge_aware_lora_linears,
+        )
+
+        wrapped = install_merge_aware_lora_linears(model)
+        if wrapped:
+            LOG.info(
+                "merge-aware LoRA forward installed on %d non-expert NVFP4 linears",
+                wrapped,
             )
 
-            callbacks.append(AutotuneReportCallback())
+    def add_callbacks_pre_trainer(self, cfg, model):
+        callbacks = []
+        if (
+            cfg.autotune_cache_path
+            or cfg.autotune_profiles
+            or cfg.autotune_neighborhood
+        ):
+            from axolotl.integrations.kernels.autotune_cache import (
+                AutotuneCacheCallback,
+            )
+
+            callbacks.append(
+                AutotuneCacheCallback(
+                    cfg.autotune_cache_path,
+                    cfg.autotune_profiles,
+                    neighborhood=cfg.autotune_neighborhood,
+                )
+            )
+        if cfg.use_sonicmoe and cfg.nvfp4_merge_aware:
+            from axolotl.integrations.kernels.merge_aware_callback import (
+                MergeAwareScheduleCallback,
+            )
+
+            self._merge_aware_schedule_callback = MergeAwareScheduleCallback(
+                cfg.nvfp4_merge_aware_start_step
+            )
+            callbacks.append(self._merge_aware_schedule_callback)
         return callbacks
+
+    def post_train_unload(self, cfg):
+        # runs after the FINAL adapter save (on_save only covers checkpoint-*/)
+        if not (cfg.use_sonicmoe and cfg.nvfp4_merge_aware):
+            return
+        from axolotl.integrations.kernels.libs.sonicmoe import merge_aware_enabled
+        from axolotl.integrations.kernels.merge_aware_callback import (
+            write_merge_aware_metadata,
+        )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            is_main = torch.distributed.get_rank() == 0
+        else:
+            is_main = os.environ.get("RANK", "0") == "0"
+
+        # merge_aware_enabled() still False => start_step was never reached, the
+        # adapter never trained through the fake-quant: leave it unstamped
+        callback = getattr(self, "_merge_aware_schedule_callback", None)
+        if is_main and callback is not None and not callback.merge_aware_valid:
+            from axolotl.integrations.kernels.merge_aware_callback import (
+                clear_merge_aware_metadata,
+            )
+
+            clear_merge_aware_metadata(cfg.output_dir)
+            return
+        if is_main and merge_aware_enabled():
+            if write_merge_aware_metadata(
+                cfg.output_dir, start_step=cfg.nvfp4_merge_aware_start_step
+            ):
+                LOG.info(
+                    "stamped nvfp4_merge_aware quantizer identity into %s/adapter_config.json",
+                    cfg.output_dir,
+                )

@@ -513,13 +513,24 @@ def _resolve_eager_attention(base: nn.Module):
     return getattr(base_mod, "eager_attention_forward", eager_attention_forward)
 
 
+def _partial_rotary_factor(config: Any) -> float:
+    """``partial_rotary_factor`` from ``config.rope_parameters`` (transformers 5.x)
+    or the legacy top-level attribute; ``1.0`` when absent."""
+    if config is None:
+        return 1.0
+    rope = getattr(config, "rope_parameters", None)
+    if isinstance(rope, dict) and "partial_rotary_factor" in rope:
+        return float(rope["partial_rotary_factor"])
+    return float(getattr(config, "partial_rotary_factor", 1.0))
+
+
 def _partial_rotary_dim(config: Any, head_dim: int) -> Optional[int]:
     """RoPE rotary width for partial-rotary models (StableLM/Phi), else ``None``.
 
     ``partial_rotary_factor < 1.0`` rotates only the leading ``factor * head_dim``
     of each head; the rest passes through. ``None`` means full-head RoPE.
     """
-    prf = getattr(config, "partial_rotary_factor", 1.0) if config is not None else 1.0
+    prf = _partial_rotary_factor(config)
     return int(prf * head_dim) if prf < 1.0 else None
 
 

@@ -11,6 +11,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.distributed.tensor import DTensor
 from transformers import GradientCheckpointingLayer, Trainer
 from trl.models.activation_offloading import (
     NoOpManager,
@@ -59,6 +60,133 @@ def _patch_trl_offload_current_stream() -> None:
     )
 
 
+def _is_offload_parameter_view(tensor, parameter_storages) -> bool:
+    local = (
+        getattr(tensor, "_local_tensor", tensor)
+        if isinstance(tensor, DTensor)
+        else tensor
+    )
+    try:
+        return local.untyped_storage().data_ptr() in parameter_storages
+    except (RuntimeError, AttributeError):
+        return False
+
+
+def _storage_ptr(tensor):
+    local = (
+        getattr(tensor, "_local_tensor", tensor)
+        if isinstance(tensor, DTensor)
+        else tensor
+    )
+    try:
+        return local.untyped_storage().data_ptr()
+    except (RuntimeError, AttributeError):
+        return None
+
+
+def _install_live_fsdp_parameter_storage_hooks(context, model) -> None:
+    if not hasattr(context, "param_storages"):
+        return
+    if getattr(context, "_axolotl_live_parameter_storage_hooks", False):
+        return
+    if not any(isinstance(parameter, DTensor) for parameter in model.parameters()):
+        return
+
+    # TRL captures storage before Accelerate applies FSDP2. Those pointers can be
+    # freed and reused, so only retain storage observed while a parameter owner runs.
+    context.param_storages.clear()
+    active_storages: dict[int, int] = {}
+    forward_storages: dict[int, list[set[int]]] = {}
+    owners = {
+        module
+        for module in model.modules()
+        if any(True for _ in module.parameters(recurse=False))
+    }
+    wrapper_owners = {
+        module
+        for module in model.modules()
+        if hasattr(module, "base_layer")
+        and (hasattr(module, "lora_A") or hasattr(module, "lora_embedding_A"))
+    }
+    owners.update(wrapper_owners)
+
+    def enter(module, _args):
+        pointers = {
+            pointer
+            for parameter in module.parameters(recurse=module in wrapper_owners)
+            if (pointer := _storage_ptr(parameter)) not in (None, 0)
+        }
+        forward_storages.setdefault(id(module), []).append(pointers)
+        for pointer in pointers:
+            active_storages[pointer] = active_storages.get(pointer, 0) + 1
+            context.param_storages.add(pointer)
+
+    def exit(module, _args, _output):
+        stacks = forward_storages.get(id(module))
+        if not stacks:
+            return
+        for pointer in stacks.pop():
+            remaining = active_storages[pointer] - 1
+            if remaining:
+                active_storages[pointer] = remaining
+            else:
+                del active_storages[pointer]
+                context.param_storages.discard(pointer)
+
+    handles = []
+    for module in owners:
+        handles.append(module.register_forward_pre_hook(enter))
+        handles.append(module.register_forward_hook(exit, always_call=True))
+    context._axolotl_live_parameter_storage_hooks = True
+    context._axolotl_live_parameter_storage_hook_handles = handles
+
+
+def _patch_trl_offload_compute_stream_clone() -> None:
+    """Clone offset/non-contiguous saved tensors on the COMPUTE stream before TRL's pack hook.
+
+    ``pack_tensor`` clones such tensors inside its ``torch.cuda.stream(s1)`` context, so the
+    stash copy is transfer-stream-pool memory written on s1 but consumed by compute kernels with
+    no ordering edge: the consumer can read the block before s1 executes the clone (stale bytes
+    from a recycled block), and once the stash entry is dropped mid-backward the block returns to
+    the s1 pool and the next H2D restore overwrites it while the compute-stream read is still
+    pending. Cross-entropy's saved ``shift_labels`` (storage_offset=1 from the label shift) hits
+    this every step: garbage targets -> device-side assert in nll_loss backward, corrupted CUDA
+    context. Pre-cloning on the compute stream closes both edges — the write is stream-ordered
+    with all consumers and the block never enters the transfer stream's allocator pool.
+    """
+    from trl.models.activation_offloading import OffloadActivations
+
+    if getattr(OffloadActivations, "_axolotl_compute_stream_clone", False):
+        return
+
+    orig_init = OffloadActivations.__init__
+
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        pack = self.pack_hook
+
+        def pack_contiguous(tensor):
+            if (
+                torch.is_tensor(tensor)
+                and tensor.device.type in ("cuda", "xpu", "npu")
+                and not isinstance(tensor, torch.nn.Parameter)
+                # Cloning a weight view would defeat TRL's parameter-storage filter.
+                and not _is_offload_parameter_view(tensor, self.param_storages)
+                and (not tensor.is_contiguous() or tensor.storage_offset() != 0)
+            ):
+                tensor = tensor.clone(memory_format=torch.contiguous_format)
+            return pack(tensor)
+
+        self.pack_hook = pack_contiguous
+
+    OffloadActivations.__init__ = patched_init
+    OffloadActivations._axolotl_compute_stream_clone = True
+    LOG.info(
+        "Patched TRL OffloadActivations to clone offset/non-contiguous saved tensors "
+        "on the compute stream (fixes cross-stream use-after-free of the pack-time clone)"
+    )
+
+
 class ActivationOffloadingMixin(Trainer):
     """
     Trainer mixin class for activation checkpointing w offloading
@@ -74,6 +202,7 @@ class ActivationOffloadingMixin(Trainer):
             use_streams = self.args.activation_offloading != "legacy"
             if use_streams:
                 _patch_trl_offload_current_stream()
+                _patch_trl_offload_compute_stream_clone()
             if self.args.activation_offloading == "hidden_states":
                 from axolotl.monkeypatch.checkpoint_activation_offload import (
                     get_checkpoint_hidden_states_offloading_ctx_manager,
@@ -96,6 +225,9 @@ class ActivationOffloadingMixin(Trainer):
             self.activation_offload_context = contextlib.nullcontext()
 
     def training_step(self, *args, **kwargs):
+        _install_live_fsdp_parameter_storage_hooks(
+            self.activation_offload_context, self.model
+        )
         with self.activation_offload_context:
             return super().training_step(*args, **kwargs)
 
