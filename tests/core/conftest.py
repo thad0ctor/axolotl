@@ -30,8 +30,8 @@ def fixture_base_cfg():
             "optimizer": "adamw_torch_fused",
             "learning_rate": 0.00005,
             "weight_decay": 0.01,
-            "adam_beta1": 0.998,
-            "adam_beta2": 0.9,
+            "adam_beta1": 0.91,
+            "adam_beta2": 0.99,
             "adam_epsilon": 0.00001,
             "max_grad_norm": 1.0,
             # LR scheduler settings
@@ -144,7 +144,7 @@ def fixture_grpo_cfg(base_cfg):
                 {
                     "path": "openai/gsm8k",
                     "name": "main",
-                    "split": "train[:1%]",
+                    "split": "train[:16]",
                 }
             ],
         }
@@ -205,7 +205,7 @@ def fixture_rm_cfg(sft_cfg):
                     {
                         "path": "argilla/distilabel-intel-orca-dpo-pairs",
                         "type": "bradley_terry.chat_template",
-                        "split": "train[:1%]",
+                        "split": "train[:16]",
                     }
                 ],
             }
@@ -225,7 +225,7 @@ def fixture_prm_cfg(sft_cfg):
                     {
                         "path": "trl-lib/math_shepherd",
                         "type": "stepwise_supervised",
-                        "split": "train[:1%]",
+                        "split": "train[:16]",
                     }
                 ],
             }

@@ -2,21 +2,182 @@
 monkeypatch for accelerate fsdp2 fix when modifying ordereddict during interation, and saving full state dicts
 """
 
+import contextlib
 import copy
 import functools
-import gc
 import os
-import sys
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
+from axolotl.monkeypatch.accelerate.fsdp2_grouping import carve_trainable_dtype
 from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.fp32_norms import get_fp32_norm_patterns, shard_norms_fp32
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+def _nvfp4_local_tensor_cls(p):
+    """Return the NVFP4Tensor class if ``p`` is a DTensor whose local shard is an NVFP4Tensor."""
+    try:
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+    except ImportError:
+        return None
+    lt = getattr(p, "_local_tensor", None)
+    return NVFP4Tensor if isinstance(lt, NVFP4Tensor) else None
+
+
+def _rebuild_nvfp4_like(
+    reference, qdata, scale, per_tensor_scale, act_per_tensor_scale=None
+):
+    """Rebuild an NVFP4 shard without changing its encoding recipe."""
+    return type(reference)(
+        qdata,
+        scale,
+        reference.block_size,
+        reference.orig_dtype,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=(
+            reference.act_per_tensor_scale
+            if act_per_tensor_scale is None
+            else act_per_tensor_scale
+        ),
+        is_swizzled_scales=reference.is_swizzled_scales,
+        use_triton_kernel=reference.use_triton_kernel,
+        act_quant_kwargs=reference.act_quant_kwargs,
+    )
+
+
+def _restore_non_persistent_buffers(model, original_buffers, accelerator):
+    for fqn in sorted(original_buffers):
+        original = original_buffers[fqn]
+        if accelerator.is_main_process:
+            restored = original.to(accelerator.device)
+        else:
+            restored = torch.empty_like(original, device=accelerator.device)
+        dist.broadcast(restored, src=0)
+
+        if "." in fqn:
+            parent_fqn, local_buffer_name = fqn.rsplit(".", 1)
+            parent_module = model.get_submodule(parent_fqn)
+        else:
+            local_buffer_name = fqn
+            parent_module = model
+
+        parent_module.register_buffer(local_buffer_name, restored, persistent=False)
+
+
+def _broadcast_nvfp4_param(sharded_meta_param, full_nvfp4, is_main, device, nvfp4_cls):
+    """Scatter rank-0's full NVFP4Tensor expert param to each rank's shard.
+
+    ``distribute_tensor`` calls ``c10d.scatter_``, which torchao's NVFP4Tensor doesn't implement.
+    Instead scatter the PLAIN component tensors (qdata uint8, scale e4m3, per_tensor_scale fp32 — all
+    collective-capable) along the same Shard placement, then rebuild a local NVFP4Tensor shard and
+    wrap it back into a DTensor matching the sharded model param."""
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    mesh = sharded_meta_param.device_mesh
+    placements = sharded_meta_param.placements
+    local_meta = sharded_meta_param._local_tensor
+    e_global = sharded_meta_param.shape[0]
+
+    def _scatter_component(name, ref_local):
+        # Direct per-shard scatter: send each rank ONLY its dim-0 (expert-axis) shard. Avoids the
+        # full-global placeholder that non-rank0 otherwise allocates (256 experts to receive 32),
+        # the generic distribute_tensor path, and its trailing .clone(). Valid for the common
+        # Shard(0) + even-division + full-world mesh (GLM-5.2: 256 experts / 8 ranks); falls back to
+        # distribute_tensor for anything else (uneven, replicate, sub-group meshes).
+        group = mesh.get_group()
+        world = dist.get_world_size(group)
+        p0 = placements[0] if len(placements) == 1 else None
+        # Direct per-shard scatter on the param's mesh group — the full WORLD (pure data-parallel) OR a
+        # dp_shard/cp SUBGROUP (EP composition). Source is the group's rank-0 (== the is_main rank set by
+        # the caller). Avoids distribute_tensor, which deadlocks scattering from src_data_rank=0 on a
+        # sub-mesh. Falls back to distribute_tensor only for non-Shard(0)/uneven placements.
+        if (
+            p0 is not None
+            and getattr(p0, "dim", None) == 0
+            and ref_local.shape[0] * world == e_global
+        ):
+            src_rank = dist.get_process_group_ranks(group)[0]
+            local = torch.empty_like(ref_local, device=device)
+            chunks = None
+            if is_main:
+                full = getattr(full_nvfp4, name)
+                chunks = [c.contiguous().to(device) for c in full.chunk(world, dim=0)]
+            dist.scatter(local, scatter_list=chunks, src=src_rank, group=group)
+            del chunks
+            return local
+        # Fallback: generic distribute_tensor (uneven / replicate / sub-group).
+        gshape = (e_global,) + tuple(ref_local.shape[1:])
+        if is_main:
+            full = getattr(full_nvfp4, name).to(device)
+        else:
+            full = torch.empty(gshape, device=device, dtype=ref_local.dtype)
+        dt = distribute_tensor(full, mesh, placements, src_data_rank=0)
+        return dt._local_tensor.clone()
+
+    local_qdata = _scatter_component("qdata", local_meta.qdata)
+    local_scale = _scatter_component("scale", local_meta.scale)
+
+    def _local_aux_scale(name):
+        ref = getattr(local_meta, name, None)
+        if ref is None:
+            return None
+        if ref.dim() >= 1 and ref.shape[0] == local_meta.qdata.shape[0]:
+            return _scatter_component(name, ref)
+        group = mesh.get_group()
+        src_rank = dist.get_process_group_ranks(group)[0]
+        if is_main:
+            local = getattr(full_nvfp4, name).to(device)
+        else:
+            local = torch.empty(ref.shape, device=device, dtype=ref.dtype)
+        dist.broadcast(local, src=src_rank, group=group)
+        return local
+
+    local_pts = _local_aux_scale("per_tensor_scale")
+    local_act_pts = _local_aux_scale("act_per_tensor_scale")
+    local_nvfp4 = _rebuild_nvfp4_like(
+        local_meta, local_qdata, local_scale, local_pts, local_act_pts
+    )
+    return DTensor.from_local(local_nvfp4, mesh, placements, run_check=False)
+
+
+def _ep_expert_from_local(sharded_meta_param, full_local, nvfp4_cls):
+    """Build an EP-sharded NVFP4 expert DTensor from THIS rank's already-correct local copy — NO
+    collective. shard_expert_weights scattered each rank its ep-group's full ``[E_local]`` NVFP4
+    (``full_local``); slice this rank's dp-axis shard (``[E_local // dp]`` at its position in the
+    mesh group) and wrap it with ``from_local``. Used instead of a per-subgroup scatter, which
+    deadlocks against the interleaved full-mesh non-expert loads (the receiver ranks race ahead of
+    the source ranks)."""
+    from torch.distributed.tensor import DTensor
+
+    mesh = sharded_meta_param.device_mesh
+    placements = sharded_meta_param.placements
+    local_meta = sharded_meta_param._local_tensor
+    dev = mesh.device_type
+    e_dp = local_meta.qdata.shape[0]  # this rank's dp-local expert count
+    dp_rank = mesh.get_local_rank(
+        mesh.ndim - 1
+    )  # the shard dim; outer dims replicate (HSDP)
+    s = slice(dp_rank * e_dp, (dp_rank + 1) * e_dp)
+    qd = full_local.qdata[s].to(dev)
+    sc = full_local.scale[s].to(dev)
+
+    def _local_aux_scale(name):
+        value = getattr(full_local, name, None)
+        if value is None:
+            return None
+        if value.dim() >= 1 and value.shape[0] == full_local.qdata.shape[0]:
+            return value[s].to(dev)
+        return value.to(dev)
+
+    local_pts = _local_aux_scale("per_tensor_scale")
+    local_act_pts = _local_aux_scale("act_per_tensor_scale")
+    local_nv = _rebuild_nvfp4_like(full_local, qd, sc, local_pts, local_act_pts)
+    return DTensor.from_local(local_nv, mesh, placements, run_check=False)
 
 
 def fsdp2_load_full_state_dict(
@@ -31,22 +192,183 @@ def fsdp2_load_full_state_dict(
             The model to load the state dict into, expected to be on meta device or a VRAM spike can occur
         full_sd (`dict`): The full state dict to load, can only be on rank 0
     """
-    from torch.distributed.tensor import distribute_tensor
-
     LOG.info("Broadcasting full state dict to all ranks...")
     import time
 
     start_time = time.time()
 
-    meta_sharded_sd = model.state_dict()
+    # EP-sharded expert params hold RANK-SPECIFIC content (each rank owns experts
+    # [r*E_local, (r+1)*E_local)). The default rank0-authoritative load below would broadcast
+    # rank 0's shard to every rank, replicating experts[0:E_local] everywhere and silently
+    # destroying expert parallelism. shard_expert_weights() already scattered the correct shard
+    # to every rank BEFORE the model was moved to meta, so each rank's own `full_sd` entry is
+    # already correct — load it locally with no cross-rank broadcast. Match via the `.experts.`
+    # infix (excludes `shared_experts`, survives the `_checkpoint_wrapped_module` infix) tied to
+    # the propagated DDP-ignore list.
+    _ep_ignore = getattr(model, "_ddp_params_and_buffers_to_ignore", None) or []
+    _ep_tails = tuple(
+        sorted(
+            {"." + n.split(".experts.", 1)[1] for n in _ep_ignore if ".experts." in n}
+        )
+    )
+
+    def _is_ep_expert_param(name: str) -> bool:
+        return bool(_ep_tails) and ".experts." in name and name.endswith(_ep_tails)
+
+    # keep_vars: tell params from buffers by type, since named_parameters() keys keep
+    # the `_checkpoint_wrapped_module.` segment that state_dict() strips.
+    meta_sharded_sd = model.state_dict(keep_vars=True)
     sharded_sd = {}
+
     for param_name, sharded_meta_param in meta_sharded_sd.items():
+        nvfp4_cls = _nvfp4_local_tensor_cls(sharded_meta_param)
+
+        # EP-sharded experts as DTensors (pure EP per-rank mesh, or an EP×dp_shard subgroup): every
+        # rank of the mesh already holds its ep-group's [E_local] slice in its own full_sd, so shard
+        # that locally instead of sourcing from a rank 0 that owns different experts.
+        if (
+            _is_ep_expert_param(param_name)
+            and nvfp4_cls is None
+            and hasattr(sharded_meta_param, "device_mesh")
+        ):
+            from torch.distributed.tensor import distribute_tensor
+
+            device_mesh = sharded_meta_param.device_mesh
+            own = full_sd[param_name].to(
+                device_mesh.device_type, dtype=sharded_meta_param.dtype
+            )
+            sharded_param = distribute_tensor(
+                own, device_mesh, sharded_meta_param.placements, src_data_rank=None
+            )
+            if offload_to_cpu:
+                sharded_param = sharded_param.cpu()
+            sharded_sd[param_name] = nn.Parameter(
+                sharded_param, requires_grad=sharded_meta_param.requires_grad
+            )
+            full_sd[param_name] = None
+            continue
+
         full_tensor = None
-        if _accelerator.is_main_process:
+        # Skip the dtype cast for NVFP4 (its components are scattered raw, not cast to bf16).
+        if _accelerator.is_main_process and nvfp4_cls is None:
             full_tensor = full_sd[param_name]
             full_tensor = full_tensor.to(sharded_meta_param.dtype)
 
-        if hasattr(sharded_meta_param, "device_mesh"):
+        if nvfp4_cls is not None:
+            # NVFP4Tensor params can't go through distribute_tensor (c10d.scatter_ unimplemented on
+            # the subclass); scatter their plain qdata/scale/per_tensor_scale components instead.
+            device_mesh = sharded_meta_param.device_mesh
+            # Source each NVFP4 expert from its OWN mesh-group's rank-0, not the global rank 0. Under
+            # EP×dp_shard / EP×cp composition the experts live on a dp_shard SUBGROUP mesh, and
+            # shard_expert_weights scattered each rank its ep-group's real slice — so the subgroup's
+            # rank-0 holds the data (global rank 0 is outside ep-groups 1..N's subgroups). For full-world
+            # params the subgroup rank-0 IS global rank 0, so this reduces to is_main_process.
+            if _is_ep_expert_param(param_name):
+                # EP-sharded NVFP4 experts: shard_expert_weights already scattered THIS rank its
+                # ep-group's full [E_local] NVFP4 into full_sd. Build the DTensor by slicing the dp-axis
+                # shard out of that local copy and wrapping it with from_local — NO collective. The
+                # per-subgroup scatter (any flavor) deadlocks because it interleaves with the full-mesh
+                # non-expert loads, racing the receiver ranks ahead of the source ranks; from_local
+                # sidesteps every collective.
+                sharded_param = _ep_expert_from_local(
+                    sharded_meta_param, full_sd[param_name], nvfp4_cls
+                )
+            else:
+                # Non-EP NVFP4 on the full data-parallel mesh: only rank 0 has data -> scatter from it.
+                full_nvfp4 = (
+                    full_sd[param_name] if _accelerator.is_main_process else None
+                )
+                sharded_param = _broadcast_nvfp4_param(
+                    sharded_meta_param,
+                    full_nvfp4,
+                    _accelerator.is_main_process,
+                    device_mesh.device_type,
+                    nvfp4_cls,
+                )
+        elif (
+            ".experts." in param_name
+            and (".lora_A." in param_name or ".lora_B." in param_name)
+            and hasattr(sharded_meta_param, "device_mesh")
+            and sharded_meta_param.device_mesh.size() < dist.get_world_size()
+        ):
+            # The routed-expert LoRA adapter lives on the expert mesh (a per-rank mesh under pure EP,
+            # the dp_shard/cp subgroup under composition) and holds only THIS ep-group's E_local
+            # experts. full_sd normally carries the adapter at that same local shape, drawn on every
+            # rank from the seed for ITS experts (reinit_lora_from_seed), so shard each rank's own
+            # copy: broadcasting rank 0's would hand every ep-group rank 0's experts. A GLOBAL
+            # (all-experts) adapter is instead broadcast whole, then cut to THIS rank's ep-experts
+            # + dp_shard slice; that ep slice is expert-aware (lora_B's experts are not contiguous
+            # in its flat r*E dim).
+            from torch.distributed.tensor import DTensor, distribute_tensor
+
+            from axolotl.integrations.expert_parallel.shard import (
+                ep_adapter_load_local_shard,
+            )
+
+            mesh = sharded_meta_param.device_mesh
+            placements = sharded_meta_param.placements
+            dev = mesh.device_type
+            is_local = torch.zeros(1, dtype=torch.uint8, device=dev)
+            if _accelerator.is_main_process:
+                is_local.fill_(
+                    int(tuple(full_tensor.shape) == tuple(sharded_meta_param.size()))
+                )
+            dist.broadcast(is_local, src=0)
+            if is_local.item():
+                g = full_sd[param_name].to(dev, dtype=sharded_meta_param.dtype)
+                sharded_param = distribute_tensor(
+                    g, mesh, placements, src_data_rank=None
+                )
+                if offload_to_cpu:
+                    sharded_param = sharded_param.cpu()
+                sharded_sd[param_name] = nn.Parameter(
+                    sharded_param, requires_grad=sharded_meta_param.requires_grad
+                )
+                full_sd[param_name] = None
+                continue
+            # The adapter mesh is a sub-mesh (dp_shard or cp, with dp_replicate under HSDP) of the
+            # root mesh; read this rank's ep coordinate from the root rather than deriving it from
+            # the group's ranks, which only works when the world is exactly ep x that mesh.
+            root = mesh._get_root_mesh() or mesh
+            root_names = tuple(root.mesh_dim_names or ())
+            if "ep" in root_names:
+                ep_size = root["ep"].size()
+                ep_coord = root.get_coordinate()[root_names.index("ep")]
+            else:
+                ep_size = dist.get_world_size() // mesh.size()
+                ep_coord = min(mesh.mesh.flatten().tolist()) // mesh.size()
+            shard_dim = mesh.ndim - 1
+            dp_size = mesh.size(shard_dim)
+            dp_rank = mesh.get_local_rank(shard_dim)
+            ep_dim = 0 if ".lora_A." in param_name else 1
+            gshape = list(sharded_meta_param.size())
+            gshape[ep_dim] *= ep_size
+            if _accelerator.is_main_process:
+                g = full_tensor.to(dev)
+            else:
+                g = torch.empty(gshape, device=dev, dtype=sharded_meta_param.dtype)
+            dist.broadcast(g, src=0)
+            local = ep_adapter_load_local_shard(
+                g,
+                ep_dim,
+                model._ep_num_experts_global,
+                ep_coord,
+                ep_size,
+                (placements[shard_dim],),
+                dp_size,
+                dp_rank,
+            )
+            sharded_param = DTensor.from_local(local, mesh, placements, run_check=False)
+        elif hasattr(sharded_meta_param, "device_mesh"):
+            # Generic sharded params (the whole non-EP model, and EP composition's NON-expert weights)
+            # live on a FULL mesh that includes global rank 0, so distribute_tensor(src_data_rank=0)
+            # broadcasts rank-0's data and shards it correctly — including FSDP's padding for uneven
+            # sizes, which a manual chunk + from_local gets wrong (it builds a DTensor with the raw
+            # global size and mismatches the model param). EP-composition's rank-0-EXCLUDING subgroup
+            # params (experts, and the routed-expert LoRA adapter) are handled by their own branches
+            # above, so they never reach here.
+            from torch.distributed.tensor import distribute_tensor
+
             device_mesh = sharded_meta_param.device_mesh
             if _accelerator.is_main_process:
                 full_tensor = full_tensor.to(device_mesh.device_type)
@@ -85,7 +407,11 @@ def fsdp2_load_full_state_dict(
         if offload_to_cpu:
             sharded_param = sharded_param.cpu()
 
-        sharded_sd[param_name] = nn.Parameter(sharded_param)
+        if isinstance(sharded_meta_param, nn.Parameter):
+            sharded_param = nn.Parameter(
+                sharded_param, requires_grad=sharded_meta_param.requires_grad
+            )
+        sharded_sd[param_name] = sharded_param
 
         del full_tensor
         full_sd[param_name] = None
@@ -97,114 +423,6 @@ def fsdp2_load_full_state_dict(
     )
     log_gpu_memory_usage(LOG, "Memory usage after broadcasting full state dict", 0)
     return model
-
-
-def get_state_dict(self, model, unwrap=True):
-    """
-    Returns the state dictionary of a model sent through [`Accelerator.prepare`] potentially without full
-    precision.
-
-    Args:
-        model (`torch.nn.Module`):
-            A PyTorch model sent through [`Accelerator.prepare`]
-        unwrap (`bool`, *optional*, defaults to `True`):
-            Whether to return the original underlying state_dict of `model` or to return the wrapped state_dict
-
-    Returns:
-        `dict`: The state dictionary of the model potentially without full precision.
-
-    Example:
-
-    ```python
-    >>> import torch
-    >>> from accelerate import Accelerator
-
-    >>> accelerator = Accelerator()
-    >>> net = torch.nn.Linear(2, 2)
-    >>> net = accelerator.prepare(net)
-    >>> state_dict = accelerator.get_state_dict(net)
-    ```
-    """
-    from accelerate import DistributedType
-    from accelerate.utils import compare_versions
-
-    if self.distributed_type == DistributedType.DEEPSPEED:
-        zero3_sharding = self.deepspeed_config["zero_optimization"]["stage"] == 3
-        tp_sharding = (
-            self.deepspeed_config.get("tensor_parallel", {}).get("autotp_size", 0) > 1
-        )
-        if zero3_sharding or tp_sharding:
-            if model.zero_gather_16bit_weights_on_model_save():
-                if tp_sharding and not compare_versions("deepspeed", ">=", "0.16.4"):
-                    raise ImportError(
-                        "Deepspeed TP requires deepspeed >= 0.16.4, Please update DeepSpeed via `pip install deepspeed -U`."
-                    )
-                state_dict = (
-                    model._consolidated_16bit_state_dict()
-                    if tp_sharding
-                    else model._zero3_consolidated_16bit_state_dict()
-                )
-            else:
-                raise ValueError(
-                    "Cannot get 16bit model weights because `stage3_gather_16bit_weights_on_model_save` in DeepSpeed config is False. "
-                    "To save the model weights in 16bit, set `stage3_gather_16bit_weights_on_model_save` to True in DeepSpeed config file or "
-                    "set `zero3_save_16bit_model` to True when using `accelerate config`. "
-                    "To save the full checkpoint, run `model.save_checkpoint(save_dir)` and use `zero_to_fp32.py` to recover weights."
-                )
-        else:
-            from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
-
-            state_dict = clone_tensors_for_torch_save(
-                self.unwrap_model(model).state_dict()
-            )
-    elif self.is_fsdp2:
-        # https://github.com/pytorch/torchtune/blob/main/torchtune/training/_distributed.py#L465
-        from torch.distributed.tensor import DTensor
-
-        state_dict = {}
-        sharded_state_dict = model.state_dict()
-        is_rank_zero = torch.distributed.get_rank() == 0
-        for param_name, param in sharded_state_dict.items():
-            if param.is_cpu:
-                param = param.to(torch.device("cuda"))
-
-            if isinstance(param, DTensor):
-                param = param.full_tensor()
-
-            if is_rank_zero:
-                state_dict[param_name] = param.cpu()
-            # Drop the GPU-resident gathered tensor before the next iteration
-            # allocates the next one; otherwise the caching allocator holds
-            # both reservations and we accumulate ~model-size of VRAM.
-            del param
-            torch.distributed.barrier()
-
-        # Release the sharded view and force the allocator to give back the
-        # gather buffers.
-        del sharded_state_dict
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    elif self.distributed_type == DistributedType.FSDP:
-        from torch.distributed.fsdp import (
-            FullStateDictConfig,
-            FullyShardedDataParallel as FSDP,
-            StateDictType,
-        )
-
-        full_state_dict_config = FullStateDictConfig(
-            offload_to_cpu=True, rank0_only=True
-        )
-        with FSDP.state_dict_type(
-            model, StateDictType.FULL_STATE_DICT, full_state_dict_config
-        ):
-            state_dict = model.state_dict()
-    else:
-        if unwrap:
-            model = self.unwrap_model(model)
-        state_dict = model.state_dict()
-
-    return state_dict
 
 
 def patch_peft_param_wrapper_for_fsdp2():
@@ -246,48 +464,120 @@ def patch_peft_param_wrapper_for_fsdp2():
     LOG.info("Patched PEFT _LoraParameterProxy.forward for FSDP2 DTensor compatibility")
 
 
-def _process_lora_module_for_fsdp(module, fsdp2_kwargs):
-    """Helper function to process LoRA modules for FSDP2."""
+def _process_lora_module_for_fsdp(module):
+    """Align a LoRA layer's base bias dtype with its weight; returns whether it had to."""
     from peft.tuners.lora.layer import ParamWrapper
-    from torch.distributed.fsdp import fully_shard
 
-    # Skip ParamWrapper — its lora_A/B must not be independently sharded.
-    # The parent decoder layer's FSDP wrapper handles unsharding them.
-    # TODO: review if we even need to shard them separately in first place.
     if isinstance(module, ParamWrapper):
         return False
 
-    log_bias_dtype_mismatch = False
+    # The adapters themselves stay inside the enclosing decoder-layer unit: FSDP2 only
+    # requires one dtype across a unit's *trainable* parameters, so fp32 factors next to
+    # frozen bf16/uint8 base weights are fine. See fsdp2_grouping for the mixed case.
+    base_layer = getattr(module, "base_layer", None)
+    bias = getattr(base_layer, "bias", None)
+    if bias is not None and base_layer.weight.dtype != bias.dtype:
+        bias.data = bias.data.to(base_layer.weight.dtype)
+        return True
+    return False
 
-    # Linear4Bit will keep it's bias term in fp32. If the weight dtype is in bf16 we are not able to
-    # wrap this. Therefore we must ensure the bias has the same dtype as the weight
-    if hasattr(module.base_layer, "bias") and module.base_layer.bias is not None:
-        if module.base_layer.weight.dtype != module.base_layer.bias.dtype:
-            log_bias_dtype_mismatch = True
-            module.base_layer.bias.data = module.base_layer.bias.data.to(
-                module.base_layer.weight.dtype
-            )
 
-    for active_adapter in module.active_adapters:
-        if module.lora_A:
-            fully_shard(module.lora_A[active_adapter], **fsdp2_kwargs)
-        if module.lora_B:
-            fully_shard(module.lora_B[active_adapter], **fsdp2_kwargs)
-        if module.lora_magnitude_vector:
-            fully_shard(module.lora_magnitude_vector[active_adapter], **fsdp2_kwargs)
+def _expert_param_leaf(name: str) -> str:
+    """The expert attribute a parameter name ends in, seen through a parametrization.
 
-    # lora_embedding_A/B are ParameterDicts containing nn.Parameter (Tensors),
-    # not nn.Module. fully_shard() only accepts nn.Module, so we cannot shard
-    # individual embedding Parameters. Instead, shard the entire LoraLayer module. fully_shard() can be used hierarchically because it does not
-    # override groups already assigned by fully_shard(), so modules
-    # where fully_shard() was already called are not affected [see https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html]
-    if module.lora_embedding_A or module.lora_embedding_B:
-        from torch.distributed.fsdp import FSDPModule
+    Quantized experts live at ``...parametrizations.gate_up_proj.original``; the move to
+    meta re-creates the parameter objects, so identity cannot be relied on and the name
+    must be read as the attribute it parametrizes.
+    """
+    if name.endswith(".original") and ".parametrizations." in name:
+        return name.rsplit(".parametrizations.", 1)[1][: -len(".original")]
+    return name.rsplit(".", 1)[-1]
 
-        if not isinstance(module, FSDPModule):
-            fully_shard(module, **fsdp2_kwargs)
 
-    return log_bias_dtype_mismatch
+def _builds_original_state_dict(staged_nf4: bool, is_main_process: bool) -> bool:
+    """Staged NF4 holds the real weights on rank zero only; a peer's state dict would materialize meta."""
+    return not staged_nf4 or is_main_process
+
+
+def _install_requested_native_nvfp4_merge_aware_lora_linears(model) -> int:
+    from axolotl.monkeypatch.torchao_nvfp4_fsdp_lora import (
+        install_fsdp_native_nvfp4_merge_aware_lora_linears,
+    )
+
+    installed = install_fsdp_native_nvfp4_merge_aware_lora_linears(model)
+    if not installed:
+        LOG.info(
+            "No FSDP2-safe native merge-aware LoRA projections were installed; "
+            "leaving merge-aware support status unchanged."
+        )
+    return installed
+
+
+def _activation_checkpoint_wrapper_fn():
+    """Non-reentrant ``checkpoint_wrapper`` that honours registered mandatory SAC saves."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        CheckpointImpl,
+        checkpoint_wrapper,
+    )
+
+    from axolotl.monkeypatch.selective_checkpointing import (
+        build_sac_context_fn,
+        has_registered_saves,
+    )
+
+    kwargs = {}
+    if has_registered_saves():
+        kwargs["context_fn"] = build_sac_context_fn(save=[])
+    return functools.partial(
+        checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT, **kwargs
+    )
+
+
+def _has_checkpoint_wrapper(model: torch.nn.Module) -> bool:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        CheckpointWrapper,
+    )
+
+    return any(isinstance(m, CheckpointWrapper) for m in model.modules())
+
+
+def _activation_checkpointing_active(model: torch.nn.Module) -> bool:
+    """A CheckpointWrapper already wraps the layers, or HF `gradient_checkpointing_enable`
+    already recomputes them from inside their forward; a second checkpoint nests recompute."""
+    if _has_checkpoint_wrapper(model):
+        return True
+    if any(
+        getattr(m, "gradient_checkpointing", False) is True for m in model.modules()
+    ):
+        LOG.warning(
+            "fsdp_config.activation_checkpointing skipped: gradient_checkpointing already "
+            "recomputes every layer; set one of the two."
+        )
+        return True
+    return False
+
+
+def fsdp2_apply_ac(accelerator, model: torch.nn.Module) -> torch.nn.Module:
+    """accelerate's per-layer AC pass using axolotl's SAC-aware, non-reentrant wrapper."""
+    from accelerate.utils.fsdp_utils import fsdp2_prepare_auto_wrap_policy
+    from accelerate.utils.other import get_module_children_bottom_up
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        offload_wrapper,
+    )
+
+    if _activation_checkpointing_active(model):
+        return model
+    plugin = accelerator.state.fsdp_plugin
+    policy = fsdp2_prepare_auto_wrap_policy(plugin, model)
+    wrap = _activation_checkpoint_wrapper_fn()
+    offload = bool(getattr(plugin, "activation_checkpointing_offload", False))
+    for name, layer in get_module_children_bottom_up(model, return_fqns=True)[:-1]:
+        if policy(layer):
+            wrapped = wrap(layer)
+            if offload:
+                wrapped = offload_wrapper(wrapped)
+            model.set_submodule(name, wrapped)
+    return model
 
 
 def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
@@ -320,7 +610,34 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
     fsdp2_plugin = accelerator.state.fsdp_plugin
 
-    original_sd = model.state_dict()
+    from axolotl.monkeypatch.accelerate.fsdp2_quantized import model_has_nvfp4_params
+
+    if getattr(model, "_axolotl_native_nvfp4_metadata_requested", False):
+        from axolotl.monkeypatch.torchao_nvfp4_merge_persistence import (
+            prepare_sharded_native_metadata,
+        )
+
+        prepare_sharded_native_metadata(model)
+
+    if model_has_nvfp4_params(model):
+        from axolotl.integrations.kernels.libs.scattermoe_lora.nvfp4_fsdp import (
+            normalize_dense_nvfp4_scales,
+            patch_nvfp4_fsdp,
+        )
+        from axolotl.monkeypatch.accelerate.fsdp2_quantized import (
+            patch_fsdp2_traceable_wrapper_param_move,
+        )
+
+        normalize_dense_nvfp4_scales(model)
+        patch_nvfp4_fsdp()
+        patch_fsdp2_traceable_wrapper_param_move()
+
+    staged_nf4 = getattr(model, "_axolotl_staged_nf4", False)
+    original_sd = (
+        model.state_dict()
+        if _builds_original_state_dict(staged_nf4, accelerator.is_main_process)
+        else {}
+    )
 
     from torch.distributed.fsdp.wrap import (
         size_based_auto_wrap_policy,
@@ -338,20 +655,19 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     # This is because of `apply_activation_checkpointing` which will can reuse this function
     fsdp2_plugin.set_auto_wrap_policy(model)
 
-    if fsdp2_plugin.activation_checkpointing:
+    # accelerate >= 1.15 applies AC in `_prepare_fsdp2` (via the patched `fsdp2_apply_ac`)
+    # before calling this; wrapping again nests two checkpoints per layer.
+    if fsdp2_plugin.activation_checkpointing and not _activation_checkpointing_active(
+        model
+    ):
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-            CheckpointImpl,
             apply_activation_checkpointing,
-            checkpoint_wrapper,
         )
 
         # Apply activation checkpointing before applying `fully_shard`
         apply_activation_checkpointing(
             model,
-            checkpoint_wrapper_fn=functools.partial(
-                checkpoint_wrapper,
-                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-            ),
+            checkpoint_wrapper_fn=_activation_checkpoint_wrapper_fn(),
             auto_wrap_policy=fsdp2_plugin.auto_wrap_policy,
         )
 
@@ -359,7 +675,10 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
     # Disable memory pinning if requested
     offload_to_cpu = isinstance(fsdp2_plugin.cpu_offload, CPUOffloadPolicy)
-    if offload_to_cpu and os.environ.get("FSDP_CPU_OFFLOAD_PIN_MEMORY", "") == "false":
+    if (
+        offload_to_cpu
+        and os.environ.get("FSDP_CPU_OFFLOAD_PIN_MEMORY", "").lower() == "false"
+    ):
         fsdp2_plugin.cpu_offload.pin_memory = False
 
     fsdp2_kwargs = {
@@ -373,6 +692,12 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             else None
         ),
     }
+    if getattr(model, "_axolotl_lora_fp32_gradients", False):
+        from axolotl.utils.lora_precision import lora_fsdp2_precision_policy
+
+        fsdp2_kwargs["mp_policy"] = lora_fsdp2_precision_policy(
+            fsdp2_kwargs["mp_policy"]
+        )
     model_has_params4bit = False
     for _, param in model.named_parameters():
         # this is a temporary fix whereby loading models with bnb params cannot be moved from
@@ -382,6 +707,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             model_has_params4bit = True
             break
 
+    ep_local_state: dict = {}
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # Context: `fully_shard` moves the model to GPU if it was on CPU, however it can also be on `meta` and then it stays there even after `fully_shard`
         # For this reason, we need to move the model to `meta` device, as then sharding happens on `meta` device
@@ -395,8 +721,19 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             model, recurse=True, fqns=True
         )
         original_non_persistent_buffers = copy.deepcopy(
-            {k: v for k, v in model.named_buffers() if k in non_persistent_buffer_fqns}
+            {
+                k: v
+                for k, v in model.named_buffers(remove_duplicate=False)
+                if k in non_persistent_buffer_fqns
+            }
         )
+        # expert-parallel expert slices are rank-local and never in rank zero's state dict
+        if staged_nf4:
+            from axolotl.monkeypatch.accelerate.fsdp2_nf4 import (
+                expert_parallel_local_state,
+            )
+
+            ep_local_state = expert_parallel_local_state(model)
         # We move the model to meta device, as then sharding happens on meta device
         model = model.to(torch.device("meta"))
         # We need to re-tie the weights, not exactly sure why, but if we don't do this, reference to `lm_head/embed_tokens` stay hanging -> more VRAM usage
@@ -416,15 +753,110 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
     # EP+FSDP: pre-wrap experts on `dp_shard` before the outer auto-wrap so
     # the walker skips them. See `expert_parallel/README.md`.
-    if (
-        mesh is not None
-        and "ep" in getattr(mesh, "mesh_dim_names", ())
-        and "dp_shard" in mesh.mesh_dim_names
-    ):
+    # EP composition shards the experts on the non-ep axis so they don't sit replicated per rank. With
+    # dp_shard that's the data axis; with pure EP×cp (no dp_shard) the cp ranks of an ep-group hold the
+    # SAME experts (cp shards the sequence, not the experts), so FSDP-shard them on cp and let the MoE
+    # forward all-gather — otherwise each rank keeps its full ep-group slice (e.g. 64 experts at ep=4)
+    # and OOMs on the first forward's all-gather.
+    from axolotl.integrations.expert_parallel.plugin import expert_shard_axis
+
+    _ep_shard_axis = expert_shard_axis(
+        getattr(mesh, "mesh_dim_names", None) if mesh is not None else None
+    )
+    if _ep_shard_axis is not None:
+        from axolotl.integrations.expert_parallel.shard import _detect_experts_modules
+
+        # The EP plugin's fallback path leaves the experts unsharded; FSDP them normally then.
+        if not any(
+            getattr(m, "num_experts_global", None) is not None
+            and m.num_local_experts < m.num_experts_global
+            for _n, m in _detect_experts_modules(model)
+        ):
+            _ep_shard_axis = None
+    if _ep_shard_axis is not None:
         from axolotl.integrations.expert_parallel.plugin import ExpertParallelPlugin
+        from axolotl.integrations.expert_parallel.shard import shard_expert_lora
 
-        ExpertParallelPlugin.fully_shard_experts(model, mesh["dp_shard"], fsdp2_kwargs)
+        # Realign target_parameters expert LoRA with the EP-sharded weights before
+        # FSDP wraps the experts (PEFT sized it for the global expert count). Stash the
+        # exact ep group so the save path gathers across the same axis (re-resolving at
+        # save time can pick up a stale/size-1 mesh).
+        model._ep_lora_group = mesh["ep"].get_group()
+        shard_expert_lora(model, mesh["ep"].size())
+        from axolotl.integrations.expert_parallel.plugin import expert_fsdp_mesh
 
+        ExpertParallelPlugin.fully_shard_experts(
+            model, expert_fsdp_mesh(mesh), fsdp2_kwargs
+        )
+    elif getattr(model, "_ddp_params_and_buffers_to_ignore", None):
+        # EP with no shard axis (pure EP, or dp_replicate x ep): shard_expert_weights scattered each
+        # rank its real [E_local] slice, but there is no dp_shard/cp axis to FSDP them onto. Left to
+        # the outer fully_shard they would be re-sharded across the ep ranks and replicated from
+        # rank 0, destroying EP.
+        from axolotl.integrations.expert_parallel.plugin import (
+            ExpertParallelPlugin,
+            per_rank_expert_mesh,
+        )
+        from axolotl.integrations.expert_parallel.shard import (
+            _detect_experts_modules,
+            shard_expert_lora,
+        )
+
+        ep_ignored_ids = {id(p) for p in getattr(model, "_ep_ignored_params", [])}
+        ep_ignored = {
+            p
+            for n, p in model.named_parameters()
+            if id(p) in ep_ignored_ids
+            or (
+                ".experts." in n
+                and ".shared_experts." not in n
+                and _expert_param_leaf(n)
+                in (
+                    "gate_up_proj",
+                    "up_proj",
+                    "down_proj",
+                    "gate_up_proj_bias",
+                    "up_proj_bias",
+                    "down_proj_bias",
+                )
+            )
+        }
+        if ep_ignored:
+            # Every param must be a DTensor (foreach/fused optimizers and clip reject a
+            # Tensor/DTensor mix), so wrap the experts — and the expert-LoRA wrappers, which the
+            # outer decoder-layer unit would otherwise shard ACROSS ep ranks — on a per-rank
+            # (size-1) dp_shard mesh: the all-gather is a no-op and each rank keeps its own slice.
+            # Under dp_replicate x ep that mesh keeps dp_replicate as the outer dim, so the
+            # replicas' expert grads all-reduce like any other HSDP param.
+            device_type = mesh.device_type if mesh is not None else "cuda"
+            expert_mesh = per_rank_expert_mesh(mesh, device_type)
+            root = expert_mesh._get_root_mesh()
+            model._ep_lora_group = (
+                mesh["ep"].get_group()
+                if mesh is not None and "ep" in (mesh.mesh_dim_names or ())
+                else dist.group.WORLD
+            )
+            shard_expert_lora(model, root["ep"].size())
+            ExpertParallelPlugin.fully_shard_experts(model, expert_mesh, fsdp2_kwargs)
+            LOG.info(
+                f"expert_parallel: wrapped {len(list(_detect_experts_modules(model)))} "
+                f"Experts module(s) on a per-rank mesh {tuple(root.mesh_dim_names)}="
+                f"{tuple(root.shape)}."
+            )
+
+    nf4_unwrapped_children = set()
+    if staged_nf4 and is_peft_model:
+        for module in model.modules():
+            if isinstance(module, ParamWrapper):
+                # ParamWrapper reads adapter weights directly, without invoking their forward hooks.
+                nf4_unwrapped_children.update(list(module.modules())[1:])
+
+    from axolotl.utils.lora_tying import tied_lora_no_wrap_modules
+
+    tied_no_wrap = tied_lora_no_wrap_modules(model)
+    # Modules the loop leaves unwrapped read their parameters directly; a unit of their own
+    # would never gather them, so the dtype carve-out must not create one either.
+    no_carve = set(nf4_unwrapped_children) | set(tied_no_wrap)
     auto_wrap_policy = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
     log_bias_dtype_mismatch = False
     fp32_norm_patterns = get_fp32_norm_patterns(model)
@@ -435,17 +867,64 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             fully_shard_kwargs=fsdp2_kwargs,
         )
 
-    if auto_wrap_policy is not None:
-        for module in get_module_children_bottom_up(model)[:-1]:
-            if is_peft_model and isinstance(module, LoraLayer):
-                module_log_bias_mismatch = _process_lora_module_for_fsdp(
-                    module, fsdp2_kwargs
-                )
-                log_bias_dtype_mismatch |= module_log_bias_mismatch
-            if auto_wrap_policy(module) and not isinstance(module, FSDPModule):
-                fully_shard(module, **fsdp2_kwargs)
+    # Pre-quantized / mixed-dtype models (e.g. an NVFP4 checkpoint loaded for LoRA) carry
+    # non-float Parameters and keep-fp32 modules that the generic FSDP2 path can't shard
+    # uniformly. Engage the quantized capability path ONLY when such params exist; pure-bf16
+    # models take the original generic path unchanged. The nonfloat ``nn.Parameter.__new__``
+    # patch is process-global and is restored via the context manager's ``finally`` (an
+    # exception in ``fully_shard`` can no longer leave it patched).
+    from axolotl.monkeypatch.accelerate.fsdp2_quantized import (
+        cast_residual_fp32,
+        model_has_float_logical_quantized_params,
+        model_has_nonfloat_params,
+        nonfloat_param_guard,
+        shard_fp32_modules,
+    )
+    from axolotl.monkeypatch.fsdp2_qlora import apply_init_dtype_attrs_patch
 
-    fully_shard(model, **fsdp2_kwargs)
+    # Apply the quantized dtype/cast/sharding policy ONLY for float-logical torchao subclasses
+    # (NVFP4Tensor/Float8Tensor/MXTensor) — the pre-quantized checkpoint case this path is for.
+    # Plain bnb Params4bit QLoRA is excluded so cast_residual_fp32 does not downcast its fp32 LoRA.
+    # The nn.Parameter.__new__ guard is separate: it is needed for ANY plain non-float param (uint8
+    # packed, which includes bnb Params4bit) and stays gated on that.
+    _quantized = model_has_float_logical_quantized_params(model)
+    _needs_nonfloat_guard = model_has_nonfloat_params(model)
+    if _needs_nonfloat_guard:
+        # PatchManager applies this for fsdp2 + 4/8-bit configs; direct callers of
+        # this function (tests, probes) would otherwise see FSDP2 cast packed bytes
+        apply_init_dtype_attrs_patch()
+    _guard = (
+        nonfloat_param_guard(model)
+        if _needs_nonfloat_guard
+        else contextlib.nullcontext()
+    )
+    from axolotl.utils.nf4_loading import nf4_phase
+
+    phase = nf4_phase("NF4 FSDP2 wrapping") if staged_nf4 else contextlib.nullcontext()
+    with _guard, phase:
+        if _quantized:
+            # keep-fp32 modules (registered by model adapters, e.g. DSV4 mHC) get their own
+            # fp32 shard group; remaining plain fp32 (PEFT LoRA) is cast to the compute dtype.
+            shard_fp32_modules(model, fsdp2_kwargs)
+            cast_residual_fp32(model)
+
+        if auto_wrap_policy is not None:
+            for module in get_module_children_bottom_up(model)[:-1]:
+                if module in nf4_unwrapped_children or module in tied_no_wrap:
+                    continue
+                if isinstance(
+                    module,
+                    (nn.ModuleList, nn.ModuleDict, nn.ParameterList, nn.ParameterDict),
+                ):
+                    continue
+                if is_peft_model and isinstance(module, LoraLayer):
+                    log_bias_dtype_mismatch |= _process_lora_module_for_fsdp(module)
+                if auto_wrap_policy(module) and not isinstance(module, FSDPModule):
+                    carve_trainable_dtype(module, fsdp2_kwargs, pinned=no_carve)
+                    fully_shard(module, **fsdp2_kwargs)
+
+        carve_trainable_dtype(model, fsdp2_kwargs, pinned=no_carve)
+        fully_shard(model, **fsdp2_kwargs)
 
     if log_bias_dtype_mismatch:
         LOG.warning(
@@ -453,25 +932,26 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         )
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
-        fsdp2_load_full_state_dict(
-            accelerator, model, original_sd, offload_to_cpu=offload_to_cpu
-        )
+        if staged_nf4:
+            from axolotl.monkeypatch.accelerate.fsdp2_nf4 import load_staged_nf4_state
+
+            load_staged_nf4_state(
+                accelerator,
+                model,
+                original_sd,
+                offload_to_cpu=offload_to_cpu,
+                local_state=ep_local_state,
+            )
+        else:
+            fsdp2_load_full_state_dict(
+                accelerator, model, original_sd, offload_to_cpu=offload_to_cpu
+            )
 
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # We re-register the buffers, as they may not be in the state_dict
-        for fqn, buffer_tensor in original_non_persistent_buffers.items():
-            buffer_tensor = buffer_tensor.to(accelerator.device)
-
-            if "." in fqn:
-                parent_fqn, local_buffer_name = fqn.rsplit(".", 1)
-                parent_module = model.get_submodule(parent_fqn)
-            else:
-                local_buffer_name = fqn
-                parent_module = model
-
-            parent_module.register_buffer(
-                local_buffer_name, buffer_tensor, persistent=False
-            )
+        _restore_non_persistent_buffers(
+            model, original_non_persistent_buffers, accelerator
+        )
 
         # We need to tie the weights again, as call to `load_full_state_dict` breaks the tie
         # Needs to be called both here and above
@@ -479,6 +959,27 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         # removing the call above leads to extra memory usage as explained in the comment above
         if hasattr(model, "tie_weights"):
             model.tie_weights()
+
+    if getattr(model, "_axolotl_native_nvfp4_merge_aware_requested", False):
+        _install_requested_native_nvfp4_merge_aware_lora_linears(model)
+
+    if (
+        getattr(model, "_axolotl_native_nvfp4_dynamic_input_gradients_requested", None)
+        == "FSDP"
+    ):
+        from axolotl.monkeypatch.torchao_nvfp4_dynamic_ste import (
+            install_fsdp_native_nvfp4_dynamic_input_stes,
+        )
+
+        install_fsdp_native_nvfp4_dynamic_input_stes(model)
+        if not getattr(model, "_axolotl_native_nvfp4_dynamic_input_gradients", False):
+            model._axolotl_merge_aware_unsupported = True
+            LOG.warning(
+                "NVFP4 MERGE WARNING: dynamic native NVFP4 input-gradient coverage "
+                "is incomplete after FSDP2 wrapping; continuing without merged-NVFP4 "
+                "parity guarantee."
+            )
+
     return model
 
 
@@ -491,6 +992,11 @@ def patch_tied_keys_for_meta_device():
     from collections import defaultdict
 
     from transformers import PreTrainedModel
+
+    # recent transformers replaced data_ptr tie detection (_adjust_tied_keys_with_tied_pointers) with
+    # config-driven get_expanded_tied_weights_keys; absent on the pinned version, so bail (nothing to patch).
+    if not hasattr(PreTrainedModel, "_adjust_tied_keys_with_tied_pointers"):
+        return
 
     def _patched_adjust_tied_keys_with_tied_pointers(self, missing_keys):
         param_pointers = defaultdict(list)
@@ -559,13 +1065,95 @@ def patch_initialize_missing_keys_for_fsdp():
     PreTrainedModel._initialize_missing_keys._axolotl_patched = True
 
 
+def patch_move_missing_keys_meta_for_fsdp():
+    """Stop transformers materializing the FULL model on every non-rank-0 rank during load.
+
+    ``_move_missing_keys_from_meta_to_device`` has a branch ``is_fsdp_enabled() and not
+    is_local_dist_rank_0() and not is_quantized`` that moves EVERY meta parameter to real CPU
+    storage (``torch.zeros_like(param, device="cpu")``). For an unrecognized-quantizer checkpoint
+    (NVFP4-modelopt → ``is_quantized=False``) on a large model, that puts the whole model on each
+    non-rank-0 rank → ``world_size``× CPU RAM → OOM. axolotl's ``fsdp2_prepare_model`` immediately
+    does ``model.to("meta")`` then broadcasts rank 0's weights, so the materialized params are
+    pure waste. Keep params on meta (FSDP fills them); only buffers — computed in ``__init__`` and
+    not broadcast — get real CPU storage.
+
+    Caller MUST restrict this to frozen-base (adapter) runs: leaving base params on meta on
+    non-rank-0 deadlocks the FSDP2 optimizer-state all-gather at checkpoint save for a FULL
+    fine-tune (rank-0 real DTensors vs non-rank-0 meta). LoRA/qLoRA carry no base optimizer state,
+    so the gather never touches these params.
+
+    Trainable params created after the load (the adapters) must NOT stay on meta on non-rank-0 —
+    accelerate keys its FSDP2 optimizer param remap on ``data_ptr()``, which is 0 for every meta
+    tensor; see ``axolotl.loaders.utils.materialize_trainable_meta_params``."""
+    from transformers import PreTrainedModel
+    from transformers.integrations import (
+        is_deepspeed_zero3_enabled,
+        is_fsdp_enabled,
+    )
+    from transformers.modeling_utils import (
+        _load_parameter_into_model,
+        get_device,
+        is_local_dist_rank_0,
+    )
+
+    if getattr(
+        PreTrainedModel._move_missing_keys_from_meta_to_device,
+        "_axolotl_patched",
+        False,
+    ):
+        return
+
+    def _patched_move_missing_keys(
+        self, missing_keys, device_map, device_mesh, hf_quantizer
+    ):
+        is_quantized = hf_quantizer is not None
+        if is_deepspeed_zero3_enabled() and not is_quantized:
+            return
+
+        if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
+            # Params: leave on meta — FSDP broadcasts rank 0's real weights into them. (Upstream
+            # materialized them all to cpu zeros here, OOMing large models.) Buffers still need real
+            # storage, but they are small.
+            for key, buffer in self.named_buffers():
+                if buffer.is_meta:
+                    value = torch.zeros_like(buffer, device="cpu")
+                    _load_parameter_into_model(self, key, value)
+            return
+
+        for key in missing_keys - self.all_tied_weights_keys.keys():
+            param = self.get_parameter_or_buffer(key)
+            param_device = get_device(device_map, key, valid_torch_device=True)
+            value = torch.empty_like(param, device=param_device)
+            if device_mesh is not None:
+                from transformers.modeling_utils import shard_and_distribute_module
+
+                shard_and_distribute_module(
+                    self,
+                    value,
+                    param,
+                    key,
+                    None,
+                    False,
+                    device_mesh.get_local_rank(),
+                    device_mesh,
+                )
+            else:
+                _load_parameter_into_model(self, key, value)
+        for key, buffer in self.named_non_persistent_buffers():
+            buffer_device = get_device(device_map, key, valid_torch_device=True)
+            value = torch.empty_like(buffer, device=buffer_device)
+            _load_parameter_into_model(self, key, value)
+
+    PreTrainedModel._move_missing_keys_from_meta_to_device = _patched_move_missing_keys
+    PreTrainedModel._move_missing_keys_from_meta_to_device._axolotl_patched = True
+    LOG.info(
+        "Patched transformers _move_missing_keys_from_meta_to_device: non-rank-0 params stay "
+        "on meta (FSDP broadcast fills them) instead of full-model CPU materialization"
+    )
+
+
 def patch_accelerate_fsdp2():
     import accelerate
 
     accelerate.accelerator.fsdp2_prepare_model = fsdp2_prepare_model
-    accelerate.Accelerator.get_state_dict = get_state_dict
-    setattr(
-        sys.modules["accelerate"],
-        "Accelerator.get_state_dict",
-        get_state_dict,
-    )
+    accelerate.accelerator.fsdp2_apply_ac = fsdp2_apply_ac

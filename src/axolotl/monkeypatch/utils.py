@@ -9,35 +9,82 @@ import torch
 import torch.nn.functional as F
 
 
-@torch.jit.script
 def get_max_seqlen_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
-    max_num = int(torch.max(attention_mask).item())
-    batch_size, _ = attention_mask.shape
-    counts = torch.zeros((batch_size, max_num), dtype=torch.int32)
-    for i in range(1, max_num + 1):
-        mask = attention_mask == i
-        counts[:, i - 1] = torch.sum(mask, dim=-1).to(dtype=torch.int32)
-    result = counts.flatten()
-    nonzero_indices = torch.nonzero(result).squeeze(-1)
-    return result[nonzero_indices]
+    """Token counts for each packed sub-sequence in a multipack attention mask.
+
+    Multipack encodes every packed document as a distinct positive integer id
+    (``1, 2, 3, ...``) with ``0`` for padding, so a row looks like
+    ``[1, 1, 1, 2, 2, 3, 3, 0, 0]``. This returns the length of each non-pad
+    document, flattened across the batch.
+
+    Vectorized on purpose: the previous implementation used
+    ``int(mask.max().item())`` as a Python loop bound, which forced a
+    device->host sync and broke torch.compile. This variant computes segment
+    boundaries with tensor ops only.
+    """
+    bsz, slen = attention_mask.shape
+    flat = attention_mask.reshape(-1)
+    # A token begins a new document when its id differs from the previous token.
+    seg_start = torch.ones_like(flat, dtype=torch.bool)
+    seg_start[1:] = flat[1:] != flat[:-1]
+    # Force a boundary at every row start so equal ids in adjacent rows (e.g. two
+    # rows each fully filled by a single document) are not merged into one segment.
+    seg_start = seg_start.view(bsz, slen)
+    seg_start[:, 0] = True
+    seg_start = seg_start.reshape(-1)
+
+    start_idx = seg_start.nonzero().flatten()
+    end_idx = torch.cat([start_idx[1:], start_idx.new_full((1,), flat.numel())])
+    lengths = (end_idx - start_idx).to(dtype=torch.int32)
+    # Drop padding runs (id == 0).
+    return lengths[flat[start_idx] != 0]
 
 
-@torch.jit.script
 def get_unpad_data(attention_mask: torch.Tensor):
     device = attention_mask.device
     seqlens_in_batch = get_max_seqlen_in_batch(attention_mask)
     indices = torch.nonzero(attention_mask.flatten()).flatten()
+    # flash_attn's varlen API wants a Python int for max_seqlen; this is the only
+    # remaining device->host sync and is kept solely for that ABI.
     max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = (
-        F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-        .to(device=device)
-        .detach()
-    )
+    cu_seqlens = F.pad(
+        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+    ).to(device=device)
     return (
         indices,
         cu_seqlens,
         max_seqlen_in_batch,
     )
+
+
+def cu_seqlens_from_position_ids(
+    position_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Flat ``[N + 1]`` document offsets for fla's varlen API, or None if unpacked.
+
+    Axolotl removes the packed attention mask whenever sample packing is on
+    (``sample_packing_drop_attention_mask``), so a ``position_ids`` restarting at 0
+    is the only remaining signal for a document boundary. A batch is concatenated
+    into a single varlen stream, so each row boundary is a document boundary too.
+    """
+    if position_ids is None:
+        return None
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    rows, seq_len = position_ids.shape
+    restarts = (position_ids == 0).nonzero()
+    # a plain batch packs nothing; fla takes `[B, T, ...]` without a varlen stream
+    if rows > 1 and not bool((restarts[:, 1] != 0).any()):
+        return None
+    starts = restarts[:, 0] * seq_len + restarts[:, 1]
+    # a row can start mid-document: under context parallelism a chunk has no leading
+    # 0, and flattening a batch splits at every row start whether or not one is there
+    row_starts = torch.arange(rows, device=position_ids.device) * seq_len
+    starts = torch.cat([row_starts, starts]).unique()
+    if rows == 1 and starts.numel() < 2:
+        return None
+    total = starts.new_tensor([rows * seq_len])
+    return torch.cat([starts, total]).to(torch.int32)
 
 
 def get_cu_seqlens(attn_mask):

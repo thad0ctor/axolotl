@@ -36,11 +36,12 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "dpo",
+                "dataset_num_proc": 4,
                 "datasets": [
                     {
                         "path": "arcee-ai/distilabel-intel-orca-dpo-pairs-binarized",
                         "type": "chatml.ultra",
-                        "split": "train",
+                        "split": "train[:200]",
                     },
                 ],
                 "num_epochs": 1,
@@ -84,12 +85,13 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "dpo",
+                "dataset_num_proc": 4,
                 "dpo_use_weighting": True,
                 "datasets": [
                     {
                         "path": "arcee-ai/distilabel-intel-orca-dpo-pairs-binarized",
                         "type": "chatml.ultra",
-                        "split": "train",
+                        "split": "train[:200]",
                     },
                 ],
                 "num_epochs": 1,
@@ -135,13 +137,14 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "dpo",
+                "dataset_num_proc": 4,
                 "dpo_loss_type": ["sigmoid", "sft"],
                 "dpo_loss_weights": [1.0, 1.0],
                 "datasets": [
                     {
                         "path": "arcee-ai/distilabel-intel-orca-dpo-pairs-binarized",
                         "type": "chatml.ultra",
-                        "split": "train",
+                        "split": "train[:200]",
                     },
                 ],
                 "num_epochs": 1,
@@ -186,11 +189,12 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "kto_pair",
+                "dataset_num_proc": 4,
                 "datasets": [
                     {
                         "path": "arcee-ai/distilabel-intel-orca-dpo-pairs-binarized",
                         "type": "chatml.ultra",
-                        "split": "train",
+                        "split": "train[:200]",
                     },
                 ],
                 "num_epochs": 1,
@@ -234,12 +238,13 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "dpo",
+                "dataset_num_proc": 4,
                 "dpo_loss_type": ["ipo"],
                 "datasets": [
                     {
                         "path": "arcee-ai/distilabel-intel-orca-dpo-pairs-binarized",
                         "type": "chatml.ultra",
-                        "split": "train",
+                        "split": "train[:200]",
                     },
                 ],
                 "num_epochs": 1,
@@ -284,6 +289,7 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "orpo",
+                "dataset_num_proc": 4,
                 "orpo_alpha": 0.1,
                 "remove_unused_columns": False,
                 "chat_template": "chatml",
@@ -291,7 +297,7 @@ class TestDPOLlamaLora(unittest.TestCase):
                     {
                         "path": "argilla/distilabel-capybara-dpo-7k-binarized",
                         "type": "chat_template.argilla",
-                        "split": "train",
+                        "split": "train[:200]",
                     },
                 ],
                 "num_epochs": 1,
@@ -324,7 +330,7 @@ class TestDPOLlamaLora(unittest.TestCase):
         cfg = DictDefault(
             {
                 "base_model": "HuggingFaceTB/SmolLM2-135M",
-                "tokenizer_type": "LlamaTokenizer",
+                "tokenizer_type": "AutoTokenizer",
                 "sequence_len": 1024,
                 "load_in_8bit": True,
                 "adapter": "lora",
@@ -336,26 +342,30 @@ class TestDPOLlamaLora(unittest.TestCase):
                     "pad_token": "<|endoftext|>",
                 },
                 "rl": "kto",
+                "dataset_num_proc": 4,
                 "rl_beta": 0.5,
                 "kto_desirable_weight": 1.0,
                 "kto_undesirable_weight": 1.0,
                 "remove_unused_columns": False,
                 "datasets": [
-                    # {
-                    #     "path": "argilla/kto-mix-15k",
-                    #     "type": "chatml.argilla_chat",
-                    #     "split": "train",
-                    # },
+                    {
+                        # this repo's test split carries a DPO schema that fails to cast
+                        "path": "argilla/kto-mix-15k",
+                        "data_files": ["data/train-*.parquet"],
+                        "type": "chatml.argilla_chat",
+                        "split": "train",
+                    },
                     {
                         "path": "argilla/ultrafeedback-binarized-preferences-cleaned-kto",
                         "type": "chatml.ultra",
                         "split": "train",
                     },
-                    # {
-                    #     "path": "argilla/kto-mix-15k",
-                    #     "type": "llama3.argilla_chat",
-                    #     "split": "train",
-                    # },
+                    {
+                        "path": "argilla/kto-mix-15k",
+                        "data_files": ["data/train-*.parquet"],
+                        "type": "llama3.argilla_chat",
+                        "split": "train",
+                    },
                     {
                         "path": "argilla/ultrafeedback-binarized-preferences-cleaned-kto",
                         "type": "llama3.ultra",

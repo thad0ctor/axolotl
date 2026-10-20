@@ -2,6 +2,7 @@
 
 import atexit
 import importlib
+import math
 import os
 import platform
 import uuid
@@ -243,11 +244,16 @@ class TelemetryManager:
                     if not self._is_whitelisted(value):
                         return "[REDACTED]"
 
+            if isinstance(value, float) and not math.isfinite(value):
+                if math.isnan(value):
+                    return "NaN"
+                return "Infinity" if value > 0 else "-Infinity"
+
             # Handle nested values
             if isinstance(value, dict):
                 return {k: redact_value(v, k) for k, v in value.items()}
             if isinstance(value, list):
-                return [redact_value(item) for item in value]
+                return [redact_value(item, key) for item in value]
 
             return value
 

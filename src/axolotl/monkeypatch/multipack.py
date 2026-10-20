@@ -2,7 +2,6 @@
 
 import importlib
 
-import transformers
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.integrations import is_deepspeed_zero3_enabled
@@ -11,6 +10,7 @@ from axolotl.monkeypatch.mixtral import patch_mixtral_moe_forward_zero3
 from axolotl.monkeypatch.utils import get_unpad_data
 
 SUPPORTED_MULTIPACK_MODEL_TYPES = [
+    "beam",
     "apertus",
     "mllama_text_model",
     "llama",
@@ -24,6 +24,8 @@ SUPPORTED_MULTIPACK_MODEL_TYPES = [
     "qwen3_next",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
+    "qwen4_exp_text",
     "falcon",
     "phi",
     "phi3",
@@ -40,6 +42,9 @@ SUPPORTED_MULTIPACK_MODEL_TYPES = [
     "glm",
     "glm4",
     "glm4_moe",
+    "glm_moe_dsa",
+    "glm5_next",
+    "glm5_next_text",
     "smollm3",
     "granite",
     "granitemoe",
@@ -64,18 +69,21 @@ SUPPORTED_MULTIPACK_MODEL_TYPES = [
     "nemotron",
     "nemotron_h",
     "falcon_h1",
+    "minimax_m2",
+    "bailing_hybrid",
+    "k2_horizon",
 ]
 
 
 def patch_for_multipack(model_type, model_name=None, has_remote_code=False):
+    # In-tree HF models handle sample packing natively via position_ids
+    # (transformers `_is_packed_sequence` / `find_packed_sequence_indices`): the 2D
+    # mask is cast to bool before flash attention, so the segment ids we encode in
+    # it never reach `_get_unpad_data` and overriding it there is a no-op. Only
+    # remote-code modeling files that call `_get_unpad_data` directly on the raw
+    # segment-id mask still need the override.
     if has_remote_code:
         patch_remote(model_name)
-    elif hasattr(transformers, "modeling_flash_attention_utils"):
-        # sanity check in case upstream api changes on this
-        assert hasattr(
-            transformers.modeling_flash_attention_utils, "_get_unpad_data"
-        ), "transformers api changed for _get_unpad_data for flash attention"
-        transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
 
     if model_type == "mixtral" and is_deepspeed_zero3_enabled():
         patch_mixtral_moe_forward_zero3()

@@ -1,0 +1,283 @@
+"""CPU-only tests for the FSDP2 quantized capability helpers (#2)."""
+
+import pytest
+import torch
+import torch.nn as nn
+
+from axolotl.monkeypatch.accelerate import fsdp2_quantized as fq
+
+
+def test_model_has_nonfloat_params():
+    float_only = nn.Linear(4, 4)
+    assert not fq.model_has_nonfloat_params(float_only)
+
+    class Quant(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(
+                torch.zeros(4, 4, dtype=torch.uint8), requires_grad=False
+            )
+
+    assert fq.model_has_nonfloat_params(Quant())
+
+
+def test_nonfloat_param_guard_restores_on_success():
+    orig = nn.Parameter.__new__
+    model = nn.Linear(2, 2)
+    with fq.nonfloat_param_guard(model):
+        assert nn.Parameter.__new__ is not orig  # patched inside
+    assert nn.Parameter.__new__ is orig  # restored after
+
+
+def test_nonfloat_param_guard_restores_on_exception():
+    orig = nn.Parameter.__new__
+    model = nn.Linear(2, 2)
+    with pytest.raises(RuntimeError, match="boom"):
+        with fq.nonfloat_param_guard(model):
+            assert nn.Parameter.__new__ is not orig
+            raise RuntimeError("boom during fully_shard")
+    # the process-global patch must be restored even though the body raised
+    assert nn.Parameter.__new__ is orig
+
+
+def test_nonfloat_param_guard_defaults_new_nonfloat_to_no_grad():
+    # torch normally forbids constructing a non-float Parameter with the default requires_grad=True;
+    # inside the guard the default flips to False for non-float data, so it succeeds.
+    with pytest.raises(RuntimeError):
+        nn.Parameter(torch.zeros(2, dtype=torch.uint8))  # default True -> torch rejects
+
+    model = nn.Linear(2, 2)
+    with fq.nonfloat_param_guard(model):
+        p = nn.Parameter(
+            torch.zeros(2, dtype=torch.uint8)
+        )  # default True -> guard makes it False
+        assert p.requires_grad is False
+        assert nn.Parameter(torch.zeros(2)).requires_grad is True  # float keeps True
+
+    # after restore, the normal torch behavior returns
+    with pytest.raises(RuntimeError):
+        nn.Parameter(torch.zeros(2, dtype=torch.uint8))
+
+
+def test_nonfloat_param_guard_freezes_existing_nonfloat():
+    class Quant(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # non-float params must be created frozen (torch forbids requires_grad=True here)
+            self.q = nn.Parameter(
+                torch.zeros(2, 2, dtype=torch.uint8), requires_grad=False
+            )
+            self.f = nn.Parameter(torch.zeros(2, 2), requires_grad=True)
+
+    m = Quant()
+    with fq.nonfloat_param_guard(m):
+        assert m.q.requires_grad is False  # non-float stays frozen
+        assert m.f.requires_grad is True  # float untouched
+
+
+def test_traceable_wrapper_device_move_preserves_requires_grad(monkeypatch):
+    import torch.distributed.fsdp._fully_shard._fsdp_init as fsdp_init
+
+    class FakeTraceable(torch.Tensor):
+        @staticmethod
+        def __new__(cls, value):
+            return value.as_subclass(cls)
+
+        def to(self, *args, **kwargs):
+            return self.detach().clone().as_subclass(type(self))
+
+    def parameter(requires_grad):
+        return nn.Parameter(FakeTraceable(torch.zeros(2)), requires_grad=requires_grad)
+
+    original_move = fsdp_init._move_states_to_device
+    original_patched = getattr(
+        fq.patch_fsdp2_traceable_wrapper_param_move, "_axolotl_patched", False
+    )
+    monkeypatch.setattr(
+        fsdp_init,
+        "is_traceable_wrapper_subclass",
+        lambda value: isinstance(value, FakeTraceable),
+    )
+    try:
+        fq.patch_fsdp2_traceable_wrapper_param_move._axolotl_patched = False
+        fq.patch_fsdp2_traceable_wrapper_param_move()
+        frozen = parameter(False)
+        trainable = parameter(True)
+        fsdp_init._move_states_to_device([frozen, trainable], [], torch.device("cuda"))
+        assert not frozen.requires_grad
+        assert trainable.requires_grad
+    finally:
+        fsdp_init._move_states_to_device = original_move
+        fq.patch_fsdp2_traceable_wrapper_param_move._axolotl_patched = original_patched
+
+
+def test_register_fp32_shard_classes():
+    saved = set(fq._FP32_SHARD_CLASS_NAMES)
+    try:
+        fq.register_fp32_shard_classes(["FooBarModule"])
+        assert "FooBarModule" in fq._FP32_SHARD_CLASS_NAMES
+    finally:  # restore the global registry so tests stay order-independent
+        fq._FP32_SHARD_CLASS_NAMES.clear()
+        fq._FP32_SHARD_CLASS_NAMES.update(saved)
+
+
+def test_quantized_param_detection_float_logical_subclass():
+    # torchao NVFP4Tensor/Float8Tensor report a logical FLOAT dtype, so the nonfloat check misses
+    # them; the quantized check must still catch them by tensor-subclass name.
+    saved = set(fq._QUANT_TENSOR_CLASS_NAMES)
+    try:
+
+        class FakeNVFP4Tensor(torch.Tensor):
+            pass
+
+        t = torch.zeros(4, 4, dtype=torch.bfloat16).as_subclass(FakeNVFP4Tensor)
+        assert torch.is_floating_point(
+            t
+        )  # float-logical -> invisible to the nonfloat check
+
+        fq.register_quantized_tensor_classes(["FakeNVFP4Tensor"])
+        assert fq._is_quantized_param(t)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # torchao wraps the subclass directly in the Parameter (preserves the subclass type)
+                self.w = nn.Parameter(
+                    torch.zeros(4, 4, dtype=torch.bfloat16).as_subclass(
+                        FakeNVFP4Tensor
+                    ),
+                    requires_grad=False,
+                )
+
+        m = M()
+        assert fq.model_has_quantized_params(m)  # detected via the registry
+        assert not fq.model_has_nonfloat_params(m)  # but NOT a plain non-float param
+
+        # built-in torchao names are detected out of the box
+        assert "NVFP4Tensor" in fq._QUANT_TENSOR_CLASS_NAMES
+        assert "Float8Tensor" in fq._QUANT_TENSOR_CLASS_NAMES
+    finally:  # restore the global registry so tests stay order-independent
+        fq._QUANT_TENSOR_CLASS_NAMES.clear()
+        fq._QUANT_TENSOR_CLASS_NAMES.update(saved)
+
+
+def test_builds_original_state_dict_skips_staged_nf4_peers():
+    from axolotl.monkeypatch.accelerate.fsdp2 import _builds_original_state_dict
+
+    assert [
+        _builds_original_state_dict(staged, main)
+        for staged in (False, True)
+        for main in (True, False)
+    ] == [True, True, True, False]
+
+
+def test_nvfp4_dense_scale_normalization_precedes_state_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+
+    from axolotl.integrations.kernels.libs.scattermoe_lora import nvfp4_fsdp
+    from axolotl.monkeypatch.accelerate import fsdp2, fsdp2_quantized
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+            self.normalized = False
+
+        def state_dict(self, *args, **kwargs):
+            assert self.normalized, "FSDP snapshot captured swizzled dense NVFP4 scales"
+            return super().state_dict(*args, **kwargs)
+
+    model = Model()
+    plugin = SimpleNamespace(
+        auto_wrap_policy=None,
+        activation_checkpointing=False,
+        reshard_after_forward=True,
+        cpu_offload=None,
+        mixed_precision_policy=None,
+        cpu_ram_efficient_loading=False,
+        set_auto_wrap_policy=lambda _model: None,
+    )
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(
+            fsdp_plugin=plugin, device_mesh=None, parallelism_config=None
+        ),
+        is_main_process=True,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(fsdp2_quantized, "model_has_nvfp4_params", lambda _: True)
+    monkeypatch.setattr(
+        nvfp4_fsdp,
+        "normalize_dense_nvfp4_scales",
+        lambda m: setattr(m, "normalized", True) or 1,
+    )
+    monkeypatch.setattr(nvfp4_fsdp, "patch_nvfp4_fsdp", lambda: None)
+    monkeypatch.setattr(
+        torch.distributed.fsdp, "fully_shard", lambda module, **_: module
+    )
+    fsdp2.fsdp2_prepare_model(accelerator, model)
+
+
+def test_native_merge_bridge_installs_after_meta_state_load_and_retie(monkeypatch):
+    from types import SimpleNamespace
+
+    from axolotl.monkeypatch import torchao_nvfp4_fsdp_lora
+    from axolotl.monkeypatch.accelerate import fsdp2
+
+    events = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1), requires_grad=False)
+            self._axolotl_native_nvfp4_merge_aware_requested = True
+
+        def tie_weights(self):
+            events.append(("tie", self.weight.device.type))
+
+    model = Model()
+    plugin = SimpleNamespace(
+        auto_wrap_policy=None,
+        activation_checkpointing=False,
+        reshard_after_forward=True,
+        cpu_offload=None,
+        mixed_precision_policy=None,
+        cpu_ram_efficient_loading=True,
+        set_auto_wrap_policy=lambda _model: None,
+    )
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(
+            fsdp_plugin=plugin, device_mesh=None, parallelism_config=None
+        ),
+        is_main_process=True,
+        device=torch.device("cpu"),
+    )
+
+    def load_state(_accelerator, target, state, **_kwargs):
+        assert target.weight.is_meta
+        target.load_state_dict(state, assign=True)
+        events.append(("load", target.weight.device.type))
+
+    def install(target):
+        assert events[-2:] == [("load", "cpu"), ("tie", "cpu")]
+        assert not target.weight.is_meta
+        events.append(("install", "cpu"))
+        return 1
+
+    monkeypatch.setattr(
+        torch.distributed.fsdp, "fully_shard", lambda module, **_: module
+    )
+    monkeypatch.setattr(fsdp2, "fsdp2_load_full_state_dict", load_state)
+    monkeypatch.setattr(
+        torchao_nvfp4_fsdp_lora,
+        "install_fsdp_native_nvfp4_merge_aware_lora_linears",
+        install,
+    )
+    fsdp2.fsdp2_prepare_model(accelerator, model)
+    assert events == [
+        ("tie", "meta"),
+        ("load", "cpu"),
+        ("tie", "cpu"),
+        ("install", "cpu"),
+    ]

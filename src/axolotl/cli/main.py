@@ -2,6 +2,7 @@
 
 import os
 import subprocess  # nosec B404
+from pathlib import Path
 from typing import Literal, Optional
 
 import click
@@ -10,14 +11,17 @@ from dotenv import load_dotenv
 import axolotl
 from axolotl.cli.args import (
     EvaluateCliArgs,
+    ExportCliArgs,
     PreprocessCliArgs,
     QuantizeCliArgs,
     TrainerCliArgs,
     VllmServeCliArgs,
 )
 from axolotl.cli.art import print_axolotl_text_art
+from axolotl.cli.config_options import AXOLOTL_CONFIG_CLI_OPTIONS
+from axolotl.cli.plugins import PluginCommandGroup
 from axolotl.cli.utils import (
-    add_options_from_config,
+    add_options_from_config_options,
     add_options_from_dataclass,
     build_command,
     fetch_from_github,
@@ -25,10 +29,8 @@ from axolotl.cli.utils import (
     generate_config_files,
     launch_training,
 )
-from axolotl.integrations.lm_eval.cli import lm_eval
 from axolotl.utils import set_misc_env, set_pytorch_cuda_alloc_conf
 from axolotl.utils.logging import get_logger
-from axolotl.utils.schemas.config import AxolotlInputConfig
 
 LOG = get_logger(__name__)
 
@@ -38,7 +40,21 @@ LAUNCHER_COMMAND_MAPPING = {
 }
 
 
-@click.group()
+class ConfigPath(click.Path):
+    """Click path type for `axolotl` config files.
+
+    Configs may be local files or HTTPS URLs to remote YAML files (see
+    `docs/cli.qmd`). HTTPS URLs pass conversion unchanged; they are downloaded
+    later by `axolotl.cli.config.check_remote_config` when the config loads.
+    """
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, str) and value.startswith("https://"):
+            return value
+        return super().convert(value, param, ctx)
+
+
+@click.group(cls=PluginCommandGroup)
 @click.version_option(version=axolotl.__version__, prog_name="axolotl")
 def cli():
     """Axolotl CLI - Train and fine-tune large language models"""
@@ -49,10 +65,10 @@ def cli():
 
 
 @cli.command()
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @click.option("--cloud", default=None, type=click.Path(exists=True, path_type=str))
 @add_options_from_dataclass(PreprocessCliArgs)
-@add_options_from_config(AxolotlInputConfig)
+@add_options_from_config_options(AXOLOTL_CONFIG_CLI_OPTIONS)
 @filter_none_kwargs
 def preprocess(config: str, cloud: Optional[str] = None, **kwargs):
     """
@@ -67,8 +83,9 @@ def preprocess(config: str, cloud: Optional[str] = None, **kwargs):
 
     if cloud:
         from axolotl.cli.cloud import do_cli_preprocess
+        from axolotl.cli.config import check_remote_config
 
-        do_cli_preprocess(cloud_config=cloud, config=config)
+        do_cli_preprocess(cloud_config=cloud, config=check_remote_config(config))
     else:
         from axolotl.cli.preprocess import do_cli
 
@@ -78,7 +95,7 @@ def preprocess(config: str, cloud: Optional[str] = None, **kwargs):
 @cli.command(
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
 )
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @click.option(
     "--launcher",
     type=click.Choice(["accelerate", "torchrun", "python"]),
@@ -92,7 +109,7 @@ def preprocess(config: str, cloud: Optional[str] = None, **kwargs):
     help="YAML config for sweeping hyperparameters",
 )
 @add_options_from_dataclass(TrainerCliArgs)
-@add_options_from_config(AxolotlInputConfig)
+@add_options_from_config_options(AXOLOTL_CONFIG_CLI_OPTIONS)
 @filter_none_kwargs
 @click.pass_context
 def train(
@@ -121,6 +138,12 @@ def train(
     # Handle Ray launcher override
     _launcher = None if kwargs.get("use_ray") else launcher
 
+    if sweep or cloud:
+        from axolotl.cli.config import check_remote_config
+
+        # Sweep and cloud read the config in-process, before load_cfg would fetch it.
+        config = str(check_remote_config(config))
+
     # Process each configuration
     for cfg_file, is_group in generate_config_files(config, sweep):
         try:
@@ -139,7 +162,7 @@ def train(
 @cli.command(
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
 )
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @click.option(
     "--launcher",
     type=click.Choice(["accelerate", "torchrun", "python"]),
@@ -147,7 +170,7 @@ def train(
     help="Launcher to use for multi-GPU evaluation",
 )
 @add_options_from_dataclass(EvaluateCliArgs)
-@add_options_from_config(AxolotlInputConfig)
+@add_options_from_config_options(AXOLOTL_CONFIG_CLI_OPTIONS)
 @filter_none_kwargs
 @click.pass_context
 def evaluate(ctx: click.Context, config: str, launcher: str, **kwargs):
@@ -183,7 +206,7 @@ def evaluate(ctx: click.Context, config: str, launcher: str, **kwargs):
 @cli.command(
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
 )
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @click.option(
     "--launcher",
     type=click.Choice(["accelerate", "torchrun", "python"]),
@@ -195,7 +218,7 @@ def evaluate(ctx: click.Context, config: str, launcher: str, **kwargs):
     "--chat", is_flag=True, help="Launch interactive multi-turn chat interface"
 )
 @add_options_from_dataclass(TrainerCliArgs)
-@add_options_from_config(AxolotlInputConfig)
+@add_options_from_config_options(AXOLOTL_CONFIG_CLI_OPTIONS)
 @filter_none_kwargs
 @click.pass_context
 def inference(
@@ -242,7 +265,7 @@ def inference(
 @cli.command(
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
 )
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @click.option(
     "--launcher",
     type=click.Choice(["accelerate", "torchrun", "python"]),
@@ -250,7 +273,7 @@ def inference(
     help="Launcher to use for weight merging",
 )
 @add_options_from_dataclass(TrainerCliArgs)
-@add_options_from_config(AxolotlInputConfig)
+@add_options_from_config_options(AXOLOTL_CONFIG_CLI_OPTIONS)
 @filter_none_kwargs
 @click.pass_context
 def merge_sharded_fsdp_weights(
@@ -286,9 +309,23 @@ def merge_sharded_fsdp_weights(
 
 
 @cli.command()
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
+@click.option(
+    "--dequant",
+    is_flag=True,
+    default=False,
+    help="Dequantize a quantized base to bf16 in the merged checkpoint instead of "
+    "re-quantizing to the base's format.",
+)
+@click.option(
+    "--override-quantizer",
+    is_flag=True,
+    default=False,
+    help="Merge a merge-aware adapter despite a quantizer-identity mismatch "
+    "(e.g. different torchao version than trained with).",
+)
 @add_options_from_dataclass(TrainerCliArgs)
-@add_options_from_config(AxolotlInputConfig)
+@add_options_from_config_options(AXOLOTL_CONFIG_CLI_OPTIONS)
 @filter_none_kwargs
 def merge_lora(config: str, **kwargs):
     """
@@ -326,7 +363,7 @@ def fetch(directory: str, dest: Optional[str]):
 
 
 @cli.command()
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @add_options_from_dataclass(VllmServeCliArgs)
 @filter_none_kwargs
 def vllm_serve(config: str, **cli_args: VllmServeCliArgs):
@@ -336,7 +373,7 @@ def vllm_serve(config: str, **cli_args: VllmServeCliArgs):
 
 
 @cli.command()
-@click.argument("config", type=click.Path(exists=True, path_type=str))
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
 @add_options_from_dataclass(QuantizeCliArgs)
 @filter_none_kwargs
 def quantize(config: str, **cli_args: QuantizeCliArgs):
@@ -346,12 +383,39 @@ def quantize(config: str, **cli_args: QuantizeCliArgs):
 
 
 @cli.command()
+@click.argument("config", type=ConfigPath(exists=True, path_type=str))
+@add_options_from_dataclass(ExportCliArgs)
+@filter_none_kwargs
+def export(config: str, **cli_args: ExportCliArgs):
+    """Export a trained model to a deployment format (GGUF)."""
+    from axolotl.cli.export import do_export
+
+    do_export(config, cli_args)
+
+
+@cli.command()
 @click.argument("model", type=click.Path(exists=True, path_type=str))
 @click.argument("output", type=click.Path(exists=False, path_type=str))
 def delinearize_llama4(model: str, output: str):
     from axolotl.cli.delinearize_llama4 import do_cli as do_delinearize_llama4
 
     do_delinearize_llama4(model, output)
+
+
+@cli.command("generate-cli-config-options")
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=Path("src/axolotl/cli/config_options.py"),
+    show_default=True,
+    help="Path to write generated option metadata.",
+)
+@click.option("--check", is_flag=True, help="Fail if generated metadata is stale.")
+def generate_cli_config_options(output: Path, check: bool):
+    """Regenerate CLI config override option metadata."""
+    from axolotl.cli.generate_config_options import write_options
+
+    write_options(output, check=check)
 
 
 @cli.command("agent-docs")
@@ -409,6 +473,8 @@ def config_schema(output_format: str, field: Optional[str]):
     """
     import json
 
+    from axolotl.utils.schemas.config import AxolotlInputConfig
+
     try:
         schema = AxolotlInputConfig.model_json_schema()
     except (TypeError, ValueError, AttributeError) as exc:
@@ -458,9 +524,6 @@ def config_schema(output_format: str, field: Optional[str]):
         click.echo(yaml.dump(schema, default_flow_style=False, sort_keys=False))
     else:
         click.echo(json.dumps(schema, indent=2))
-
-
-cli.add_command(lm_eval)
 
 
 def main():

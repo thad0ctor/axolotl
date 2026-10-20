@@ -4,7 +4,7 @@ FSDP Configuration Schema
 
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 
 class FSDPConfig(BaseModel):
@@ -25,10 +25,6 @@ class FSDPConfig(BaseModel):
         default=None,
         description="Offload parameters to CPU to reduce GPU memory usage",
     )
-    sync_module_states: bool | None = Field(
-        default=None,
-        description="Synchronize module states across all processes",
-    )
     cpu_ram_efficient_loading: bool | None = Field(
         default=None,
         description="Enable CPU RAM efficient loading to reduce memory usage during model loading",
@@ -37,11 +33,6 @@ class FSDPConfig(BaseModel):
         default=None,
         description="Disabling this enables swap memory usage for resource-constrained setups when offload_params is enabled.",
     )
-    use_orig_params: bool | None = Field(
-        default=None,
-        description="Use original parameters instead of flattened parameters",
-    )
-
     state_dict_type: (
         Literal["FULL_STATE_DICT", "LOCAL_STATE_DICT", "SHARDED_STATE_DICT"] | None
     ) = Field(
@@ -66,6 +57,12 @@ class FSDPConfig(BaseModel):
         description="Class name of transformer layers to wrap (e.g., 'LlamaDecoderLayer')",
     )
 
+    min_num_params: int | None = Field(
+        default=None,
+        ge=1,
+        description="Minimum parameter count a module must have to be wrapped under the SIZE_BASED_WRAP policy",
+    )
+
     reshard_after_forward: bool | None = Field(
         default=None,
         description="Reshard parameters after forward pass to save memory",
@@ -74,3 +71,11 @@ class FSDPConfig(BaseModel):
         default=None,
         description="Mixed precision policy for FSDP (e.g., 'fp16', 'bf16')",
     )
+
+    @model_validator(mode="after")
+    def validate_size_based_wrap(self):
+        if self.auto_wrap_policy == "SIZE_BASED_WRAP" and self.min_num_params is None:
+            raise ValueError(
+                "fsdp_config.min_num_params is required when auto_wrap_policy is SIZE_BASED_WRAP"
+            )
+        return self

@@ -1,0 +1,329 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Axolotl AI
+# Licensed under the Apache License, Version 2.0
+
+"""CPU round-trip tests for the FSDP2 sharding substrate on torchao ``NVFP4Tensor``.
+
+The substrate (``...scattermoe_lora.nvfp4_fsdp``) teaches a frozen, expert-sharded
+``NVFP4Tensor`` the aten ops FSDP2 needs to dim-0 (expert axis) shard the weight:
+``split`` / ``narrow`` / ``slice`` / ``new_zeros`` / ``clone`` / ``detach`` /
+``as_strided`` / ``view`` / ``copy_`` plus the ``fsdp_pre_all_gather`` /
+``fsdp_post_all_gather`` reconstruct hooks. These are pure tensor logic over the inner
+``(qdata, scale, per_tensor_scale)`` triple and are fully exercisable on CPU - no GPU, no
+Blackwell, no fused kernel.
+
+Each round-trip test simulates the FSDP2 shard -> all-gather -> reconstruct flow and asserts
+the reconstructed tensor dequantizes equal to the unsharded original across several world
+sizes including one where the expert axis does NOT divide evenly. Covers the B11 data-
+independent FSDP2 collective contract for the NVFP4 substrate.
+
+Round-trip verification covers shared scalar and per-expert scales with numeric equality.
+
+Skip gate: requires torchao's NVFP4Tensor. The substrate module is loaded by file path so the
+scattermoe_lora package __init__ (which imports triton) is NOT executed - the ops are pure CPU
+tensor logic, so this runs on the no-CUDA / triton-less CI lane (matching the Float8 sibling).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+
+import pytest
+import torch
+
+NVFP4Tensor = pytest.importorskip(
+    "torchao.prototype.mx_formats.nvfp4_tensor", reason="torchao required"
+).NVFP4Tensor
+
+
+def _load_nvfp4_fsdp():
+    """Load nvfp4_fsdp by file path so the scattermoe_lora package __init__ (which imports triton) is
+    NOT executed. The module needs only torch + torchao, so it imports triton-free and runs on CPU."""
+    import axolotl
+
+    path = os.path.join(
+        os.path.dirname(axolotl.__file__),
+        "integrations",
+        "kernels",
+        "libs",
+        "scattermoe_lora",
+        "nvfp4_fsdp.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_axolotl_nvfp4_fsdp_under_test", path
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+nvfp4_fsdp = _load_nvfp4_fsdp()
+nvfp4_fsdp.patch_nvfp4_fsdp()
+
+DEV = "cpu"
+
+
+def _cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _make_nvfp4(E: int, N: int, K: int, seed: int = 0, per_expert_pts: bool = False):
+    """Build a frozen ``NVFP4Tensor`` [E,N,K] (qdata [E,N,K//2], scale [E,N,K//16]).
+
+    per_expert_pts=False uses a unit scalar per_tensor_scale (the real DSV4 case, dequant-able);
+    True uses per-expert [E, 1, 1] scales.
+    """
+    torch.manual_seed(seed)
+    packed = torch.randint(0, 255, (E, N, K // 2), dtype=torch.uint8)
+    scale = (torch.rand(E, N, K // 16) * 0.5 + 0.5).to(torch.float8_e4m3fn)
+    pts = (torch.rand(E, 1, 1) * 0.5 + 0.5) if per_expert_pts else torch.tensor(0.37)
+    return NVFP4Tensor(packed.contiguous(), scale.contiguous(), 16, torch.bfloat16, pts)
+
+
+def _shard_all_gather_reconstruct(nv, world: int):
+    """Simulate one FSDP2 dim-0 (expert axis) shard -> all-gather -> reconstruct cycle on CPU.
+
+    Pads the expert axis to a per-rank-equal count (FSDP2 pads uneven shards via new_zeros +
+    copy_ into a narrow), chunks into ``world`` shards, runs each shard's fsdp_pre_all_gather,
+    concatenates every gathered inner tensor on dim 0, and reconstructs via fsdp_post_all_gather. Returns the unpadded NVFP4Tensor.
+    """
+    E = nv.shape[0]
+    shard = _cdiv(E, world)
+    padded = shard * world
+    if padded != E:
+        full = nv.new_zeros([padded, *nv.shape[1:]])
+        full.narrow(0, 0, E).copy_(nv)
+    else:
+        full = nv.clone()
+    shards = torch.split(full, shard, 0)
+    assert len(shards) == world, (len(shards), world)
+    pre = [s.fsdp_pre_all_gather(mesh=None) for s in shards]
+    meta = pre[0][1]
+    gathered = []
+    for k in range(len(pre[0][0])):
+        tensors = [p[0][k] for p in pre]
+        assert all(t.dim() > 0 for t in tensors)
+        gathered.append(torch.cat(tensors, 0))
+    recon, _ = shards[0].fsdp_post_all_gather(tuple(gathered), meta, torch.bfloat16)
+    reused = recon.clone()
+    shards[0].fsdp_post_all_gather(tuple(gathered), meta, torch.bfloat16, out=reused)
+    assert torch.equal(reused.dequantize(), recon.dequantize())
+    return recon.narrow(0, 0, E)
+
+
+@pytest.mark.parametrize("E,N,K", [(4, 8, 16), (6, 8, 32)], ids=["E4_K16", "E6_K32"])
+def test_nvfp4_split_narrow_slice_roundtrip(E, N, K):
+    """split/narrow/slice on the expert axis dequantize equal to the original slice."""
+    nv = _make_nvfp4(E, N, K)
+    orig = nv.dequantize(torch.bfloat16)
+
+    parts = torch.split(nv, 2, 0)
+    rec = torch.cat([p.dequantize(torch.bfloat16) for p in parts], 0)
+    assert torch.equal(rec, orig), "split round-trip diverged"
+
+    nar = torch.narrow(nv, 0, 1, 2)
+    assert torch.equal(nar.dequantize(torch.bfloat16), orig[1:3]), "narrow diverged"
+
+    sl = nv[1:3]  # aten.slice on dim 0
+    assert torch.equal(sl.dequantize(torch.bfloat16), orig[1:3]), "slice diverged"
+
+
+def test_nvfp4_clone_detach_as_strided_roundtrip():
+    """clone / detach / as_strided preserve the dequantized value (view ops return new tensors)."""
+    nv = _make_nvfp4(6, 8, 32)
+    orig = nv.dequantize(torch.bfloat16)
+    assert torch.equal(nv.clone().dequantize(torch.bfloat16), orig), "clone diverged"
+    assert torch.equal(nv.detach().dequantize(torch.bfloat16), orig), "detach diverged"
+
+    shape = list(nv.shape)
+    stride = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        stride[i] = stride[i + 1] * shape[i + 1]
+    ast = torch.as_strided(nv, shape, stride)
+    assert torch.equal(ast.dequantize(torch.bfloat16), orig), "as_strided diverged"
+
+
+@pytest.mark.parametrize(
+    "E,worlds",
+    [(6, (1, 2, 3)), (6, (4,)), (8, (3,))],
+    ids=["even_1_2_3", "uneven_world4_E6", "uneven_world3_E8"],
+)
+@pytest.mark.parametrize("scale_kind", ["none", "scalar", "shared", "per_expert"])
+def test_nvfp4_fsdp_all_gather_roundtrip(E, worlds, scale_kind):
+    """FSDP2 shard -> all-gather -> reconstruct round-trips across worlds, incl. uneven expert splits.
+
+    world=4 over E=6 and world=3 over E=8 do NOT divide evenly: the shard is padded on the expert
+    axis (new_zeros + copy_ into a narrow) and narrowed back after reconstruct. Pure CPU logic.
+    """
+    nv = _make_nvfp4(E, 8, 32, per_expert_pts=scale_kind == "per_expert")
+    if scale_kind == "none":
+        nv.per_tensor_scale = None
+    elif scale_kind == "shared":
+        nv.per_tensor_scale = nv.per_tensor_scale.reshape(1, 1, 1)
+    orig = nv.dequantize(torch.bfloat16)
+    for world in worlds:
+        recon = _shard_all_gather_reconstruct(nv, world)
+        assert torch.equal(recon.dequantize(torch.bfloat16), orig), (
+            f"FSDP all-gather reconstruct diverged at world={world} (E={E})"
+        )
+
+
+def test_nvfp4_new_zeros_preserves_trailing_shapes():
+    """new_zeros varies only dim 0 (experts); qdata/scale trailing dims are preserved verbatim."""
+    nv = _make_nvfp4(6, 8, 32)
+    nz = nv.new_zeros([10, 8, 32])
+    assert nz.qdata.shape == (10, *nv.qdata.shape[1:])
+    assert nz.scale.shape == (10, *nv.scale.shape[1:])
+
+
+def test_nvfp4_per_expert_pts_split_narrow_shapes():
+    """Per-expert scales are sliced alongside packed weights without changing their values."""
+    nv = _make_nvfp4(6, 8, 32, per_expert_pts=True)
+    assert nv.per_tensor_scale is not None and nv.per_tensor_scale.shape == (6, 1, 1)
+
+    parts = torch.split(nv, 2, 0)
+    assert all(p.per_tensor_scale.shape == (2, 1, 1) for p in parts), (
+        "per-expert per_tensor_scale not split on the expert axis"
+    )
+    assert torch.equal(
+        torch.cat([p.per_tensor_scale for p in parts], 0), nv.per_tensor_scale
+    )
+
+    nar = torch.narrow(nv, 0, 1, 3)
+    assert nar.per_tensor_scale.shape == (3, 1, 1)
+    assert torch.equal(nar.per_tensor_scale, nv.per_tensor_scale[1:4])
+    assert torch.equal(nar.dequantize(), nv.dequantize()[1:4])
+    assert torch.equal(torch.cat([p.dequantize() for p in parts]), nv.dequantize())
+
+
+def test_nvfp4_split_dim_other_than_zero_rejected():
+    """Sharding is restricted to dim 0 (expert axis); a non-zero dim split must raise."""
+    nv = _make_nvfp4(4, 8, 16)
+    with pytest.raises(NotImplementedError, match="only on dim 0"):
+        torch.split(nv, 4, 1)
+
+
+def _make_dense_nvfp4(rows, cols=64):
+    torch.manual_seed(rows)
+    nv = NVFP4Tensor.to_nvfp4(
+        torch.randn(rows, cols, dtype=torch.bfloat16),
+        per_tensor_scale=torch.tensor(0.73),
+        is_swizzled_scales=True,
+    )
+    nvfp4_fsdp.normalize_dense_nvfp4_scales(nv)
+    return nv
+
+
+@pytest.mark.parametrize("rows", [32, 64, 128, 256])
+def test_dense_swizzled_nvfp4_component_roundtrip(rows):
+    nv = _make_dense_nvfp4(rows)
+    original_rows = nvfp4_fsdp._dense_row_scales(nv).clone()
+    original_qdata = nv.qdata.clone()
+    original = nv.dequantize()
+    for world in (1, 2, 3):
+        shard = _cdiv(rows, world)
+        padded = shard * world
+        full = nv.new_zeros([padded, *nv.shape[1:]]) if padded != rows else nv.clone()
+        if padded != rows:
+            full.narrow(0, 0, rows).copy_(nv)
+        parts = torch.split(full, shard, 0)
+        pre = [part.fsdp_pre_all_gather(mesh=None) for part in parts]
+        gathered = tuple(
+            torch.cat([item[0][index] for item in pre], 0)
+            for index in range(len(pre[0][0]))
+        )
+        rebuilt, _ = parts[0].fsdp_post_all_gather(gathered, pre[0][1], torch.bfloat16)
+        rebuilt = rebuilt.narrow(0, 0, rows)
+        assert torch.equal(rebuilt.qdata, original_qdata)
+        assert torch.equal(nvfp4_fsdp._dense_row_scales(rebuilt), original_rows)
+        assert torch.equal(rebuilt.dequantize(), original)
+
+
+def test_dense_normalization_preserves_view_copy_aliases():
+    nv = _make_dense_nvfp4(64)
+    padded = nv.new_zeros([96, 64])
+    view = padded.narrow(0, 16, 64)
+    view.copy_(nv)
+    assert (
+        view.qdata.untyped_storage().data_ptr()
+        == padded.qdata.untyped_storage().data_ptr()
+    )
+    assert (
+        view.scale.untyped_storage().data_ptr()
+        == padded.scale.untyped_storage().data_ptr()
+    )
+    assert torch.equal(padded.scale[16:80], nv.scale)
+    assert torch.equal(padded.qdata[16:80], nv.qdata)
+
+
+def test_dense_swizzled_sharding_requires_normalization():
+    nv = NVFP4Tensor.to_nvfp4(
+        torch.randn(64, 64, dtype=torch.bfloat16),
+        per_tensor_scale=torch.tensor(0.73),
+        is_swizzled_scales=True,
+    )
+    with pytest.raises(ValueError, match="Normalize dense NVFP4 scales"):
+        torch.split(nv, 32, 0)
+    with pytest.raises(ValueError, match="Normalize dense NVFP4 scales"):
+        nv.narrow(0, 0, 32)
+
+
+def test_dense_normalization_preserves_values_storage_and_parameter_identity():
+    nv = NVFP4Tensor.to_nvfp4(
+        torch.randn(64, 64, dtype=torch.bfloat16),
+        per_tensor_scale=torch.tensor(0.73),
+        is_swizzled_scales=True,
+    )
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(nv, requires_grad=False))
+    parameter = model.weight
+    original = parameter.dequantize().clone()
+    qdata_pointer = parameter.qdata.untyped_storage().data_ptr()
+    scale = parameter.per_tensor_scale.clone()
+    assert nvfp4_fsdp.normalize_dense_nvfp4_scales(model) == 1
+    assert model.weight is parameter
+    assert parameter.qdata.untyped_storage().data_ptr() == qdata_pointer
+    assert torch.equal(parameter.per_tensor_scale, scale)
+    assert torch.equal(parameter.dequantize(), original)
+    assert nvfp4_fsdp.normalize_dense_nvfp4_scales(model) == 0
+    assert model.weight is parameter
+    assert torch.equal(parameter.dequantize(), original)
+
+
+class _Mesh:
+    def __init__(self, n):
+        self._n = n
+
+    def size(self, mesh_dim=None):
+        return self._n
+
+
+@pytest.mark.parametrize("scale_kind", ["none", "scalar", "per_expert"])
+def test_nvfp4_fsdp_single_rank_packed_roundtrip(scale_kind):
+    """A size-1 shard mesh (pure EP, dp_replicate x ep) gets ONE packed all-gather input, since
+    FSDP2's single-rank unshard copies only ``all_gather_inputs[0]``; the unpack side views the
+    components straight out of that buffer."""
+    nv = _make_nvfp4(4, 8, 32, per_expert_pts=scale_kind == "per_expert")
+    if scale_kind == "none":
+        nv.per_tensor_scale = None
+    orig = nv.dequantize(torch.bfloat16)
+
+    inputs, meta = nv.fsdp_pre_all_gather(_Mesh(1))
+    assert len(inputs) == 1
+    assert inputs[0].dtype == torch.uint8 and inputs[0].shape[0] == 4
+    buf = torch.empty_like(inputs[0])
+    buf.copy_(inputs[0])
+    recon, inner = nv.fsdp_post_all_gather((buf,), meta, torch.bfloat16)
+    assert inner == (buf,)
+    assert torch.equal(recon.dequantize(torch.bfloat16), orig)
+    assert recon.qdata.data_ptr() == buf.data_ptr()
+    if scale_kind == "scalar":
+        assert recon.per_tensor_scale.dim() == 0
+    reused = recon.clone()
+    nv.fsdp_post_all_gather((buf,), meta, torch.bfloat16, out=reused)
+    assert torch.equal(reused.dequantize(torch.bfloat16), orig)
+    # multi-rank meshes keep the per-component inputs the gathered path expects
+    assert len(nv.fsdp_pre_all_gather(_Mesh(2))[0]) == (
+        2 if scale_kind == "none" else 3
+    )

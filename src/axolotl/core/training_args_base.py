@@ -31,6 +31,15 @@ class AxolotlTrainingMixins:
         default=False,
         metadata={"help": "Use sample packing for efficient training."},
     )
+    batch_flattening: bool = field(default=False)
+    balance_labels: bool = field(
+        default=False,
+        metadata={"help": "Balance supervised token counts across training batches."},
+    )
+    label_balance_window_optim_steps: int = field(
+        default=1,
+        metadata={"help": "Optimizer steps per label-balancing refinement window."},
+    )
     sample_packing_sequentially: bool = field(
         default=False,
         metadata={
@@ -259,14 +268,14 @@ class AxolotlTrainingMixins:
         },
     )
 
-    # "hidden_states" never reaches the trainer (it's handled via the checkpoint
-    # monkeypatch in the model loader), so the trainer only sees these values.
-    activation_offloading: Literal["legacy", "disk"] | bool | None = field(
-        default=None,
-        metadata={
-            "help": "Activation offloading mode: True (stream-overlapped), "
-            "'legacy' (synchronous), 'disk', or False."
-        },
+    activation_offloading: Literal["legacy", "disk", "hidden_states"] | bool | None = (
+        field(
+            default=None,
+            metadata={
+                "help": "Activation offloading mode: True (stream-overlapped), "
+                "'legacy' (synchronous), 'disk', 'hidden_states', or False."
+            },
+        )
     )
 
     layer_offloading: bool | None = field(

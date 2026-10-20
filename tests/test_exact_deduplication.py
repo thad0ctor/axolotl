@@ -17,7 +17,7 @@ from axolotl.utils.data import prepare_datasets, prepare_preference_datasets
 from axolotl.utils.data.utils import deduplicate_and_log_datasets
 from axolotl.utils.dict import DictDefault
 
-from tests.constants import ALPACA_MESSAGES_CONFIG_REVISION
+from tests.constants import ALPACA_MESSAGES_CONFIG_REVISION, alpaca_messages_dpo_rows
 from tests.hf_offline_utils import enable_hf_offline
 
 
@@ -193,6 +193,11 @@ class TestDeduplicateIndividualFunctions(unittest.TestCase):
         verify_deduplication(train_dataset, expected_dataset_train, "train_dataset")
         verify_deduplication(eval_dataset, expected_dataset_eval, "eval_dataset")
 
+    def test_image_datasets_are_not_deduplicated(self):
+        dataset = Dataset.from_dict({"prompt": ["a", "a"], "images": [[], []]})
+        train_dataset, _ = deduplicate_and_log_datasets(dataset=dataset)
+        assert len(train_dataset) == 2
+
 
 class TestDeduplicateRLDataset:
     """Test a configured dataloader with deduplication."""
@@ -210,7 +215,7 @@ class TestDeduplicateRLDataset:
                     ALPACA_MESSAGES_CONFIG_REVISION,
                     ALPACA_MESSAGES_CONFIG_REVISION,
                 ],
-                "dataset_num_proc": 1,
+                "dataset_num_proc": None,
             }
         )
         yield fixture
@@ -219,10 +224,10 @@ class TestDeduplicateRLDataset:
     def test_load_with_deduplication(
         self,
         cfg,
-        dataset_fozziethebeat_alpaca_messages_2k_dpo_test_rev_ea82cff,
         tokenizer_huggyllama,
     ):
         """Verify that loading with deduplication removes duplicates."""
+        dataset = Dataset.from_list(alpaca_messages_dpo_rows())
 
         with (
             patch(
@@ -231,25 +236,25 @@ class TestDeduplicateRLDataset:
             patch("axolotl.loaders.load_tokenizer") as mock_load_tokenizer,
         ):
             # Set up the mock to return different values on successive calls
-            mock_load_dataset.side_effect = [
-                dataset_fozziethebeat_alpaca_messages_2k_dpo_test_rev_ea82cff,
-                dataset_fozziethebeat_alpaca_messages_2k_dpo_test_rev_ea82cff,
-            ]
+            mock_load_dataset.side_effect = [dataset, dataset]
             mock_load_tokenizer.return_value = tokenizer_huggyllama
 
             tokenizer = load_tokenizer(cfg)
             train_dataset, _ = prepare_preference_datasets(cfg, tokenizer)
 
             # Verify that the dataset has been deduplicated
-            assert len(train_dataset) == 1800, "Dataset was not properly deduplicated"
+            assert len(train_dataset) == len(dataset), (
+                "Dataset was not properly deduplicated"
+            )
 
     @enable_hf_offline
     def test_load_without_deduplication(
         self,
         cfg,
-        dataset_fozziethebeat_alpaca_messages_2k_dpo_test_rev_ea82cff,
         tokenizer_huggyllama,
     ):
+        dataset = Dataset.from_list(alpaca_messages_dpo_rows())
+
         with (
             patch(
                 "axolotl.utils.data.rl.load_dataset_with_config"
@@ -257,10 +262,7 @@ class TestDeduplicateRLDataset:
             patch("axolotl.loaders.load_tokenizer") as mock_load_tokenizer,
         ):
             # Set up the mock to return different values on successive calls
-            mock_load_dataset.side_effect = [
-                dataset_fozziethebeat_alpaca_messages_2k_dpo_test_rev_ea82cff,
-                dataset_fozziethebeat_alpaca_messages_2k_dpo_test_rev_ea82cff,
-            ]
+            mock_load_dataset.side_effect = [dataset, dataset]
             mock_load_tokenizer.return_value = tokenizer_huggyllama
 
             # Load the dataset without deduplication
@@ -269,7 +271,7 @@ class TestDeduplicateRLDataset:
             train_dataset, _ = prepare_preference_datasets(cfg, tokenizer)
 
             # Verify that the dataset retains duplicates
-            assert len(train_dataset) == 1800 * 2, (
+            assert len(train_dataset) == len(dataset) * 2, (
                 "Dataset deduplication occurred when it should not have"
             )
 
